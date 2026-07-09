@@ -10,9 +10,15 @@ from typing import Any, cast
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import GetMe, SendMessage, TelegramMethod
+from aiogram.methods import (
+    AnswerCallbackQuery,
+    EditMessageText,
+    GetMe,
+    SendMessage,
+    TelegramMethod,
+)
 from aiogram.methods.base import TelegramType
-from aiogram.types import Chat, Message, Update
+from aiogram.types import CallbackQuery, Chat, Message, Update
 from aiogram.types import User as TgUser
 
 
@@ -43,6 +49,8 @@ class RecordingSession(BaseSession):
         if isinstance(method, GetMe):
             bot_user = TgUser(id=1, is_bot=True, first_name="Epigone", username="epigone_bot")
             return cast(TelegramType, bot_user)
+        if isinstance(method, AnswerCallbackQuery | EditMessageText):
+            return cast(TelegramType, True)
         raise AssertionError(f"Fake transport has no canned reply for {type(method).__name__}")
 
     async def stream_content(
@@ -61,6 +69,12 @@ class RecordingSession(BaseSession):
 
     def sent_messages(self) -> list[SendMessage]:
         return [m for m in self.requests if isinstance(m, SendMessage)]
+
+    def edited_messages(self) -> list[EditMessageText]:
+        return [m for m in self.requests if isinstance(m, EditMessageText)]
+
+    def callback_answers(self) -> list[AnswerCallbackQuery]:
+        return [m for m in self.requests if isinstance(m, AnswerCallbackQuery)]
 
 
 def make_bot(session: RecordingSession) -> Bot:
@@ -88,12 +102,44 @@ async def feed_text(
             message_id=_update_id,
             date=datetime.now(UTC),
             chat=Chat(id=user_id, type="private"),
-            from_user=TgUser(
-                id=user_id, is_bot=False, first_name=first_name, username=username
-            ),
+            from_user=TgUser(id=user_id, is_bot=False, first_name=first_name, username=username),
             text=text,
         ),
     )
+    await _deliver(dp, bot, update)
+
+
+async def feed_callback(
+    dp: Dispatcher,
+    bot: Bot,
+    data: str,
+    *,
+    user_id: int,
+    message_id: int = 1,
+    username: str | None = None,
+) -> None:
+    """Deliver an inline-button tap from a User to the bot, as Telegram would."""
+    global _update_id
+    _update_id += 1
+    update = Update(
+        update_id=_update_id,
+        callback_query=CallbackQuery(
+            id=str(_update_id),
+            from_user=TgUser(id=user_id, is_bot=False, first_name="Test", username=username),
+            chat_instance="test-chat-instance",
+            data=data,
+            message=Message(
+                message_id=message_id,
+                date=datetime.now(UTC),
+                chat=Chat(id=user_id, type="private"),
+                text="tracked list",
+            ),
+        ),
+    )
+    await _deliver(dp, bot, update)
+
+
+async def _deliver(dp: Dispatcher, bot: Bot, update: Update) -> None:
     # Re-validate with bot context so nested objects (message.answer etc.) are bound.
     bound = Update.model_validate(update.model_dump(), context={"bot": bot})
     await dp.feed_update(bot, bound)

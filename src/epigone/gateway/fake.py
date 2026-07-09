@@ -10,6 +10,7 @@ class FakeHyperliquidGateway:
 
     def __init__(self) -> None:
         self.positions: dict[str, list[Position]] = {}
+        self.positions_errors: dict[str, Exception] = {}
         self.leaderboard: list[LeaderboardEntry] = []
         self.leaderboard_error: Exception | None = None
         self.portfolios: dict[str, dict[Window, PortfolioWindow]] = {}
@@ -17,7 +18,11 @@ class FakeHyperliquidGateway:
         self.portfolio_calls: list[str] = []
 
     async def get_open_positions(self, address: str) -> list[Position]:
-        return self.positions.get(address.lower(), [])
+        key = address.lower()
+        error = self.positions_errors.get(key)
+        if error is not None:
+            raise error
+        return self.positions.get(key, [])
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
         if self.leaderboard_error is not None:

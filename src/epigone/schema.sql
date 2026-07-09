@@ -12,9 +12,10 @@ CREATE TABLE IF NOT EXISTS users (
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- The Universe: candidate Traders seeded from the leaderboard source (issue #5).
--- Addresses are stored lowercased. refresh_tier is NULL until the first coarse
--- pass classifies the Trader; timestamps come from the injected clock, not now().
+-- The Universe: candidate Traders seeded from the leaderboard source (issue #5)
+-- or pasted directly by a User (issue #3). Addresses are stored lowercased.
+-- refresh_tier is NULL until the first coarse pass classifies the Trader;
+-- timestamps come from the injected clock, not now().
 CREATE TABLE IF NOT EXISTS traders (
     address             TEXT PRIMARY KEY,
     display_name        TEXT,
@@ -41,4 +42,12 @@ CREATE TABLE IF NOT EXISTS coarse_metrics (
     account_value NUMERIC NOT NULL,
     computed_at   TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (address, time_window)
+);
+
+-- A Track is a User's explicit, manual follow of a Trader (CONTEXT.md).
+CREATE TABLE IF NOT EXISTS tracks (
+    user_telegram_id BIGINT NOT NULL REFERENCES users (telegram_id),
+    trader_address   TEXT   NOT NULL REFERENCES traders (address),
+    tracked_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_telegram_id, trader_address)
 );

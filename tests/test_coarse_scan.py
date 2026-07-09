@@ -36,9 +36,7 @@ def full_portfolio(week_volume: str = "5000") -> dict[Window, PortfolioWindow]:
 async def seed_traders(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, addresses: list[str]
 ) -> None:
-    gateway.set_leaderboard(
-        [LeaderboardEntry(address=a, display_name=None) for a in addresses]
-    )
+    gateway.set_leaderboard([LeaderboardEntry(address=a, display_name=None) for a in addresses])
     await seed_universe(pool, gateway, clock)
 
 

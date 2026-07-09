@@ -8,6 +8,8 @@ from aiogram import Bot, Dispatcher
 
 from epigone.bot.handlers import build_router
 from epigone.db import apply_schema
+from epigone.gateway.fake import FakeHyperliquidGateway
+from tests.support.clock import FakeClock
 from tests.support.telegram import RecordingSession, make_bot
 
 DEFAULT_TEST_DATABASE_URL = "postgresql://epigone:epigone@localhost:5432/epigone_test"
@@ -48,7 +50,7 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
     pool = await asyncpg.create_pool(database_url)
     assert pool is not None
     async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE users, traders, coarse_metrics")
+        await conn.execute("TRUNCATE users, traders, coarse_metrics, tracks")
     yield pool
     await pool.close()
 
@@ -66,8 +68,20 @@ async def bot(session: RecordingSession) -> AsyncGenerator[Bot, None]:
 
 
 @pytest.fixture
-def dp(pool: asyncpg.Pool) -> Dispatcher:
+def gateway() -> FakeHyperliquidGateway:
+    return FakeHyperliquidGateway()
+
+
+@pytest.fixture
+def clock() -> FakeClock:
+    return FakeClock()
+
+
+@pytest.fixture
+def dp(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) -> Dispatcher:
     dispatcher = Dispatcher()
     dispatcher["pool"] = pool
+    dispatcher["gateway"] = gateway
+    dispatcher["clock"] = clock
     dispatcher.include_router(build_router())
     return dispatcher
