@@ -1,3 +1,4 @@
+import asyncio
 import os
 from collections.abc import AsyncGenerator
 
@@ -14,9 +15,7 @@ from tests.support.telegram import RecordingSession, make_bot
 DEFAULT_TEST_DATABASE_URL = "postgresql://epigone:epigone@localhost:5432/epigone_test"
 
 
-@pytest.fixture
-async def pool() -> AsyncGenerator[asyncpg.Pool, None]:
-    url = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
+async def _rebuild_schema(url: str) -> None:
     server_url, _, dbname = url.rpartition("/")
     admin = await asyncpg.connect(f"{server_url}/postgres")
     exists = await admin.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", dbname)
@@ -24,9 +23,32 @@ async def pool() -> AsyncGenerator[asyncpg.Pool, None]:
         await admin.execute(f'CREATE DATABASE "{dbname}"')
     await admin.close()
 
+    conn = await asyncpg.connect(url)
+    # CREATE TABLE IF NOT EXISTS never ALTERs an existing table, so a schema.sql
+    # change on main would otherwise leave this database stale (UndefinedColumnError).
+    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
+    await conn.close()
+
     pool = await asyncpg.create_pool(url)
     assert pool is not None
     await apply_schema(pool)
+    await pool.close()
+
+
+@pytest.fixture(scope="session")
+def database_url() -> str:
+    """Once per test run: the throwaway DB with its schema rebuilt from scratch,
+    so it is actually throwaway. Sync + asyncio.run keeps it out of pytest-asyncio's
+    per-test event loops."""
+    url = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
+    asyncio.run(_rebuild_schema(url))
+    return url
+
+
+@pytest.fixture
+async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
+    pool = await asyncpg.create_pool(database_url)
+    assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE users, traders, coarse_metrics, tracks")
     yield pool
