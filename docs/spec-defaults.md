@@ -1,0 +1,10 @@
+# Spec defaults (carried into /to-spec)
+
+Working defaults agreed during the 2026-07-09 grilling session. Not architecture (see `docs/adr/`), not glossary (see `CONTEXT.md`) — tunable starting values for the spec.
+
+- **Stream poll interval: 30 seconds** (user decision 2026-07-09). Per-IP capacity at 30s ≈ 200–300 distinct tracked wallets (4 weight/min/wallet against the 1200/min budget, with ~⅓ reserved for ingest). Global trades-feed firehose removes the ceiling when needed.
+- **Metrics refresh tiers:** full-universe scan is an ~11+ hour rate-limited batch (run rarely); active/tracked/screener-visible traders refresh incrementally (hourly–daily); dormant accounts swept weekly.
+- **Two-stage scan (discovered via Bullpen R&D 2026-07-09):** HL's info API `portfolio` request returns precomputed windowed PnL / account value / volume (day, week, month, allTime, perp variants) for any address in a single weight-20 call — verified live via `bullpen hyperliquid stats --address`. Stage 1 (coarse): portfolio stats across the Universe → cheap windowed PnL/ROI/volume metrics, one call per account, no fill paging. Stage 2 (fine): fills-based metrics (win rate, avg win/loss, Sharpe, drawdown) only for accounts passing coarse filters (likely a few thousand). Screener filters should distinguish coarse metrics (available Universe-wide) from fine metrics (available for the vetted subset).
+- **Fine-metrics backfill via S3 (ecosystem survey 2026-07-09):** Hyperliquid publishes raw fills to official S3 buckets (`hl-mainnet-node-data/node_fills_by_block`, `hyperliquid-archive`; free third-party mirror: Reservoir). Prefer bulk-downloading fills and computing fine metrics offline for the whole Universe over rate-limited API paging; the API budget then serves only incremental freshness + the stream. Verify bucket access/cost/lag at build time.
+- **Alert noise controls** (min position size, per-user rate caps): to be designed in the spec.
+- **Alert events:** position open / close / flip; on-demand current-positions view.
