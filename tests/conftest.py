@@ -26,7 +26,7 @@ async def pool() -> AsyncGenerator[asyncpg.Pool, None]:
     assert pool is not None
     await apply_schema(pool)
     async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE users")
+        await conn.execute("TRUNCATE users, traders, coarse_metrics")
     yield pool
     await pool.close()
 
