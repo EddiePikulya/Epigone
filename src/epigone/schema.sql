@@ -1,5 +1,10 @@
 -- Epigone schema. Idempotent: applied at process startup.
 -- Vocabulary per CONTEXT.md — a User is a person on Telegram, never a Trader.
+--
+-- CREATE TABLE IF NOT EXISTS never ALTERs an existing table. Tests rebuild
+-- their throwaway schema every run (tests/conftest.py), but a deployed
+-- database keeps its old shape — before V1 deploys with data worth keeping,
+-- it needs a real migration story (issue #16).
 
 CREATE TABLE IF NOT EXISTS users (
     telegram_id   BIGINT PRIMARY KEY,
