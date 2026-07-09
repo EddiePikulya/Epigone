@@ -6,3 +6,32 @@ CREATE TABLE IF NOT EXISTS users (
     username      TEXT,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- The Universe: candidate Traders seeded from the leaderboard source (issue #5).
+-- Addresses are stored lowercased. refresh_tier is NULL until the first coarse
+-- pass classifies the Trader; timestamps come from the injected clock, not now().
+CREATE TABLE IF NOT EXISTS traders (
+    address             TEXT PRIMARY KEY,
+    display_name        TEXT,
+    refresh_tier        TEXT CHECK (refresh_tier IN ('active', 'dormant')),
+    first_seen_at       TIMESTAMPTZ NOT NULL,
+    last_seen_at        TIMESTAMPTZ NOT NULL,
+    coarse_refreshed_at TIMESTAMPTZ
+);
+
+-- Stale-first scan order: never-refreshed Traders come before everyone else.
+CREATE INDEX IF NOT EXISTS traders_coarse_refresh_order
+    ON traders (coarse_refreshed_at ASC NULLS FIRST, address);
+
+-- Coarse Metric Library: one row per Trader per timeframe, from a single
+-- portfolio call (spec-defaults two-stage scan, stage 1).
+CREATE TABLE IF NOT EXISTS coarse_metrics (
+    address       TEXT NOT NULL REFERENCES traders (address),
+    time_window   TEXT NOT NULL CHECK (time_window IN ('day', 'week', 'month', 'allTime')),
+    pnl           NUMERIC NOT NULL,
+    roi           NUMERIC NOT NULL,
+    volume        NUMERIC NOT NULL,
+    account_value NUMERIC NOT NULL,
+    computed_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (address, time_window)
+);
