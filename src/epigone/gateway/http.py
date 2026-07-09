@@ -52,7 +52,6 @@ def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
             LeaderboardEntry(
                 address=str(row["ethAddress"]).lower(),
                 display_name=row["displayName"],
-                account_value=Decimal(row["accountValue"]),
             )
             for row in rows
         ]

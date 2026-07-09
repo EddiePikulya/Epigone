@@ -16,12 +16,14 @@ CREATE TABLE IF NOT EXISTS traders (
     refresh_tier        TEXT CHECK (refresh_tier IN ('active', 'dormant')),
     first_seen_at       TIMESTAMPTZ NOT NULL,
     last_seen_at        TIMESTAMPTZ NOT NULL,
-    coarse_refreshed_at TIMESTAMPTZ
+    coarse_refreshed_at TIMESTAMPTZ,
+    coarse_attempted_at TIMESTAMPTZ
 );
 
--- Stale-first scan order: never-refreshed Traders come before everyone else.
-CREATE INDEX IF NOT EXISTS traders_coarse_refresh_order
-    ON traders (coarse_refreshed_at ASC NULLS FIRST, address);
+-- Scan order: least-recently-attempted first, so Traders whose fetch keeps
+-- failing rotate to the back instead of blocking the pass forever.
+CREATE INDEX IF NOT EXISTS traders_coarse_attempt_order
+    ON traders (coarse_attempted_at ASC NULLS FIRST, address);
 
 -- Coarse Metric Library: one row per Trader per timeframe, from a single
 -- portfolio call (spec-defaults two-stage scan, stage 1).

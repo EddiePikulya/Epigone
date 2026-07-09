@@ -71,6 +71,7 @@ async def run_coarse_pass(
             portfolio = await gateway.get_portfolio(address)
         except GatewayError:
             log.warning("coarse scan: portfolio fetch failed for %s", address, exc_info=True)
+            await _record_attempt(pool, address, clock.now())
             failed += 1
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -91,18 +92,28 @@ async def run_coarse_pass(
 
 
 async def _due_addresses(pool: asyncpg.Pool, now: datetime) -> list[str]:
+    # Ordered by last *attempt*, not last success, so an address whose fetch
+    # keeps failing rotates to the back instead of blocking every pass.
     rows = await pool.fetch(
         """
         SELECT address FROM traders
         WHERE coarse_refreshed_at IS NULL
            OR (refresh_tier = 'active' AND coarse_refreshed_at <= $1)
            OR (refresh_tier = 'dormant' AND coarse_refreshed_at <= $2)
-        ORDER BY coarse_refreshed_at ASC NULLS FIRST, address
+        ORDER BY coarse_attempted_at ASC NULLS FIRST, address
         """,
         now - ACTIVE_REFRESH_INTERVAL,
         now - DORMANT_REFRESH_INTERVAL,
     )
     return [row["address"] for row in rows]
+
+
+async def _record_attempt(pool: asyncpg.Pool, address: str, attempted_at: datetime) -> None:
+    await pool.execute(
+        "UPDATE traders SET coarse_attempted_at = $2 WHERE address = $1",
+        address,
+        attempted_at,
+    )
 
 
 async def _store_coarse_metrics(
@@ -131,7 +142,11 @@ async def _store_coarse_metrics(
             ],
         )
         await conn.execute(
-            "UPDATE traders SET refresh_tier = $2, coarse_refreshed_at = $3 WHERE address = $1",
+            """
+            UPDATE traders
+            SET refresh_tier = $2, coarse_refreshed_at = $3, coarse_attempted_at = $3
+            WHERE address = $1
+            """,
             address,
             tier,
             computed_at,
@@ -139,7 +154,9 @@ async def _store_coarse_metrics(
 
 
 def _roi(window: PortfolioWindow) -> Decimal:
-    """Return on the stack the window started with; zero when it started empty."""
+    """Coarse ROI proxy: pnl over the stack the window started with; zero when
+    it started empty. Differs from Hyperliquid's leaderboard ROI (net-deposit
+    adjusted), so a Trader funded mid-window reads differently here than there."""
     if window.starting_account_value > 0:
         return window.pnl / window.starting_account_value
     return Decimal(0)

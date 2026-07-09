@@ -37,10 +37,7 @@ async def seed_traders(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, addresses: list[str]
 ) -> None:
     gateway.set_leaderboard(
-        [
-            LeaderboardEntry(address=a, display_name=None, account_value=Decimal("1000"))
-            for a in addresses
-        ]
+        [LeaderboardEntry(address=a, display_name=None) for a in addresses]
     )
     await seed_universe(pool, gateway, clock)
 
@@ -189,3 +186,27 @@ async def test_interrupted_scan_resumes_where_it_left_off(pool: asyncpg.Pool) ->
     assert [r["computed_at"] for r in healthy_times] == [first_pass_time]
     assert gateway.portfolio_calls.count("0x001") == 1
     assert gateway.portfolio_calls.count("0x002") == 1
+
+
+async def test_persistently_failing_traders_do_not_block_the_scan(pool: asyncpg.Pool) -> None:
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    poison = [f"0x{i:03d}" for i in range(5)]  # first in scan order, always failing
+    healthy = ["0x900", "0x901"]
+    await seed_traders(pool, gateway, clock, poison + healthy)
+    for a in healthy:
+        gateway.set_portfolio(a, full_portfolio())
+    for a in poison:
+        gateway.portfolio_errors[a] = GatewayError("malformed payload")
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+
+    first = await run_coarse_pass(pool, gateway, budget, clock)
+    assert first.aborted and first.refreshed == 0
+
+    # The failed attempts were recorded, so next cycle the poison addresses
+    # rotate to the back and the healthy Traders get their turn.
+    clock.advance(60)
+    second = await run_coarse_pass(pool, gateway, budget, clock)
+    assert second.refreshed == 2
+    query = "SELECT address FROM traders WHERE coarse_refreshed_at IS NOT NULL"
+    assert sorted(r["address"] for r in await pool.fetch(query)) == healthy

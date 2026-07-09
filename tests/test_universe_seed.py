@@ -1,7 +1,6 @@
 """Universe seeding: leaderboard entries become Trader rows, idempotently."""
 
 import logging
-from decimal import Decimal
 
 import asyncpg
 import pytest
@@ -13,7 +12,7 @@ from tests.support.clock import FakeClock
 
 
 def entry(address: str, name: str | None = None) -> LeaderboardEntry:
-    return LeaderboardEntry(address=address, display_name=name, account_value=Decimal("1000"))
+    return LeaderboardEntry(address=address, display_name=name)
 
 
 async def test_seed_creates_a_trader_per_leaderboard_entry(pool: asyncpg.Pool) -> None:

@@ -43,11 +43,7 @@ async def test_unknown_trader_has_no_positions() -> None:
     assert await gateway.get_open_positions("0x" + "0" * 40) == []
 
 
-WHALE_ENTRY = LeaderboardEntry(
-    address=WHALE.lower(),
-    display_name="whale",
-    account_value=Decimal("1200000"),
-)
+WHALE_ENTRY = LeaderboardEntry(address=WHALE.lower(), display_name="whale")
 
 DAY_WINDOW = PortfolioWindow(
     pnl=Decimal("5000"),

@@ -32,11 +32,13 @@ class Window(Enum):
 
 @dataclass(frozen=True)
 class LeaderboardEntry:
-    """One row of the leaderboard source — a candidate Trader for the Universe."""
+    """One row of the leaderboard source — a candidate Trader for the Universe.
+
+    Deliberately thin: metrics come from the coarse portfolio pass, so the
+    seam carries only what seeding persists."""
 
     address: str
     display_name: str | None
-    account_value: Decimal
 
 
 @dataclass(frozen=True)

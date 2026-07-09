@@ -39,7 +39,6 @@ def test_parse_leaderboard_yields_an_entry_per_row() -> None:
     assert len(entries) == 2
     assert entries[0].address == "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
     assert entries[0].display_name == "whale"
-    assert entries[0].account_value == Decimal("1234567.89")
     assert entries[1].display_name is None
 
 
