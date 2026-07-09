@@ -5,7 +5,7 @@ description = "Telegram bot that finds and tracks the best Hyperliquid perp trad
 requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.15",
-    "aiohttp>=3.10",
+    "aiohttp>=3.9",
     "asyncpg>=0.30",
 ]
 

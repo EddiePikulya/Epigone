@@ -7,11 +7,36 @@ CREATE TABLE IF NOT EXISTS users (
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Traders are observed Hyperliquid wallets, never Users. Addresses are stored
--- lowercase; validation/normalization happens at the edge (bot input).
+-- The Universe: candidate Traders seeded from the leaderboard source (issue #5)
+-- or pasted directly by a User (issue #3). Addresses are stored lowercased.
+-- refresh_tier is NULL until the first coarse pass classifies the Trader;
+-- timestamps come from the injected clock, not now().
 CREATE TABLE IF NOT EXISTS traders (
-    address       TEXT PRIMARY KEY CHECK (address = lower(address)),
-    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    address             TEXT PRIMARY KEY,
+    display_name        TEXT,
+    refresh_tier        TEXT CHECK (refresh_tier IN ('active', 'dormant')),
+    first_seen_at       TIMESTAMPTZ NOT NULL,
+    last_seen_at        TIMESTAMPTZ NOT NULL,
+    coarse_refreshed_at TIMESTAMPTZ,
+    coarse_attempted_at TIMESTAMPTZ
+);
+
+-- Scan order: least-recently-attempted first, so Traders whose fetch keeps
+-- failing rotate to the back instead of blocking the pass forever.
+CREATE INDEX IF NOT EXISTS traders_coarse_attempt_order
+    ON traders (coarse_attempted_at ASC NULLS FIRST, address);
+
+-- Coarse Metric Library: one row per Trader per timeframe, from a single
+-- portfolio call (spec-defaults two-stage scan, stage 1).
+CREATE TABLE IF NOT EXISTS coarse_metrics (
+    address       TEXT NOT NULL REFERENCES traders (address),
+    time_window   TEXT NOT NULL CHECK (time_window IN ('day', 'week', 'month', 'allTime')),
+    pnl           NUMERIC NOT NULL,
+    roi           NUMERIC NOT NULL,
+    volume        NUMERIC NOT NULL,
+    account_value NUMERIC NOT NULL,
+    computed_at   TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (address, time_window)
 );
 
 -- A Track is a User's explicit, manual follow of a Trader (CONTEXT.md).

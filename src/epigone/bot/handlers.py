@@ -11,7 +11,8 @@ from aiogram.types import (
     Message,
 )
 
-from epigone.gateway import HyperliquidGateway, Position
+from epigone.clock import Clock
+from epigone.gateway import GatewayError, HyperliquidGateway, Position
 
 START_TEXT = (
     "Welcome to Epigone — clone the best to be the best.\n\n"
@@ -46,6 +47,10 @@ NOT_TRACKING_TEXT = (
 
 UNKNOWN_COMMAND_TEXT = "I don't know that command. Type /help to see what I can do."
 
+DATA_DELAYED_TEXT = (
+    "Hyperliquid data is delayed right now — your tracked list is safe, try again in a moment."
+)
+
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
@@ -60,16 +65,22 @@ async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT)
 
 
-async def follow_pasted_address(message: Message, pool: asyncpg.Pool) -> None:
+async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clock) -> None:
     """A pasted valid address Follows the Trader; re-following is idempotent."""
     user = message.from_user
     if user is None or message.text is None:
         return
     address = message.text.strip().lower()
+    now = clock.now()
     async with pool.acquire() as conn, conn.transaction():
         await _upsert_user(conn, user.id, user.username)
         await conn.execute(
-            "INSERT INTO traders (address) VALUES ($1) ON CONFLICT DO NOTHING", address
+            """
+            INSERT INTO traders (address, first_seen_at, last_seen_at)
+            VALUES ($1, $2, $2) ON CONFLICT (address) DO NOTHING
+            """,
+            address,
+            now,
         )
         freshly_tracked = await conn.fetchrow(
             """
@@ -100,7 +111,11 @@ async def cmd_tracked(message: Message, pool: asyncpg.Pool, gateway: Hyperliquid
     user = message.from_user
     if user is None:
         return
-    text, markup = await _render_tracked_list(pool, gateway, user.id)
+    try:
+        text, markup = await _render_tracked_list(pool, gateway, user.id)
+    except GatewayError:
+        await message.answer(DATA_DELAYED_TEXT)
+        return
     await message.answer(text, reply_markup=markup)
 
 
@@ -117,7 +132,11 @@ async def on_positions(
     if not tracked:
         await callback.answer("You're not tracking this trader.", show_alert=True)
         return
-    positions = await gateway.get_open_positions(address)
+    try:
+        positions = await gateway.get_open_positions(address)
+    except GatewayError:
+        await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
+        return
     view = _render_positions(address, positions)
     if isinstance(callback.message, Message):
         await callback.message.answer(view)  # the chat the button lives in
@@ -138,8 +157,11 @@ async def on_unfollow(
     )
     removed = status != "DELETE 0"  # a stale button tap deletes nothing
     if isinstance(callback.message, Message):
-        text, markup = await _render_tracked_list(pool, gateway, callback.from_user.id)
-        await callback.message.edit_text(text, reply_markup=markup)
+        try:
+            text, markup = await _render_tracked_list(pool, gateway, callback.from_user.id)
+            await callback.message.edit_text(text, reply_markup=markup)
+        except GatewayError:
+            pass  # the unfollow itself succeeded; only the list refresh is stale
     await callback.answer(
         f"Unfollowed {_short(address)}" if removed else "You weren't tracking this trader."
     )

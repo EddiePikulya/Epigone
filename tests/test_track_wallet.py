@@ -5,7 +5,7 @@ from decimal import Decimal
 import asyncpg
 from aiogram import Bot, Dispatcher
 
-from epigone.gateway import Position, Side
+from epigone.gateway import GatewayError, Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.telegram import RecordingSession, feed_callback, feed_text
 
@@ -243,6 +243,23 @@ async def test_unfollow_only_affects_the_tapping_user(
 
     assert await _tracked_addresses(pool, 111) == []
     assert await _tracked_addresses(pool, 222) == [WHALE]
+
+
+async def test_tracked_list_degrades_gracefully_when_hyperliquid_is_delayed(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    await feed_text(dp, bot, WHALE, user_id=111)
+    gateway.positions_errors[WHALE] = GatewayError("info API timed out")
+
+    await feed_text(dp, bot, "/tracked", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "delayed" in text.lower()
+    assert await _tracked_addresses(pool, 111) == [WHALE]  # a data hiccup never loses Tracks
 
 
 async def test_help_mentions_tracking(

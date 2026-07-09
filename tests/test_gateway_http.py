@@ -1,4 +1,4 @@
-"""Recorded-response tests for the real HyperliquidGateway (ticket #3).
+"""Recorded-response tests for the real gateway's positions call (ticket #3).
 
 The fixture is a verbatim `clearinghouseState` response recorded from the
 public info API on 2026-07-10 for a known whale address. A local HTTP server
@@ -12,11 +12,14 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import aiohttp
+import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from epigone.gateway import Side
-from epigone.gateway.http import HttpHyperliquidGateway
+import epigone.gateway.http as gateway_http
+from epigone.gateway import GatewayError, Side
+from epigone.gateway.http import HttpHyperliquidGateway, parse_positions
 
 WHALE = "0xAF0FDD39E5d92499B0eD9F68693DA99C0ec1e92e"
 
@@ -29,7 +32,7 @@ RECORDED: dict[str, Any] = json.loads(
 async def replaying_gateway(
     payload: dict[str, Any],
 ) -> AsyncGenerator[tuple[HttpHyperliquidGateway, list[Any]], None]:
-    """A real gateway pointed at a local server that replays `payload`."""
+    """A real gateway whose INFO_URL points at a local server replaying `payload`."""
     received: list[Any] = []
 
     async def info(request: web.Request) -> web.Response:
@@ -40,11 +43,14 @@ async def replaying_gateway(
     app.router.add_post("/info", info)
     server = TestServer(app)
     await server.start_server()
-    gateway = HttpHyperliquidGateway(api_url=str(server.make_url("/info")))
+    original_url = gateway_http.INFO_URL
+    gateway_http.INFO_URL = str(server.make_url("/info"))
+    session = aiohttp.ClientSession()
     try:
-        yield gateway, received
+        yield HttpHyperliquidGateway(session), received
     finally:
-        await gateway.close()
+        gateway_http.INFO_URL = original_url
+        await session.close()
         await server.close()
 
 
@@ -77,3 +83,8 @@ async def test_trader_with_no_positions_yields_empty_list() -> None:
     empty = {**RECORDED, "assetPositions": []}
     async with replaying_gateway(empty) as (gateway, _):
         assert await gateway.get_open_positions(WHALE) == []
+
+
+def test_parse_positions_rejects_unexpected_shape() -> None:
+    with pytest.raises(GatewayError):
+        parse_positions({"positions": []})
