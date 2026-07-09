@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: epigone
+      POSTGRES_PASSWORD: epigone
+      POSTGRES_DB: epigone
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U epigone"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  bot:
+    build: .
+    command: ["/app/.venv/bin/python", "-m", "epigone.bot.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ingest:
+    build: .
+    command: ["/app/.venv/bin/python", "-m", "epigone.ingest.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  stream:
+    build: .
+    command: ["/app/.venv/bin/python", "-m", "epigone.stream.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
