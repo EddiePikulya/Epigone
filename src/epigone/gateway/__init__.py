@@ -17,6 +17,13 @@ class GatewayError(Exception):
     """A Hyperliquid data source failed (network, HTTP, or malformed payload)."""
 
 
+class RateLimitedError(GatewayError):
+    """Hyperliquid kept answering 429 after backoff-and-retry (issue #28).
+
+    Pacing, not an outage: callers should treat the item as retryable later and
+    never count it toward outage-style abort thresholds."""
+
+
 class Side(Enum):
     LONG = "long"
     SHORT = "short"

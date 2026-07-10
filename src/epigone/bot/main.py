@@ -23,7 +23,7 @@ async def main() -> None:
     async with aiohttp.ClientSession() as session:
         dp = Dispatcher()
         dp["pool"] = pool
-        dp["gateway"] = HttpHyperliquidGateway(session)
+        dp["gateway"] = HttpHyperliquidGateway(session, clock)
         dp["clock"] = clock
         dp["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
         dp.include_router(build_router())

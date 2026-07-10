@@ -17,7 +17,7 @@ import asyncpg
 
 from epigone.budget import WeightBudget
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, Position, Side
+from epigone.gateway import GatewayError, Position, RateLimitedError, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.stream.poller import POSITIONS_WEIGHT, run_poll_pass
 from tests.support.clock import FakeClock
@@ -68,9 +68,7 @@ async def alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     return await pool.fetch("SELECT * FROM position_alerts ORDER BY id")
 
 
-async def baseline(
-    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
-) -> None:
+async def baseline(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) -> None:
     """First pass: establish snapshots; asserts it stayed silent."""
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
     assert await alerts(pool) == []
@@ -324,9 +322,7 @@ async def test_one_failing_wallet_does_not_stop_the_pass(
     (row,) = await alerts(pool)
     assert row["trader_address"] == "0xbbb" and row["kind"] == "close"
     # The failed wallet's bookkeeping is untouched: next pass diffs, not re-baselines.
-    state = await pool.fetchrow(
-        "SELECT * FROM position_poll_state WHERE trader_address = '0xaaa'"
-    )
+    state = await pool.fetchrow("SELECT * FROM position_poll_state WHERE trader_address = '0xaaa'")
     assert state is not None
     assert state["last_polled_at"] < clock.now()
 
@@ -343,6 +339,24 @@ async def test_sustained_failures_abort_the_pass(
 
     assert result.aborted
     assert result.failed == 5  # stops at the failure streak, not the full list
+
+
+async def test_rate_limit_streaks_do_not_abort_the_pass(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # Rate limiting is pacing, not an outage (issue #28): even a streak longer
+    # than the abort threshold must leave the pass polling the rest.
+    limited = [f"0x{i:03d}" for i in range(6)]
+    for address in limited:
+        await track(pool, clock, address, 42)
+        gateway.positions_errors[address] = RateLimitedError("still 429 after retries")
+    await track(pool, clock, "0xhealthy", 42)
+    gateway.set_positions("0xhealthy", [position()])
+
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert not result.aborted
+    assert result.failed == 6 and result.polled == 1
 
 
 async def test_the_pass_is_paced_by_the_weight_budget(

@@ -11,16 +11,12 @@ import logging
 
 import aiohttp
 
-from epigone.budget import WeightBudget
+from epigone.budget import SharedWeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
 from epigone.db import apply_schema, create_pool
 from epigone.gateway.http import HttpHyperliquidGateway
-from epigone.stream.poller import (
-    POLL_INTERVAL_SECONDS,
-    STREAM_WEIGHT_PER_MINUTE,
-    run_poll_pass,
-)
+from epigone.stream.poller import POLL_INTERVAL_SECONDS, run_poll_pass
 
 log = logging.getLogger(__name__)
 
@@ -28,9 +24,11 @@ log = logging.getLogger(__name__)
 async def run(pool_url: str, clock: Clock) -> None:
     pool = await create_pool(pool_url)
     await apply_schema(pool)
-    budget = WeightBudget(STREAM_WEIGHT_PER_MINUTE, clock)
+    # The stream spends the shared budget (issue #28) with no reserve to leave:
+    # it has priority — ingest is the one that must keep clear of its floor.
+    budget = SharedWeightBudget(pool, clock)
     async with aiohttp.ClientSession() as session:
-        gateway = HttpHyperliquidGateway(session)
+        gateway = HttpHyperliquidGateway(session, clock)
         while True:
             started = clock.now()
             result = await run_poll_pass(pool, gateway, budget, clock)

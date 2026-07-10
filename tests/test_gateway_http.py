@@ -1,4 +1,5 @@
-"""Recorded-response tests for the real gateway's positions call (ticket #3).
+"""Recorded-response tests for the real gateway's positions call (ticket #3)
+and its 429 backoff-and-retry behavior (issue #28).
 
 The fixture is a verbatim `clearinghouseState` response recorded from the
 public info API on 2026-07-10 for a known whale address. A local HTTP server
@@ -6,7 +7,7 @@ replays it so the real gateway code runs an actual request/response cycle.
 """
 
 import json
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
@@ -18,8 +19,13 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 import epigone.gateway.http as gateway_http
-from epigone.gateway import GatewayError, Side
-from epigone.gateway.http import HttpHyperliquidGateway, parse_positions
+from epigone.gateway import GatewayError, RateLimitedError, Side
+from epigone.gateway.http import (
+    RATE_LIMIT_MAX_TRIES,
+    HttpHyperliquidGateway,
+    parse_positions,
+)
+from tests.support.clock import FakeClock
 
 WHALE = "0xAF0FDD39E5d92499B0eD9F68693DA99C0ec1e92e"
 
@@ -31,12 +37,23 @@ RECORDED: dict[str, Any] = json.loads(
 @asynccontextmanager
 async def replaying_gateway(
     payload: dict[str, Any],
+    *,
+    clock: FakeClock | None = None,
+    rng: Callable[[], float] = lambda: 1.0,
+    rate_limited: int = 0,
+    retry_after: str | None = None,
 ) -> AsyncGenerator[tuple[HttpHyperliquidGateway, list[Any]], None]:
-    """A real gateway whose INFO_URL points at a local server replaying `payload`."""
+    """A real gateway whose INFO_URL points at a local server replaying `payload`,
+    after answering the first `rate_limited` requests with a 429."""
     received: list[Any] = []
+    remaining_429s = [rate_limited]
 
     async def info(request: web.Request) -> web.Response:
         received.append(await request.json())
+        if remaining_429s[0] > 0:
+            remaining_429s[0] -= 1
+            headers = {"Retry-After": retry_after} if retry_after is not None else {}
+            return web.Response(status=429, headers=headers)
         return web.json_response(payload)
 
     app = web.Application()
@@ -47,7 +64,7 @@ async def replaying_gateway(
     gateway_http.INFO_URL = str(server.make_url("/info"))
     session = aiohttp.ClientSession()
     try:
-        yield HttpHyperliquidGateway(session), received
+        yield HttpHyperliquidGateway(session, clock or FakeClock(), rng=rng), received
     finally:
         gateway_http.INFO_URL = original_url
         await session.close()
@@ -123,3 +140,60 @@ async def test_trader_with_no_positions_yields_empty_list() -> None:
 def test_parse_positions_rejects_unexpected_shape() -> None:
     with pytest.raises(GatewayError):
         parse_positions({"positions": []})
+
+
+async def test_a_429_sleeps_the_retry_after_and_retries() -> None:
+    clock = FakeClock()
+    async with replaying_gateway(RECORDED, clock=clock, rate_limited=1, retry_after="7") as (
+        gateway,
+        received,
+    ):
+        positions = await gateway.get_open_positions(WHALE)
+
+    assert positions[0].coin == "ETH"  # the retry succeeded and parsed normally
+    assert len(received) == 2
+    assert clock.slept == [7.0]
+
+
+async def test_a_429_without_retry_after_backs_off_exponentially() -> None:
+    clock = FakeClock()
+    async with replaying_gateway(RECORDED, clock=clock, rate_limited=3, rng=lambda: 1.0) as (
+        gateway,
+        received,
+    ):
+        await gateway.get_open_positions(WHALE)
+
+    assert clock.slept == [1.0, 2.0, 4.0]  # the full window at rng()=1.0
+    assert len(received) == 4
+
+
+async def test_backoff_jitter_scales_the_window_but_never_to_zero() -> None:
+    clock = FakeClock()
+    async with replaying_gateway(RECORDED, clock=clock, rate_limited=2, rng=lambda: 0.0) as (
+        gateway,
+        _,
+    ):
+        await gateway.get_open_positions(WHALE)
+
+    assert clock.slept == [0.5, 1.0]  # rng()=0.0 bottoms out at half the window
+
+
+async def test_an_unparseable_retry_after_falls_back_to_backoff() -> None:
+    clock = FakeClock()
+    async with replaying_gateway(
+        RECORDED, clock=clock, rate_limited=1, retry_after="Fri, 10 Jul 2026 12:01:00 GMT"
+    ) as (gateway, _):
+        await gateway.get_open_positions(WHALE)
+
+    assert clock.slept == [1.0]
+
+
+async def test_persistent_429s_surface_as_rate_limited_after_bounded_retries() -> None:
+    clock = FakeClock()
+    async with replaying_gateway(RECORDED, clock=clock, rate_limited=99) as (gateway, received):
+        with pytest.raises(RateLimitedError):
+            await gateway.get_fills(WHALE)
+
+    assert len(received) == RATE_LIMIT_MAX_TRIES
+    # A GatewayError subclass: callers that degrade gracefully keep doing so.
+    assert issubclass(RateLimitedError, GatewayError)

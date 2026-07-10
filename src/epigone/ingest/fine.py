@@ -5,6 +5,9 @@ active month — the default gate, tunable as thresholds firm up) plus every
 tracked Trader. Metrics come from the pure engine (epigone.metrics.fine);
 Bot vetting (epigone.metrics.bots) runs on the same fetch. Structure mirrors
 the coarse pass: per-Trader commits, stale-first order, failure-streak abort.
+Rate limiting is the exception (issue #28): a RateLimitedError counts as a
+failure but never toward the abort streak — the gateway already backed off,
+and a 429 under load is pacing, not an outage.
 """
 
 import logging
@@ -14,10 +17,9 @@ from decimal import Decimal
 
 import asyncpg
 
-from epigone.budget import WeightBudget
+from epigone.budget import Budget
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway
-from epigone.ingest.budget import FILLS_WEIGHT
+from epigone.gateway import GatewayError, HyperliquidGateway, RateLimitedError
 from epigone.ingest.scan import (
     ACTIVE_REFRESH_INTERVAL,
     DORMANT_REFRESH_INTERVAL,
@@ -27,6 +29,8 @@ from epigone.metrics.bots import classify_bot
 from epigone.metrics.fine import FineMetrics, compute_fine_metrics
 
 log = logging.getLogger(__name__)
+
+FILLS_WEIGHT = 20  # one userFills call, against the shared budget (epigone.budget)
 
 
 @dataclass(frozen=True)
@@ -44,7 +48,7 @@ class _DueTrader:
 
 
 async def run_fine_pass(
-    pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: WeightBudget, clock: Clock
+    pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: Budget, clock: Clock
 ) -> FineScanResult:
     """One fills call per due eligible Trader, stale-first, paced by the budget."""
     due = await _due_traders(pool, clock.now())
@@ -53,13 +57,17 @@ async def run_fine_pass(
         await budget.spend(FILLS_WEIGHT)
         try:
             fills = await gateway.get_fills(trader.address)
+        except RateLimitedError:
+            # Pacing, not an outage (issue #28): the gateway already backed off
+            # and retried, so just rotate the Trader to the back and move on —
+            # a 429 streak must never abort the pass.
+            log.warning("fine pass: rate limited fetching fills for %s", trader.address)
+            await _stamp_attempt(pool, trader.address, clock.now())
+            failed += 1
+            continue
         except GatewayError:
             log.warning("fine pass: fills fetch failed for %s", trader.address, exc_info=True)
-            await pool.execute(
-                "UPDATE traders SET fine_attempted_at = $2 WHERE address = $1",
-                trader.address,
-                clock.now(),
-            )
+            await _stamp_attempt(pool, trader.address, clock.now())
             failed += 1
             consecutive_failures += 1
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -79,6 +87,10 @@ async def run_fine_pass(
     if refreshed or failed:
         log.info("fine pass done: %d refreshed, %d failed", refreshed, failed)
     return FineScanResult(refreshed=refreshed, failed=failed, aborted=False)
+
+
+async def _stamp_attempt(pool: asyncpg.Pool, address: str, now: datetime) -> None:
+    await pool.execute("UPDATE traders SET fine_attempted_at = $2 WHERE address = $1", address, now)
 
 
 async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:

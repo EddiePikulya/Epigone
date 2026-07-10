@@ -155,3 +155,13 @@ CREATE TABLE IF NOT EXISTS criteria (
     updated_at       TIMESTAMPTZ NOT NULL,
     UNIQUE (user_telegram_id, name)
 );
+
+-- The shared Hyperliquid weight budget (issue #28): one token-bucket row that
+-- ingest and stream both draw from, so their combined spend stays under the
+-- per-IP cap (the two processes meet only in Postgres, ADR-0002). The row is
+-- seeded lazily by SharedWeightBudget with the injected clock, not here.
+CREATE TABLE IF NOT EXISTS rate_budget (
+    id          BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    available   DOUBLE PRECISION NOT NULL,
+    last_refill TIMESTAMPTZ NOT NULL
+);

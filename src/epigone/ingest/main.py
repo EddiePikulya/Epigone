@@ -3,9 +3,10 @@
 
 Each cycle reseeds from the leaderboard at most daily — that single download
 also lands the whole Universe's coarse Metric Library, at zero per-account cost.
-The full ingest weight budget then goes to the fine pass (survivors and tracked
-Traders). Interruptions are safe: fine-pass progress lives in per-Trader
-bookkeeping, so a restart resumes where the scan stopped.
+The fine pass (survivors and tracked Traders) then spends whatever the shared
+weight budget (epigone.budget, issue #28) has left above the stream's reserve.
+Interruptions are safe: fine-pass progress lives in per-Trader bookkeeping, so
+a restart resumes where the scan stopped.
 """
 
 import asyncio
@@ -14,12 +15,11 @@ from datetime import datetime, timedelta
 
 import aiohttp
 
-from epigone.budget import WeightBudget
+from epigone.budget import STREAM_RESERVE_WEIGHT, SharedWeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
 from epigone.db import apply_schema, create_pool
 from epigone.gateway.http import HttpHyperliquidGateway
-from epigone.ingest.budget import INGEST_WEIGHT_PER_MINUTE
 from epigone.ingest.fine import run_fine_pass
 from epigone.ingest.scan import seed_universe
 
@@ -32,10 +32,12 @@ log = logging.getLogger(__name__)
 async def run(pool_url: str, clock: Clock) -> None:
     pool = await create_pool(pool_url)
     await apply_schema(pool)
-    budget = WeightBudget(INGEST_WEIGHT_PER_MINUTE, clock)
+    # Ingest is the background spender: it draws the shared budget (issue #28)
+    # only above the stream's reserve, so Position Alerts always poll first.
+    budget = SharedWeightBudget(pool, clock, reserve=STREAM_RESERVE_WEIGHT)
     last_seeded: datetime | None = None
     async with aiohttp.ClientSession() as session:
-        gateway = HttpHyperliquidGateway(session)
+        gateway = HttpHyperliquidGateway(session, clock)
         while True:
             if last_seeded is None or clock.now() - last_seeded >= SEED_INTERVAL:
                 seeded = await seed_universe(pool, gateway, clock)
