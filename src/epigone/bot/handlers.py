@@ -42,6 +42,12 @@ HELP_TEXT = (
 
 SCREENER_HEADER = "🏆 Top traders — best 30-day ROI, bots excluded"
 
+# A row without fine metrics is usually a strong candidate the fill-history pass
+# hasn't reached yet, not a weak one (weak months sink on ROI). Frame it as
+# in-progress, never as a verdict. The Criteria builder (#7) will let a User
+# opt into fully-analyzed-only.
+SCREENER_PENDING_LABEL = "⏳ analyzing"
+
 SCREENER_EMPTY_TEXT = (
     "No traders to rank yet — the universe is still being scanned.\n"
     "Paste a wallet address (0x…) to start tracking one in the meantime."
@@ -325,12 +331,13 @@ async def _render_screener_page(
 
 def _screener_stats(row: ScreenerRow) -> str:
     """One line of key stats per row: ROI and PnL always, win rate where the
-    fine pass has run, else a coarse-only marker (issue #8 distinction)."""
+    fine pass has run, else a 'still analyzing' marker (issue #8 distinction,
+    framed as pending rather than a quality verdict)."""
     parts = [f"ROI {_signed_pct(row.roi)}", f"PnL {_signed_usd(row.pnl)}"]
     if row.win_rate is not None:
         parts.append(f"{row.win_rate:.0%} win")
     elif not row.fine_available:
-        parts.append("coarse-only")
+        parts.append(SCREENER_PENDING_LABEL)
     return " · ".join(parts)
 
 

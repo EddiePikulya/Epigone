@@ -124,6 +124,20 @@ async def test_screener_lists_ranked_traders_with_key_stats_and_follow_buttons(
     assert "profile:0xbest" in data
 
 
+async def test_coarse_only_rows_read_as_pending_not_a_verdict(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # A high-ROI trader the fine pass hasn't reached yet: likely strong, not weak.
+    await add_trader(pool, "0xnew", month_roi="0.9", month_pnl="9000", display_name="FreshWhale")
+
+    await feed_text(dp, bot, "/screener", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "FreshWhale" in text
+    assert "analyzing" in text.lower()  # framed as in-progress…
+    assert "coarse" not in text.lower()  # …never as a quality verdict
+
+
 async def test_screener_excludes_bots(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
