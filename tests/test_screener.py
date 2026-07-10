@@ -77,6 +77,19 @@ async def test_limit_caps_the_page(pool: asyncpg.Pool) -> None:
     assert [r.address for r in rows] == ["0x004", "0x003"]
 
 
+async def test_offset_pages_through_the_ranking(pool: asyncpg.Pool) -> None:
+    for i in range(5):
+        await add_trader(pool, f"0x{i:03d}", month_roi=str(i))
+
+    page1 = await run_screener(pool, window=Window.MONTH, limit=2, offset=0)
+    page2 = await run_screener(pool, window=Window.MONTH, limit=2, offset=2)
+    page3 = await run_screener(pool, window=Window.MONTH, limit=2, offset=4)
+
+    assert [r.address for r in page1] == ["0x004", "0x003"]
+    assert [r.address for r in page2] == ["0x002", "0x001"]
+    assert [r.address for r in page3] == ["0x000"]  # a partial last page
+
+
 async def test_bots_never_appear_but_keep_their_rows(pool: asyncpg.Pool) -> None:
     await add_trader(pool, "0xhuman", month_roi="0.1")
     await add_trader(pool, "0xbot", month_roi="99.0", bot_reason="100% win rate over 637 exits")

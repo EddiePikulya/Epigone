@@ -1,4 +1,5 @@
 import re
+from datetime import datetime
 from decimal import Decimal
 
 import asyncpg
@@ -12,7 +13,10 @@ from aiogram.types import (
 )
 
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway, Position
+from epigone.gateway import GatewayError, HyperliquidGateway, Position, Window
+from epigone.screener import ScreenerRow, run_screener
+
+SCREENER_PAGE_SIZE = 5
 
 START_TEXT = (
     "Welcome to Epigone — clone the best to be the best.\n\n"
@@ -28,11 +32,25 @@ START_TEXT = (
 
 HELP_TEXT = (
     "Epigone commands:\n\n"
+    "/screener — the best traders right now, ranked by 30-day ROI\n"
     "/start — what Epigone is and how it works\n"
     "/tracked — your tracked traders and their positions\n"
     "/help — this list\n\n"
     "Paste a wallet address (0x…) to start tracking that trader.\n\n"
-    "Coming soon: the screener and criteria builder."
+    "Coming soon: the criteria builder to define your own “best.”"
+)
+
+SCREENER_HEADER = "🏆 Top traders — best 30-day ROI, bots excluded"
+
+# A row without fine metrics is usually a strong candidate the fill-history pass
+# hasn't reached yet, not a weak one (weak months sink on ROI). Frame it as
+# in-progress, never as a verdict. The Criteria builder (#7) will let a User
+# opt into fully-analyzed-only.
+SCREENER_PENDING_LABEL = "⏳ analyzing"
+
+SCREENER_EMPTY_TEXT = (
+    "No traders to rank yet — the universe is still being scanned.\n"
+    "Paste a wallet address (0x…) to start tracking one in the meantime."
 )
 
 INVALID_ADDRESS_TEXT = (
@@ -71,26 +89,9 @@ async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clo
     if user is None or message.text is None:
         return
     address = message.text.strip().lower()
-    now = clock.now()
     async with pool.acquire() as conn, conn.transaction():
-        await _upsert_user(conn, user.id, user.username)
-        await conn.execute(
-            """
-            INSERT INTO traders (address, first_seen_at, last_seen_at)
-            VALUES ($1, $2, $2) ON CONFLICT (address) DO NOTHING
-            """,
-            address,
-            now,
-        )
-        freshly_tracked = await conn.fetchrow(
-            """
-            INSERT INTO tracks (user_telegram_id, trader_address)
-            VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1
-            """,
-            user.id,
-            address,
-        )
-    if freshly_tracked is not None:
+        freshly_tracked = await _track_address(conn, user.id, user.username, address, clock.now())
+    if freshly_tracked:
         await message.answer(
             f"Now tracking {_short(address)}.\n"
             "Paste more addresses any time — /tracked shows your whole list."
@@ -165,9 +166,249 @@ async def on_unfollow(
             await callback.message.edit_text(text, reply_markup=markup)
         except GatewayError:
             pass  # the unfollow itself succeeded; only the list refresh is stale
-    await callback.answer(
-        f"Unfollowed {_short(address)}" if removed else "You weren't tracking this trader."
+    await callback.answer(_unfollow_toast(removed, address))
+
+
+async def cmd_screener(message: Message, pool: asyncpg.Pool) -> None:
+    """The default Criteria: the Universe ranked by 30-day ROI, Bots excluded.
+    A pure database read — zero Hyperliquid calls (issue #6 acceptance)."""
+    user = message.from_user
+    if user is None:
+        return
+    await _upsert_user(pool, user.id, user.username)
+    text, markup = await _render_screener_page(pool, user.id, offset=0)
+    await message.answer(text, reply_markup=markup)
+
+
+async def on_screener_page(callback: CallbackQuery, pool: asyncpg.Pool) -> None:
+    """Page through the ranking in place. Still a pure database read."""
+    offset = _parse_offset((callback.data or "").removeprefix("screen:"))
+    text, markup = await _render_screener_page(pool, callback.from_user.id, offset=offset)
+    if isinstance(callback.message, Message):
+        await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer()
+
+
+async def on_screener_follow(callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock) -> None:
+    """Follow straight from a results row, then re-render the page so the row
+    flips to Following. The offset rides in the callback data so the re-render
+    lands on the same page."""
+    offset_str, _, address = (callback.data or "").removeprefix("sfollow:").partition(":")
+    offset = _parse_offset(offset_str)
+    async with pool.acquire() as conn, conn.transaction():
+        freshly = await _track_address(
+            conn, callback.from_user.id, callback.from_user.username, address, clock.now()
+        )
+    if isinstance(callback.message, Message):
+        text, markup = await _render_screener_page(pool, callback.from_user.id, offset=offset)
+        await callback.message.edit_text(text, reply_markup=markup)
+    await callback.answer(_follow_toast(freshly, address))
+
+
+async def on_profile(
+    callback: CallbackQuery,
+    bot: Bot,
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
+) -> None:
+    """Open a Trader's profile from the screener: coarse/fine metrics, freshness,
+    current positions, and a follow/unfollow toggle. Reachable for any Trader,
+    tracked or not — the one screener surface that touches the gateway, and only
+    on this explicit tap."""
+    address = (callback.data or "").removeprefix("profile:")
+    try:
+        text, markup = await _render_profile(pool, gateway, clock, callback.from_user.id, address)
+    except GatewayError:
+        await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
+        return
+    if isinstance(callback.message, Message):
+        await callback.message.answer(text, reply_markup=markup)
+    else:
+        await bot.send_message(chat_id=callback.from_user.id, text=text, reply_markup=markup)
+    await callback.answer()
+
+
+async def on_profile_follow(
+    callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
+) -> None:
+    address = (callback.data or "").removeprefix("pfollow:")
+    async with pool.acquire() as conn, conn.transaction():
+        freshly = await _track_address(
+            conn, callback.from_user.id, callback.from_user.username, address, clock.now()
+        )
+    await _refresh_profile_in_place(
+        callback, pool, gateway, clock, address, _follow_toast(freshly, address)
     )
+
+
+async def on_profile_unfollow(
+    callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
+) -> None:
+    address = (callback.data or "").removeprefix("punfollow:")
+    status = await pool.execute(
+        "DELETE FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
+        callback.from_user.id,
+        address,
+    )
+    removed = status != "DELETE 0"  # a stale button tap deletes nothing
+    await _refresh_profile_in_place(
+        callback, pool, gateway, clock, address, _unfollow_toast(removed, address)
+    )
+
+
+async def _refresh_profile_in_place(
+    callback: CallbackQuery,
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
+    address: str,
+    toast: str,
+) -> None:
+    if isinstance(callback.message, Message):
+        try:
+            text, markup = await _render_profile(
+                pool, gateway, clock, callback.from_user.id, address
+            )
+            await callback.message.edit_text(text, reply_markup=markup)
+        except GatewayError:
+            pass  # the follow/unfollow itself succeeded; only the redraw is stale
+    await callback.answer(toast)
+
+
+def _parse_offset(raw: str) -> int:
+    """Callback offsets are self-authored, but never trust one into a negative."""
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+async def _render_screener_page(
+    pool: asyncpg.Pool, user_id: int, *, offset: int
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    # One extra row tells us whether a next page exists without a second query.
+    rows = await run_screener(
+        pool, window=Window.MONTH, limit=SCREENER_PAGE_SIZE + 1, offset=offset
+    )
+    has_next = len(rows) > SCREENER_PAGE_SIZE
+    rows = rows[:SCREENER_PAGE_SIZE]
+    if not rows:
+        return SCREENER_EMPTY_TEXT, None
+
+    tracked = await _tracked_set(pool, user_id, [r.address for r in rows])
+    lines = [SCREENER_HEADER, ""]
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for rank, row in enumerate(rows, start=offset + 1):
+        lines.append(f"{rank}. {row.display_name or _short(row.address)}")
+        lines.append(f"    {_screener_stats(row)}")
+        followed = row.address in tracked
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📊 {_short(row.address)}", callback_data=f"profile:{row.address}"
+                ),
+                InlineKeyboardButton(
+                    text="✓ Following" if followed else "➕ Follow",
+                    callback_data=f"sfollow:{offset}:{row.address}",
+                ),
+            ]
+        )
+    nav: list[InlineKeyboardButton] = []
+    if offset > 0:
+        prev_offset = max(0, offset - SCREENER_PAGE_SIZE)
+        nav.append(InlineKeyboardButton(text="◀ Prev", callback_data=f"screen:{prev_offset}"))
+    if has_next:
+        nav.append(
+            InlineKeyboardButton(
+                text="Next ▶", callback_data=f"screen:{offset + SCREENER_PAGE_SIZE}"
+            )
+        )
+    if nav:
+        keyboard.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _screener_stats(row: ScreenerRow) -> str:
+    """One line of key stats per row: ROI and PnL always, win rate where the
+    fine pass has run, else a 'still analyzing' marker (issue #8 distinction,
+    framed as pending rather than a quality verdict)."""
+    parts = [f"ROI {_signed_pct(row.roi)}", f"PnL {_signed_usd(row.pnl)}"]
+    if row.win_rate is not None:
+        parts.append(f"{row.win_rate:.0%} win")
+    elif not row.fine_available:
+        parts.append(SCREENER_PENDING_LABEL)
+    return " · ".join(parts)
+
+
+async def _tracked_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) -> set[str]:
+    if not addresses:
+        return set()
+    rows = await pool.fetch(
+        """
+        SELECT trader_address FROM tracks
+        WHERE user_telegram_id = $1 AND trader_address = ANY($2::text[])
+        """,
+        user_id,
+        addresses,
+    )
+    return {row["trader_address"] for row in rows}
+
+
+async def _render_profile(
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
+    user_id: int,
+    address: str,
+) -> tuple[str, InlineKeyboardMarkup]:
+    positions = await gateway.get_open_positions(address)  # may raise GatewayError
+    followed = await pool.fetchval(
+        "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
+        user_id,
+        address,
+    )
+    parts = [
+        _render_positions(address, positions),
+        await _render_track_record(pool, address),
+    ]
+    freshness = await _metric_freshness(pool, clock, address)
+    if freshness is not None:
+        parts.append(freshness)
+    button = (
+        InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"punfollow:{address}")
+        if followed
+        else InlineKeyboardButton(text="➕ Follow", callback_data=f"pfollow:{address}")
+    )
+    return "\n\n".join(parts), InlineKeyboardMarkup(inline_keyboard=[[button]])
+
+
+async def _metric_freshness(pool: asyncpg.Pool, clock: Clock, address: str) -> str | None:
+    """How stale the shown metrics are — the freshest of the coarse/fine passes.
+    None when the Trader has never been scanned."""
+    latest = await pool.fetchval(
+        """
+        SELECT greatest(
+            (SELECT max(computed_at) FROM coarse_metrics WHERE address = $1),
+            (SELECT computed_at FROM fine_metrics WHERE address = $1)
+        )
+        """,
+        address,
+    )
+    if latest is None:
+        return None
+    return f"🕒 Metrics updated {_relative_age(clock.now(), latest)}"
+
+
+def _relative_age(now: datetime, then: datetime) -> str:
+    seconds = (now - then).total_seconds()
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
 
 
 def _is_wallet_paste(message: Message) -> bool:
@@ -176,6 +417,34 @@ def _is_wallet_paste(message: Message) -> bool:
 
 def _is_command(message: Message) -> bool:
     return message.text is not None and message.text.startswith("/")
+
+
+async def _track_address(
+    conn: asyncpg.Connection, telegram_id: int, username: str | None, address: str, now: datetime
+) -> bool:
+    """Follow `address` for a User; idempotent. Returns True on a fresh Track.
+
+    The single write behind every Follow — pasting (#3), the screener row, and
+    the profile toggle (#6). A Track is exactly what the alert poller (#4)
+    reads, so following from results feeds the alert pipeline for free."""
+    await _upsert_user(conn, telegram_id, username)
+    await conn.execute(
+        """
+        INSERT INTO traders (address, first_seen_at, last_seen_at)
+        VALUES ($1, $2, $2) ON CONFLICT (address) DO NOTHING
+        """,
+        address,
+        now,
+    )
+    freshly_tracked = await conn.fetchrow(
+        """
+        INSERT INTO tracks (user_telegram_id, trader_address)
+        VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1
+        """,
+        telegram_id,
+        address,
+    )
+    return freshly_tracked is not None
 
 
 async def _upsert_user(
@@ -294,8 +563,21 @@ def _signed_usd(amount: Decimal) -> str:
     return f"{sign}${abs(amount):,.0f}"
 
 
+def _signed_pct(ratio: Decimal) -> str:
+    sign = "-" if ratio < 0 else "+"
+    return f"{sign}{abs(ratio):.0%}"
+
+
 def _short(address: str) -> str:
     return f"{address[:6]}…{address[-4:]}"
+
+
+def _follow_toast(freshly: bool, address: str) -> str:
+    return f"Now following {_short(address)}" if freshly else f"Already following {_short(address)}"
+
+
+def _unfollow_toast(removed: bool, address: str) -> str:
+    return f"Unfollowed {_short(address)}" if removed else "You weren't tracking this trader."
 
 
 def build_router() -> Router:
@@ -303,10 +585,16 @@ def build_router() -> Router:
     router = Router()
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
+    router.message.register(cmd_screener, Command("screener"))
     router.message.register(cmd_tracked, Command("tracked"))
     router.message.register(follow_pasted_address, _is_wallet_paste)
     router.message.register(reject_unknown_command, _is_command)
     router.message.register(reject_unrecognized_input)  # anything else: text, stickers, photos…
+    router.callback_query.register(on_screener_page, F.data.startswith("screen:"))
+    router.callback_query.register(on_screener_follow, F.data.startswith("sfollow:"))
+    router.callback_query.register(on_profile, F.data.startswith("profile:"))
+    router.callback_query.register(on_profile_follow, F.data.startswith("pfollow:"))
+    router.callback_query.register(on_profile_unfollow, F.data.startswith("punfollow:"))
     router.callback_query.register(on_positions, F.data.startswith("positions:"))
     router.callback_query.register(on_unfollow, F.data.startswith("unfollow:"))
     return router

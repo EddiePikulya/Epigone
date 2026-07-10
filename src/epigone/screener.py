@@ -45,10 +45,11 @@ class ScreenerRow:
 
 
 async def run_screener(
-    pool: asyncpg.Pool, window: Window = Window.MONTH, limit: int = 10
+    pool: asyncpg.Pool, window: Window = Window.MONTH, limit: int = 10, offset: int = 0
 ) -> list[ScreenerRow]:
     """The default Criteria: Traders with coarse metrics for `window`, Bots
-    excluded, ranked by that window's ROI."""
+    excluded, ranked by that window's ROI. `offset` pages through the ranking;
+    the (roi, address) sort is total so pages never overlap or skip a row."""
     rows = await pool.fetch(
         """
         SELECT t.address, t.display_name,
@@ -63,9 +64,10 @@ async def run_screener(
         LEFT JOIN fine_metrics fm ON fm.address = t.address
         WHERE t.bot_reason IS NULL
         ORDER BY cm.roi DESC, t.address
-        LIMIT $2
+        LIMIT $2 OFFSET $3
         """,
         window.value,
         limit,
+        offset,
     )
     return [ScreenerRow(**row) for row in rows]
