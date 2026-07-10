@@ -18,6 +18,9 @@ Diff semantics (tested in tests/test_position_poller.py):
 - **Silent update** — same coin, same side: partial closes, adds, and
   entry/leverage drift update the snapshot (preserving opened_at) without
   alerting.
+- **Re-follow.** When a Trader loses their last follower, the pass prunes
+  their snapshots and poll state; following them again re-baselines silently
+  instead of diffing against a stale snapshot and alerting on ancient changes.
 
 Snapshot updates and alert-row inserts share one transaction per Trader, so an
 event is detected exactly once: after a stream restart the snapshots already
@@ -78,6 +81,7 @@ async def run_poll_pass(
     pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: WeightBudget, clock: Clock
 ) -> PollResult:
     """One clearinghouseState call per distinct tracked Trader, paced by the budget."""
+    await _prune_untracked(pool)
     rows = await pool.fetch("SELECT DISTINCT trader_address FROM tracks ORDER BY trader_address")
     polled = failed = events = consecutive_failures = 0
     for row in rows:
@@ -104,6 +108,25 @@ async def run_poll_pass(
     if events or failed:
         log.info("poll pass done: %d polled, %d events, %d failed", polled, events, failed)
     return PollResult(polled=polled, failed=failed, events=events, aborted=False)
+
+
+async def _prune_untracked(pool: asyncpg.Pool) -> None:
+    """Drop poll bookkeeping for Traders nobody follows (the re-follow rule in
+    the module docstring). Queued alerts are untouched — they were real when
+    detected and still owe delivery."""
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            DELETE FROM position_snapshots
+            WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
+            """
+        )
+        await conn.execute(
+            """
+            DELETE FROM position_poll_state
+            WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
+            """
+        )
 
 
 async def _apply_poll(

@@ -261,6 +261,30 @@ async def test_a_new_follower_of_a_baselined_trader_gets_no_backfill_alerts(
     assert await alerts(pool) == []
 
 
+async def test_a_refollowed_trader_rebaselines_instead_of_replaying_stale_diffs(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Losing the last follower prunes the bookkeeping, so changes that happen
+    while nobody watches never surface as stale alerts on re-follow."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    await baseline(pool, gateway, clock)
+
+    await pool.execute("DELETE FROM tracks")  # the last follower leaves
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [])  # ...and the position closes unwatched
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+    assert gateway.positions_calls == ["0xaaa"]  # pruned, not polled
+    assert await pool.fetchval("SELECT count(*) FROM position_snapshots") == 0
+    assert await pool.fetchval("SELECT count(*) FROM position_poll_state") == 0
+
+    clock.advance(30)
+    await track(pool, clock, "0xaaa", 42)  # re-follow
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert await alerts(pool) == []  # a silent fresh baseline, no stale CLOSE
+
+
 async def test_untracked_traders_are_not_polled(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:

@@ -5,16 +5,25 @@ processes meet only in Postgres); this loop drains undelivered rows oldest
 first and stamps delivered_at only after Telegram accepts the send. Stamped
 rows are never resent, so bot restarts are duplicate-free; a crash in the
 instant between send and stamp re-sends that single alert — the at-least-once
-residue of an outbox without delivery receipts. Sends Telegram rejects
-(blocked bot, deleted chat) increment attempts, and a row is abandoned after
-MAX_DELIVERY_ATTEMPTS so one dead chat cannot wedge the queue.
+residue of an outbox without delivery receipts.
+
+Failures split by durability: transient trouble (network, flood control,
+Telegram 5xx) pauses the run and retries everything untouched next tick,
+while a per-chat reject (blocked bot, deleted chat) increments that row's
+attempts until MAX_DELIVERY_ATTEMPTS abandons it — one dead chat must not
+wedge the queue, but an outage must not shed alerts.
 """
 
 import logging
 
 import asyncpg
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 
 from epigone.bot.format import held_for, signed_pct, signed_usd, trader_label
 from epigone.clock import Clock
@@ -26,12 +35,18 @@ MAX_DELIVERY_ATTEMPTS = 5
 
 
 async def run_delivery_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> None:
+    """Supervised drain loop: one broken iteration (database blip, unexpected
+    error) is logged and retried, never allowed to silently kill the task
+    (ADR-0002's asyncio mitigation) while dialog polling carries on."""
     while True:
-        await deliver_pending(pool, bot)
+        try:
+            await deliver_pending(pool, bot, clock)
+        except Exception:
+            log.exception("alert delivery iteration failed; retrying next tick")
         await clock.sleep(DELIVERY_INTERVAL_SECONDS)
 
 
-async def deliver_pending(pool: asyncpg.Pool, bot: Bot) -> int:
+async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
     """Send every undelivered alert, oldest first. Returns the delivered count."""
     rows = await pool.fetch(
         """
@@ -47,9 +62,15 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot) -> int:
     for row in rows:
         try:
             await bot.send_message(chat_id=row["user_telegram_id"], text=render_alert(row))
+        except (TelegramNetworkError, TelegramRetryAfter, TelegramServerError):
+            # Telegram itself is struggling, not this chat: touching attempts
+            # here would bleed alerts away during an outage. Leave every
+            # remaining row for the next tick.
+            log.warning("alert delivery paused: Telegram transient failure", exc_info=True)
+            break
         except TelegramAPIError:
             log.warning(
-                "alert %d: send to user %d failed",
+                "alert %d: send to user %d rejected",
                 row["id"],
                 row["user_telegram_id"],
                 exc_info=True,
@@ -59,7 +80,9 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot) -> int:
             )
             continue
         await pool.execute(
-            "UPDATE position_alerts SET delivered_at = now() WHERE id = $1", row["id"]
+            "UPDATE position_alerts SET delivered_at = $2 WHERE id = $1",
+            row["id"],
+            clock.now(),
         )
         delivered += 1
     return delivered

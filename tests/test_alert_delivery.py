@@ -11,7 +11,7 @@ from typing import cast
 
 import asyncpg
 from aiogram import Bot
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import SendMessage, TelegramMethod
 from aiogram.methods.base import TelegramType
 
@@ -82,13 +82,13 @@ async def queue_alert(
 
 
 async def test_an_open_alert_is_delivered_with_label_and_position_fields(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     await queue_alert(
         pool, kind="open", side="short", size_usd="20000", leverage="10", entry_price="97.5"
     )
 
-    delivered = await deliver_pending(pool, bot)
+    delivered = await deliver_pending(pool, bot, clock)
 
     assert delivered == 1
     (message,) = session.sent_messages()
@@ -106,7 +106,7 @@ async def test_an_open_alert_is_delivered_with_label_and_position_fields(
 
 
 async def test_a_close_alert_reports_pnl_return_and_holding_time(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     await queue_alert(
         pool,
@@ -121,7 +121,7 @@ async def test_a_close_alert_reports_pnl_return_and_holding_time(
         opened_at=T0 - timedelta(hours=1, minutes=30),
     )
 
-    await deliver_pending(pool, bot)
+    await deliver_pending(pool, bot, clock)
 
     (message,) = session.sent_messages()
     assert "closed BTC LONG" in message.text
@@ -131,7 +131,7 @@ async def test_a_close_alert_reports_pnl_return_and_holding_time(
 
 
 async def test_a_flip_alert_shows_both_legs(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     await queue_alert(
         pool,
@@ -146,7 +146,7 @@ async def test_a_flip_alert_shows_both_legs(
         opened_at=T0 - timedelta(hours=2),
     )
 
-    await deliver_pending(pool, bot)
+    await deliver_pending(pool, bot, clock)
 
     (message,) = session.sent_messages()
     assert "flipped BTC LONG → SHORT" in message.text
@@ -156,12 +156,12 @@ async def test_a_flip_alert_shows_both_legs(
 
 
 async def test_an_unlabeled_trader_is_identified_by_short_address(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     address = "0x1116b5fcc070945062e8879841c29807db373d0d"
     await queue_alert(pool, address=address, display_name=None)
 
-    await deliver_pending(pool, bot)
+    await deliver_pending(pool, bot, clock)
 
     (message,) = session.sent_messages()
     assert "0x1116…3d0d" in message.text
@@ -169,24 +169,24 @@ async def test_an_unlabeled_trader_is_identified_by_short_address(
 
 
 async def test_delivered_alerts_are_never_resent(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     """The restart story: delivery marks rows in Postgres, so a bot restart
     (or the next loop iteration) resends nothing."""
     await queue_alert(pool)
 
-    assert await deliver_pending(pool, bot) == 1
-    assert await deliver_pending(pool, bot) == 0
+    assert await deliver_pending(pool, bot, clock) == 1
+    assert await deliver_pending(pool, bot, clock) == 0
     assert len(session.sent_messages()) == 1
 
 
 async def test_alerts_deliver_oldest_first(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     await queue_alert(pool, coin="BTC")
     await queue_alert(pool, coin="SOL")
 
-    await deliver_pending(pool, bot)
+    await deliver_pending(pool, bot, clock)
 
     texts = [m.text for m in session.sent_messages()]
     assert "BTC" in texts[0] and "SOL" in texts[1]
@@ -195,9 +195,12 @@ async def test_alerts_deliver_oldest_first(
 class FlakySession(RecordingSession):
     """Fails the first N sends the way Telegram would, then recovers."""
 
-    def __init__(self, failures: int) -> None:
+    def __init__(
+        self, failures: int, exception: type[TelegramAPIError] = TelegramBadRequest
+    ) -> None:
         super().__init__()
         self.failures = failures
+        self.exception = exception
 
     async def make_request(
         self,
@@ -207,41 +210,63 @@ class FlakySession(RecordingSession):
     ) -> TelegramType:
         if isinstance(method, SendMessage) and self.failures > 0:
             self.failures -= 1
-            raise TelegramBadRequest(method=method, message="Bad Request: chat not found")
+            raise self.exception(method=method, message="synthetic failure")
         return cast(TelegramType, await super().make_request(bot, method, timeout))
 
 
-async def test_a_failed_send_is_retried_on_the_next_run(pool: asyncpg.Pool) -> None:
+async def test_a_failed_send_is_retried_on_the_next_run(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
     flaky = FlakySession(failures=1)
     bot = make_bot(flaky)
     await queue_alert(pool)
 
-    assert await deliver_pending(pool, bot) == 0
+    assert await deliver_pending(pool, bot, clock) == 0
     assert await pool.fetchval("SELECT attempts FROM position_alerts") == 1
     assert await pool.fetchval("SELECT delivered_at FROM position_alerts") is None
 
-    assert await deliver_pending(pool, bot) == 1
+    assert await deliver_pending(pool, bot, clock) == 1
     assert len(flaky.sent_messages()) == 1
     await bot.session.close()
 
 
+async def test_a_telegram_outage_sheds_no_alerts(pool: asyncpg.Pool, clock: FakeClock) -> None:
+    """Transient failures (network, 5xx, flood control) pause the run without
+    burning attempts — an outage longer than MAX_DELIVERY_ATTEMPTS ticks must
+    not abandon alerts the way a dead chat does."""
+    flaky = FlakySession(failures=MAX_DELIVERY_ATTEMPTS + 3, exception=TelegramNetworkError)
+    bot = make_bot(flaky)
+    await queue_alert(pool, user_id=42)
+    await queue_alert(pool, user_id=43)
+
+    for _ in range(MAX_DELIVERY_ATTEMPTS + 1):
+        assert await deliver_pending(pool, bot, clock) == 0
+    assert await pool.fetchval("SELECT max(attempts) FROM position_alerts") == 0
+
+    flaky.failures = 0  # Telegram recovers
+    assert await deliver_pending(pool, bot, clock) == 2
+    await bot.session.close()
+
+
 async def test_a_poison_alert_is_dropped_after_max_attempts(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     """A User who blocked the bot must not wedge the queue forever."""
     await queue_alert(pool, attempts=MAX_DELIVERY_ATTEMPTS)
 
-    assert await deliver_pending(pool, bot) == 0
+    assert await deliver_pending(pool, bot, clock) == 0
     assert session.sent_messages() == []
 
 
-async def test_one_users_failure_does_not_block_other_users(pool: asyncpg.Pool) -> None:
+async def test_one_users_failure_does_not_block_other_users(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
     flaky = FlakySession(failures=1)  # first row's send fails, second succeeds
     bot = make_bot(flaky)
     await queue_alert(pool, user_id=42)
     await queue_alert(pool, user_id=43)
 
-    assert await deliver_pending(pool, bot) == 1
+    assert await deliver_pending(pool, bot, clock) == 1
     (message,) = flaky.sent_messages()
     assert message.chat_id == 43
     await bot.session.close()
@@ -265,7 +290,7 @@ async def test_a_position_change_travels_from_poll_to_telegram(
     clock.advance(30)
     gateway.set_positions("0xaaa", [position(coin="ETH", side=Side.LONG)])
     await run_poll_pass(pool, gateway, budget, clock)
-    delivered = await deliver_pending(pool, bot)
+    delivered = await deliver_pending(pool, bot, clock)
 
     assert delivered == 1
     (message,) = session.sent_messages()
