@@ -28,7 +28,7 @@ MAX_TRACKED_WALLETS = 15
 
 
 class TrackOutcome(Enum):
-    """The result of a Follow at the shared `_track_address` seam. Three outcomes
+    """The result of a Follow at the shared `track_address` seam. Three outcomes
     so every caller (paste / screener / profile) can word its own reply."""
 
     FRESHLY_TRACKED = "freshly_tracked"
@@ -50,12 +50,12 @@ START_TEXT = (
 
 HELP_TEXT = (
     "Epigone commands:\n\n"
+    "/criteria — build and save your own definition of “best”, then run it\n"
     "/screener — the best traders right now, ranked by 30-day ROI\n"
     "/start — what Epigone is and how it works\n"
     "/tracked — your tracked traders and their positions\n"
     "/help — this list\n\n"
-    "Paste a wallet address (0x…) to start tracking that trader.\n\n"
-    "Coming soon: the criteria builder to define your own “best.”"
+    "Paste a wallet address (0x…) to start tracking that trader."
 )
 
 SCREENER_HEADER = "🏆 Top traders — best 30-day ROI, bots excluded"
@@ -102,7 +102,7 @@ _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 async def cmd_start(message: Message, pool: asyncpg.Pool) -> None:
     user = message.from_user
     if user is not None:
-        await _upsert_user(pool, user.id, user.username)
+        await upsert_user(pool, user.id, user.username)
     await message.answer(START_TEXT)
 
 
@@ -117,7 +117,7 @@ async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clo
         return
     address = message.text.strip().lower()
     async with pool.acquire() as conn, conn.transaction():
-        outcome = await _track_address(conn, user.id, user.username, address, clock.now())
+        outcome = await track_address(conn, user.id, user.username, address, clock.now())
     if outcome is TrackOutcome.FRESHLY_TRACKED:
         await message.answer(
             f"Now tracking {short_address(address)}.\n"
@@ -204,7 +204,7 @@ async def cmd_screener(message: Message, pool: asyncpg.Pool) -> None:
     user = message.from_user
     if user is None:
         return
-    await _upsert_user(pool, user.id, user.username)
+    await upsert_user(pool, user.id, user.username)
     text, markup = await _render_screener_page(pool, user.id, offset=0)
     await message.answer(text, reply_markup=markup)
 
@@ -225,13 +225,13 @@ async def on_screener_follow(callback: CallbackQuery, pool: asyncpg.Pool, clock:
     offset_str, _, address = (callback.data or "").removeprefix("sfollow:").partition(":")
     offset = _parse_offset(offset_str)
     async with pool.acquire() as conn, conn.transaction():
-        outcome = await _track_address(
+        outcome = await track_address(
             conn, callback.from_user.id, callback.from_user.username, address, clock.now()
         )
     if isinstance(callback.message, Message):
         text, markup = await _render_screener_page(pool, callback.from_user.id, offset=offset)
         await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer(_follow_toast(outcome, address))
+    await callback.answer(follow_toast(outcome, address))
 
 
 async def on_profile(
@@ -263,11 +263,11 @@ async def on_profile_follow(
 ) -> None:
     address = (callback.data or "").removeprefix("pfollow:")
     async with pool.acquire() as conn, conn.transaction():
-        outcome = await _track_address(
+        outcome = await track_address(
             conn, callback.from_user.id, callback.from_user.username, address, clock.now()
         )
     await _refresh_profile_in_place(
-        callback, pool, gateway, clock, address, _follow_toast(outcome, address)
+        callback, pool, gateway, clock, address, follow_toast(outcome, address)
     )
 
 
@@ -325,7 +325,7 @@ async def _render_screener_page(
     if not rows:
         return SCREENER_EMPTY_TEXT, None
 
-    tracked = await _tracked_set(pool, user_id, [r.address for r in rows])
+    tracked = await tracked_set(pool, user_id, [r.address for r in rows])
     lines = [SCREENER_HEADER, ""]
     keyboard: list[list[InlineKeyboardButton]] = []
     for rank, row in enumerate(rows, start=offset + 1):
@@ -370,7 +370,7 @@ def _screener_stats(row: ScreenerRow) -> str:
     return " · ".join(parts)
 
 
-async def _tracked_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) -> set[str]:
+async def tracked_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) -> set[str]:
     if not addresses:
         return set()
     rows = await pool.fetch(
@@ -448,7 +448,7 @@ def _is_command(message: Message) -> bool:
     return message.text is not None and message.text.startswith("/")
 
 
-async def _track_address(
+async def track_address(
     conn: asyncpg.Connection, telegram_id: int, username: str | None, address: str, now: datetime
 ) -> TrackOutcome:
     """Follow `address` for a User; idempotent. Returns the follow's outcome.
@@ -461,7 +461,7 @@ async def _track_address(
     Re-touching an already-tracked wallet is always allowed (idempotent, never
     counts as a new follow), even at the cap — so the already-tracking test
     comes before the count check."""
-    await _upsert_user(conn, telegram_id, username)
+    await upsert_user(conn, telegram_id, username)
     already_tracking = await conn.fetchval(
         "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
         telegram_id,
@@ -494,7 +494,7 @@ async def _track_address(
     return TrackOutcome.FRESHLY_TRACKED
 
 
-async def _upsert_user(
+async def upsert_user(
     executor: asyncpg.Pool | asyncpg.Connection, telegram_id: int, username: str | None
 ) -> None:
     await executor.execute(
@@ -605,7 +605,7 @@ def _summarize(positions: list[Position]) -> str:
     return f"{len(positions)} {noun}, uPnL {signed_usd(total_upnl)}"
 
 
-def _follow_toast(outcome: TrackOutcome, address: str) -> str:
+def follow_toast(outcome: TrackOutcome, address: str) -> str:
     if outcome is TrackOutcome.LIMIT_REACHED:
         return TRACK_LIMIT_TOAST
     verb = "Now following" if outcome is TrackOutcome.FRESHLY_TRACKED else "Already following"
@@ -620,11 +620,18 @@ def _unfollow_toast(removed: bool, address: str) -> str:
 
 def build_router() -> Router:
     """A fresh Router per Dispatcher — a Router instance can only attach once."""
+    # Deferred import: the criteria flow builds on this module's shared seams
+    # (track_address, upsert_user, …), so importing it at the top would cycle.
+    from epigone.bot import criteria
+
     router = Router()
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_screener, Command("screener"))
     router.message.register(cmd_tracked, Command("tracked"))
+    # Before the paste/reject handlers: consumes the builder's typed input
+    # (thresholds, names) while a prompt is pending; commands still cut through.
+    criteria.register(router)
     router.message.register(follow_pasted_address, _is_wallet_paste)
     router.message.register(reject_unknown_command, _is_command)
     router.message.register(reject_unrecognized_input)  # anything else: text, stickers, photos…

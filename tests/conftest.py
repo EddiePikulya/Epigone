@@ -52,7 +52,7 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
     async with pool.acquire() as conn:
         await conn.execute(
             "TRUNCATE users, traders, coarse_metrics, fine_metrics, tracks, "
-            "position_poll_state, position_snapshots, position_alerts"
+            "position_poll_state, position_snapshots, position_alerts, criteria"
         )
     yield pool
     await pool.close()
@@ -86,5 +86,6 @@ def dp(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) ->
     dispatcher["pool"] = pool
     dispatcher["gateway"] = gateway
     dispatcher["clock"] = clock
+    dispatcher["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
     dispatcher.include_router(build_router())
     return dispatcher
