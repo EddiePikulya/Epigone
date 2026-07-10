@@ -15,6 +15,7 @@ wedge the queue, but an outage must not shed alerts.
 """
 
 import logging
+from decimal import Decimal
 
 import asyncpg
 from aiogram import Bot
@@ -91,10 +92,15 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
 def render_alert(row: asyncpg.Record) -> str:
     label = trader_label(row["display_name"], row["trader_address"])
     coin: str = row["coin"]
-    if row["kind"] == "open":
+    kind: str = row["kind"]
+    if kind == "open":
         return f"🟢 {label} opened {coin} {_side(row['side'])} — {_new_leg(row)}"
-    if row["kind"] == "close":
+    if kind == "close":
         return f"🔴 {label} closed {coin} {_side(row['prev_side'])} — {_closed_leg(row)}"
+    if kind == "scale_in":
+        return f"📈 {label} added to {coin} {_side(row['side'])} — {_scale_leg(row)}"
+    if kind == "scale_out":
+        return f"📉 {label} trimmed {coin} {_side(row['side'])} — {_scale_leg(row)}"
     return (
         f"🔄 {label} flipped {coin} {_side(row['prev_side'])} → {_side(row['side'])} — "
         f"{_closed_leg(row)}; now {_side(row['side'])} {_new_leg(row)}"
@@ -107,6 +113,15 @@ def _side(side: str) -> str:
 
 def _new_leg(row: asyncpg.Record) -> str:
     return f"${row['size_usd']:,.0f} at {row['leverage']}x, entry {row['entry_price']}"
+
+
+def _scale_leg(row: asyncpg.Record) -> str:
+    """A scale alert (issue #10): the size it grew from → to, with the % change
+    so a User sees at a glance how big a conviction move it was."""
+    prev: Decimal = row["prev_size_usd"]
+    new: Decimal = row["size_usd"]
+    change = (new - prev) / prev if prev else Decimal(0)
+    return f"${prev:,.0f} → ${new:,.0f} ({signed_pct(change)}) at {row['leverage']}x"
 
 
 def _closed_leg(row: asyncpg.Record) -> str:

@@ -26,6 +26,7 @@ async def main() -> None:
         dp["gateway"] = HttpHyperliquidGateway(session, clock)
         dp["clock"] = clock
         dp["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
+        dp["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
         dp.include_router(build_router())
 
         # Position Alert delivery (issue #4) rides in the bot process — the

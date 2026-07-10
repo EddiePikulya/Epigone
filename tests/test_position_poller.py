@@ -6,9 +6,12 @@ epigone.stream.poller):
 
 - first poll of a Trader baselines silently (pre-existing positions are not news)
 - coin appears -> OPEN; coin disappears -> CLOSE; side changes -> FLIP
-- same-side size/entry/leverage changes (partial closes, adds) never alert
+- same-side size change >= SCALE_SIGNIFICANCE_THRESHOLD -> SCALE-IN/SCALE-OUT
+  (issue #10); smaller drift (entry/leverage/partial-close) stays silent
 - one alert row per event per follower, in the same transaction as the
   snapshot update, so a restart neither re-alerts nor loses events
+
+Alert-control suppression (mute, min-size) lives in tests/test_alert_controls.py.
 """
 
 from decimal import Decimal
@@ -192,18 +195,21 @@ async def test_a_side_change_emits_one_flip_alert_with_both_legs(
     assert snapshot["opened_at"] == clock.now()
 
 
-async def test_partial_closes_and_size_changes_are_silent(
+async def test_subthreshold_size_and_entry_changes_are_silent(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
+    """Below SCALE_SIGNIFICANCE_THRESHOLD, same-side drift (small partial close,
+    entry/leverage change) updates the snapshot without alerting — the pre-#10
+    silent-update behavior, now bounded by the threshold."""
     await track(pool, clock, "0xaaa", 42)
     gateway.set_positions("0xaaa", [position(size_usd="10000")])
     await baseline(pool, gateway, clock)
     opened = clock.now()
 
-    clock.advance(30)  # partial close: same side, smaller position
+    clock.advance(30)  # 10% partial close, well under the 25% threshold
     gateway.set_positions(
         "0xaaa",
-        [position(size_usd="4000", entry_price="105", leverage="8", unrealized_pnl="120")],
+        [position(size_usd="9000", entry_price="105", leverage="8", unrealized_pnl="120")],
     )
     result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
@@ -211,7 +217,7 @@ async def test_partial_closes_and_size_changes_are_silent(
     assert await alerts(pool) == []
     snapshot = await pool.fetchrow("SELECT * FROM position_snapshots")
     assert snapshot is not None
-    assert snapshot["size_usd"] == Decimal("4000")
+    assert snapshot["size_usd"] == Decimal("9000")
     assert snapshot["entry_price"] == Decimal("105")
     assert snapshot["leverage"] == Decimal("8")
     assert snapshot["unrealized_pnl"] == Decimal("120")
@@ -440,7 +446,11 @@ async def test_an_xyz_close_emits_an_alert(
     await baseline(pool, gateway, clock)
 
     clock.advance(30)
-    gateway.set_positions("0xaaa", [position(coin="xyz:BB", unrealized_pnl="900")], dex="xyz")
+    gateway.set_positions(
+        "0xaaa",
+        [position(coin="xyz:BB", size_usd="6000", leverage="3", unrealized_pnl="900")],
+        dex="xyz",
+    )
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
     clock.advance(30)
@@ -544,3 +554,110 @@ async def test_a_partial_fetch_alerts_nothing_and_keeps_the_baseline(
     assert await alerts(pool) == []
     coins = {r["coin"] for r in await pool.fetch("SELECT coin FROM position_snapshots")}
     assert coins == {"BTC", "xyz:META"}  # baseline intact, ready to diff next pass
+
+
+# --- scale-in / scale-out (issue #10) ---------------------------------------
+#
+# A same-coin/same-side size change at or above SCALE_SIGNIFICANCE_THRESHOLD
+# alerts as SCALE-IN (bigger) or SCALE-OUT (smaller); anything below stays a
+# silent snapshot update. The alert carries the size it grew/shrank from.
+
+
+async def _scale_from(
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+    *,
+    before: str,
+    after: str,
+) -> list[asyncpg.Record]:
+    """Baseline a BTC-long at `before`, then repoll it at `after`; return alerts."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(size_usd=before)])
+    await baseline(pool, gateway, clock)
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(size_usd=after)])
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+    return await alerts(pool)
+
+
+async def test_a_large_add_emits_a_scale_in_with_both_sizes(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    rows = await _scale_from(pool, gateway, clock, before="10000", after="20000")
+
+    (row,) = rows
+    assert row["kind"] == "scale_in"
+    assert row["coin"] == "BTC"
+    assert row["side"] == "long"
+    assert row["prev_size_usd"] == Decimal("10000")
+    assert row["size_usd"] == Decimal("20000")
+    # The snapshot now carries the new size but keeps the original opened_at.
+    snapshot = await pool.fetchrow("SELECT * FROM position_snapshots")
+    assert snapshot is not None
+    assert snapshot["size_usd"] == Decimal("20000")
+
+
+async def test_a_large_trim_emits_a_scale_out(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    rows = await _scale_from(pool, gateway, clock, before="10000", after="6000")
+
+    (row,) = rows
+    assert row["kind"] == "scale_out"
+    assert row["prev_size_usd"] == Decimal("10000")
+    assert row["size_usd"] == Decimal("6000")
+
+
+async def test_a_change_just_below_the_threshold_stays_silent(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # +24% < 25% threshold: still an ordinary silent update.
+    rows = await _scale_from(pool, gateway, clock, before="10000", after="12400")
+
+    assert rows == []
+    snapshot = await pool.fetchrow("SELECT * FROM position_snapshots")
+    assert snapshot is not None
+    assert snapshot["size_usd"] == Decimal("12400")  # snapshot still tracks the drift
+
+
+async def test_a_change_exactly_at_the_threshold_alerts(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # +25% == threshold fires (>= is the boundary).
+    rows = await _scale_from(pool, gateway, clock, before="10000", after="12500")
+
+    (row,) = rows
+    assert row["kind"] == "scale_in"
+
+
+async def test_scale_respects_the_snapshot_baseline_not_the_original_open(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Each poll measures against the last snapshot, so gradual drift that never
+    clears the threshold in one step stays silent even as it accumulates."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(size_usd="10000")])
+    await baseline(pool, gateway, clock)
+
+    for size in ("11500", "13000", "14500"):  # ~13-15% steps, each below 25%
+        clock.advance(30)
+        gateway.set_positions("0xaaa", [position(size_usd=size)])
+        await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert await alerts(pool) == []  # drift never clears the threshold in one poll
+
+
+async def test_scale_fires_on_the_xyz_venue_too(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="xyz:META", size_usd="8000")], dex="xyz")
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="xyz:META", size_usd="16000")], dex="xyz")
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    (row,) = await alerts(pool)
+    assert row["kind"] == "scale_in" and row["coin"] == "xyz:META"

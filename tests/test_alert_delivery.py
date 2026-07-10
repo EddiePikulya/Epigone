@@ -35,6 +35,7 @@ async def queue_alert(
     coin: str = "BTC",
     side: str | None = "long",
     size_usd: str | None = "10000",
+    prev_size_usd: str | None = None,
     leverage: str | None = "5",
     entry_price: str | None = "100",
     prev_side: str | None = None,
@@ -60,9 +61,10 @@ async def queue_alert(
     await pool.execute(
         """
         INSERT INTO position_alerts
-            (user_telegram_id, trader_address, kind, coin, side, size_usd, leverage,
-             entry_price, prev_side, realized_pnl, pct_return, opened_at, created_at, attempts)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            (user_telegram_id, trader_address, kind, coin, side, size_usd, prev_size_usd,
+             leverage, entry_price, prev_side, realized_pnl, pct_return, opened_at,
+             created_at, attempts)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
         """,
         user_id,
         address,
@@ -70,6 +72,7 @@ async def queue_alert(
         coin,
         side,
         Decimal(size_usd) if size_usd is not None else None,
+        Decimal(prev_size_usd) if prev_size_usd is not None else None,
         Decimal(leverage) if leverage is not None else None,
         Decimal(entry_price) if entry_price is not None else None,
         prev_side,
@@ -153,6 +156,46 @@ async def test_a_flip_alert_shows_both_legs(
     assert "-$120" in message.text and "-6%" in message.text  # the closed leg
     assert "$15,000" in message.text and "3x" in message.text  # the new leg
     assert "entry 110" in message.text
+
+
+async def test_a_scale_in_alert_shows_the_size_growth(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    await queue_alert(
+        pool,
+        kind="scale_in",
+        side="long",
+        size_usd="25000",
+        prev_size_usd="10000",
+        leverage="5",
+    )
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    assert "added to BTC LONG" in message.text
+    assert "$10,000 → $25,000" in message.text
+    assert "+150%" in message.text  # doubled-and-a-half
+
+
+async def test_a_scale_out_alert_shows_the_size_reduction(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    await queue_alert(
+        pool,
+        kind="scale_out",
+        side="short",
+        size_usd="4000",
+        prev_size_usd="10000",
+        leverage="5",
+    )
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    assert "trimmed BTC SHORT" in message.text
+    assert "$10,000 → $4,000" in message.text
+    assert "-60%" in message.text
 
 
 async def test_an_xyz_market_alert_names_the_dex_qualified_coin(
