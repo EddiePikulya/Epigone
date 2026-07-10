@@ -11,9 +11,10 @@ from decimal import Decimal
 
 import asyncpg
 
+from epigone.budget import WeightBudget
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, HyperliquidGateway, PortfolioWindow, Window
-from epigone.ingest.budget import PORTFOLIO_WEIGHT, WeightBudget
+from epigone.ingest.budget import PORTFOLIO_WEIGHT
 
 log = logging.getLogger(__name__)
 

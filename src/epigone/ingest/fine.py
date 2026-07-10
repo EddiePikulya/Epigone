@@ -14,9 +14,10 @@ from decimal import Decimal
 
 import asyncpg
 
+from epigone.budget import WeightBudget
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, HyperliquidGateway
-from epigone.ingest.budget import FILLS_WEIGHT, WeightBudget
+from epigone.ingest.budget import FILLS_WEIGHT
 from epigone.ingest.scan import (
     ACTIVE_REFRESH_INTERVAL,
     DORMANT_REFRESH_INTERVAL,

@@ -10,9 +10,9 @@ from decimal import Decimal
 
 import asyncpg
 
+from epigone.budget import WeightBudget
 from epigone.gateway import GatewayError
 from epigone.gateway.fake import FakeHyperliquidGateway
-from epigone.ingest.budget import WeightBudget
 from epigone.ingest.fine import run_fine_pass
 from tests.support.clock import FakeClock
 from tests.support.fills import T0, fill

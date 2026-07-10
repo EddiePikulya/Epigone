@@ -48,3 +48,4 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 [tool.ruff.lint.per-file-ignores]
 # aiogram's BaseSession interface mandates `timeout` parameters.
 "tests/support/telegram.py" = ["ASYNC109"]
+"tests/test_alert_delivery.py" = ["ASYNC109"]

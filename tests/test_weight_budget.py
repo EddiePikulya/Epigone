@@ -2,7 +2,7 @@
 
 import pytest
 
-from epigone.ingest.budget import WeightBudget
+from epigone.budget import WeightBudget
 from tests.support.clock import FakeClock
 
 

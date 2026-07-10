@@ -4,9 +4,9 @@ from decimal import Decimal
 
 import asyncpg
 
+from epigone.budget import WeightBudget
 from epigone.gateway import GatewayError, LeaderboardEntry, PortfolioWindow, Window
 from epigone.gateway.fake import FakeHyperliquidGateway
-from epigone.ingest.budget import WeightBudget
 from epigone.ingest.scan import run_coarse_pass, seed_universe
 from tests.support.clock import FakeClock
 

@@ -13,11 +13,12 @@ from datetime import datetime, timedelta
 
 import aiohttp
 
+from epigone.budget import WeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
 from epigone.db import apply_schema, create_pool
 from epigone.gateway.http import HttpHyperliquidGateway
-from epigone.ingest.budget import INGEST_WEIGHT_PER_MINUTE, WeightBudget
+from epigone.ingest.budget import INGEST_WEIGHT_PER_MINUTE
 from epigone.ingest.fine import run_fine_pass
 from epigone.ingest.scan import run_coarse_pass, seed_universe
 
