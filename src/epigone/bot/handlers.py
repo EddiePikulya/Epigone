@@ -20,10 +20,11 @@ from epigone.screener import ScreenerRow, run_screener
 
 SCREENER_PAGE_SIZE = 5
 
-# The stream poller can only sustain ~100 distinct tracked wallets across ALL
-# Users within its rate-budget share (halved by the xyz builder-DEX's second poll,
-# #21), so an unbounded per-User follow list lets one User exhaust the global
-# ceiling. A per-User cap is the first guard (#23); tune this constant to retune it.
+# The stream poller can only sustain ~110 distinct tracked wallets across ALL
+# Users within the shared weight budget (epigone.budget, #28; halved by the xyz
+# builder-DEX's second poll, #21), so an unbounded per-User follow list lets one
+# User exhaust the global ceiling. A per-User cap is the first guard (#23); tune
+# this constant to retune it.
 MAX_TRACKED_WALLETS = 15
 
 

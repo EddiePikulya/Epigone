@@ -42,18 +42,17 @@ from decimal import Decimal
 
 import asyncpg
 
-from epigone.budget import WeightBudget
+from epigone.budget import Budget
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway, Position
+from epigone.gateway import GatewayError, HyperliquidGateway, Position, RateLimitedError
 
 log = logging.getLogger(__name__)
 
-# The stream owns what ingest's 400/min share leaves of the 1200/min per-IP
-# budget. Each tracked wallet costs two clearinghouseState calls per poll — core
-# plus the xyz builder DEX (issue #21) — so weight 4 per wallet per 30s poll,
-# giving ~100 distinct tracked wallets before pacing stretches the interval
-# (halved from the ~200 of the core-only #4 poller; documented on the ticket).
-STREAM_WEIGHT_PER_MINUTE = 800
+# The stream spends against the shared 900/min budget (epigone.budget, issue
+# #28) with priority over ingest. Each tracked wallet costs two
+# clearinghouseState calls per poll — core plus the xyz builder DEX (issue #21)
+# — so weight 4 per wallet per 30s poll, giving ~110 distinct tracked wallets
+# before pacing stretches the interval even with ingest fully idle.
 POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this once per DEX
 
 # The single HIP-3 builder DEX we cover: xyz hosts ~90% of non-core activity
@@ -94,7 +93,7 @@ class _Event:
 
 
 async def run_poll_pass(
-    pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: WeightBudget, clock: Clock
+    pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: Budget, clock: Clock
 ) -> PollResult:
     """Two clearinghouseState calls per distinct tracked Trader — core and the
     xyz builder DEX (issue #21) — merged before diffing, paced by the budget."""
@@ -105,6 +104,13 @@ async def run_poll_pass(
         address: str = row["trader_address"]
         try:
             positions = await _fetch_positions(gateway, budget, address)
+        except RateLimitedError:
+            # Pacing, not an outage (issue #28): the gateway already backed off
+            # and retried; the wallet just polls again next pass. Never counts
+            # toward the abort streak.
+            log.warning("poll pass: rate limited polling %s; retrying next pass", address)
+            failed += 1
+            continue
         except GatewayError:
             log.warning("poll pass: positions fetch failed for %s", address, exc_info=True)
             failed += 1
@@ -127,7 +133,7 @@ async def run_poll_pass(
 
 
 async def _fetch_positions(
-    gateway: HyperliquidGateway, budget: WeightBudget, address: str
+    gateway: HyperliquidGateway, budget: Budget, address: str
 ) -> list[Position]:
     """A Trader's open positions across the venues we cover: core plus the xyz
     builder DEX (issue #21). Each call is budgeted separately (weight 2 apiece).

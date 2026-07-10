@@ -11,7 +11,7 @@ from decimal import Decimal
 import asyncpg
 
 from epigone.budget import WeightBudget
-from epigone.gateway import GatewayError
+from epigone.gateway import GatewayError, RateLimitedError
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.ingest.fine import run_fine_pass
 from tests.support.clock import FakeClock
@@ -205,6 +205,29 @@ async def test_sustained_failures_abort_the_pass(pool: asyncpg.Pool) -> None:
 
     assert result.aborted
     assert result.failed == 5  # stops at the failure streak, not the full list
+
+
+async def test_rate_limit_streaks_do_not_abort_the_pass(pool: asyncpg.Pool) -> None:
+    # Rate limiting is pacing, not an outage (issue #28): even a streak longer
+    # than the abort threshold must leave the pass making forward progress.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    limited = [f"0x{i:03d}" for i in range(6)]
+    for address in limited:
+        await add_trader(pool, clock, address)
+        gateway.fills_errors[address] = RateLimitedError("still 429 after retries")
+    await add_trader(pool, clock, "0xhealthy")
+    gateway.set_fills("0xhealthy", human_fills())
+
+    result = await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert not result.aborted
+    assert result.failed == 6 and result.refreshed == 1
+    # The rate-limited attempt still rotates the Trader to the back of the scan.
+    attempted = await pool.fetchval(
+        "SELECT fine_attempted_at FROM traders WHERE address = $1", limited[0]
+    )
+    assert attempted == clock.now()
 
 
 async def test_the_pass_is_paced_by_the_weight_budget(pool: asyncpg.Pool) -> None:

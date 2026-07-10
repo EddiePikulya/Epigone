@@ -4,53 +4,74 @@ The undocumented stats-data leaderboard is quarantined to Universe seeding —
 every failure surfaces as GatewayError so callers can degrade gracefully. The
 single leaderboard download also carries the coarse Metric Library, so no
 per-account call feeds coarse (issue #26). `clearinghouseState` costs weight 2,
-`userFills` weight 20, against the 1200/min per-IP budget.
+`userFills` weight 20, against the shared weight budget (epigone.budget).
+
+A 429 backs off and retries here rather than surfacing (issue #28): sleep the
+server's Retry-After when present, else an exponential window with jitter.
+Only a persistent streak escapes, as RateLimitedError, which callers treat as
+pacing — retry the item later, never abort a whole pass over it.
 """
 
+import logging
+import random
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import aiohttp
 
+from epigone.clock import Clock
 from epigone.gateway import (
     Fill,
     GatewayError,
     LeaderboardEntry,
     LeaderboardWindow,
     Position,
+    RateLimitedError,
     Side,
     Window,
 )
+
+log = logging.getLogger(__name__)
 
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
+# Bounded 429 retries: 6 tries = up to 5 sleeps (1+2+4+8+16s at full jitter),
+# ~30s worst case — long enough to ride out a blip, short enough that a pass
+# under sustained limiting still moves on and resumes next cycle.
+RATE_LIMIT_MAX_TRIES = 6
+RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
+RATE_LIMIT_BACKOFF_CAP_SECONDS = 30.0
+
 
 class HttpHyperliquidGateway:
-    def __init__(self, session: aiohttp.ClientSession) -> None:
+    def __init__(
+        self,
+        session: aiohttp.ClientSession,
+        clock: Clock,
+        *,
+        rng: Callable[[], float] = random.random,
+    ) -> None:
         self._session = session
+        self._clock = clock
+        self._rng = rng
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
         try:
-            async with self._session.get(LEADERBOARD_URL, timeout=REQUEST_TIMEOUT) as response:
-                response.raise_for_status()
-                payload = await response.json()
+            payload = await self._request_json("GET", LEADERBOARD_URL)
         except aiohttp.ClientError as exc:
             raise GatewayError(f"leaderboard request failed: {exc}") from exc
         return parse_leaderboard(payload)
 
     async def get_fills(self, address: str) -> list[Fill]:
         try:
-            async with self._session.post(
-                INFO_URL,
-                json={"type": "userFills", "user": address.lower()},
-                timeout=REQUEST_TIMEOUT,
-            ) as response:
-                response.raise_for_status()
-                payload = await response.json()
+            payload = await self._request_json(
+                "POST", INFO_URL, json_body={"type": "userFills", "user": address.lower()}
+            )
         except aiohttp.ClientError as exc:
             raise GatewayError(f"userFills request failed for {address}: {exc}") from exc
         return parse_fills(payload)
@@ -60,14 +81,47 @@ class HttpHyperliquidGateway:
         if dex is not None:
             body["dex"] = dex  # a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21)
         try:
-            async with self._session.post(
-                INFO_URL, json=body, timeout=REQUEST_TIMEOUT
-            ) as response:
-                response.raise_for_status()
-                payload = await response.json()
+            payload = await self._request_json("POST", INFO_URL, json_body=body)
         except aiohttp.ClientError as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
         return parse_positions(payload, dex)
+
+    async def _request_json(
+        self, method: str, url: str, *, json_body: dict[str, str] | None = None
+    ) -> Any:
+        """One request with 429 backoff-and-retry; other failures raise untouched
+        (aiohttp errors, wrapped per-endpoint by the callers)."""
+        for attempt in range(RATE_LIMIT_MAX_TRIES):
+            async with self._session.request(
+                method, url, json=json_body, timeout=REQUEST_TIMEOUT
+            ) as response:
+                if response.status != 429:
+                    response.raise_for_status()
+                    return await response.json()
+                delay = _parse_retry_after(response.headers.get("Retry-After"))
+                if delay is None:
+                    delay = self._backoff_delay(attempt)
+            if attempt + 1 < RATE_LIMIT_MAX_TRIES:
+                log.warning("429 from %s: backing off %.1fs (try %d)", url, delay, attempt + 1)
+                await self._clock.sleep(delay)
+        raise RateLimitedError(f"still 429 from {url} after {RATE_LIMIT_MAX_TRIES} tries")
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """Exponential window with equal jitter: 50–100% of base * 2^attempt."""
+        window = min(RATE_LIMIT_BACKOFF_CAP_SECONDS, RATE_LIMIT_BACKOFF_BASE_SECONDS * 2.0**attempt)
+        return window * (0.5 + 0.5 * self._rng())
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    """Retry-After as delta-seconds; the HTTP-date form (or garbage) falls back
+    to our own backoff rather than trusting a parse of the server's clock."""
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        return None
+    return max(0.0, seconds)
 
 
 def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:

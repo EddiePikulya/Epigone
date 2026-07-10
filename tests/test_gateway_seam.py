@@ -50,9 +50,11 @@ WHALE_ENTRY = LeaderboardEntry(
     address=WHALE.lower(),
     display_name="whale",
     account_value=Decimal("1200000"),
-    windows={Window.DAY: LeaderboardWindow(
-        pnl=Decimal("5000"), roi=Decimal("0.004"), volume=Decimal("300000")
-    )},
+    windows={
+        Window.DAY: LeaderboardWindow(
+            pnl=Decimal("5000"), roi=Decimal("0.004"), volume=Decimal("300000")
+        )
+    },
 )
 
 
