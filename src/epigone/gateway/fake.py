@@ -5,13 +5,14 @@ class FakeHyperliquidGateway:
     """In-memory gateway for tests: set data per address, no network.
 
     Configure failures by assigning `leaderboard_error` / `portfolio_errors` /
-    `fills_errors`; `portfolio_calls` and `fills_calls` record every request
-    (lowercased) in order.
+    `fills_errors`; `positions_calls`, `portfolio_calls` and `fills_calls`
+    record every request (lowercased) in order.
     """
 
     def __init__(self) -> None:
         self.positions: dict[str, list[Position]] = {}
         self.positions_errors: dict[str, Exception] = {}
+        self.positions_calls: list[str] = []
         self.leaderboard: list[LeaderboardEntry] = []
         self.leaderboard_error: Exception | None = None
         self.portfolios: dict[str, dict[Window, PortfolioWindow]] = {}
@@ -23,6 +24,7 @@ class FakeHyperliquidGateway:
 
     async def get_open_positions(self, address: str) -> list[Position]:
         key = address.lower()
+        self.positions_calls.append(key)
         error = self.positions_errors.get(key)
         if error is not None:
             raise error
