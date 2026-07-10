@@ -7,6 +7,7 @@ the real client.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from typing import Protocol
@@ -63,6 +64,44 @@ class Position:
     unrealized_pnl: Decimal
 
 
+@dataclass(frozen=True)
+class Fill:
+    """One fill from a Trader's history — the raw material of fine metrics (issue #8).
+
+    `direction` keeps Hyperliquid's raw dir string ("Open Long", "Close Short",
+    "Long > Short", "Settlement", "Buy", …); the classification properties own
+    its semantics so callers never string-match themselves."""
+
+    coin: str
+    price: Decimal
+    size: Decimal  # unsigned, in coin units
+    direction: str
+    closed_pnl: Decimal  # realized PnL this fill, before fees; 0 for opens
+    start_position: Decimal  # signed position size before this fill (negative = short)
+    crossed: bool  # True = taker (crossed the book), False = maker (resting order)
+    order_id: int
+    time: datetime
+
+    @property
+    def is_perp(self) -> bool:
+        """Perp fills name a Long/Short leg; Settlement force-closes a delisted
+        perp market. Everything else ("Buy"/"Sell"/dust conversion) is spot."""
+        return (
+            "Long" in self.direction or "Short" in self.direction or self.direction == "Settlement"
+        )
+
+    @property
+    def closes_position(self) -> bool:
+        """Fills that realize PnL: closes, flips ("Long > Short"), liquidations,
+        and settlements. Opens and spot fills never do."""
+        return (
+            self.direction.startswith("Close")
+            or ">" in self.direction
+            or "Liquidat" in self.direction
+            or self.direction == "Settlement"
+        )
+
+
 class HyperliquidGateway(Protocol):
     async def get_open_positions(self, address: str) -> list[Position]:
         """Current open perp positions for a Trader's address."""
@@ -74,4 +113,9 @@ class HyperliquidGateway(Protocol):
 
     async def get_portfolio(self, address: str) -> dict[Window, PortfolioWindow]:
         """Windowed portfolio stats for a Trader. Raises GatewayError on failure."""
+        ...
+
+    async def get_fills(self, address: str) -> list[Fill]:
+        """A Trader's recent fills, newest first (the info API caps at ~2000).
+        Raises GatewayError on failure."""
         ...

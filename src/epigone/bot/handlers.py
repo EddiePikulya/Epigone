@@ -122,7 +122,8 @@ async def cmd_tracked(message: Message, pool: asyncpg.Pool, gateway: Hyperliquid
 async def on_positions(
     callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool, gateway: HyperliquidGateway
 ) -> None:
-    """On-demand current-positions view for a tracked Trader."""
+    """On-demand profile for a tracked Trader: current positions + track record.
+    Fine metrics where the fine pass has run; coarse-only Traders say so."""
     address = (callback.data or "").removeprefix("positions:")
     tracked = await pool.fetchval(
         "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
@@ -137,7 +138,9 @@ async def on_positions(
     except GatewayError:
         await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
         return
-    view = _render_positions(address, positions)
+    view = (
+        _render_positions(address, positions) + "\n\n" + await _render_track_record(pool, address)
+    )
     if isinstance(callback.message, Message):
         await callback.message.answer(view)  # the chat the button lives in
     else:
@@ -214,6 +217,56 @@ async def _render_tracked_list(
             ]
         )
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
+    """The profile's metrics block. Metric definitions: docs/metrics.md."""
+    row = await pool.fetchrow(
+        """
+        SELECT t.bot_reason, fm.address IS NOT NULL AS fine_available,
+               fm.trade_count, fm.win_rate, fm.avg_win, fm.avg_loss, fm.sharpe,
+               fm.max_drawdown, fm.avg_leverage, fm.maker_share,
+               cm.pnl AS month_pnl, cm.roi AS month_roi
+        FROM traders t
+        LEFT JOIN fine_metrics fm ON fm.address = t.address
+        LEFT JOIN coarse_metrics cm ON cm.address = t.address AND cm.time_window = 'month'
+        WHERE t.address = $1
+        """,
+        address,
+    )
+    lines: list[str] = []
+    if row is not None and row["bot_reason"] is not None:
+        # A User may track anything, but the vetting verdict travels with it.
+        lines.append(f"⚠️ Flagged as a market-maker bot: {row['bot_reason']}")
+    if row is not None and row["fine_available"]:
+        lines.append("Track record (from recent fills):")
+        lines.extend(_fine_lines(row))
+    elif row is not None and row["month_pnl"] is not None:
+        lines.append("Coarse metrics only — fine stats haven't been computed yet.")
+        lines.append(f"30d PnL {_signed_usd(row['month_pnl'])} · ROI {row['month_roi']:.0%}")
+    else:
+        lines.append("No metrics yet — this trader hasn't been scanned.")
+    return "\n".join(lines)
+
+
+def _fine_lines(row: asyncpg.Record) -> list[str]:
+    lines: list[str] = []
+    if row["win_rate"] is not None:
+        lines.append(f"{row['win_rate']:.0%} win rate over {row['trade_count']} closed trades")
+    else:
+        lines.append("No closed trades in the recent fills")
+    if row["avg_win"] is not None and row["avg_loss"] is not None:
+        lines.append(f"avg win ${row['avg_win']:,.0f} · avg loss ${row['avg_loss']:,.0f}")
+    sharpe = f"Sharpe {row['sharpe']:.1f} · " if row["sharpe"] is not None else ""
+    if row["win_rate"] is not None:
+        lines.append(f"{sharpe}max drawdown ${row['max_drawdown']:,.0f}")
+    style = [
+        f"{row['maker_share']:.0%} maker" if row["maker_share"] is not None else None,
+        f"~{row['avg_leverage']:.1f}x leverage" if row["avg_leverage"] is not None else None,
+    ]
+    if any(style):
+        lines.append(" · ".join(part for part in style if part is not None))
+    return lines
 
 
 def _render_positions(address: str, positions: list[Position]) -> str:
