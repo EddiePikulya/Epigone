@@ -2,16 +2,18 @@
 
 The undocumented stats-data leaderboard is quarantined to Universe seeding —
 every failure surfaces as GatewayError so callers can degrade gracefully.
-`clearinghouseState` costs weight 2, `portfolio` weight 20, against the
-1200/min per-IP budget.
+`clearinghouseState` costs weight 2, `portfolio` and `userFills` weight 20,
+against the 1200/min per-IP budget.
 """
 
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import aiohttp
 
 from epigone.gateway import (
+    Fill,
     GatewayError,
     LeaderboardEntry,
     PortfolioWindow,
@@ -49,6 +51,19 @@ class HttpHyperliquidGateway:
         except aiohttp.ClientError as exc:
             raise GatewayError(f"portfolio request failed for {address}: {exc}") from exc
         return parse_portfolio(payload)
+
+    async def get_fills(self, address: str) -> list[Fill]:
+        try:
+            async with self._session.post(
+                INFO_URL,
+                json={"type": "userFills", "user": address.lower()},
+                timeout=REQUEST_TIMEOUT,
+            ) as response:
+                response.raise_for_status()
+                payload = await response.json()
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"userFills request failed for {address}: {exc}") from exc
+        return parse_fills(payload)
 
     async def get_open_positions(self, address: str) -> list[Position]:
         try:
@@ -97,6 +112,26 @@ def parse_portfolio(payload: Any) -> dict[Window, PortfolioWindow]:
         return windows
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected portfolio payload shape: {exc!r}") from exc
+
+
+def parse_fills(payload: Any) -> list[Fill]:
+    try:
+        return [
+            Fill(
+                coin=str(fill["coin"]),
+                price=Decimal(fill["px"]),
+                size=Decimal(fill["sz"]),
+                direction=str(fill["dir"]),
+                closed_pnl=Decimal(fill["closedPnl"]),
+                start_position=Decimal(fill["startPosition"]),
+                crossed=bool(fill["crossed"]),
+                order_id=int(fill["oid"]),
+                time=datetime.fromtimestamp(fill["time"] / 1000, tz=UTC),
+            )
+            for fill in payload
+        ]
+    except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+        raise GatewayError(f"unexpected userFills payload shape: {exc!r}") from exc
 
 
 def parse_positions(payload: Any) -> list[Position]:

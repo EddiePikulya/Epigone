@@ -5,6 +5,7 @@ from epigone.clock import Clock
 
 INGEST_WEIGHT_PER_MINUTE = 400
 PORTFOLIO_WEIGHT = 20
+FILLS_WEIGHT = 20
 
 
 class WeightBudget:
