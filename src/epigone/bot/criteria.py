@@ -37,7 +37,7 @@ from epigone.bot.handlers import (
     upsert_user,
 )
 from epigone.clock import Clock
-from epigone.criteria import (
+from epigone.criteria_store import (
     SavedCriteria,
     delete_criteria,
     get_criteria,

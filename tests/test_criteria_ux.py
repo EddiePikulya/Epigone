@@ -12,7 +12,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import InlineKeyboardMarkup
 
 from epigone.bot.handlers import build_router
-from epigone.criteria import get_criteria, list_criteria, save_criteria
+from epigone.criteria_store import get_criteria, list_criteria, save_criteria
 from epigone.gateway import Window
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.metrics.library import METRICS

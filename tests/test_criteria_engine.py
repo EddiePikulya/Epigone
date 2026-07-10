@@ -11,7 +11,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
-from epigone.criteria import (
+from epigone.criteria_store import (
     delete_criteria,
     get_criteria,
     list_criteria,
