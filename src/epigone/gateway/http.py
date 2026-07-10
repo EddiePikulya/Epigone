@@ -1,9 +1,10 @@
 """The production HyperliquidGateway: direct Hyperliquid endpoints (ADR-0001).
 
 The undocumented stats-data leaderboard is quarantined to Universe seeding —
-every failure surfaces as GatewayError so callers can degrade gracefully.
-`clearinghouseState` costs weight 2, `portfolio` and `userFills` weight 20,
-against the 1200/min per-IP budget.
+every failure surfaces as GatewayError so callers can degrade gracefully. The
+single leaderboard download also carries the coarse Metric Library, so no
+per-account call feeds coarse (issue #26). `clearinghouseState` costs weight 2,
+`userFills` weight 20, against the 1200/min per-IP budget.
 """
 
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from epigone.gateway import (
     Fill,
     GatewayError,
     LeaderboardEntry,
-    PortfolioWindow,
+    LeaderboardWindow,
     Position,
     Side,
     Window,
@@ -40,17 +41,6 @@ class HttpHyperliquidGateway:
         except aiohttp.ClientError as exc:
             raise GatewayError(f"leaderboard request failed: {exc}") from exc
         return parse_leaderboard(payload)
-
-    async def get_portfolio(self, address: str) -> dict[Window, PortfolioWindow]:
-        try:
-            async with self._session.post(
-                INFO_URL, json={"type": "portfolio", "user": address}, timeout=REQUEST_TIMEOUT
-            ) as response:
-                response.raise_for_status()
-                payload = await response.json()
-        except aiohttp.ClientError as exc:
-            raise GatewayError(f"portfolio request failed for {address}: {exc}") from exc
-        return parse_portfolio(payload)
 
     async def get_fills(self, address: str) -> list[Fill]:
         try:
@@ -81,38 +71,27 @@ class HttpHyperliquidGateway:
 
 
 def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
+    known = {window.value: window for window in Window}
     try:
-        rows = payload["leaderboardRows"]
         return [
             LeaderboardEntry(
                 address=str(row["ethAddress"]).lower(),
                 display_name=row["displayName"],
+                account_value=Decimal(row["accountValue"]),
+                windows={
+                    known[name]: LeaderboardWindow(
+                        pnl=Decimal(perf["pnl"]),
+                        roi=Decimal(perf["roi"]),
+                        volume=Decimal(perf["vlm"]),
+                    )
+                    for name, perf in row["windowPerformances"]
+                    if name in known  # perpDay/perpWeek/... — combined windows only in V1
+                },
             )
-            for row in rows
+            for row in payload["leaderboardRows"]
         ]
-    except (KeyError, TypeError, InvalidOperation) as exc:
-        raise GatewayError(f"unexpected leaderboard payload shape: {exc!r}") from exc
-
-
-def parse_portfolio(payload: Any) -> dict[Window, PortfolioWindow]:
-    known = {window.value: window for window in Window}
-    try:
-        windows: dict[Window, PortfolioWindow] = {}
-        for name, stats in payload:
-            window = known.get(name)
-            if window is None:  # perpDay/perpWeek/... — combined windows only in V1
-                continue
-            values = [Decimal(v) for _, v in stats["accountValueHistory"]]
-            pnls = [Decimal(v) for _, v in stats["pnlHistory"]]
-            windows[window] = PortfolioWindow(
-                pnl=pnls[-1] if pnls else Decimal(0),
-                volume=Decimal(stats["vlm"]),
-                account_value=values[-1] if values else Decimal(0),
-                starting_account_value=values[0] if values else Decimal(0),
-            )
-        return windows
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-        raise GatewayError(f"unexpected portfolio payload shape: {exc!r}") from exc
+        raise GatewayError(f"unexpected leaderboard payload shape: {exc!r}") from exc
 
 
 def parse_fills(payload: Any) -> list[Fill]:

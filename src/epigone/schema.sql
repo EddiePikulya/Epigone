@@ -14,8 +14,9 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- The Universe: candidate Traders seeded from the leaderboard source (issue #5)
 -- or pasted directly by a User (issue #3). Addresses are stored lowercased.
--- refresh_tier is NULL until the first coarse pass classifies the Trader;
--- timestamps come from the injected clock, not now().
+-- refresh_tier (from the leaderboard's week volume, issue #26) is NULL until a
+-- Trader is first seeded from the leaderboard — a directly-pasted Trader has no
+-- tier until then. Timestamps come from the injected clock, not now().
 -- bot_reason marks a Bot (CONTEXT.md): an account whose profile is
 -- market-making, not copyable skill. Bots keep their rows and metrics but
 -- never reach a screener result (issue #8).
@@ -25,8 +26,6 @@ CREATE TABLE IF NOT EXISTS traders (
     refresh_tier        TEXT CHECK (refresh_tier IN ('active', 'dormant')),
     first_seen_at       TIMESTAMPTZ NOT NULL,
     last_seen_at        TIMESTAMPTZ NOT NULL,
-    coarse_refreshed_at TIMESTAMPTZ,
-    coarse_attempted_at TIMESTAMPTZ,
     fine_refreshed_at   TIMESTAMPTZ,
     fine_attempted_at   TIMESTAMPTZ,
     bot_flagged_at      TIMESTAMPTZ,
@@ -34,13 +33,9 @@ CREATE TABLE IF NOT EXISTS traders (
     CHECK ((bot_flagged_at IS NULL) = (bot_reason IS NULL))
 );
 
--- Scan order: least-recently-attempted first, so Traders whose fetch keeps
--- failing rotate to the back instead of blocking the pass forever.
-CREATE INDEX IF NOT EXISTS traders_coarse_attempt_order
-    ON traders (coarse_attempted_at ASC NULLS FIRST, address);
-
--- Coarse Metric Library: one row per Trader per timeframe, from a single
--- portfolio call (spec-defaults two-stage scan, stage 1).
+-- Coarse Metric Library: one row per Trader per timeframe, populated directly
+-- from the leaderboard download (issue #26). "Refreshing" is re-seeding, so
+-- there is no per-Trader coarse bookkeeping.
 CREATE TABLE IF NOT EXISTS coarse_metrics (
     address       TEXT NOT NULL REFERENCES traders (address),
     time_window   TEXT NOT NULL CHECK (time_window IN ('day', 'week', 'month', 'allTime')),

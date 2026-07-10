@@ -174,7 +174,6 @@ async def test_a_screener_run_makes_zero_gateway_calls(
 
     # The acceptance line: a screener run is a database query only.
     assert gateway.positions_calls == []
-    assert gateway.portfolio_calls == []
     assert gateway.fills_calls == []
 
 

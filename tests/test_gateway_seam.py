@@ -10,7 +10,7 @@ from epigone.gateway import (
     GatewayError,
     HyperliquidGateway,
     LeaderboardEntry,
-    PortfolioWindow,
+    LeaderboardWindow,
     Position,
     Side,
     Window,
@@ -46,13 +46,13 @@ async def test_unknown_trader_has_no_positions() -> None:
     assert await gateway.get_open_positions("0x" + "0" * 40) == []
 
 
-WHALE_ENTRY = LeaderboardEntry(address=WHALE.lower(), display_name="whale")
-
-DAY_WINDOW = PortfolioWindow(
-    pnl=Decimal("5000"),
-    volume=Decimal("300000"),
+WHALE_ENTRY = LeaderboardEntry(
+    address=WHALE.lower(),
+    display_name="whale",
     account_value=Decimal("1200000"),
-    starting_account_value=Decimal("1195000"),
+    windows={Window.DAY: LeaderboardWindow(
+        pnl=Decimal("5000"), roi=Decimal("0.004"), volume=Decimal("300000")
+    )},
 )
 
 
@@ -68,20 +68,6 @@ async def test_fake_leaderboard_failure_raises_gateway_error() -> None:
     fake.leaderboard_error = GatewayError("stats-data is down")
     with pytest.raises(GatewayError):
         await fake.get_leaderboard()
-
-
-async def test_fake_returns_portfolio_windows_for_a_trader() -> None:
-    fake = FakeHyperliquidGateway()
-    fake.set_portfolio(WHALE, {Window.DAY: DAY_WINDOW})
-    gateway: HyperliquidGateway = fake
-    assert await gateway.get_portfolio(WHALE.lower()) == {Window.DAY: DAY_WINDOW}
-
-
-async def test_fake_portfolio_failure_raises_configured_error() -> None:
-    fake = FakeHyperliquidGateway()
-    fake.portfolio_errors[WHALE.lower()] = GatewayError("info API timeout")
-    with pytest.raises(GatewayError):
-        await fake.get_portfolio(WHALE)
 
 
 HYPE_CLOSE_FILL = Fill(

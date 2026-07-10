@@ -9,9 +9,10 @@ file in sync with them.
 
 ## Coarse metrics
 
-Coarse metrics come from Hyperliquid's precomputed portfolio stats (two-stage
-scan stage 1, docs/spec-defaults.md): one row per Trader per timeframe (24h /
-7d / 30d / all time), available Universe-wide with no fill paging.
+Coarse metrics come straight from the leaderboard download (issue #26): every
+row already carries account value plus per-window pnl/roi/volume, so the whole
+Universe is coarse-complete the moment the leaderboard lands — one row per
+Trader per timeframe (24h / 7d / 30d / all time), at zero per-account API cost.
 
 ### PnL
 - **In plain words:** how much money the account made or lost over the
@@ -20,6 +21,9 @@ scan stage 1, docs/spec-defaults.md): one row per Trader per timeframe (24h /
 ### ROI
 - **In plain words:** the account's percentage return over the timeframe —
   how hard the money worked, regardless of account size.
+- **Definition:** Hyperliquid's own leaderboard ROI for the window, stored
+  verbatim. It is net-deposit-adjusted, so mid-window funding doesn't read as
+  return the way a raw pnl-over-starting-stack proxy would.
 
 ### Volume
 - **In plain words:** how much the account traded over the timeframe, in
