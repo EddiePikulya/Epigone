@@ -12,6 +12,7 @@ from aiogram.types import (
     Message,
 )
 
+from epigone.bot.format import short_address, signed_pct, signed_usd
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, HyperliquidGateway, Position, Window
 from epigone.screener import ScreenerRow, run_screener
@@ -93,11 +94,11 @@ async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clo
         freshly_tracked = await _track_address(conn, user.id, user.username, address, clock.now())
     if freshly_tracked:
         await message.answer(
-            f"Now tracking {_short(address)}.\n"
+            f"Now tracking {short_address(address)}.\n"
             "Paste more addresses any time — /tracked shows your whole list."
         )
     else:
-        await message.answer(f"You're already tracking {_short(address)}.")
+        await message.answer(f"You're already tracking {short_address(address)}.")
 
 
 async def reject_unknown_command(message: Message) -> None:
@@ -300,13 +301,13 @@ async def _render_screener_page(
     lines = [SCREENER_HEADER, ""]
     keyboard: list[list[InlineKeyboardButton]] = []
     for rank, row in enumerate(rows, start=offset + 1):
-        lines.append(f"{rank}. {row.display_name or _short(row.address)}")
+        lines.append(f"{rank}. {row.display_name or short_address(row.address)}")
         lines.append(f"    {_screener_stats(row)}")
         followed = row.address in tracked
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=f"📊 {_short(row.address)}", callback_data=f"profile:{row.address}"
+                    text=f"📊 {short_address(row.address)}", callback_data=f"profile:{row.address}"
                 ),
                 InlineKeyboardButton(
                     text="✓ Following" if followed else "➕ Follow",
@@ -333,7 +334,7 @@ def _screener_stats(row: ScreenerRow) -> str:
     """One line of key stats per row: ROI and PnL always, win rate where the
     fine pass has run, else a 'still analyzing' marker (issue #8 distinction,
     framed as pending rather than a quality verdict)."""
-    parts = [f"ROI {_signed_pct(row.roi)}", f"PnL {_signed_usd(row.pnl)}"]
+    parts = [f"ROI {signed_pct(row.roi)}", f"PnL {signed_usd(row.pnl)}"]
     if row.win_rate is not None:
         parts.append(f"{row.win_rate:.0%} win")
     elif not row.fine_available:
@@ -476,11 +477,11 @@ async def _render_tracked_list(
     for row in rows:
         address: str = row["trader_address"]
         positions = await gateway.get_open_positions(address)
-        lines.append(f"{_short(address)} — {_summarize(positions)}")
+        lines.append(f"{short_address(address)} — {_summarize(positions)}")
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=f"📊 {_short(address)}", callback_data=f"positions:{address}"
+                    text=f"📊 {short_address(address)}", callback_data=f"positions:{address}"
                 ),
                 InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"unfollow:{address}"),
             ]
@@ -512,7 +513,7 @@ async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
         lines.extend(_fine_lines(row))
     elif row is not None and row["month_pnl"] is not None:
         lines.append("Coarse metrics only — fine stats haven't been computed yet.")
-        lines.append(f"30d PnL {_signed_usd(row['month_pnl'])} · ROI {row['month_roi']:.0%}")
+        lines.append(f"30d PnL {signed_usd(row['month_pnl'])} · ROI {row['month_roi']:.0%}")
     else:
         lines.append("No metrics yet — this trader hasn't been scanned.")
     return "\n".join(lines)
@@ -540,12 +541,12 @@ def _fine_lines(row: asyncpg.Record) -> list[str]:
 
 def _render_positions(address: str, positions: list[Position]) -> str:
     if not positions:
-        return f"{_short(address)} has no open positions right now."
-    blocks = [f"{_short(address)} — current positions:", ""]
+        return f"{short_address(address)} has no open positions right now."
+    blocks = [f"{short_address(address)} — current positions:", ""]
     for p in positions:
         blocks.append(
             f"{p.coin} {p.side.value.upper()} — ${p.size_usd:,.0f} at {p.leverage}x\n"
-            f"    entry {p.entry_price} · uPnL {_signed_usd(p.unrealized_pnl)}"
+            f"    entry {p.entry_price} · uPnL {signed_usd(p.unrealized_pnl)}"
         )
     return "\n".join(blocks)
 
@@ -555,29 +556,18 @@ def _summarize(positions: list[Position]) -> str:
         return "no open positions"
     total_upnl = sum((p.unrealized_pnl for p in positions), Decimal(0))
     noun = "position" if len(positions) == 1 else "positions"
-    return f"{len(positions)} {noun}, uPnL {_signed_usd(total_upnl)}"
-
-
-def _signed_usd(amount: Decimal) -> str:
-    sign = "-" if amount < 0 else "+"
-    return f"{sign}${abs(amount):,.0f}"
-
-
-def _signed_pct(ratio: Decimal) -> str:
-    sign = "-" if ratio < 0 else "+"
-    return f"{sign}{abs(ratio):.0%}"
-
-
-def _short(address: str) -> str:
-    return f"{address[:6]}…{address[-4:]}"
+    return f"{len(positions)} {noun}, uPnL {signed_usd(total_upnl)}"
 
 
 def _follow_toast(freshly: bool, address: str) -> str:
-    return f"Now following {_short(address)}" if freshly else f"Already following {_short(address)}"
+    verb = "Now following" if freshly else "Already following"
+    return f"{verb} {short_address(address)}"
 
 
 def _unfollow_toast(removed: bool, address: str) -> str:
-    return f"Unfollowed {_short(address)}" if removed else "You weren't tracking this trader."
+    if not removed:
+        return "You weren't tracking this trader."
+    return f"Unfollowed {short_address(address)}"
 
 
 def build_router() -> Router:
