@@ -141,3 +141,22 @@ CREATE TABLE IF NOT EXISTS position_alerts (
 -- The bot's delivery scan: undelivered rows only, oldest first.
 CREATE INDEX IF NOT EXISTS position_alerts_undelivered
     ON position_alerts (id) WHERE delivered_at IS NULL;
+
+-- A saved Criteria (CONTEXT.md): a User's named definition of "best trader" —
+-- filters over the Metric Library plus a timeframe and a sort (issue #7).
+-- filters is a JSONB list of {metric, op, threshold}; metric keys come from
+-- the Metric Library registry (src/epigone/metrics/library.py) and thresholds
+-- are stored as strings so Decimals round-trip exactly. Timestamps come from
+-- the injected clock, not now().
+CREATE TABLE IF NOT EXISTS criteria (
+    id               BIGSERIAL PRIMARY KEY,
+    user_telegram_id BIGINT NOT NULL REFERENCES users (telegram_id),
+    name             TEXT NOT NULL,
+    time_window      TEXT NOT NULL CHECK (time_window IN ('day', 'week', 'month', 'allTime')),
+    sort_key         TEXT NOT NULL,
+    sort_desc        BOOLEAN NOT NULL,
+    filters          JSONB NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL,
+    updated_at       TIMESTAMPTZ NOT NULL,
+    UNIQUE (user_telegram_id, name)
+);

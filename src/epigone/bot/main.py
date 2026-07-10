@@ -25,6 +25,7 @@ async def main() -> None:
         dp["pool"] = pool
         dp["gateway"] = HttpHyperliquidGateway(session)
         dp["clock"] = clock
+        dp["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
         dp.include_router(build_router())
 
         # Position Alert delivery (issue #4) rides in the bot process — the

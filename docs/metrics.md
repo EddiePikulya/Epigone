@@ -1,10 +1,32 @@
 # Metric definitions (issue #8)
 
-Plain-language definitions of the fills-based fine metrics and the Bot
-heuristics. The one-line "In plain words" sentences are written to be lifted
-verbatim by the criteria builder (V1 spec, user story 8). Source of truth for
-the math: `src/epigone/metrics/fine.py` and `src/epigone/metrics/bots.py` —
-keep this file in sync with them.
+Plain-language definitions of the Metric Library and the Bot heuristics. The
+one-line "In plain words" sentences are lifted verbatim by the criteria
+builder (issue #7) — they live in code in
+`src/epigone/metrics/library.py`. Source of truth for the math:
+`src/epigone/metrics/fine.py` and `src/epigone/metrics/bots.py` — keep this
+file in sync with them.
+
+## Coarse metrics
+
+Coarse metrics come from Hyperliquid's precomputed portfolio stats (two-stage
+scan stage 1, docs/spec-defaults.md): one row per Trader per timeframe (24h /
+7d / 30d / all time), available Universe-wide with no fill paging.
+
+### PnL
+- **In plain words:** how much money the account made or lost over the
+  timeframe, in dollars.
+
+### ROI
+- **In plain words:** the account's percentage return over the timeframe —
+  how hard the money worked, regardless of account size.
+
+### Volume
+- **In plain words:** how much the account traded over the timeframe, in
+  dollars — activity, not profit.
+
+### Account value
+- **In plain words:** what the account is worth right now, in dollars.
 
 ## Where fine metrics come from
 
@@ -39,9 +61,10 @@ independently verified win rates (`tests/test_golden_wallets.py`).
   trades.
 
 ### Average win / average loss
-- **In plain words:** the typical size of this account's winning trade versus
-  its typical losing trade — big wins with small losses is the profile you
-  want to copy.
+- **In plain words (average win):** the typical profit on this account's
+  winning trades, in dollars.
+- **In plain words (average loss):** the typical damage of this account's
+  losing trades, in dollars (a positive number — smaller is better).
 - **Definition:** mean PnL of winning trades; mean absolute PnL of losing
   trades (reported positive). Breakeven trades join neither. Each side is
   unavailable until it has at least one trade.
