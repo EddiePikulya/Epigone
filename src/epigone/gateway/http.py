@@ -65,18 +65,19 @@ class HttpHyperliquidGateway:
             raise GatewayError(f"userFills request failed for {address}: {exc}") from exc
         return parse_fills(payload)
 
-    async def get_open_positions(self, address: str) -> list[Position]:
+    async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
+        body: dict[str, str] = {"type": "clearinghouseState", "user": address.lower()}
+        if dex is not None:
+            body["dex"] = dex  # a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21)
         try:
             async with self._session.post(
-                INFO_URL,
-                json={"type": "clearinghouseState", "user": address.lower()},
-                timeout=REQUEST_TIMEOUT,
+                INFO_URL, json=body, timeout=REQUEST_TIMEOUT
             ) as response:
                 response.raise_for_status()
                 payload = await response.json()
         except aiohttp.ClientError as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
-        return parse_positions(payload)
+        return parse_positions(payload, dex)
 
 
 def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
@@ -134,7 +135,7 @@ def parse_fills(payload: Any) -> list[Fill]:
         raise GatewayError(f"unexpected userFills payload shape: {exc!r}") from exc
 
 
-def parse_positions(payload: Any) -> list[Position]:
+def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:
     try:
         positions: list[Position] = []
         for entry in payload["assetPositions"]:
@@ -144,7 +145,7 @@ def parse_positions(payload: Any) -> list[Position]:
                 continue
             positions.append(
                 Position(
-                    coin=str(raw["coin"]),
+                    coin=_namespaced_coin(str(raw["coin"]), dex),
                     side=Side.LONG if size_in_coin > 0 else Side.SHORT,
                     size_usd=Decimal(raw["positionValue"]),
                     leverage=Decimal(raw["leverage"]["value"]),
@@ -155,3 +156,13 @@ def parse_positions(payload: Any) -> list[Position]:
         return positions
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected clearinghouseState payload shape: {exc!r}") from exc
+
+
+def _namespaced_coin(coin: str, dex: str | None) -> str:
+    """Builder-DEX coins are `dex:COIN` (e.g. `xyz:META`) so they never collide
+    with core coins in the (trader, coin) snapshot key (issue #21). The live API
+    already returns them namespaced; prefixing is idempotent, so this stays
+    correct if that ever changes."""
+    if dex is None or coin.startswith(f"{dex}:"):
+        return coin
+    return f"{dex}:{coin}"

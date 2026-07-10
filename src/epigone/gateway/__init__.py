@@ -103,8 +103,12 @@ class Fill:
 
 
 class HyperliquidGateway(Protocol):
-    async def get_open_positions(self, address: str) -> list[Position]:
-        """Current open perp positions for a Trader's address."""
+    async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
+        """Current open perp positions for a Trader's address.
+
+        `dex` selects a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21);
+        None reads the core venue. Builder-DEX coins are namespaced `dex:COIN`
+        (e.g. `xyz:META`), keeping them distinct from core positions."""
         ...
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:

@@ -1,7 +1,13 @@
 """The tracked-wallet poll pass: position diffing for Position Alerts (issue #4).
 
-Each pass polls every distinct tracked Trader once (deduped across Users) via
+Each pass polls every distinct tracked Trader (deduped across Users) via
 clearinghouseState, diffs against the persisted snapshots, and queues alerts.
+Every Trader is polled on two venues per pass — the core perps and the xyz
+HIP-3 builder DEX (issue #21) — because most non-core activity (equity/"stock"
+perps like `xyz:META`) lives on xyz. The two position lists merge before
+diffing; xyz coins are namespaced (`xyz:META`) so the (trader, coin) snapshot
+key tracks the venues independently, with no schema change and no false
+OPEN/CLOSE from mixing them.
 
 Diff semantics (tested in tests/test_position_poller.py):
 
@@ -43,10 +49,20 @@ from epigone.gateway import GatewayError, HyperliquidGateway, Position
 log = logging.getLogger(__name__)
 
 # The stream owns what ingest's 400/min share leaves of the 1200/min per-IP
-# budget. At weight 2 per wallet per 30s poll that is ~200 distinct tracked
-# wallets before pacing stretches the interval (spec-defaults).
+# budget. Each tracked wallet costs two clearinghouseState calls per poll — core
+# plus the xyz builder DEX (issue #21) — so weight 4 per wallet per 30s poll,
+# giving ~100 distinct tracked wallets before pacing stretches the interval
+# (halved from the ~200 of the core-only #4 poller; documented on the ticket).
 STREAM_WEIGHT_PER_MINUTE = 800
-POSITIONS_WEIGHT = 2  # clearinghouseState
+POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this once per DEX
+
+# The single HIP-3 builder DEX we cover: xyz hosts ~90% of non-core activity
+# (equity/"stock" perps: xyz:META, xyz:BB, …) at 2x the poll cost, versus 10x
+# for all nine. Coins come back namespaced (`xyz:META`), distinct from core.
+# The name is hard-coded rather than validated via the perpDexs endpoint (issue
+# #21 left that optional): it is a stable HIP-3 deployment, and a per-pass
+# perpDexs lookup would spend budget to confirm a constant.
+XYZ_DEX = "xyz"
 
 POLL_INTERVAL_SECONDS = 30
 
@@ -80,15 +96,15 @@ class _Event:
 async def run_poll_pass(
     pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: WeightBudget, clock: Clock
 ) -> PollResult:
-    """One clearinghouseState call per distinct tracked Trader, paced by the budget."""
+    """Two clearinghouseState calls per distinct tracked Trader — core and the
+    xyz builder DEX (issue #21) — merged before diffing, paced by the budget."""
     await _prune_untracked(pool)
     rows = await pool.fetch("SELECT DISTINCT trader_address FROM tracks ORDER BY trader_address")
     polled = failed = events = consecutive_failures = 0
     for row in rows:
         address: str = row["trader_address"]
-        await budget.spend(POSITIONS_WEIGHT)
         try:
-            positions = await gateway.get_open_positions(address)
+            positions = await _fetch_positions(gateway, budget, address)
         except GatewayError:
             log.warning("poll pass: positions fetch failed for %s", address, exc_info=True)
             failed += 1
@@ -108,6 +124,24 @@ async def run_poll_pass(
     if events or failed:
         log.info("poll pass done: %d polled, %d events, %d failed", polled, events, failed)
     return PollResult(polled=polled, failed=failed, events=events, aborted=False)
+
+
+async def _fetch_positions(
+    gateway: HyperliquidGateway, budget: WeightBudget, address: str
+) -> list[Position]:
+    """A Trader's open positions across the venues we cover: core plus the xyz
+    builder DEX (issue #21). Each call is budgeted separately (weight 2 apiece).
+
+    The two lists merge cleanly — xyz coins are namespaced (`xyz:META`), core
+    coins are not — so the (trader, coin) diff tracks the venues independently.
+    Both calls must succeed to apply: a partial fetch would read one venue's
+    positions as all-closed and fire false CLOSE alerts, so a failure on either
+    raises and the whole wallet is retried next pass (its snapshots untouched)."""
+    await budget.spend(POSITIONS_WEIGHT)
+    positions = list(await gateway.get_open_positions(address))
+    await budget.spend(POSITIONS_WEIGHT)
+    positions.extend(await gateway.get_open_positions(address, dex=XYZ_DEX))
+    return positions
 
 
 async def _prune_untracked(pool: asyncpg.Pool) -> None:
