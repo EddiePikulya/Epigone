@@ -32,24 +32,31 @@ class Window(Enum):
 
 
 @dataclass(frozen=True)
-class LeaderboardEntry:
-    """One row of the leaderboard source — a candidate Trader for the Universe.
+class LeaderboardWindow:
+    """One timeframe's precomputed performance carried by a leaderboard row.
 
-    Deliberately thin: metrics come from the coarse portfolio pass, so the
-    seam carries only what seeding persists."""
+    Hyperliquid ships these for every row of the leaderboard download, so the
+    coarse Metric Library is populated Universe-wide at zero per-account API
+    cost (issue #26). `roi` is Hyperliquid's own net-deposit-adjusted figure."""
 
-    address: str
-    display_name: str | None
+    pnl: Decimal
+    roi: Decimal
+    volume: Decimal
 
 
 @dataclass(frozen=True)
-class PortfolioWindow:
-    """One timeframe of a Trader's portfolio stats, from a single weight-20 call."""
+class LeaderboardEntry:
+    """One row of the leaderboard source — a candidate Trader for the Universe.
 
-    pnl: Decimal
-    volume: Decimal
+    Carries the coarse metrics the row already includes (issue #26):
+    `account_value` (account-wide) plus per-window pnl/roi/volume. Seeding
+    persists them straight into `coarse_metrics`, retiring the old per-account
+    portfolio scan."""
+
+    address: str
+    display_name: str | None
     account_value: Decimal
-    starting_account_value: Decimal
+    windows: dict[Window, LeaderboardWindow]
 
 
 @dataclass(frozen=True)
@@ -112,11 +119,8 @@ class HyperliquidGateway(Protocol):
         ...
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
-        """Candidate Traders from the leaderboard source. Raises GatewayError on failure."""
-        ...
-
-    async def get_portfolio(self, address: str) -> dict[Window, PortfolioWindow]:
-        """Windowed portfolio stats for a Trader. Raises GatewayError on failure."""
+        """Candidate Traders from the leaderboard source, each carrying its coarse
+        metrics (issue #26). Raises GatewayError on failure."""
         ...
 
     async def get_fills(self, address: str) -> list[Fill]:

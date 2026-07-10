@@ -1,10 +1,11 @@
-"""Ingest process: Universe seed + coarse metric pass (issue #5) + fine
-metric pass with Bot vetting (issue #8).
+"""Ingest process: Universe seed + coarse metrics from the leaderboard download
+(issues #5, #26) + fine metric pass with Bot vetting (issue #8).
 
-Each cycle reseeds from the leaderboard at most daily, then refreshes every due
-Trader within the ingest weight budget: coarse first (the whole Universe), fine
-after (survivors and tracked Traders). Interruptions are safe: progress lives
-in per-Trader bookkeeping, so a restart resumes where the scans stopped.
+Each cycle reseeds from the leaderboard at most daily — that single download
+also lands the whole Universe's coarse Metric Library, at zero per-account cost.
+The full ingest weight budget then goes to the fine pass (survivors and tracked
+Traders). Interruptions are safe: fine-pass progress lives in per-Trader
+bookkeeping, so a restart resumes where the scan stopped.
 """
 
 import asyncio
@@ -20,7 +21,7 @@ from epigone.db import apply_schema, create_pool
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.ingest.budget import INGEST_WEIGHT_PER_MINUTE
 from epigone.ingest.fine import run_fine_pass
-from epigone.ingest.scan import run_coarse_pass, seed_universe
+from epigone.ingest.scan import seed_universe
 
 SEED_INTERVAL = timedelta(days=1)
 CYCLE_PAUSE_SECONDS = 60
@@ -37,15 +38,12 @@ async def run(pool_url: str, clock: Clock) -> None:
         gateway = HttpHyperliquidGateway(session)
         while True:
             if last_seeded is None or clock.now() - last_seeded >= SEED_INTERVAL:
-                if await seed_universe(pool, gateway, clock) is not None:
+                seeded = await seed_universe(pool, gateway, clock)
+                if seeded is not None:
                     last_seeded = clock.now()
-            coarse = await run_coarse_pass(pool, gateway, budget, clock)
             fine = await run_fine_pass(pool, gateway, budget, clock)
             log.info(
-                "ingest cycle: coarse %d refreshed / %d failed%s; fine %d refreshed / %d failed%s",
-                coarse.refreshed,
-                coarse.failed,
-                " (aborted)" if coarse.aborted else "",
+                "ingest cycle: fine %d refreshed / %d failed%s",
                 fine.refreshed,
                 fine.failed,
                 " (aborted)" if fine.aborted else "",

@@ -1,18 +1,33 @@
 """Universe seeding: leaderboard entries become Trader rows, idempotently."""
 
 import logging
+from decimal import Decimal
 
 import asyncpg
 import pytest
 
-from epigone.gateway import GatewayError, LeaderboardEntry
+from epigone.gateway import GatewayError, LeaderboardEntry, LeaderboardWindow, Window
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.ingest.scan import seed_universe
 from tests.support.clock import FakeClock
 
 
-def entry(address: str, name: str | None = None) -> LeaderboardEntry:
-    return LeaderboardEntry(address=address, display_name=name)
+def entry(
+    address: str,
+    name: str | None = None,
+    account_value: str = "1000",
+    week_volume: str = "5000",
+) -> LeaderboardEntry:
+    return LeaderboardEntry(
+        address=address,
+        display_name=name,
+        account_value=Decimal(account_value),
+        windows={
+            Window.WEEK: LeaderboardWindow(
+                pnl=Decimal("100"), roi=Decimal("0.1"), volume=Decimal(week_volume)
+            )
+        },
+    )
 
 
 async def test_seed_creates_a_trader_per_leaderboard_entry(pool: asyncpg.Pool) -> None:
@@ -27,7 +42,8 @@ async def test_seed_creates_a_trader_per_leaderboard_entry(pool: asyncpg.Pool) -
     assert seeded == [("0xaaa", "alice"), ("0xbbb", None)]
     assert all(r["first_seen_at"] == clock.now() for r in rows)
     assert all(r["last_seen_at"] == clock.now() for r in rows)
-    assert all(r["refresh_tier"] is None and r["coarse_refreshed_at"] is None for r in rows)
+    # refresh_tier is set from the leaderboard's week volume in the same pass.
+    assert all(r["refresh_tier"] == "active" for r in rows)
 
 
 async def test_addresses_are_stored_lowercased(pool: asyncpg.Pool) -> None:
