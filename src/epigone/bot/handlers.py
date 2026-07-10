@@ -1,6 +1,7 @@
 import re
 from datetime import datetime
 from decimal import Decimal
+from enum import Enum
 
 import asyncpg
 from aiogram import Bot, F, Router
@@ -18,6 +19,22 @@ from epigone.gateway import GatewayError, HyperliquidGateway, Position, Window
 from epigone.screener import ScreenerRow, run_screener
 
 SCREENER_PAGE_SIZE = 5
+
+# The stream poller can only sustain ~100 distinct tracked wallets across ALL
+# Users within its rate-budget share (halved by the xyz builder-DEX's second poll,
+# #21), so an unbounded per-User follow list lets one User exhaust the global
+# ceiling. A per-User cap is the first guard (#23); tune this constant to retune it.
+MAX_TRACKED_WALLETS = 15
+
+
+class TrackOutcome(Enum):
+    """The result of a Follow at the shared `_track_address` seam. Three outcomes
+    so every caller (paste / screener / profile) can word its own reply."""
+
+    FRESHLY_TRACKED = "freshly_tracked"
+    ALREADY_TRACKING = "already_tracking"
+    LIMIT_REACHED = "limit_reached"
+
 
 START_TEXT = (
     "Welcome to Epigone — clone the best to be the best.\n\n"
@@ -70,6 +87,15 @@ DATA_DELAYED_TEXT = (
     "Hyperliquid data is delayed right now — your tracked list is safe, try again in a moment."
 )
 
+# Shown when a User at the cap tries to follow one more (#23). Full-message form
+# for the paste path; the shorter toast for the screener/profile button paths,
+# which surface through callback answers.
+TRACK_LIMIT_TEXT = (
+    f"You're tracking {MAX_TRACKED_WALLETS} wallets — that's the limit.\n"
+    "Unfollow one from /tracked before following another."
+)
+TRACK_LIMIT_TOAST = f"Limit reached — {MAX_TRACKED_WALLETS} wallets max. Unfollow one first."
+
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
@@ -91,14 +117,16 @@ async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clo
         return
     address = message.text.strip().lower()
     async with pool.acquire() as conn, conn.transaction():
-        freshly_tracked = await _track_address(conn, user.id, user.username, address, clock.now())
-    if freshly_tracked:
+        outcome = await _track_address(conn, user.id, user.username, address, clock.now())
+    if outcome is TrackOutcome.FRESHLY_TRACKED:
         await message.answer(
             f"Now tracking {short_address(address)}.\n"
             "Paste more addresses any time — /tracked shows your whole list."
         )
-    else:
+    elif outcome is TrackOutcome.ALREADY_TRACKING:
         await message.answer(f"You're already tracking {short_address(address)}.")
+    else:  # LIMIT_REACHED — the wallet was not added
+        await message.answer(TRACK_LIMIT_TEXT)
 
 
 async def reject_unknown_command(message: Message) -> None:
@@ -197,13 +225,13 @@ async def on_screener_follow(callback: CallbackQuery, pool: asyncpg.Pool, clock:
     offset_str, _, address = (callback.data or "").removeprefix("sfollow:").partition(":")
     offset = _parse_offset(offset_str)
     async with pool.acquire() as conn, conn.transaction():
-        freshly = await _track_address(
+        outcome = await _track_address(
             conn, callback.from_user.id, callback.from_user.username, address, clock.now()
         )
     if isinstance(callback.message, Message):
         text, markup = await _render_screener_page(pool, callback.from_user.id, offset=offset)
         await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer(_follow_toast(freshly, address))
+    await callback.answer(_follow_toast(outcome, address))
 
 
 async def on_profile(
@@ -235,11 +263,11 @@ async def on_profile_follow(
 ) -> None:
     address = (callback.data or "").removeprefix("pfollow:")
     async with pool.acquire() as conn, conn.transaction():
-        freshly = await _track_address(
+        outcome = await _track_address(
             conn, callback.from_user.id, callback.from_user.username, address, clock.now()
         )
     await _refresh_profile_in_place(
-        callback, pool, gateway, clock, address, _follow_toast(freshly, address)
+        callback, pool, gateway, clock, address, _follow_toast(outcome, address)
     )
 
 
@@ -422,13 +450,31 @@ def _is_command(message: Message) -> bool:
 
 async def _track_address(
     conn: asyncpg.Connection, telegram_id: int, username: str | None, address: str, now: datetime
-) -> bool:
-    """Follow `address` for a User; idempotent. Returns True on a fresh Track.
+) -> TrackOutcome:
+    """Follow `address` for a User; idempotent. Returns the follow's outcome.
 
     The single write behind every Follow — pasting (#3), the screener row, and
     the profile toggle (#6). A Track is exactly what the alert poller (#4)
-    reads, so following from results feeds the alert pipeline for free."""
+    reads, so following from results feeds the alert pipeline for free.
+
+    The per-User cap (#23) is enforced here so all three paths share one check.
+    Re-touching an already-tracked wallet is always allowed (idempotent, never
+    counts as a new follow), even at the cap — so the already-tracking test
+    comes before the count check."""
     await _upsert_user(conn, telegram_id, username)
+    already_tracking = await conn.fetchval(
+        "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
+        telegram_id,
+        address,
+    )
+    if already_tracking:
+        return TrackOutcome.ALREADY_TRACKING
+    tracked_count = await conn.fetchval(
+        "SELECT count(*) FROM tracks WHERE user_telegram_id = $1",
+        telegram_id,
+    )
+    if tracked_count >= MAX_TRACKED_WALLETS:
+        return TrackOutcome.LIMIT_REACHED
     await conn.execute(
         """
         INSERT INTO traders (address, first_seen_at, last_seen_at)
@@ -437,15 +483,15 @@ async def _track_address(
         address,
         now,
     )
-    freshly_tracked = await conn.fetchrow(
+    await conn.execute(
         """
         INSERT INTO tracks (user_telegram_id, trader_address)
-        VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1
+        VALUES ($1, $2) ON CONFLICT DO NOTHING
         """,
         telegram_id,
         address,
     )
-    return freshly_tracked is not None
+    return TrackOutcome.FRESHLY_TRACKED
 
 
 async def _upsert_user(
@@ -559,8 +605,10 @@ def _summarize(positions: list[Position]) -> str:
     return f"{len(positions)} {noun}, uPnL {signed_usd(total_upnl)}"
 
 
-def _follow_toast(freshly: bool, address: str) -> str:
-    verb = "Now following" if freshly else "Already following"
+def _follow_toast(outcome: TrackOutcome, address: str) -> str:
+    if outcome is TrackOutcome.LIMIT_REACHED:
+        return TRACK_LIMIT_TOAST
+    verb = "Now following" if outcome is TrackOutcome.FRESHLY_TRACKED else "Already following"
     return f"{verb} {short_address(address)}"
 
 
