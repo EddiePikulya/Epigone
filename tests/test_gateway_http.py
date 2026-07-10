@@ -79,6 +79,41 @@ async def test_sends_the_documented_clearinghouse_state_request() -> None:
     assert received == [{"type": "clearinghouseState", "user": WHALE.lower()}]
 
 
+async def test_a_dex_poll_adds_the_dex_field_to_the_request() -> None:
+    async with replaying_gateway({"assetPositions": []}) as (gateway, received):
+        await gateway.get_open_positions(WHALE, dex="xyz")
+
+    assert received == [{"type": "clearinghouseState", "user": WHALE.lower(), "dex": "xyz"}]
+
+
+async def test_parse_positions_namespaces_bare_dex_coins() -> None:
+    # Defensive: even if the API returned a bare coin under a dex, the parser
+    # namespaces it so it never collides with a core coin (issue #21).
+    payload = {
+        "assetPositions": [
+            {
+                "position": {
+                    "coin": "META",
+                    "szi": "-10",
+                    "positionValue": "8000",
+                    "leverage": {"value": "3"},
+                    "entryPx": "800",
+                    "unrealizedPnl": "120",
+                }
+            }
+        ]
+    }
+
+    (bare,) = parse_positions(payload, dex="xyz")
+    assert bare.coin == "xyz:META"
+    assert bare.side is Side.SHORT
+
+    # Already-namespaced coins (what the live API actually returns) pass through.
+    payload["assetPositions"][0]["position"]["coin"] = "xyz:META"
+    (namespaced,) = parse_positions(payload, dex="xyz")
+    assert namespaced.coin == "xyz:META"
+
+
 async def test_trader_with_no_positions_yields_empty_list() -> None:
     empty = {**RECORDED, "assetPositions": []}
     async with replaying_gateway(empty) as (gateway, _):

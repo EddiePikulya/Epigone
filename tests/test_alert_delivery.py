@@ -155,6 +155,19 @@ async def test_a_flip_alert_shows_both_legs(
     assert "entry 110" in message.text
 
 
+async def test_an_xyz_market_alert_names_the_dex_qualified_coin(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """An xyz builder-DEX position (issue #21) is legible at a glance: the
+    delivered text carries the namespaced `xyz:META`, not a bare `META`."""
+    await queue_alert(pool, kind="open", coin="xyz:META", side="short")
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    assert "opened xyz:META SHORT" in message.text
+
+
 async def test_an_unlabeled_trader_is_identified_by_short_address(
     pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:

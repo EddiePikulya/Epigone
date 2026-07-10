@@ -120,8 +120,14 @@ async def test_a_new_position_emits_an_open_alert_to_every_follower(
         assert row["entry_price"] == Decimal("100")
         assert row["created_at"] == clock.now()
         assert row["delivered_at"] is None
-    # Deduped across Users: one wallet, one clearinghouseState call per pass.
-    assert gateway.positions_calls == ["0xaaa", "0xaaa"]
+    # Deduped across Users, and each pass polls both venues (core + xyz):
+    # baseline pass then this pass, two clearinghouseState calls apiece.
+    assert gateway.positions_calls == [
+        ("0xaaa", None),
+        ("0xaaa", "xyz"),
+        ("0xaaa", None),
+        ("0xaaa", "xyz"),
+    ]
 
 
 async def test_a_disappeared_position_emits_a_close_alert_with_pnl_and_holding(
@@ -274,7 +280,8 @@ async def test_a_refollowed_trader_rebaselines_instead_of_replaying_stale_diffs(
     clock.advance(30)
     gateway.set_positions("0xaaa", [])  # ...and the position closes unwatched
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
-    assert gateway.positions_calls == ["0xaaa"]  # pruned, not polled
+    # Only the baseline's two calls (core + xyz); the pruned wallet isn't polled.
+    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz")]
     assert await pool.fetchval("SELECT count(*) FROM position_snapshots") == 0
     assert await pool.fetchval("SELECT count(*) FROM position_poll_state") == 0
 
@@ -297,7 +304,7 @@ async def test_untracked_traders_are_not_polled(
     result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
     assert result.polled == 1
-    assert gateway.positions_calls == ["0xaaa"]
+    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz")]
 
 
 async def test_one_failing_wallet_does_not_stop_the_pass(
@@ -345,10 +352,181 @@ async def test_the_pass_is_paced_by_the_weight_budget(
         await track(pool, clock, f"0x{i:03d}", 42)
 
     start = clock.now()
-    # 10 clearinghouseState calls x 2 weight = 20 against a 4/min budget:
-    # the burst covers 2 calls, each further call refills for 30s.
+    # 10 wallets x 2 calls (core + xyz) x 2 weight = 40 against a 4/min budget:
+    # the burst covers the first 2 calls, each of the other 18 refills for 30s.
     await run_poll_pass(pool, gateway, WeightBudget(4, clock), clock)
 
-    assert (clock.now() - start).total_seconds() >= 8 * 30
+    assert (clock.now() - start).total_seconds() >= 18 * 30
     assert POSITIONS_WEIGHT == 2
-    assert len(gateway.positions_calls) == 10
+    assert len(gateway.positions_calls) == 20
+
+
+# --- xyz builder DEX coverage (issue #21) -----------------------------------
+#
+# The poller polls each Trader on both the core venue and the xyz HIP-3 builder
+# DEX per pass, merging the two position lists before diffing. xyz coins are
+# namespaced (`xyz:META`), so the same diff machinery tracks them independently
+# of core, with the market/DEX legible in every alert's coin field.
+
+
+async def test_each_pass_polls_both_the_core_and_the_xyz_venue(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz")]
+
+
+async def test_first_poll_baselines_xyz_positions_without_alerts(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    gateway.set_positions("0xaaa", [position(coin="xyz:META")], dex="xyz")
+
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 0
+    assert await alerts(pool) == []
+    coins = {r["coin"] for r in await pool.fetch("SELECT coin FROM position_snapshots")}
+    assert coins == {"BTC", "xyz:META"}  # both venues baselined under one Trader
+
+
+async def test_an_xyz_open_emits_an_alert_naming_the_market(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42, 43)
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.set_positions(
+        "0xaaa", [position(coin="xyz:META", side=Side.SHORT, size_usd="8000")], dex="xyz"
+    )
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1
+    rows = await alerts(pool)
+    assert sorted(r["user_telegram_id"] for r in rows) == [42, 43]
+    for row in rows:
+        assert row["kind"] == "open"
+        assert row["coin"] == "xyz:META"  # the market/DEX is legible in the alert
+        assert row["side"] == "short"
+        assert row["size_usd"] == Decimal("8000")
+
+
+async def test_an_xyz_close_emits_an_alert(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions(
+        "0xaaa", [position(coin="xyz:BB", size_usd="6000", leverage="3")], dex="xyz"
+    )
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="xyz:BB", unrealized_pnl="900")], dex="xyz")
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [], dex="xyz")
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    (row,) = await alerts(pool)
+    assert row["kind"] == "close"
+    assert row["coin"] == "xyz:BB"
+    assert row["prev_side"] == "long"
+    assert row["realized_pnl"] == Decimal("900")
+    assert await pool.fetchval("SELECT count(*) FROM position_snapshots") == 0
+
+
+async def test_an_xyz_flip_emits_one_flip_alert(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions(
+        "0xaaa", [position(coin="xyz:SNDK", side=Side.LONG, unrealized_pnl="200")], dex="xyz"
+    )
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.set_positions(
+        "0xaaa", [position(coin="xyz:SNDK", side=Side.SHORT, size_usd="12000")], dex="xyz"
+    )
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1
+    (row,) = await alerts(pool)
+    assert row["kind"] == "flip"
+    assert row["coin"] == "xyz:SNDK"
+    assert row["prev_side"] == "long"
+    assert row["side"] == "short"
+    assert row["size_usd"] == Decimal("12000")
+
+
+async def test_xyz_and_core_positions_on_one_trader_track_independently(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A change on one venue must not read as an open/close on the other — the
+    namespaced coin keeps the two snapshot sets from mixing."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    gateway.set_positions("0xaaa", [position(coin="xyz:META", side=Side.SHORT)], dex="xyz")
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    # Core opens SOL and is otherwise unchanged; xyz closes META. Neither venue's
+    # move should touch the other's still-open position.
+    gateway.set_positions("0xaaa", [position(coin="BTC"), position(coin="SOL")])
+    gateway.set_positions("0xaaa", [], dex="xyz")
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 2
+    kinds = {(r["kind"], r["coin"]) for r in await alerts(pool)}
+    assert kinds == {("open", "SOL"), ("close", "xyz:META")}
+    # BTC (core) survived untouched; only SOL was added and xyz:META removed.
+    coins = {r["coin"] for r in await pool.fetch("SELECT coin FROM position_snapshots")}
+    assert coins == {"BTC", "SOL"}
+
+
+async def test_same_symbol_on_core_and_xyz_never_collides(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Even if a symbol existed on both venues, the `xyz:` namespace keeps the
+    snapshots separate — closing one leaves the other alerting-clean."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="META", side=Side.LONG)])
+    gateway.set_positions("0xaaa", [position(coin="xyz:META", side=Side.SHORT)], dex="xyz")
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [], dex="xyz")  # only the xyz leg closes
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1
+    (row,) = await alerts(pool)
+    assert row["kind"] == "close" and row["coin"] == "xyz:META"
+    coins = {r["coin"] for r in await pool.fetch("SELECT coin FROM position_snapshots")}
+    assert coins == {"META"}  # the core leg is still open and un-alerted
+
+
+async def test_a_partial_fetch_alerts_nothing_and_keeps_the_baseline(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """If the xyz call fails after the core call succeeds, the pass must not
+    apply a half-poll — that would read xyz positions as all-closed. The wallet
+    is counted failed and retried next pass, its snapshots untouched."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    gateway.set_positions("0xaaa", [position(coin="xyz:META")], dex="xyz")
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.positions_errors_by_dex[("0xaaa", "xyz")] = GatewayError("xyz info API timeout")
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.failed == 1 and result.polled == 0 and result.events == 0
+    assert await alerts(pool) == []
+    coins = {r["coin"] for r in await pool.fetch("SELECT coin FROM position_snapshots")}
+    assert coins == {"BTC", "xyz:META"}  # baseline intact, ready to diff next pass
