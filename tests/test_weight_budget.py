@@ -47,3 +47,15 @@ async def test_a_single_spend_larger_than_the_allowance_is_rejected() -> None:
     budget = WeightBudget(weight_per_minute=400, clock=FakeClock())
     with pytest.raises(ValueError):
         await budget.spend(401)
+
+
+async def test_settle_bills_already_consumed_weight_into_debt() -> None:
+    # A response can reveal more weight than the nominal pre-call bill (issue
+    # #41: userFills adds weight per 20 fills returned). settle() records that
+    # truth unconditionally — even past the capacity — and later spends wait
+    # out the debt's refill before drawing again.
+    clock = FakeClock()
+    budget = WeightBudget(weight_per_minute=400, clock=clock)
+    await budget.settle(480)  # 80 into debt
+    await budget.spend(20)
+    assert sum(clock.slept) >= (80 + 20) / (400 / 60)

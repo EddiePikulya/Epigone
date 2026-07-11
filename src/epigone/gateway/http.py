@@ -3,8 +3,10 @@
 The undocumented stats-data leaderboard is quarantined to Universe seeding —
 every failure surfaces as GatewayError so callers can degrade gracefully. The
 single leaderboard download also carries the coarse Metric Library, so no
-per-account call feeds coarse (issue #26). `clearinghouseState` costs weight 2,
-`userFills` weight 20, against the shared weight budget (epigone.budget).
+per-account call feeds coarse (issue #26). `clearinghouseState` costs weight 2;
+`userFills` weight 20 plus weight per 20 fills returned (issue #41), against
+the shared weight budget (epigone.budget) — callers settle the response-size
+surcharge once they see the payload.
 
 A 429 backs off and retries here rather than surfacing (issue #28): sleep the
 server's Retry-After when present, else an exponential window with jitter.
