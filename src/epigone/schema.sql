@@ -6,9 +6,13 @@
 -- database keeps its old shape — before V1 deploys with data worth keeping,
 -- it needs a real migration story (issue #16).
 
+-- min_size_usd is the User's global Position Alert floor (issue #10): alerts
+-- for positions notionally smaller than this are suppressed across every Track
+-- unless that Track sets its own floor. NULL means no global floor.
 CREATE TABLE IF NOT EXISTS users (
     telegram_id   BIGINT PRIMARY KEY,
     username      TEXT,
+    min_size_usd  NUMERIC CHECK (min_size_usd IS NULL OR min_size_usd >= 0),
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -72,9 +76,15 @@ CREATE TABLE IF NOT EXISTS fine_metrics (
 );
 
 -- A Track is a User's explicit, manual follow of a Trader (CONTEXT.md).
+-- muted silences a Track's Position Alerts without unfollowing (issue #10):
+-- the poller drops suppressed events at queue time, so unmuting never dumps a
+-- backlog. min_size_usd is a per-Track alert floor overriding the User's global
+-- one (users.min_size_usd); NULL means "fall back to the global floor".
 CREATE TABLE IF NOT EXISTS tracks (
     user_telegram_id BIGINT NOT NULL REFERENCES users (telegram_id),
     trader_address   TEXT   NOT NULL REFERENCES traders (address),
+    muted            BOOLEAN NOT NULL DEFAULT FALSE,
+    min_size_usd     NUMERIC CHECK (min_size_usd IS NULL OR min_size_usd >= 0),
     tracked_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_telegram_id, trader_address)
 );
@@ -110,15 +120,19 @@ CREATE TABLE IF NOT EXISTS position_snapshots (
 -- (each event is detected exactly once, restart-safe); the bot process delivers
 -- and stamps delivered_at. side/size/leverage/entry describe the new leg
 -- (open, flip); prev_side/realized_pnl/pct_return/opened_at the closed leg
--- (close, flip).
+-- (close, flip). scale_in/scale_out (issue #10) fire on a significant same-side
+-- size change: side/size/leverage/entry carry the resized position and
+-- prev_size_usd the size before, so the alert can show old → new.
 CREATE TABLE IF NOT EXISTS position_alerts (
     id               BIGSERIAL PRIMARY KEY,
     user_telegram_id BIGINT NOT NULL REFERENCES users (telegram_id),
     trader_address   TEXT NOT NULL REFERENCES traders (address),
-    kind             TEXT NOT NULL CHECK (kind IN ('open', 'close', 'flip')),
+    kind             TEXT NOT NULL
+                       CHECK (kind IN ('open', 'close', 'flip', 'scale_in', 'scale_out')),
     coin             TEXT NOT NULL,
     side             TEXT CHECK (side IN ('long', 'short')),
     size_usd         NUMERIC,
+    prev_size_usd    NUMERIC,
     leverage         NUMERIC,
     entry_price      NUMERIC,
     prev_side        TEXT CHECK (prev_side IN ('long', 'short')),
@@ -130,7 +144,11 @@ CREATE TABLE IF NOT EXISTS position_alerts (
     attempts         INTEGER NOT NULL DEFAULT 0,
     CHECK (kind != 'open' OR side IS NOT NULL),
     CHECK (kind != 'close' OR prev_side IS NOT NULL),
-    CHECK (kind != 'flip' OR (side IS NOT NULL AND prev_side IS NOT NULL))
+    CHECK (kind != 'flip' OR (side IS NOT NULL AND prev_side IS NOT NULL)),
+    CHECK (
+        kind NOT IN ('scale_in', 'scale_out')
+        OR (side IS NOT NULL AND size_usd IS NOT NULL AND prev_size_usd IS NOT NULL)
+    )
 );
 
 -- The bot's delivery scan: undelivered rows only, oldest first.

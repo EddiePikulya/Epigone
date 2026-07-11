@@ -54,9 +54,11 @@ HELP_TEXT = (
     "/criteria — build and save your own definition of “best”, then run it\n"
     "/screener — the best traders right now, ranked by 30-day ROI\n"
     "/start — what Epigone is and how it works\n"
-    "/tracked — your tracked traders and their positions\n"
+    "/tracked — your tracked traders, their positions, and alert controls\n"
     "/help — this list\n\n"
-    "Paste a wallet address (0x…) to start tracking that trader."
+    "Paste a wallet address (0x…) to start tracking that trader.\n"
+    "From /tracked you can mute a trader or set a minimum position size so "
+    "small trades stay quiet."
 )
 
 SCREENER_HEADER = "🏆 Top traders — best 30-day ROI, bots excluded"
@@ -513,8 +515,14 @@ async def _render_tracked_list(
     pool: asyncpg.Pool, gateway: HyperliquidGateway, user_id: int
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     rows = await pool.fetch(
-        "SELECT trader_address FROM tracks WHERE user_telegram_id = $1 ORDER BY tracked_at",
+        """
+        SELECT trader_address, muted, min_size_usd
+        FROM tracks WHERE user_telegram_id = $1 ORDER BY tracked_at
+        """,
         user_id,
+    )
+    global_min: Decimal | None = await pool.fetchval(
+        "SELECT min_size_usd FROM users WHERE telegram_id = $1", user_id
     )
     if not rows:
         return NOT_TRACKING_TEXT, None
@@ -525,15 +533,53 @@ async def _render_tracked_list(
         address: str = row["trader_address"]
         positions = await gateway.get_open_positions(address)
         lines.append(f"{short_address(address)} — {_summarize(positions)}")
+        # The alert controls (issue #10), so they are visible and editable
+        # right where the User reviews the roster.
+        lines.append(f"    {_controls_status(row['muted'], row['min_size_usd'], global_min)}")
         keyboard.append(
             [
                 InlineKeyboardButton(
                     text=f"📊 {short_address(address)}", callback_data=f"positions:{address}"
                 ),
+                _mute_button(address, row["muted"]),
+            ]
+        )
+        keyboard.append(
+            [
+                InlineKeyboardButton(text="💵 Min size", callback_data=f"tmin:{address}"),
                 InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"unfollow:{address}"),
             ]
         )
+    keyboard.append(
+        [InlineKeyboardButton(text=_global_min_label(global_min), callback_data="gmin")]
+    )
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _controls_status(muted: bool, track_min: Decimal | None, global_min: Decimal | None) -> str:
+    """One line per Track showing its alert controls: mute state and the
+    effective minimum position size (per-Track override, else the global floor,
+    else none)."""
+    state = "🔕 muted" if muted else "🔔 alerts on"
+    if track_min is not None:
+        floor = f"min ${track_min:,.0f}"
+    elif global_min is not None:
+        floor = f"min ${global_min:,.0f} (global)"
+    else:
+        floor = "no min size"
+    return f"{state} · {floor}"
+
+
+def _mute_button(address: str, muted: bool) -> InlineKeyboardButton:
+    if muted:
+        return InlineKeyboardButton(text="🔔 Unmute", callback_data=f"unmute:{address}")
+    return InlineKeyboardButton(text="🔕 Mute", callback_data=f"mute:{address}")
+
+
+def _global_min_label(global_min: Decimal | None) -> str:
+    if global_min is not None:
+        return f"⚙️ Global min: ${global_min:,.0f}"
+    return "⚙️ Set global min size"
 
 
 async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
@@ -621,18 +667,21 @@ def _unfollow_toast(removed: bool, address: str) -> str:
 
 def build_router() -> Router:
     """A fresh Router per Dispatcher — a Router instance can only attach once."""
-    # Deferred import: the criteria flow builds on this module's shared seams
-    # (track_address, upsert_user, …), so importing it at the top would cycle.
-    from epigone.bot import criteria
+    # Deferred import: the criteria and controls flows build on this module's
+    # shared seams (track_address, _render_tracked_list, …), so importing them
+    # at the top would cycle.
+    from epigone.bot import controls, criteria
 
     router = Router()
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_screener, Command("screener"))
     router.message.register(cmd_tracked, Command("tracked"))
-    # Before the paste/reject handlers: consumes the builder's typed input
-    # (thresholds, names) while a prompt is pending; commands still cut through.
+    # Before the paste/reject handlers: each consumes its own typed input
+    # (criteria thresholds/names, a min-size amount) while a prompt is pending;
+    # commands still cut through.
     criteria.register(router)
+    controls.register(router)
     router.message.register(follow_pasted_address, _is_wallet_paste)
     router.message.register(reject_unknown_command, _is_command)
     router.message.register(reject_unrecognized_input)  # anything else: text, stickers, photos…

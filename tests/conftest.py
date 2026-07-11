@@ -87,5 +87,6 @@ def dp(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) ->
     dispatcher["gateway"] = gateway
     dispatcher["clock"] = clock
     dispatcher["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
+    dispatcher["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
     dispatcher.include_router(build_router())
     return dispatcher

@@ -21,9 +21,19 @@ Diff semantics (tested in tests/test_position_poller.py):
   observation); holding time runs from when the poller first saw the position.
 - **FLIP** — the same coin changes side: one alert carrying the closed leg
   (as CLOSE) and the new leg (as OPEN). The snapshot restarts at flip time.
-- **Silent update** — same coin, same side: partial closes, adds, and
-  entry/leverage drift update the snapshot (preserving opened_at) without
-  alerting.
+- **SCALE-IN / SCALE-OUT** (issue #10) — same coin, same side, notional size
+  changed by at least SCALE_SIGNIFICANCE_THRESHOLD of the last snapshot: a
+  whale adding to (scale-in) or trimming (scale-out) an existing position.
+  One alert carrying the resized leg and the size it grew/shrank from.
+- **Silent update** — same coin, same side, size change *below* the threshold:
+  ordinary drift, partial closes, and entry/leverage changes update the
+  snapshot (preserving opened_at) without alerting, exactly as before #10.
+
+Every queued event is filtered per follower against that Track's alert
+controls (issue #10): a muted Track receives nothing, and an effective minimum
+position size (per-Track override, else the User's global floor) drops alerts
+for positions notionally smaller than the floor. Suppression happens at queue
+time, never at delivery, so unmuting or raising a floor never dumps a backlog.
 - **Re-follow.** When a Trader loses their last follower, the pass prunes
   their snapshots and poll state; following them again re-baselines silently
   instead of diffing against a stale snapshot and alerting on ancient changes.
@@ -63,6 +73,13 @@ POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this on
 # perpDexs lookup would spend budget to confirm a constant.
 XYZ_DEX = "xyz"
 
+# A same-side size change alerts as SCALE-IN/SCALE-OUT (issue #10) only once it
+# reaches this fraction of the last snapshot's notional size; anything smaller
+# stays a silent update. Conservative by design — a 25% swing is a deliberate
+# add or trim, not the incidental notional drift of a mark-price move (over a
+# 30s poll a real coin never moves 25%). Tune here to retune the signal.
+SCALE_SIGNIFICANCE_THRESHOLD = Decimal("0.25")
+
 POLL_INTERVAL_SECONDS = 30
 
 # Same reasoning as the ingest passes: a sustained streak means Hyperliquid is
@@ -80,10 +97,11 @@ class PollResult:
 
 @dataclass(frozen=True)
 class _Event:
-    kind: str  # 'open' | 'close' | 'flip'
+    kind: str  # 'open' | 'close' | 'flip' | 'scale_in' | 'scale_out'
     coin: str
     side: str | None = None  # new leg
-    size_usd: Decimal | None = None
+    size_usd: Decimal | None = None  # the position notional the alert is about
+    prev_size_usd: Decimal | None = None  # size before a scale
     leverage: Decimal | None = None
     entry_price: Decimal | None = None
     prev_side: str | None = None  # closed leg
@@ -216,6 +234,11 @@ async def _apply_poll(
                 events.append(_flip_event(snapshot, pos))
                 await _replace_snapshot(conn, address, pos, opened_at=now, updated_at=now)
             else:
+                # Same coin, same side: a significant size change scales in/out
+                # (issue #10); smaller drift stays a silent snapshot update.
+                scale = _scale_event(snapshot, pos)
+                if scale is not None:
+                    events.append(scale)
                 await _replace_snapshot(
                     conn, address, pos, opened_at=snapshot["opened_at"], updated_at=now
                 )
@@ -244,9 +267,36 @@ def _close_event(snapshot: asyncpg.Record) -> _Event:
     return _Event(
         kind="close",
         coin=snapshot["coin"],
+        # The closed position's last notional, so a min-size floor (issue #10)
+        # judges a close by the position it closed, not a null.
+        size_usd=snapshot["size_usd"],
         prev_side=snapshot["side"],
         realized_pnl=snapshot["unrealized_pnl"],
         pct_return=_return_on_margin(snapshot),
+        opened_at=snapshot["opened_at"],
+    )
+
+
+def _scale_event(snapshot: asyncpg.Record, pos: Position) -> _Event | None:
+    """A same-coin/same-side size change worth an alert, or None if it is below
+    SCALE_SIGNIFICANCE_THRESHOLD (ordinary drift — keep today's silent update).
+
+    Change is measured against the last snapshot's notional, so gradual drift
+    that never clears the threshold in one poll stays quiet by design."""
+    old: Decimal = snapshot["size_usd"]
+    new = pos.size_usd
+    if old <= 0:
+        return None
+    if abs(new - old) / old < SCALE_SIGNIFICANCE_THRESHOLD:
+        return None
+    return _Event(
+        kind="scale_in" if new > old else "scale_out",
+        coin=pos.coin,
+        side=pos.side.value,
+        size_usd=new,
+        prev_size_usd=old,
+        leverage=pos.leverage,
+        entry_price=pos.entry_price,
         opened_at=snapshot["opened_at"],
     )
 
@@ -320,33 +370,56 @@ async def _replace_snapshot(
 async def _queue_alerts(
     conn: asyncpg.Connection, address: str, events: list[_Event], now: datetime
 ) -> None:
+    """Fan out each event to this Trader's followers, honouring each Track's
+    alert controls (issue #10): a muted Track gets nothing, and an effective
+    min-size floor (per-Track override, else the User's global floor) drops
+    events for positions smaller than it. Filtering here — at queue time —
+    means a suppressed event is never stored, so unmuting never backfills."""
     followers = await conn.fetch(
-        "SELECT user_telegram_id FROM tracks WHERE trader_address = $1", address
+        """
+        SELECT t.user_telegram_id, t.muted,
+               coalesce(t.min_size_usd, u.min_size_usd) AS min_size
+        FROM tracks t
+        JOIN users u ON u.telegram_id = t.user_telegram_id
+        WHERE t.trader_address = $1
+        """,
+        address,
     )
+    rows = [
+        (
+            follower["user_telegram_id"],
+            address,
+            event.kind,
+            event.coin,
+            event.side,
+            event.size_usd,
+            event.prev_size_usd,
+            event.leverage,
+            event.entry_price,
+            event.prev_side,
+            event.realized_pnl,
+            event.pct_return,
+            event.opened_at,
+            now,
+        )
+        for follower in followers
+        if not follower["muted"]
+        for event in events
+        if not _below_floor(event, follower["min_size"])
+    ]
     await conn.executemany(
         """
         INSERT INTO position_alerts
-            (user_telegram_id, trader_address, kind, coin, side, size_usd, leverage,
-             entry_price, prev_side, realized_pnl, pct_return, opened_at, created_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            (user_telegram_id, trader_address, kind, coin, side, size_usd, prev_size_usd,
+             leverage, entry_price, prev_side, realized_pnl, pct_return, opened_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         """,
-        [
-            (
-                follower["user_telegram_id"],
-                address,
-                event.kind,
-                event.coin,
-                event.side,
-                event.size_usd,
-                event.leverage,
-                event.entry_price,
-                event.prev_side,
-                event.realized_pnl,
-                event.pct_return,
-                event.opened_at,
-                now,
-            )
-            for event in events
-            for follower in followers
-        ],
+        rows,
     )
+
+
+def _below_floor(event: _Event, floor: Decimal | None) -> bool:
+    """Whether a min-size floor suppresses this event. A floor judges every
+    alert kind by the position notional it carries (event.size_usd); an event
+    with no notional (should not happen) is never suppressed."""
+    return floor is not None and event.size_usd is not None and event.size_usd < floor
