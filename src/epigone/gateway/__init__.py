@@ -161,6 +161,14 @@ class HyperliquidGateway(Protocol):
         Raises GatewayError on failure."""
         ...
 
+    async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
+        """A Trader's fills at or after `start` (userFillsByTime), for the
+        incremental fine refresh (issue #11): a fast-tier pass fetches only what
+        is new since its checkpoint instead of re-pulling the full ~2000-fill
+        history. Same ~2000 cap per call, so callers checkpoint forward far
+        enough that a window never overflows. Raises GatewayError on failure."""
+        ...
+
 
 # The single HIP-3 builder DEX Epigone covers: xyz hosts ~90% of non-core
 # activity (equity/"stock" perps: xyz:META, xyz:BB, …) at 2x the poll cost,

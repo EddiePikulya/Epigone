@@ -34,12 +34,16 @@ Trader per timeframe (24h / 7d / 30d / all time), at zero per-account API cost.
 
 ## Where fine metrics come from
 
-Fine metrics are computed from a Trader's **recent fill history** (the info
-API serves roughly the last 2,000 fills; S3 bulk backfill for deeper history
-is issue #9). Only perp fills count; spot trades and dust conversions are
-ignored. The fine pass runs for **coarse-pass survivors** (Traders with a
-profitable, active month — positive month PnL and nonzero month volume; a
-tunable default gate) **and every tracked Trader**.
+Fine metrics are computed from a Trader's **fill history**. The first refresh
+pulls the account's recent fills (the info API serves roughly the last 2,000);
+each later refresh **folds in only the fills since the last checkpoint**
+(issue #11), so the history accumulates past that 2,000-fill window instead of
+being re-truncated on every pull — and a fast-tier refresh costs a few fills'
+worth of weight, not a full re-pull. (S3 bulk backfill for pre-first-refresh
+history is still issue #9.) Only perp fills count; spot trades and dust
+conversions are ignored. The fine pass runs for **coarse-pass survivors**
+(Traders with a profitable, active month — positive month PnL and nonzero
+month volume; a tunable default gate) **and every tracked Trader**.
 
 A metric can be **unavailable (NULL)** when the fill history can't support it
 — a trader with no closed trades has no win rate; one active day can't have a

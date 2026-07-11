@@ -13,7 +13,13 @@ from decimal import Decimal
 import pytest
 
 from epigone.gateway import Fill
-from epigone.metrics.fine import FineMetrics, compute_fine_metrics
+from epigone.metrics.fine import (
+    FineMetrics,
+    compute_fine_metrics,
+    extract_state,
+    fold_state,
+    metrics_from_state,
+)
 from tests.support.fills import T0, fill
 
 
@@ -203,3 +209,50 @@ def test_no_perp_fills_yields_an_empty_but_present_result() -> None:
     assert metrics.realized_pnl == Decimal("0")
     assert metrics.window_start is None
     assert metrics.window_end is None
+
+
+# --- Incremental folding (issue #11) -----------------------------------------
+# The foldable state is what persists between incremental refreshes: extract a
+# batch, fold in the fills since the checkpoint, then reduce to metrics. Folding
+# disjoint batches must equal computing the whole history at once.
+
+
+def test_folding_the_fills_since_a_checkpoint_equals_computing_the_union() -> None:
+    early = [
+        fill(pnl="100", order_id=1, at=T0, crossed=False, start_position="50"),
+        fill(pnl="-40", order_id=2, at=T0 + timedelta(days=1)),
+    ]
+    late = [
+        fill("Open Long", order_id=3, at=T0 + timedelta(days=2), start_position="0"),
+        fill(pnl="60", order_id=3, at=T0 + timedelta(days=2, hours=1)),
+    ]
+    account = Decimal("1000")
+    folded = metrics_from_state(fold_state(extract_state(early), late), account)
+    whole = compute_fine_metrics(early + late, account_value=account)
+    assert folded == whole
+
+
+def test_folding_retains_trades_from_before_the_new_batch() -> None:
+    # The point of the fold: history accumulates past any single pull's window,
+    # so nothing is lost to the ~2000-fill cap a full re-pull would hit (#11).
+    prior = extract_state(
+        [fill(pnl="10", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 6)]
+    )
+    folded = fold_state(prior, [fill(pnl="10", order_id=99, at=T0 + timedelta(days=1))])
+    assert len(folded.trades) == 6
+    assert metrics_from_state(folded, None).realized_pnl == Decimal("60")
+
+
+def test_folding_keeps_the_earliest_window_and_advances_the_checkpoint() -> None:
+    prior = extract_state([fill(order_id=1, at=T0)])
+    folded = fold_state(prior, [fill(order_id=2, at=T0 + timedelta(days=5))])
+    assert folded.window_start == T0  # earliest perp fill is preserved
+    assert folded.window_end == T0 + timedelta(days=5)
+    assert folded.last_fill_at == T0 + timedelta(days=5)  # checkpoint moves forward
+
+
+def test_folding_an_empty_batch_leaves_the_state_unchanged() -> None:
+    prior = extract_state(
+        [fill(pnl="30", order_id=1, at=T0, crossed=False), fill(pnl="-5", order_id=2, at=T0)]
+    )
+    assert fold_state(prior, []) == prior
