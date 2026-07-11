@@ -27,6 +27,15 @@ ETH_SHORT_POS = Position(
     entry_price=Decimal("1677.9"),
     unrealized_pnl=Decimal("-108299.96"),
 )
+# A HIP-3 builder-DEX position (issue #21): namespaced coin, from the xyz venue.
+XYZ_SP500_POS = Position(
+    coin="xyz:SP500",
+    side=Side.LONG,
+    size_usd=Decimal("120000"),
+    leverage=Decimal("5"),
+    entry_price=Decimal("5321.4"),
+    unrealized_pnl=Decimal("8400"),
+)
 
 
 async def add_trader(
@@ -303,6 +312,48 @@ async def test_profile_for_a_coarse_only_trader_is_visibly_coarse(
     text = session.sent_messages()[-1].text or ""
     assert "Coarse metrics only" in text
     assert "updated" in text.lower()  # freshness still shown
+
+
+async def test_profile_from_screener_merges_core_and_xyz_venues(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    # The screener profile must show the same coverage the poller tracks (#31):
+    # core perps plus the xyz builder DEX, not just core.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    gateway.set_positions("0xstar", [XYZ_SP500_POS], dex="xyz")
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "ETH" in text  # core, unchanged
+    assert "xyz:SP500" in text  # the builder-DEX position
+
+
+async def test_profile_degrades_when_only_the_xyz_venue_fails(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    from epigone.gateway import GatewayError
+
+    # Core fine, xyz delayed: don't render a core-only profile that reads as a
+    # wallet with no xyz positions — degrade the whole view (#31).
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    gateway.positions_errors_by_dex[("0xstar", "xyz")] = GatewayError("xyz venue delayed")
+    sent_before = len(session.sent_messages())
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    assert len(session.sent_messages()) == sent_before  # no half-rendered profile leaked
+    assert "delayed" in (session.callback_answers()[-1].text or "").lower()
 
 
 async def test_profile_degrades_when_hyperliquid_is_delayed(

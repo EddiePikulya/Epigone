@@ -15,7 +15,13 @@ from aiogram.types import (
 
 from epigone.bot.format import short_address, signed_pct, signed_usd
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway, Position, Window
+from epigone.gateway import (
+    GatewayError,
+    HyperliquidGateway,
+    Position,
+    Window,
+    fetch_open_positions,
+)
 from epigone.screener import ScreenerRow, run_screener
 
 SCREENER_PAGE_SIZE = 5
@@ -167,7 +173,7 @@ async def on_positions(
         await callback.answer("You're not tracking this trader.", show_alert=True)
         return
     try:
-        positions = await gateway.get_open_positions(address)
+        positions = await fetch_open_positions(gateway, address)
     except GatewayError:
         await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
         return
@@ -394,7 +400,7 @@ async def _render_profile(
     user_id: int,
     address: str,
 ) -> tuple[str, InlineKeyboardMarkup]:
-    positions = await gateway.get_open_positions(address)  # may raise GatewayError
+    positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
     followed = await pool.fetchval(
         "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
         user_id,
@@ -531,7 +537,7 @@ async def _render_tracked_list(
     keyboard: list[list[InlineKeyboardButton]] = []
     for row in rows:
         address: str = row["trader_address"]
-        positions = await gateway.get_open_positions(address)
+        positions = await fetch_open_positions(gateway, address)
         lines.append(f"{short_address(address)} — {_summarize(positions)}")
         # The alert controls (issue #10), so they are visible and editable
         # right where the User reviews the roster.

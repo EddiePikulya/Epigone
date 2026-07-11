@@ -30,6 +30,15 @@ SOL_LONG_POS = Position(
     entry_price=Decimal("73.2257"),
     unrealized_pnl=Decimal("307999.31"),
 )
+# A HIP-3 builder-DEX position (issue #21): namespaced coin, from the xyz venue.
+XYZ_SP500_POS = Position(
+    coin="xyz:SP500",
+    side=Side.LONG,
+    size_usd=Decimal("120000"),
+    leverage=Decimal("5"),
+    entry_price=Decimal("5321.4"),
+    unrealized_pnl=Decimal("8400"),
+)
 
 
 async def _tracked_addresses(pool: asyncpg.Pool, user_id: int) -> list[str]:
@@ -178,6 +187,88 @@ async def test_positions_view_for_a_trader_with_no_open_positions(
     text = session.sent_messages()[-1].text or ""
     assert WHALE_SHORT in text
     assert "no open positions" in text.lower()
+
+
+# --- xyz builder DEX coverage (issue #31) -----------------------------------
+#
+# Every position display must match what the stream poller tracks: core perps
+# plus the xyz HIP-3 builder DEX. A wallet's xyz:* positions were invisible in
+# the profile even though the poller alerts on them — closing that gap here.
+
+
+async def test_positions_view_merges_core_and_xyz_venues(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    gateway.set_positions(WHALE, [ETH_SHORT_POS])
+    gateway.set_positions(WHALE, [XYZ_SP500_POS], dex="xyz")
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "ETH" in text and "SHORT" in text  # core, unchanged
+    assert "xyz:SP500" in text and "LONG" in text  # the builder-DEX position
+    # Both venues fetched, core then xyz — matching the poller's coverage.
+    assert gateway.positions_calls[-2:] == [(WHALE, None), (WHALE, "xyz")]
+
+
+async def test_tracked_list_summary_counts_core_and_xyz(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    gateway.set_positions(WHALE, [ETH_SHORT_POS, SOL_LONG_POS])
+    gateway.set_positions(WHALE, [XYZ_SP500_POS], dex="xyz")
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    await feed_text(dp, bot, "/tracked", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "3 positions" in text  # 2 core + 1 xyz, merged
+
+
+async def test_positions_view_hides_nothing_when_one_venue_fails(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    # Core succeeds, xyz is delayed: showing only the core half would read as a
+    # wallet that closed all its xyz positions. Degrade instead of half-render.
+    gateway.set_positions(WHALE, [ETH_SHORT_POS])
+    gateway.positions_errors_by_dex[(WHALE, "xyz")] = GatewayError("xyz venue delayed")
+    await feed_text(dp, bot, WHALE, user_id=111)
+    sent_before = len(session.sent_messages())
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    assert len(session.sent_messages()) == sent_before  # no half-empty list leaked
+    assert "delayed" in (session.callback_answers()[-1].text or "").lower()
+
+
+async def test_tracked_list_degrades_when_only_the_xyz_venue_fails(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    gateway.set_positions(WHALE, [ETH_SHORT_POS])
+    gateway.positions_errors_by_dex[(WHALE, "xyz")] = GatewayError("xyz venue delayed")
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    await feed_text(dp, bot, "/tracked", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "delayed" in text.lower()
+    assert await _tracked_addresses(pool, 111) == [WHALE]  # a data hiccup never loses Tracks
 
 
 async def test_positions_button_for_an_untracked_trader_is_refused(

@@ -134,3 +134,33 @@ class HyperliquidGateway(Protocol):
         """A Trader's recent fills, newest first (the info API caps at ~2000).
         Raises GatewayError on failure."""
         ...
+
+
+# The single HIP-3 builder DEX Epigone covers: xyz hosts ~90% of non-core
+# activity (equity/"stock" perps: xyz:META, xyz:BB, …) at 2x the poll cost,
+# versus 10x for all nine. Its coins come back namespaced (`xyz:META`), so they
+# never collide with core. Hard-coded rather than discovered via perpDexs (a
+# stable HIP-3 deployment; issue #21 left that lookup optional).
+XYZ_DEX = "xyz"
+
+# Every venue fetch_open_positions queries per Trader, as `dex` args: the core
+# perps (None) then the xyz builder DEX. The poller bills budget one spend per
+# entry from this same tuple, so its weight accounting can never drift from the
+# calls the helper actually makes (issue #31).
+POSITION_VENUES: tuple[str | None, ...] = (None, XYZ_DEX)
+
+
+async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> list[Position]:
+    """A Trader's open positions across every venue Epigone covers (POSITION_VENUES:
+    the core perps plus the xyz builder DEX, issue #21), merged into one list.
+
+    The lists merge cleanly — xyz coins are namespaced (`xyz:META`), core coins
+    are not — so callers can render or diff them together with no collision.
+    Every venue must succeed to return: a partial fetch would read an unqueried
+    venue as all-closed, which the poller would diff into false CLOSE alerts and
+    a display would show as a wallet that flattened everything. A failure on any
+    venue therefore raises GatewayError (issues #21, #31)."""
+    positions: list[Position] = []
+    for dex in POSITION_VENUES:
+        positions.extend(await gateway.get_open_positions(address, dex=dex))
+    return positions

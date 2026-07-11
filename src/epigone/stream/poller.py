@@ -54,7 +54,14 @@ import asyncpg
 
 from epigone.budget import Budget
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway, Position, RateLimitedError
+from epigone.gateway import (
+    POSITION_VENUES,
+    GatewayError,
+    HyperliquidGateway,
+    Position,
+    RateLimitedError,
+    fetch_open_positions,
+)
 
 log = logging.getLogger(__name__)
 
@@ -64,14 +71,6 @@ log = logging.getLogger(__name__)
 # — so weight 4 per wallet per 30s poll, giving ~110 distinct tracked wallets
 # before pacing stretches the interval even with ingest fully idle.
 POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this once per DEX
-
-# The single HIP-3 builder DEX we cover: xyz hosts ~90% of non-core activity
-# (equity/"stock" perps: xyz:META, xyz:BB, …) at 2x the poll cost, versus 10x
-# for all nine. Coins come back namespaced (`xyz:META`), distinct from core.
-# The name is hard-coded rather than validated via the perpDexs endpoint (issue
-# #21 left that optional): it is a stable HIP-3 deployment, and a per-pass
-# perpDexs lookup would spend budget to confirm a constant.
-XYZ_DEX = "xyz"
 
 # A same-side size change alerts as SCALE-IN/SCALE-OUT (issue #10) only once it
 # reaches this fraction of the last snapshot's notional size; anything smaller
@@ -153,19 +152,19 @@ async def run_poll_pass(
 async def _fetch_positions(
     gateway: HyperliquidGateway, budget: Budget, address: str
 ) -> list[Position]:
-    """A Trader's open positions across the venues we cover: core plus the xyz
-    builder DEX (issue #21). Each call is budgeted separately (weight 2 apiece).
+    """A Trader's open positions across the venues we cover (POSITION_VENUES:
+    core plus the xyz builder DEX), paced by the budget: each clearinghouseState
+    call costs POSITIONS_WEIGHT, so a wallet reserves every venue's weight before
+    polling. Billing one spend per venue off POSITION_VENUES keeps the accounting
+    in lockstep with the calls the shared fetch actually makes.
 
-    The two lists merge cleanly — xyz coins are namespaced (`xyz:META`), core
-    coins are not — so the (trader, coin) diff tracks the venues independently.
-    Both calls must succeed to apply: a partial fetch would read one venue's
-    positions as all-closed and fire false CLOSE alerts, so a failure on either
-    raises and the whole wallet is retried next pass (its snapshots untouched)."""
-    await budget.spend(POSITIONS_WEIGHT)
-    positions = list(await gateway.get_open_positions(address))
-    await budget.spend(POSITIONS_WEIGHT)
-    positions.extend(await gateway.get_open_positions(address, dex=XYZ_DEX))
-    return positions
+    The shared fetch (epigone.gateway.fetch_open_positions) merges the venues
+    and raises on a partial fetch; here that means the whole wallet is retried
+    next pass with its snapshots untouched, never diffed against a half-empty
+    list into false CLOSE alerts (issue #21)."""
+    for _venue in POSITION_VENUES:
+        await budget.spend(POSITIONS_WEIGHT)
+    return await fetch_open_positions(gateway, address)
 
 
 async def _prune_untracked(pool: asyncpg.Pool) -> None:
