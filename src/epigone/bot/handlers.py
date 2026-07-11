@@ -13,7 +13,7 @@ from aiogram.types import (
     Message,
 )
 
-from epigone.bot.format import short_address, signed_pct, signed_usd
+from epigone.bot.format import open_age, short_address, signed_pct, signed_usd
 from epigone.clock import Clock
 from epigone.gateway import (
     GatewayError,
@@ -159,7 +159,11 @@ async def cmd_tracked(message: Message, pool: asyncpg.Pool, gateway: Hyperliquid
 
 
 async def on_positions(
-    callback: CallbackQuery, bot: Bot, pool: asyncpg.Pool, gateway: HyperliquidGateway
+    callback: CallbackQuery,
+    bot: Bot,
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
 ) -> None:
     """On-demand profile for a tracked Trader: current positions + track record.
     Fine metrics where the fine pass has run; coarse-only Traders say so."""
@@ -177,8 +181,11 @@ async def on_positions(
     except GatewayError:
         await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
         return
+    ages = await _position_ages(pool, address)
     view = (
-        _render_positions(address, positions) + "\n\n" + await _render_track_record(pool, address)
+        _render_positions(address, positions, ages, clock.now())
+        + "\n\n"
+        + await _render_track_record(pool, address)
     )
     if isinstance(callback.message, Message):
         await callback.message.answer(view)  # the chat the button lives in
@@ -406,8 +413,9 @@ async def _render_profile(
         user_id,
         address,
     )
+    ages = await _position_ages(pool, address)
     parts = [
-        _render_positions(address, positions),
+        _render_positions(address, positions, ages, clock.now()),
         await _render_track_record(pool, address),
     ]
     freshness = await _metric_freshness(pool, clock, address)
@@ -638,16 +646,57 @@ def _fine_lines(row: asyncpg.Record) -> list[str]:
     return lines
 
 
-def _render_positions(address: str, positions: list[Position]) -> str:
+def _render_positions(
+    address: str,
+    positions: list[Position],
+    ages: dict[str, tuple[datetime, bool]],
+    now: datetime,
+) -> str:
+    """The shared per-position view (#31): notional plus the real margin at risk,
+    return-on-margin, and holding time (#35). `ages` maps coin → (opened_at,
+    baselined) from the poller's snapshots; a coin absent from it (an untracked
+    wallet with no snapshot) simply shows no age rather than a made-up one."""
     if not positions:
         return f"{short_address(address)} has no open positions right now."
     blocks = [f"{short_address(address)} — current positions:", ""]
     for p in positions:
+        upnl = f"uPnL {signed_usd(p.unrealized_pnl)}"
+        rom = p.return_on_margin
+        if rom is not None:
+            upnl += f" ({signed_pct(rom)})"
+        detail = [f"entry {p.entry_price}", upnl]
+        aged = ages.get(p.coin)
+        if aged is not None:
+            opened_at, baselined = aged
+            detail.append(open_age(opened_at, now, baselined=baselined))
         blocks.append(
-            f"{p.coin} {p.side.value.upper()} — ${p.size_usd:,.0f} at {p.leverage}x\n"
-            f"    entry {p.entry_price} · uPnL {signed_usd(p.unrealized_pnl)}"
+            f"{p.coin} {p.side.value.upper()} — "
+            f"${p.size_usd:,.0f} notional · ${p.margin:,.0f} margin at {p.leverage}x\n"
+            f"    " + " · ".join(detail)
         )
     return "\n".join(blocks)
+
+
+async def _position_ages(
+    pool: asyncpg.Pool, address: str
+) -> dict[str, tuple[datetime, bool]]:
+    """coin → (opened_at, baselined) from the poller's snapshots for a Trader (#35).
+
+    `opened_at` is when the poller first observed the position; a position already
+    open at baseline time (#4) carries the baseline moment, not its true open — so
+    `baselined` flags those (opened_at at or before the wallet's baseline) and the
+    display marks them as an at-least age. Empty for a wallet never polled (an
+    untracked profile), which simply omits ages."""
+    rows = await pool.fetch(
+        """
+        SELECT s.coin, s.opened_at, s.opened_at <= p.baselined_at AS baselined
+        FROM position_snapshots s
+        JOIN position_poll_state p USING (trader_address)
+        WHERE s.trader_address = $1
+        """,
+        address,
+    )
+    return {r["coin"]: (r["opened_at"], r["baselined"]) for r in rows}
 
 
 def _summarize(positions: list[Position]) -> str:

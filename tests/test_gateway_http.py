@@ -83,6 +83,12 @@ async def test_parses_all_positions_from_the_recorded_response() -> None:
     assert eth.leverage == Decimal("20")
     assert eth.entry_price == Decimal("1677.9")
     assert eth.unrealized_pnl == Decimal("-108299.961306")
+    # marginUsed / returnOnEquity ride the same call (issue #35) — the exact
+    # money at risk and its return, taken straight from the payload.
+    assert eth.margin_used == Decimal("131257.5")
+    assert eth.margin == Decimal("131257.5")
+    assert eth.return_on_equity == Decimal("-0.8605992383")
+    assert eth.return_on_margin == Decimal("-0.8605992383")
 
     sol = positions[1]
     assert sol.side is Side.LONG  # szi is positive

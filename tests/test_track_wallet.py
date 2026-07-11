@@ -5,8 +5,11 @@ from decimal import Decimal
 import asyncpg
 from aiogram import Bot, Dispatcher
 
+from epigone.budget import WeightBudget
 from epigone.gateway import GatewayError, Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
+from epigone.stream.poller import run_poll_pass
+from tests.support.clock import FakeClock
 from tests.support.telegram import RecordingSession, feed_callback, feed_text
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
@@ -21,6 +24,8 @@ ETH_SHORT_POS = Position(
     leverage=Decimal("20"),
     entry_price=Decimal("1677.9"),
     unrealized_pnl=Decimal("-108299.96"),
+    margin_used=Decimal("131257.5"),
+    return_on_equity=Decimal("-0.8253"),
 )
 SOL_LONG_POS = Position(
     coin="SOL",
@@ -29,6 +34,8 @@ SOL_LONG_POS = Position(
     leverage=Decimal("20"),
     entry_price=Decimal("73.2257"),
     unrealized_pnl=Decimal("307999.31"),
+    margin_used=Decimal("241736.63"),
+    return_on_equity=Decimal("1.2741"),
 )
 # A HIP-3 builder-DEX position (issue #21): namespaced coin, from the xyz venue.
 XYZ_SP500_POS = Position(
@@ -38,6 +45,8 @@ XYZ_SP500_POS = Position(
     leverage=Decimal("5"),
     entry_price=Decimal("5321.4"),
     unrealized_pnl=Decimal("8400"),
+    margin_used=Decimal("24000"),
+    return_on_equity=Decimal("0.35"),
 )
 
 
@@ -170,11 +179,14 @@ async def test_positions_button_shows_current_positions_on_demand(
     # coin, side, size, leverage, entry, unrealized PnL — all six alert fields
     assert "ETH" in text and "SOL" in text
     assert "SHORT" in text and "LONG" in text
-    assert "$2,625,150" in text
+    assert "$2,625,150 notional" in text
     assert "20x" in text
     assert "1677.9" in text
     assert "-$108,300" in text
     assert "+$307,999" in text
+    # The real money at risk and its return, not just leveraged size (issue #35).
+    assert "$131,258 margin" in text  # marginUsed, exact
+    assert "(-83%)" in text  # return on margin makes the leverage legible
 
 
 async def test_positions_view_for_a_trader_with_no_open_positions(
@@ -187,6 +199,37 @@ async def test_positions_view_for_a_trader_with_no_open_positions(
     text = session.sent_messages()[-1].text or ""
     assert WHALE_SHORT in text
     assert "no open positions" in text.lower()
+
+
+async def test_positions_view_shows_holding_time_from_the_poller_snapshots(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    """Age comes from position_snapshots.opened_at (issue #35). A position already
+    open at baseline (#4) only knows time-since-tracking, so it reads as an
+    at-least age; one the poller saw open reads precisely."""
+    gateway.set_positions(WHALE, [ETH_SHORT_POS])
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    # First pass baselines ETH: its opened_at is the baseline moment, not a true
+    # open — so its age must be presented honestly.
+    await run_poll_pass(pool, gateway, WeightBudget(1_000_000, clock), clock)
+
+    # A day and a bit later, SOL opens and the poller sees it open.
+    clock.advance(93_600)  # 1d 2h
+    gateway.set_positions(WHALE, [ETH_SHORT_POS, SOL_LONG_POS])
+    await run_poll_pass(pool, gateway, WeightBudget(1_000_000, clock), clock)
+
+    clock.advance(7_200)  # 2h more before the User looks
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "open ≥1d 4h" in text  # ETH: baselined → at-least age (tracked 1d 4h)
+    assert "open 2h" in text  # SOL: seen opening → precise age
 
 
 # --- xyz builder DEX coverage (issue #31) -----------------------------------

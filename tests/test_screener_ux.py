@@ -271,6 +271,8 @@ async def test_profile_from_screener_shows_metrics_freshness_positions_and_follo
     text = msg.text or ""
     assert "71% win rate over 104 closed trades" in text  # fine metrics
     assert "ETH" in text and "SHORT" in text  # current positions
+    assert "$131,258 margin" in text  # money at risk, derived from notional/leverage (#35)
+    assert "open " not in text  # untracked: no poller snapshot, so no invented age
     assert "3h ago" in text  # metric freshness
     # Not tracked yet: the profile offers a Follow.
     assert "pfollow:0xstar" in _callback_data(msg.reply_markup)

@@ -186,11 +186,22 @@ def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:
                     leverage=Decimal(raw["leverage"]["value"]),
                     entry_price=Decimal(raw["entryPx"]),
                     unrealized_pnl=Decimal(raw["unrealizedPnl"]),
+                    # marginUsed / returnOnEquity ride the same call (issue #35);
+                    # absent or null falls back to notional/leverage in Position.
+                    margin_used=_opt_decimal(raw.get("marginUsed")),
+                    return_on_equity=_opt_decimal(raw.get("returnOnEquity")),
                 )
             )
         return positions
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected clearinghouseState payload shape: {exc!r}") from exc
+
+
+def _opt_decimal(value: Any) -> Decimal | None:
+    """A Decimal for a present numeric field, None when the API omits it or
+    sends null (e.g. marginUsed on an exotic position) — the caller derives a
+    fallback (issue #35)."""
+    return None if value is None else Decimal(value)
 
 
 def _namespaced_coin(coin: str, dex: str | None) -> str:

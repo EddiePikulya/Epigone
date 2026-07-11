@@ -68,7 +68,12 @@ class LeaderboardEntry:
 
 @dataclass(frozen=True)
 class Position:
-    """An open perp position held by a Trader (an observed wallet, never a User)."""
+    """An open perp position held by a Trader (an observed wallet, never a User).
+
+    `size_usd` is the leveraged notional; `margin` is the real money the Trader
+    put up (issue #35). Hyperliquid returns both directly — `marginUsed` and
+    `returnOnEquity` — but they're optional here so a synthesized Position (tests,
+    a snapshot replay) can omit them and fall back to notional/leverage."""
 
     coin: str
     side: Side
@@ -76,6 +81,27 @@ class Position:
     leverage: Decimal
     entry_price: Decimal
     unrealized_pnl: Decimal
+    margin_used: Decimal | None = None  # exact marginUsed from the API; None → derive
+    return_on_equity: Decimal | None = None  # returnOnEquity (PnL over margin), a ratio
+
+    @property
+    def margin(self) -> Decimal:
+        """Money at risk: the API's exact `marginUsed`, else notional/leverage
+        (issue #35). Leverage is always positive for an open position, so the
+        fallback never divides by zero."""
+        if self.margin_used is not None:
+            return self.margin_used
+        return self.size_usd / self.leverage
+
+    @property
+    def return_on_margin(self) -> Decimal | None:
+        """Unrealized return on the money put up — the figure that makes leverage
+        legible (+357% on $96, issue #35). The API's `returnOnEquity` when present,
+        else derived from uPnL over margin; None only if margin is zero."""
+        if self.return_on_equity is not None:
+            return self.return_on_equity
+        margin = self.margin
+        return self.unrealized_pnl / margin if margin else None
 
 
 @dataclass(frozen=True)
