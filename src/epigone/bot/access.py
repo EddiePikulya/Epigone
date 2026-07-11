@@ -19,6 +19,7 @@ from aiogram import BaseMiddleware, Dispatcher, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, TelegramObject, Update
 from aiogram.types import User as TgUser
+from aiogram.types.update import UpdateTypeLookupError
 
 from epigone import allowlist
 
@@ -30,12 +31,20 @@ CANT_REVOKE_ADMIN_TEXT = "You're the owner — you can't revoke your own access.
 
 
 def _update_user(event: Update) -> TgUser | None:
-    """The Telegram User behind an update, for the two kinds the bot handles."""
-    if event.message is not None:
-        return event.message.from_user
-    if event.callback_query is not None:
-        return event.callback_query.from_user
-    return None
+    """The Telegram User behind an update, across every update variant that
+    carries one — message, edited_message, callback_query, inline_query,
+    chat-member changes, and so on. Reading it off ``Update.event`` (the
+    specific sub-object) means new handler-relevant types are gated
+    automatically, with no per-type branch to forget. Update types with no
+    sender (channel_post, poll, …) yield None; the gate then fails closed."""
+    try:
+        inner = event.event
+    except UpdateTypeLookupError:
+        return None  # An update type this aiogram doesn't know — nothing to gate.
+    # Most updates expose the sender as ``from_user``; a few (reactions, poll
+    # answers, chat-boosts) use ``user``. Either way, no User → fail closed.
+    user = getattr(inner, "from_user", None) or getattr(inner, "user", None)
+    return user if isinstance(user, TgUser) else None
 
 
 async def _refuse(event: Update) -> None:
@@ -63,9 +72,12 @@ class AllowlistGate(BaseMiddleware):
 
         user = _update_user(event)
         if user is None:
-            # No identifiable sender (an update type the bot doesn't handle).
-            # Nothing to gate and no handler will match anyway.
-            return await handler(event, data)
+            # Fail closed (#40): an update whose sender we can't resolve is
+            # dropped, never routed. Epigone is private and handles only
+            # messages and callbacks; any other type is ungatable and so must
+            # not reach a handler. Teaching the bot a new update type is then a
+            # deliberate change that must also teach _update_user its sender.
+            return None
 
         pool: asyncpg.Pool = data["pool"]
         admin_id: int | None = data.get("admin_telegram_id")
