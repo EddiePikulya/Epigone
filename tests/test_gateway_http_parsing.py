@@ -11,7 +11,7 @@ from decimal import Decimal
 import pytest
 
 from epigone.gateway import GatewayError, Window
-from epigone.gateway.http import parse_fills, parse_leaderboard
+from epigone.gateway.http import parse_fills, parse_leaderboard, parse_positions
 
 LEADERBOARD_PAYLOAD = {
     "leaderboardRows": [
@@ -60,6 +60,38 @@ def test_parse_leaderboard_carries_coarse_metrics_per_row() -> None:
 def test_parse_leaderboard_rejects_unexpected_shape() -> None:
     with pytest.raises(GatewayError):
         parse_leaderboard({"rows": []})
+
+
+def _position_payload(**overrides: object) -> dict[str, object]:
+    position = {
+        "coin": "BTC",
+        "szi": "0.1",
+        "leverage": {"type": "cross", "value": 40},
+        "entryPx": "38530.0",
+        "positionValue": "3853.0",
+        "unrealizedPnl": "344.0",
+        "returnOnEquity": "3.57",
+        "marginUsed": "96.325",
+        **overrides,
+    }
+    return {"assetPositions": [{"type": "oneWay", "position": position}]}
+
+
+def test_parse_positions_falls_back_to_notional_over_leverage_without_margin() -> None:
+    # An exotic position can omit marginUsed / returnOnEquity; the derived
+    # margin (notional / leverage) and return (uPnL / margin) keep the line honest
+    # (issue #35).
+    (pos,) = parse_positions(_position_payload(marginUsed=None, returnOnEquity=None))
+    assert pos.margin_used is None
+    assert pos.margin == Decimal("3853.0") / Decimal("40")  # notional / leverage
+    assert pos.return_on_equity is None
+    assert pos.return_on_margin == Decimal("344.0") / pos.margin
+
+
+def test_parse_positions_uses_exact_margin_and_return_when_present() -> None:
+    (pos,) = parse_positions(_position_payload())
+    assert pos.margin == Decimal("96.325")  # the API's exact marginUsed, not derived
+    assert pos.return_on_margin == Decimal("3.57")
 
 
 # One perp close (recorded verbatim from userFills on 2026-07-10) and one
