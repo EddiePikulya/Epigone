@@ -7,9 +7,10 @@ import pytest
 from aiogram import Bot, Dispatcher
 
 from epigone.bot.handlers import build_router
-from epigone.db import apply_schema
+from epigone.db import migrate
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.clock import FakeClock
+from tests.support.db import reset_database
 from tests.support.telegram import RecordingSession, make_bot
 
 DEFAULT_TEST_DATABASE_URL = "postgresql://epigone:epigone@localhost:5432/epigone_test"
@@ -17,21 +18,14 @@ DEFAULT_TEST_DATABASE_URL = "postgresql://epigone:epigone@localhost:5432/epigone
 
 async def _rebuild_schema(url: str) -> None:
     server_url, _, dbname = url.rpartition("/")
-    admin = await asyncpg.connect(f"{server_url}/postgres")
-    exists = await admin.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", dbname)
-    if not exists:
-        await admin.execute(f'CREATE DATABASE "{dbname}"')
-    await admin.close()
-
-    conn = await asyncpg.connect(url)
-    # CREATE TABLE IF NOT EXISTS never ALTERs an existing table, so a schema.sql
-    # change on main would otherwise leave this database stale (UndefinedColumnError).
-    await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
-    await conn.close()
+    # Migrations assume a shipped file never changes, but dev branches edit
+    # them freely — so rebuild from scratch rather than trust the bookkeeping
+    # of whatever branch touched this database last.
+    await reset_database(server_url, dbname)
 
     pool = await asyncpg.create_pool(url)
     assert pool is not None
-    await apply_schema(pool)
+    await migrate(pool)
     await pool.close()
 
 

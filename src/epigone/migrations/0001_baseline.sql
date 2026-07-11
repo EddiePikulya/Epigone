@@ -1,10 +1,12 @@
--- Epigone schema. Idempotent: applied at process startup.
+-- Migration 0001: the V1 baseline schema (formerly schema.sql).
 -- Vocabulary per CONTEXT.md — a User is a person on Telegram, never a Trader.
 --
--- CREATE TABLE IF NOT EXISTS never ALTERs an existing table. Tests rebuild
--- their throwaway schema every run (tests/conftest.py), but a deployed
--- database keeps its old shape — before V1 deploys with data worth keeping,
--- it needs a real migration story (issue #16).
+-- Deliberately idempotent (IF NOT EXISTS everywhere), unlike later migrations:
+-- it doubles as the baseline for databases that predate the migration runner
+-- (issue #16). The live production DB already has this exact shape — partly
+-- hand-applied — so running the baseline there is a no-op that just records
+-- version 1 in schema_migrations. This file is frozen history: never edit it
+-- for a schema change; add a numbered migration instead (src/epigone/db.py).
 
 -- min_size_usd is the User's global Position Alert floor (issue #10): alerts
 -- for positions notionally smaller than this are suppressed across every Track
