@@ -18,7 +18,7 @@ import aiohttp
 from epigone.budget import STREAM_RESERVE_WEIGHT, SharedWeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
-from epigone.db import apply_schema, create_pool
+from epigone.db import create_pool, migrate
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.ingest.fine import run_fine_pass
 from epigone.ingest.scan import seed_universe
@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 async def run(pool_url: str, clock: Clock) -> None:
     pool = await create_pool(pool_url)
-    await apply_schema(pool)
+    await migrate(pool)
     # Ingest is the background spender: it draws the shared budget (issue #28)
     # only above the stream's reserve, so Position Alerts always poll first.
     budget = SharedWeightBudget(pool, clock, reserve=STREAM_RESERVE_WEIGHT)

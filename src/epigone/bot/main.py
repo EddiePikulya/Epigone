@@ -8,7 +8,7 @@ from epigone.bot.alerts import run_delivery_loop
 from epigone.bot.handlers import build_router
 from epigone.clock import SystemClock
 from epigone.config import Settings
-from epigone.db import apply_schema, create_pool
+from epigone.db import create_pool, migrate
 from epigone.gateway.http import HttpHyperliquidGateway
 
 
@@ -16,7 +16,7 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = Settings.from_env()
     pool = await create_pool(settings.database_url)
-    await apply_schema(pool)
+    await migrate(pool)
 
     bot = Bot(settings.require_bot_token())
     clock = SystemClock()
