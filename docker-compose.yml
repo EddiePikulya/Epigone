@@ -6,7 +6,10 @@ services:
       POSTGRES_PASSWORD: epigone
       POSTGRES_DB: epigone
     ports:
-      - "5432:5432"
+      # Bind Postgres to loopback only: reachable locally (tests, psql) but never
+      # from the public internet on a deployed server. Services reach it over the
+      # compose network by hostname, not this mapping.
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
