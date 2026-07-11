@@ -21,6 +21,7 @@ services:
     environment:
       DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID}
     depends_on:
       postgres:
         condition: service_healthy
