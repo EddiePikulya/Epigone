@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from epigone.gateway import Fill, LeaderboardEntry, Position
 
 
@@ -5,7 +7,9 @@ class FakeHyperliquidGateway:
     """In-memory gateway for tests: set data per address, no network.
 
     Configure failures by assigning `leaderboard_error` / `fills_errors`;
-    `fills_calls` records every request (lowercased) in order. `positions_calls`
+    `fills_calls` records every full-history request (lowercased) in order;
+    `fills_since_calls` records incremental ones as (address, start).
+    `positions_calls`
     records each get_open_positions as an (address, dex) pair — dex is None for
     the core venue, "xyz" etc. for a builder DEX (issue #21).
     """
@@ -21,6 +25,7 @@ class FakeHyperliquidGateway:
         self.fills: dict[str, list[Fill]] = {}
         self.fills_errors: dict[str, Exception] = {}
         self.fills_calls: list[str] = []
+        self.fills_since_calls: list[tuple[str, datetime]] = []
 
     async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
         key = address.lower()
@@ -42,6 +47,16 @@ class FakeHyperliquidGateway:
         if error is not None:
             raise error
         return list(self.fills.get(key, []))
+
+    async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
+        key = address.lower()
+        self.fills_since_calls.append((key, start))
+        error = self.fills_errors.get(key)
+        if error is not None:
+            raise error
+        # Mirror userFillsByTime's inclusive startTime against the same store the
+        # full pull reads, so a test sets one fill list and both paths agree.
+        return [f for f in self.fills.get(key, []) if f.time >= start]
 
     def set_positions(
         self, address: str, positions: list[Position], dex: str | None = None

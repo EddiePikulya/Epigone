@@ -1,19 +1,23 @@
 """Fine metric pass (issue #8, two-stage scan stage 2).
 
-One userFills call per eligible Trader: coarse-pass survivors (profitable,
-active month — the default gate, tunable as thresholds firm up) plus every
-tracked Trader. Metrics come from the pure engine (epigone.metrics.fine);
-Bot vetting (epigone.metrics.bots) runs on the same fetch. Structure mirrors
-the coarse pass: per-Trader commits, stale-first order, failure-streak abort.
-Rate limiting is the exception (issue #28): a RateLimitedError counts as a
-failure but never toward the abort streak — the gateway already backed off,
-and a 429 under load is pacing, not an outage.
+One fills call per eligible Trader: coarse-pass survivors (profitable, active
+month — the default gate, tunable as thresholds firm up) plus every tracked
+Trader. The first refresh pulls the account's full fill history; every later
+one is **incremental** (issue #11) — it fetches only the fills since the
+Trader's checkpoint (fine_checkpoint_at) and folds them into the persisted
+trade store (epigone.metrics.fine, fine_trades), so a fast-tier refresh is
+cheap and history accumulates past the ~2000-fill API cap. Metrics come from
+the pure engine reducing the folded state; Bot vetting (epigone.metrics.bots)
+runs on it too. Structure mirrors the coarse pass: per-Trader commits,
+stale-first order, failure-streak abort. Rate limiting is the exception (issue
+#28): a RateLimitedError counts as a failure but never toward the abort streak
+— the gateway already backed off, and a 429 under load is pacing, not an outage.
 """
 
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
@@ -27,11 +31,24 @@ from epigone.ingest.scan import (
     MAX_CONSECUTIVE_FAILURES,
 )
 from epigone.metrics.bots import classify_bot
-from epigone.metrics.fine import FineMetrics, compute_fine_metrics
+from epigone.metrics.fine import (
+    EMPTY_STATE,
+    ClosedTrade,
+    FineMetrics,
+    FineState,
+    extract_state,
+    fold_states,
+    metrics_from_state,
+)
 
 log = logging.getLogger(__name__)
 
 FILLS_WEIGHT = 20  # one userFills call, against the shared budget (epigone.budget)
+
+# The incremental pass fetches fills strictly after the checkpoint. userFillsByTime
+# is inclusive on startTime, so start one fill-timestamp tick (1ms, the API's
+# resolution) past the last folded fill — never re-folding it (issue #11).
+CHECKPOINT_STEP = timedelta(milliseconds=1)
 
 # userFills really costs its base 20 *plus* weight per 20 fills returned
 # (Hyperliquid rate-limit docs; issue #41) — up to ~+100 on a full ~2000-fill
@@ -54,6 +71,7 @@ class _DueTrader:
     address: str
     account_value: Decimal | None  # from the coarse month window, when scanned
     month_pnl: Decimal | None
+    checkpoint: datetime | None  # fine_checkpoint_at: None means "never folded, full pull"
 
 
 async def run_fine_pass(
@@ -63,9 +81,19 @@ async def run_fine_pass(
     due = await _due_traders(pool, clock.now())
     refreshed = failed = consecutive_failures = 0
     for trader in due:
+        checkpoint = trader.checkpoint
+        full_pull = checkpoint is None  # no checkpoint yet: seed from a full history
+        # Load the prior fold state before spending, so a fetch failure costs
+        # only the base weight (no wasted read); the load is a cheap DB read.
+        prior = None if full_pull else await _load_fine_state(pool, trader.address, checkpoint)
         await budget.spend(FILLS_WEIGHT)
         try:
-            fills = await gateway.get_fills(trader.address)
+            if checkpoint is None:
+                fetched = await gateway.get_fills(trader.address)
+            else:
+                fetched = await gateway.get_fills_since(
+                    trader.address, checkpoint + CHECKPOINT_STEP
+                )
         except RateLimitedError:
             # Pacing, not an outage (issue #28): the gateway already backed off
             # and retried, so just rotate the Trader to the back and move on —
@@ -89,12 +117,19 @@ async def run_fine_pass(
                 return FineScanResult(refreshed=refreshed, failed=failed, aborted=True)
             continue
         consecutive_failures = 0
-        surcharge = math.ceil(len(fills) / FILLS_PER_SURCHARGE_WEIGHT)
+        # The surcharge bills only the fills actually returned — an incremental
+        # pull of a few new fills settles far less than a full ~2000-fill pull.
+        surcharge = math.ceil(len(fetched) / FILLS_PER_SURCHARGE_WEIGHT)
         if surcharge:
             await budget.settle(surcharge)
-        metrics = compute_fine_metrics(fills, account_value=trader.account_value)
+        delta = extract_state(fetched)  # reduce the batch once; reuse for fold + upsert
+        state = fold_states(prior or EMPTY_STATE, delta)
+        metrics = metrics_from_state(state, account_value=trader.account_value)
         bot_reason = classify_bot(metrics, month_pnl=trader.month_pnl)
-        await _store_fine_metrics(pool, trader.address, metrics, bot_reason, clock.now())
+        await _store_fine_refresh(
+            pool, trader.address, metrics, state, delta.trades, bot_reason, clock.now(),
+            reseed=full_pull,
+        )
         refreshed += 1
     if refreshed or failed:
         log.info("fine pass done: %d refreshed, %d failed", refreshed, failed)
@@ -111,7 +146,7 @@ async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
     # row); they refresh on the active cadence.
     rows = await pool.fetch(
         """
-        SELECT t.address, cm.account_value, cm.pnl AS month_pnl
+        SELECT t.address, t.fine_checkpoint_at, cm.account_value, cm.pnl AS month_pnl
         FROM traders t
         LEFT JOIN coarse_metrics cm ON cm.address = t.address AND cm.time_window = 'month'
         WHERE (
@@ -134,25 +169,83 @@ async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
             address=row["address"],
             account_value=row["account_value"],
             month_pnl=row["month_pnl"],
+            checkpoint=row["fine_checkpoint_at"],
         )
         for row in rows
     ]
 
 
-async def _store_fine_metrics(
+async def _load_fine_state(
+    pool: asyncpg.Pool, address: str, checkpoint: datetime | None
+) -> FineState:
+    """Rebuild the fold state from storage for an incremental refresh (issue
+    #11): the persisted closed trades plus the maker/perp accumulators and the
+    fill window, with `checkpoint` (fine_checkpoint_at) as `last_fill_at`."""
+    counters = await pool.fetchrow(
+        "SELECT maker_fill_count, perp_fill_count, window_start, window_end "
+        "FROM fine_metrics WHERE address = $1",
+        address,
+    )
+    trade_rows = await pool.fetch(
+        "SELECT order_id, pnl, peak_notional, closed_at FROM fine_trades WHERE address = $1",
+        address,
+    )
+    trades = tuple(
+        ClosedTrade(
+            order_id=r["order_id"],
+            pnl=r["pnl"],
+            peak_notional=r["peak_notional"],
+            closed_at=r["closed_at"],
+        )
+        for r in trade_rows
+    )
+    return FineState(
+        trades=trades,
+        maker_fill_count=counters["maker_fill_count"] if counters else 0,
+        perp_fill_count=counters["perp_fill_count"] if counters else 0,
+        window_start=counters["window_start"] if counters else None,
+        window_end=counters["window_end"] if counters else None,
+        last_fill_at=checkpoint,
+    )
+
+
+async def _store_fine_refresh(
     pool: asyncpg.Pool,
     address: str,
     metrics: FineMetrics,
+    state: FineState,
+    delta_trades: tuple[ClosedTrade, ...],
     bot_reason: str | None,
     computed_at: datetime,
+    *,
+    reseed: bool,
 ) -> None:
+    """Persist a refresh: the reduced metrics plus the fold state that feeds the
+    next incremental pass. `reseed` (a full pull, checkpoint was NULL) rebuilds
+    the trade store from scratch; otherwise only this batch's `delta_trades` are
+    upserted, keeping a fast-tier refresh a small write (issue #11)."""
     async with pool.acquire() as conn, conn.transaction():
+        if reseed:
+            await conn.execute("DELETE FROM fine_trades WHERE address = $1", address)
+        if delta_trades:
+            await conn.executemany(
+                """
+                INSERT INTO fine_trades (address, order_id, pnl, peak_notional, closed_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (address, order_id) DO UPDATE
+                    SET pnl = EXCLUDED.pnl,
+                        peak_notional = EXCLUDED.peak_notional,
+                        closed_at = EXCLUDED.closed_at
+                """,
+                [(address, t.order_id, t.pnl, t.peak_notional, t.closed_at) for t in delta_trades],
+            )
         await conn.execute(
             """
             INSERT INTO fine_metrics
                 (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
-                 avg_leverage, maker_share, realized_pnl, window_start, window_end, computed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                 avg_leverage, maker_share, realized_pnl, window_start, window_end,
+                 maker_fill_count, perp_fill_count, computed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (address) DO UPDATE
                 SET trade_count = EXCLUDED.trade_count,
                     win_rate = EXCLUDED.win_rate,
@@ -165,6 +258,8 @@ async def _store_fine_metrics(
                     realized_pnl = EXCLUDED.realized_pnl,
                     window_start = EXCLUDED.window_start,
                     window_end = EXCLUDED.window_end,
+                    maker_fill_count = EXCLUDED.maker_fill_count,
+                    perp_fill_count = EXCLUDED.perp_fill_count,
                     computed_at = EXCLUDED.computed_at
             """,
             address,
@@ -179,15 +274,21 @@ async def _store_fine_metrics(
             metrics.realized_pnl,
             metrics.window_start,
             metrics.window_end,
+            state.maker_fill_count,
+            state.perp_fill_count,
             computed_at,
         )
         # A flag keeps its original timestamp while the reason stays fresh; a
         # profile that stops matching the heuristics returns to the screener.
+        # fine_checkpoint_at advances to the newest folded fill so the next pass
+        # fetches only what is new (NULL only when the Trader had no fills at all,
+        # which keeps the next pass a cheap full pull).
         await conn.execute(
             """
             UPDATE traders
             SET fine_refreshed_at = $2,
                 fine_attempted_at = $2,
+                fine_checkpoint_at = $4,
                 bot_flagged_at = CASE
                     WHEN $3::text IS NULL THEN NULL
                     ELSE coalesce(bot_flagged_at, $2)
@@ -198,4 +299,5 @@ async def _store_fine_metrics(
             address,
             computed_at,
             bot_reason,
+            state.last_fill_at,
         )

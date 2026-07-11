@@ -147,6 +147,24 @@ async def test_coarse_only_rows_read_as_pending_not_a_verdict(
     assert "coarse" not in text.lower()  # …never as a quality verdict
 
 
+async def test_screener_rows_show_how_fresh_the_metrics_are(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    # Every row carries a freshness age so a User knows whether they are seeing
+    # today's picture or last week's (issue #11): the fully-scanned row and the
+    # coarse-only one alike, driven off the metrics' computed_at.
+    await add_trader(pool, "0xfresh", month_roi="2.0")
+    await add_fine(pool, "0xfresh")
+    await add_trader(pool, "0xcoarse", month_roi="1.0")  # fine pass hasn't reached it
+    clock.advance(2 * 3600)  # metrics were computed two hours ago
+
+    await feed_text(dp, bot, "/screener", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert text.count("🕒 2h ago") == 2  # both rows show the age
+    assert "analyzing" in text.lower()  # the coarse-only row is still pending
+
+
 async def test_screener_excludes_bots(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:

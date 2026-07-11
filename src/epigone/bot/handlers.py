@@ -214,21 +214,21 @@ async def on_unfollow(
     await callback.answer(_unfollow_toast(removed, address))
 
 
-async def cmd_screener(message: Message, pool: asyncpg.Pool) -> None:
+async def cmd_screener(message: Message, pool: asyncpg.Pool, clock: Clock) -> None:
     """The default Criteria: the Universe ranked by 30-day ROI, Bots excluded.
     A pure database read — zero Hyperliquid calls (issue #6 acceptance)."""
     user = message.from_user
     if user is None:
         return
     await upsert_user(pool, user.id, user.username)
-    text, markup = await _render_screener_page(pool, user.id, offset=0)
+    text, markup = await _render_screener_page(pool, user.id, clock, offset=0)
     await message.answer(text, reply_markup=markup)
 
 
-async def on_screener_page(callback: CallbackQuery, pool: asyncpg.Pool) -> None:
+async def on_screener_page(callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock) -> None:
     """Page through the ranking in place. Still a pure database read."""
     offset = _parse_offset((callback.data or "").removeprefix("screen:"))
-    text, markup = await _render_screener_page(pool, callback.from_user.id, offset=offset)
+    text, markup = await _render_screener_page(pool, callback.from_user.id, clock, offset=offset)
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer()
@@ -245,7 +245,9 @@ async def on_screener_follow(callback: CallbackQuery, pool: asyncpg.Pool, clock:
             conn, callback.from_user.id, callback.from_user.username, address, clock.now()
         )
     if isinstance(callback.message, Message):
-        text, markup = await _render_screener_page(pool, callback.from_user.id, offset=offset)
+        text, markup = await _render_screener_page(
+            pool, callback.from_user.id, clock, offset=offset
+        )
         await callback.message.edit_text(text, reply_markup=markup)
     await callback.answer(follow_toast(outcome, address))
 
@@ -330,7 +332,7 @@ def _parse_offset(raw: str) -> int:
 
 
 async def _render_screener_page(
-    pool: asyncpg.Pool, user_id: int, *, offset: int
+    pool: asyncpg.Pool, user_id: int, clock: Clock, *, offset: int
 ) -> tuple[str, InlineKeyboardMarkup | None]:
     # One extra row tells us whether a next page exists without a second query.
     rows = await run_screener(
@@ -346,7 +348,7 @@ async def _render_screener_page(
     keyboard: list[list[InlineKeyboardButton]] = []
     for rank, row in enumerate(rows, start=offset + 1):
         lines.append(f"{rank}. {row.display_name or short_address(row.address)}")
-        lines.append(f"    {_screener_stats(row)}")
+        lines.append(f"    {_screener_stats(row, clock.now())}")
         followed = row.address in tracked
         keyboard.append(
             [
@@ -374,16 +376,26 @@ async def _render_screener_page(
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _screener_stats(row: ScreenerRow) -> str:
+def _screener_stats(row: ScreenerRow, now: datetime) -> str:
     """One line of key stats per row: ROI and PnL always, win rate where the
-    fine pass has run, else a 'still analyzing' marker (issue #8 distinction,
-    framed as pending rather than a quality verdict)."""
+    fine pass has run (else a 'still analyzing' marker — issue #8, framed as
+    pending not a quality verdict), and how fresh the shown metrics are so a
+    User knows whether it is today's picture or last week's (issue #11)."""
     parts = [f"ROI {signed_pct(row.roi)}", f"PnL {signed_usd(row.pnl)}"]
     if row.win_rate is not None:
         parts.append(f"{row.win_rate:.0%} win")
     elif not row.fine_available:
         parts.append(SCREENER_PENDING_LABEL)
+    parts.append(f"🕒 {_relative_age(now, _row_freshness(row))}")
     return " · ".join(parts)
+
+
+def _row_freshness(row: ScreenerRow) -> datetime:
+    """The freshest of a row's passes — the age the User cares about. Coarse
+    metrics are always present; a later fine pass supersedes them."""
+    if row.fine_computed_at is not None and row.fine_computed_at > row.coarse_computed_at:
+        return row.fine_computed_at
+    return row.coarse_computed_at
 
 
 async def tracked_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) -> set[str]:

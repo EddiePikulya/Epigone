@@ -172,7 +172,10 @@ async def test_fresh_traders_are_not_refetched(pool: asyncpg.Pool) -> None:
     clock.advance(2 * 24 * 3600)  # past the active cadence
     result = await run_fine_pass(pool, gateway, budget, clock)
     assert result.refreshed == 1
-    assert gateway.fills_calls == ["0xaaa", "0xaaa"]
+    # Refetched, but incrementally now (issue #11): the first pass set a
+    # checkpoint, so the second pulls only fills since it — no second full pull.
+    assert gateway.fills_calls == ["0xaaa"]
+    assert [addr for addr, _ in gateway.fills_since_calls] == ["0xaaa"]
 
 
 async def test_one_failing_trader_does_not_stop_the_pass(pool: asyncpg.Pool) -> None:
@@ -302,3 +305,126 @@ async def test_a_failed_fetch_settles_no_surcharge(pool: asyncpg.Pool) -> None:
 
     assert budget.spends == [20]
     assert budget.settles == []
+
+
+# --- Incremental refresh (issue #11) -----------------------------------------
+
+
+async def test_incremental_refresh_folds_new_fills_into_the_stored_metrics(
+    pool: asyncpg.Pool,
+) -> None:
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa", account_value="1000")
+    initial = [
+        fill(pnl="100", order_id=1, at=T0, crossed=False, start_position="50"),
+        fill(pnl="-40", order_id=2, at=T0 + timedelta(days=1)),
+    ]
+    gateway.set_fills("0xaaa", initial)
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    # A new closing trade lands after the checkpoint; the next pass folds it in
+    # without re-pulling the earlier fills.
+    new_fill = fill(pnl="60", order_id=3, at=T0 + timedelta(days=1, hours=2))
+    gateway.set_fills("0xaaa", initial + [new_fill])
+    clock.advance(2 * 24 * 3600)  # past the active cadence
+    result = await run_fine_pass(pool, gateway, budget, clock)
+
+    assert result.refreshed == 1
+    # Full pull happened once; the second refresh fetched only fills since the
+    # checkpoint (one fill-tick past the last folded fill).
+    assert gateway.fills_calls == ["0xaaa"]
+    assert gateway.fills_since_calls == [("0xaaa", T0 + timedelta(days=1, milliseconds=1))]
+
+    row = await pool.fetchrow("SELECT * FROM fine_metrics WHERE address = '0xaaa'")
+    assert row is not None
+    assert row["trade_count"] == 3  # the two seeded trades plus the folded one
+    assert row["realized_pnl"] == Decimal("120")  # 100 - 40 + 60
+    assert row["win_rate"] == Decimal(2) / Decimal(3)
+    # The full history is persisted as trades, not just the last pull's window.
+    assert await pool.fetchval("SELECT count(*) FROM fine_trades WHERE address = '0xaaa'") == 3
+    checkpoint = await pool.fetchval(
+        "SELECT fine_checkpoint_at FROM traders WHERE address = '0xaaa'"
+    )
+    assert checkpoint == T0 + timedelta(days=1, hours=2)
+
+
+async def test_incremental_refresh_preserves_history_beyond_a_single_pull(
+    pool: asyncpg.Pool,
+) -> None:
+    # The point of the fold: a later pull's narrow window does not shrink the
+    # metrics back to just what that pull returned — history accumulates, so it
+    # survives past the ~2000-fill cap a full re-pull would truncate to (#11).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    seeded = [fill(pnl="10", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 6)]
+    gateway.set_fills("0xaaa", seeded)
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    # The incremental window returns ONLY the single new fill (the fake filters
+    # by time, exactly as userFillsByTime would) — the five seeded ones are gone.
+    late = fill(pnl="10", order_id=6, at=T0 + timedelta(hours=6))
+    gateway.set_fills("0xaaa", [late])
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    row = await pool.fetchrow(
+        "SELECT trade_count, realized_pnl FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert row is not None
+    assert row["trade_count"] == 6  # all six, though the last pull saw only one
+    assert row["realized_pnl"] == Decimal("60")
+
+
+async def test_incremental_refresh_settles_only_the_new_fills_surcharge(
+    pool: asyncpg.Pool,
+) -> None:
+    # A fast-tier refresh is cheaper: the surcharge bills the few new fills, not
+    # a full ~2000-fill re-pull (issue #11 / #41).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    initial = [fill(pnl="5", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 46)]
+    gateway.set_fills("0xaaa", initial)
+    budget = RecordingBudget()
+    await run_fine_pass(pool, gateway, budget, clock)  # full: settle ceil(45/20)=3
+
+    new = [fill(pnl="5", order_id=100 + i, at=T0 + timedelta(hours=45 + i)) for i in range(1, 4)]
+    gateway.set_fills("0xaaa", initial + new)
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)  # incremental: settle ceil(3/20)=1
+
+    assert budget.spends == [20, 20]  # base weight each time
+    assert budget.settles == [3, 1]  # full pull's surcharge, then just the new fills'
+
+
+async def test_a_refresh_with_no_new_fills_does_not_double_count(pool: asyncpg.Pool) -> None:
+    # A boundary re-fetch (nothing new since the checkpoint) must leave the
+    # accumulators untouched — the counters are running totals (#11).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa", account_value="1000")
+    gateway.set_fills("0xaaa", human_fills())
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    cols = "trade_count, realized_pnl, maker_share, perp_fill_count, maker_fill_count, window_start"
+    before = await pool.fetchrow(f"SELECT {cols} FROM fine_metrics WHERE address = '0xaaa'")
+    checkpoint_before = await pool.fetchval(
+        "SELECT fine_checkpoint_at FROM traders WHERE address = '0xaaa'"
+    )
+
+    clock.advance(2 * 24 * 3600)  # due again, but no fills have arrived since
+    result = await run_fine_pass(pool, gateway, budget, clock)
+
+    assert result.refreshed == 1
+    after = await pool.fetchrow(f"SELECT {cols} FROM fine_metrics WHERE address = '0xaaa'")
+    assert dict(after) == dict(before)  # metrics and counters unchanged
+    assert await pool.fetchval("SELECT count(*) FROM fine_trades WHERE address = '0xaaa'") == 3
+    checkpoint_after = await pool.fetchval(
+        "SELECT fine_checkpoint_at FROM traders WHERE address = '0xaaa'"
+    )
+    assert checkpoint_after == checkpoint_before  # nothing new, checkpoint holds

@@ -78,6 +78,24 @@ class HttpHyperliquidGateway:
             raise GatewayError(f"userFills request failed for {address}: {exc}") from exc
         return parse_fills(payload)
 
+    async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
+        # userFillsByTime is inclusive on startTime (ms); the pass passes the ms
+        # just past its checkpoint so a fill is never re-folded (issue #11).
+        start_ms = int(start.timestamp() * 1000)
+        try:
+            payload = await self._request_json(
+                "POST",
+                INFO_URL,
+                json_body={
+                    "type": "userFillsByTime",
+                    "user": address.lower(),
+                    "startTime": start_ms,
+                },
+            )
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"userFillsByTime request failed for {address}: {exc}") from exc
+        return parse_fills(payload)
+
     async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
         body: dict[str, str] = {"type": "clearinghouseState", "user": address.lower()}
         if dex is not None:
@@ -89,7 +107,7 @@ class HttpHyperliquidGateway:
         return parse_positions(payload, dex)
 
     async def _request_json(
-        self, method: str, url: str, *, json_body: dict[str, str] | None = None
+        self, method: str, url: str, *, json_body: dict[str, Any] | None = None
     ) -> Any:
         """One request with 429 backoff-and-retry; other failures raise untouched
         (aiohttp errors, wrapped per-endpoint by the callers)."""
