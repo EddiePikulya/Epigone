@@ -244,3 +244,61 @@ async def test_the_pass_is_paced_by_the_weight_budget(pool: asyncpg.Pool) -> Non
 
     assert (clock.now() - start).total_seconds() >= 30
     assert await pool.fetchval("SELECT count(*) FROM fine_metrics") == 30
+
+
+class RecordingBudget:
+    """Grants everything instantly, recording the billing calls."""
+
+    def __init__(self) -> None:
+        self.spends: list[int] = []
+        self.settles: list[int] = []
+
+    async def spend(self, weight: int) -> None:
+        self.spends.append(weight)
+
+    async def settle(self, weight: int) -> None:
+        self.settles.append(weight)
+
+
+async def test_the_fills_surcharge_is_settled_after_the_response(pool: asyncpg.Pool) -> None:
+    # userFills costs its nominal 20 plus weight per 20 fills returned (issue
+    # #41): the size of the response is billed once it is known.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    gateway.set_fills(
+        "0xaaa", [fill(pnl="5", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 46)]
+    )
+    budget = RecordingBudget()
+
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    assert budget.spends == [20]
+    assert budget.settles == [3]  # 45 fills -> ceil(45 / 20)
+
+
+async def test_an_empty_fills_response_settles_nothing(pool: asyncpg.Pool) -> None:
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    gateway.set_fills("0xaaa", [])
+    budget = RecordingBudget()
+
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    assert budget.spends == [20]
+    assert budget.settles == []
+
+
+async def test_a_failed_fetch_settles_no_surcharge(pool: asyncpg.Pool) -> None:
+    # No response arrived, so there is no revealed weight to reconcile.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    gateway.fills_errors["0xaaa"] = RateLimitedError("still 429 after retries")
+    budget = RecordingBudget()
+
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    assert budget.spends == [20]
+    assert budget.settles == []

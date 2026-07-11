@@ -11,6 +11,7 @@ and a 429 under load is pacing, not an outage.
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -31,6 +32,14 @@ from epigone.metrics.fine import FineMetrics, compute_fine_metrics
 log = logging.getLogger(__name__)
 
 FILLS_WEIGHT = 20  # one userFills call, against the shared budget (epigone.budget)
+
+# userFills really costs its base 20 *plus* weight per 20 fills returned
+# (Hyperliquid rate-limit docs; issue #41) — up to ~+100 on a full ~2000-fill
+# response. The surcharge is only known once the response arrives, so the pass
+# settles it post-hoc against the budget; billing it flat at 20 was why "under
+# budget" load still tripped a steady trickle of 429s. Ceil is the conservative
+# read of "per 20 items"; recalibrate here if production metering disagrees.
+FILLS_PER_SURCHARGE_WEIGHT = 20
 
 
 @dataclass(frozen=True)
@@ -80,6 +89,9 @@ async def run_fine_pass(
                 return FineScanResult(refreshed=refreshed, failed=failed, aborted=True)
             continue
         consecutive_failures = 0
+        surcharge = math.ceil(len(fills) / FILLS_PER_SURCHARGE_WEIGHT)
+        if surcharge:
+            await budget.settle(surcharge)
         metrics = compute_fine_metrics(fills, account_value=trader.account_value)
         bot_reason = classify_bot(metrics, month_pnl=trader.month_pnl)
         await _store_fine_metrics(pool, trader.address, metrics, bot_reason, clock.now())
