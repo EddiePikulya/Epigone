@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher
 from epigone.bot.access import install_allowlist_gate
 from epigone.bot.alerts import run_delivery_loop
 from epigone.bot.handlers import build_router
+from epigone.bot.menu import set_bot_commands
 from epigone.clock import SystemClock
 from epigone.config import Settings
 from epigone.db import create_pool, migrate
@@ -36,6 +37,9 @@ async def main() -> None:
 
         # Position Alert delivery (issue #4) rides in the bot process — the
         # one holder of the Telegram token — alongside dialog polling.
+        # Publish the Telegram command menu (admin controls scoped to the owner).
+        await set_bot_commands(bot, settings.admin_telegram_id)
+
         delivery = asyncio.create_task(run_delivery_loop(pool, bot, clock))
         logging.getLogger(__name__).info("bot: starting polling and alert delivery")
         try:

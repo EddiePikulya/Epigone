@@ -15,6 +15,7 @@ from aiogram.methods import (
     EditMessageText,
     GetMe,
     SendMessage,
+    SetMyCommands,
     TelegramMethod,
 )
 from aiogram.methods.base import TelegramType
@@ -49,7 +50,7 @@ class RecordingSession(BaseSession):
         if isinstance(method, GetMe):
             bot_user = TgUser(id=1, is_bot=True, first_name="Epigone", username="epigone_bot")
             return cast(TelegramType, bot_user)
-        if isinstance(method, AnswerCallbackQuery | EditMessageText):
+        if isinstance(method, AnswerCallbackQuery | EditMessageText | SetMyCommands):
             return cast(TelegramType, True)
         raise AssertionError(f"Fake transport has no canned reply for {type(method).__name__}")
 
