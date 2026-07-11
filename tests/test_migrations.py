@@ -224,13 +224,15 @@ async def test_live_and_fresh_converge_after_migration(
 
 async def test_0002_is_schema_noop_on_a_fresh_db(scratch_pool: asyncpg.Pool) -> None:
     """Issue #37: a DB that never had the drift must come out of 0002 with its
-    schema unchanged — 0002 only records itself as applied."""
-    baseline = [m for m in load_migrations() if m.version == 1]
-    await migrate(scratch_pool, baseline)
+    schema unchanged — 0002 only records itself as applied. Scoped to 0002 (not
+    the full chain) so later real schema migrations, like 0003's allowlist
+    table, don't make this pin fail."""
+    up_to_0002 = [m for m in load_migrations() if m.version <= 2]
+    await migrate(scratch_pool, [m for m in up_to_0002 if m.version == 1])
     async with scratch_pool.acquire() as conn:
         before = await _schema_snapshot(conn)
 
-    await migrate(scratch_pool)  # applies 0002 (and re-no-ops 0001)
+    await migrate(scratch_pool, up_to_0002)  # applies 0002 (and re-no-ops 0001)
 
     async with scratch_pool.acquire() as conn:
         after = await _schema_snapshot(conn)
@@ -239,7 +241,7 @@ async def test_0002_is_schema_noop_on_a_fresh_db(scratch_pool: asyncpg.Pool) -> 
             for r in await conn.fetch("SELECT version FROM schema_migrations ORDER BY version")
         ]
     assert before == after
-    assert applied == [m.version for m in load_migrations()]
+    assert applied == [m.version for m in up_to_0002]
 
 
 async def test_concurrent_startups_apply_once(scratch_pool: asyncpg.Pool) -> None:

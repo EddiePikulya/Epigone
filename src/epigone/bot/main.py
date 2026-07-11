@@ -4,6 +4,7 @@ import logging
 import aiohttp
 from aiogram import Bot, Dispatcher
 
+from epigone.bot.access import install_allowlist_gate
 from epigone.bot.alerts import run_delivery_loop
 from epigone.bot.handlers import build_router
 from epigone.clock import SystemClock
@@ -25,8 +26,12 @@ async def main() -> None:
         dp["pool"] = pool
         dp["gateway"] = HttpHyperliquidGateway(session, clock)
         dp["clock"] = clock
+        dp["admin_telegram_id"] = settings.require_admin_telegram_id()  # invite-only owner (#33)
         dp["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
         dp["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
+        # Invite-only gate (#33): the single outer-middleware seam every update
+        # passes before any handler runs.
+        install_allowlist_gate(dp)
         dp.include_router(build_router())
 
         # Position Alert delivery (issue #4) rides in the bot process — the

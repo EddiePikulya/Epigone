@@ -46,7 +46,8 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
     async with pool.acquire() as conn:
         await conn.execute(
             "TRUNCATE users, traders, coarse_metrics, fine_metrics, tracks, "
-            "position_poll_state, position_snapshots, position_alerts, criteria, rate_budget"
+            "position_poll_state, position_snapshots, position_alerts, criteria, "
+            "rate_budget, allowlist"
         )
     yield pool
     await pool.close()
@@ -80,6 +81,11 @@ def dp(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) ->
     dispatcher["pool"] = pool
     dispatcher["gateway"] = gateway
     dispatcher["clock"] = clock
+    # No admin here and no gate installed: the shared dispatcher is ungated so
+    # the bulk of the suite exercises handlers directly. The invite-only gate is
+    # tested against its own gated dispatcher in test_invite_only.py. Admin
+    # commands still resolve this key (None → owner-only refusal).
+    dispatcher["admin_telegram_id"] = None
     dispatcher["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
     dispatcher["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
     dispatcher.include_router(build_router())
