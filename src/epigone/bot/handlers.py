@@ -676,9 +676,13 @@ def build_router() -> Router:
     # Deferred import: the criteria and controls flows build on this module's
     # shared seams (track_address, _render_tracked_list, …), so importing them
     # at the top would cycle.
-    from epigone.bot import controls, criteria
+    from epigone.bot import access, controls, criteria
 
     router = Router()
+    # Invite-only admin commands (#33). The gate is a dispatcher-level outer
+    # middleware (access.install_allowlist_gate); these are the owner's
+    # runtime controls over it, owner-only enforced in the handlers.
+    access.register(router)
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_screener, Command("screener"))
