@@ -224,6 +224,25 @@ async def test_an_unlabeled_trader_is_identified_by_short_address(
     assert "None" not in message.text
 
 
+async def test_an_alert_is_tap_through_to_the_traders_live_positions(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """UX: the alert carries a button that opens the trader's current positions —
+    the same positions:<address> callback /tracked uses, so tapping the wallet in
+    an alert shows what they're holding right now."""
+    address = "0x1116b5fcc070945062e8879841c29807db373d0d"
+    await queue_alert(pool, address=address)
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    assert message.reply_markup is not None
+    (button_row,) = message.reply_markup.inline_keyboard
+    (button,) = button_row
+    assert button.callback_data == f"positions:{address}"
+    assert "0x1116…3d0d" in button.text  # the wallet itself is the clickable element
+
+
 async def test_delivered_alerts_are_never_resent(
     pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:

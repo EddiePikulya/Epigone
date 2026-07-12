@@ -25,8 +25,9 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from epigone.bot.format import held_for, signed_pct, signed_usd, trader_label
+from epigone.bot.format import held_for, short_address, signed_pct, signed_usd, trader_label
 from epigone.clock import Clock
 
 log = logging.getLogger(__name__)
@@ -62,7 +63,11 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
     delivered = 0
     for row in rows:
         try:
-            await bot.send_message(chat_id=row["user_telegram_id"], text=render_alert(row))
+            await bot.send_message(
+                chat_id=row["user_telegram_id"],
+                text=render_alert(row),
+                reply_markup=_positions_button(row),
+            )
         except (TelegramNetworkError, TelegramRetryAfter, TelegramServerError):
             # Telegram itself is struggling, not this chat: touching attempts
             # here would bleed alerts away during an outage. Leave every
@@ -87,6 +92,24 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
         )
         delivered += 1
     return delivered
+
+
+def _positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
+    """Make the alert tap-through to the trader's live positions — the same
+    on-demand view /tracked offers (the positions:<address> callback). An alert
+    only ever fires for a Trader the recipient follows, which is exactly the
+    relationship that handler checks, so the button always resolves."""
+    address: str = row["trader_address"]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"📊 {short_address(address)} — positions",
+                    callback_data=f"positions:{address}",
+                )
+            ]
+        ]
+    )
 
 
 def render_alert(row: asyncpg.Record) -> str:
