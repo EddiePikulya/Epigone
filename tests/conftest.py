@@ -45,9 +45,9 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
     assert pool is not None
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE users, traders, coarse_metrics, fine_metrics, fine_trades, tracks, "
-            "position_poll_state, position_snapshots, position_alerts, criteria, "
-            "rate_budget, allowlist"
+            "TRUNCATE users, traders, coarse_metrics, fine_metrics, fine_trades, "
+            "fine_open_episodes, tracks, position_poll_state, position_snapshots, "
+            "position_alerts, criteria, rate_budget, allowlist"
         )
     yield pool
     await pool.close()

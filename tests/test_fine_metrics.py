@@ -7,7 +7,7 @@ test_golden_wallets.py; here each metric earns its definition on synthetic
 fills small enough to verify by hand.
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -206,9 +206,118 @@ def test_no_perp_fills_yields_an_empty_but_present_result() -> None:
     assert metrics.max_drawdown == Decimal("0")
     assert metrics.avg_leverage is None
     assert metrics.maker_share is None
+    assert metrics.avg_hold_seconds is None
     assert metrics.realized_pnl == Decimal("0")
     assert metrics.window_start is None
     assert metrics.window_end is None
+
+
+# --- Average holding time (issue #48) ----------------------------------------
+# An episode is the span a coin is non-flat: opens when the signed position
+# leaves 0, closes when it returns to 0. avg_hold_seconds is the mean duration
+# over completed episodes; an episode still open at window end is excluded.
+
+
+def _open(coin: str = "HYPE", *, at: datetime, order_id: int = 1) -> Fill:
+    return fill("Open Long", coin=coin, at=at, order_id=order_id, start_position="0")
+
+
+def _add(coin: str = "HYPE", *, at: datetime, order_id: int = 1) -> Fill:
+    # A same-side scale-in: already long, adding more, so it never crosses 0.
+    return fill("Open Long", coin=coin, at=at, order_id=order_id, start_position="1")
+
+
+def _close(coin: str = "HYPE", *, at: datetime, start: str = "1", order_id: int = 1) -> Fill:
+    return fill("Close Long", coin=coin, at=at, order_id=order_id, start_position=start)
+
+
+def test_a_single_open_then_close_is_one_episode() -> None:
+    metrics = compute([_open(at=T0), _close(at=T0 + timedelta(hours=2))])
+    assert metrics.avg_hold_seconds == 2 * 3600
+
+
+def test_scaling_in_stays_one_episode_until_flat() -> None:
+    metrics = compute(
+        [
+            _open(at=T0),
+            _add(at=T0 + timedelta(hours=1)),  # more size, still non-flat
+            _close(at=T0 + timedelta(hours=4), start="2"),  # start 2, size 1 -> 1, still open
+            _close(at=T0 + timedelta(hours=6), start="1"),  # start 1, size 1 -> 0, closes
+        ]
+    )
+    # One episode, T0 -> T0+6h; the interim partial close never ended it.
+    assert metrics.avg_hold_seconds == 6 * 3600
+
+
+def test_the_mean_averages_completed_episodes() -> None:
+    metrics = compute(
+        [
+            _open(at=T0, order_id=1),
+            _close(at=T0 + timedelta(hours=2), order_id=1),  # 2h
+            _open(at=T0 + timedelta(hours=5), order_id=2),
+            _close(at=T0 + timedelta(hours=9), order_id=2),  # 4h
+        ]
+    )
+    assert metrics.avg_hold_seconds == 3 * 3600  # (2h + 4h) / 2
+
+
+def test_a_flip_closes_one_episode_and_opens_the_next() -> None:
+    metrics = compute(
+        [
+            _open(at=T0),
+            # Long > Short: start 1, size 3 -> -2, crosses 0 (closes the long at +2h,
+            # opens a short there).
+            fill("Long > Short", at=T0 + timedelta(hours=2), start_position="1", size="3"),
+            # Close Short: start -2, size 2 -> 0, closes the short at +5h.
+            fill("Close Short", at=T0 + timedelta(hours=5), start_position="-2", size="2"),
+        ]
+    )
+    # Two 2h/3h episodes split at the flip: (2h + 3h) / 2.
+    assert metrics.avg_hold_seconds == (2 * 3600 + 3 * 3600) // 2
+
+
+def test_an_episode_still_open_at_window_end_is_excluded() -> None:
+    only_open = compute([_open(at=T0)])
+    assert only_open.avg_hold_seconds is None  # never closed, no completed episode
+
+    one_closed_one_open = compute(
+        [
+            _open(at=T0, coin="HYPE", order_id=1),
+            _close(at=T0 + timedelta(hours=3), coin="HYPE", order_id=1),
+            _open(at=T0 + timedelta(hours=1), coin="BTC", order_id=2),  # still open at end
+        ]
+    )
+    assert one_closed_one_open.avg_hold_seconds == 3 * 3600  # only the closed one counts
+
+
+def test_episodes_are_tracked_per_coin_independently() -> None:
+    metrics = compute(
+        [
+            _open(at=T0, coin="HYPE", order_id=1),
+            _open(at=T0 + timedelta(hours=1), coin="BTC", order_id=2),
+            _close(at=T0 + timedelta(hours=2), coin="BTC", order_id=2),  # BTC: 1h
+            _close(at=T0 + timedelta(hours=4), coin="HYPE", order_id=1),  # HYPE: 4h
+        ]
+    )
+    assert metrics.avg_hold_seconds == (3600 + 4 * 3600) // 2
+
+
+def test_an_open_predating_the_window_is_not_counted() -> None:
+    # The first fill is already non-flat (start 1): its open is off the front of
+    # the pull, so closing it yields no duration — same truncation caveat as #11.
+    metrics = compute([_close(at=T0 + timedelta(hours=2), start="1")])
+    assert metrics.avg_hold_seconds is None
+
+
+def test_holding_time_folds_across_a_checkpoint() -> None:
+    # A position opened before the checkpoint, closed after it: the open-time
+    # rode the fold in open_episodes, so the close resolves to a real duration.
+    early = [_open(at=T0)]
+    late = [_close(at=T0 + timedelta(hours=3))]  # first late fill is already non-flat
+    folded = metrics_from_state(fold_state(extract_state(early), late), None)
+    assert folded.avg_hold_seconds == 3 * 3600
+    # And it equals computing the union in one shot.
+    assert folded.avg_hold_seconds == compute(early + late).avg_hold_seconds
 
 
 # --- Incremental folding (issue #11) -----------------------------------------

@@ -114,6 +114,23 @@ independently verified win rates (`tests/test_golden_wallets.py`).
 - **Definition:** share of perp fills that did not cross the book
   (`crossed = false`), by fill count.
 
+### Average holding time
+- **In plain words:** how long the account typically holds a position before
+  closing it — short means scalping, long means swinging.
+- **Definition:** mean duration of **completed position episodes** over the
+  fill window (issue #48). An *episode* is the span a coin's position stays
+  non-flat: it opens when the signed position leaves 0 and closes when it
+  returns to 0; a flip through 0 closes one episode and opens the next.
+  Duration is `close_time − open_time`, and the metric is the mean over
+  episodes that closed within the window. An episode still open at window end
+  is excluded (no close time yet), so an in-progress position never skews it.
+  Unavailable (NULL) until at least one episode has completed. Because an
+  episode can straddle an incremental checkpoint — opened in one refresh,
+  closed in a later one — the open-times persist across refreshes and the mean
+  accumulates as a running sum + count, so it stays correct under the #11 fold.
+  Thresholds are typed naturally (`2d`, `12h`, `90m`, `1d 6h`) and displayed
+  the same compact way (`2d 4h`).
+
 ## Bot exclusion
 
 A **Bot** (CONTEXT.md) is an account whose statistical profile indicates

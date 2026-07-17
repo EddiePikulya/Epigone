@@ -182,7 +182,8 @@ async def _load_fine_state(
     #11): the persisted closed trades plus the maker/perp accumulators and the
     fill window, with `checkpoint` (fine_checkpoint_at) as `last_fill_at`."""
     counters = await pool.fetchrow(
-        "SELECT maker_fill_count, perp_fill_count, window_start, window_end "
+        "SELECT maker_fill_count, perp_fill_count, window_start, window_end, "
+        "hold_seconds_sum, hold_episode_count "
         "FROM fine_metrics WHERE address = $1",
         address,
     )
@@ -199,6 +200,11 @@ async def _load_fine_state(
         )
         for r in trade_rows
     )
+    # The open episodes (issue #48): each coin held non-flat at the checkpoint,
+    # so a close arriving in the next batch resolves against its stored open-time.
+    episode_rows = await pool.fetch(
+        "SELECT coin, opened_at FROM fine_open_episodes WHERE address = $1", address
+    )
     return FineState(
         trades=trades,
         maker_fill_count=counters["maker_fill_count"] if counters else 0,
@@ -206,6 +212,9 @@ async def _load_fine_state(
         window_start=counters["window_start"] if counters else None,
         window_end=counters["window_end"] if counters else None,
         last_fill_at=checkpoint,
+        hold_seconds_sum=counters["hold_seconds_sum"] if counters else 0,
+        hold_episode_count=counters["hold_episode_count"] if counters else 0,
+        open_episodes=tuple((r["coin"], r["opened_at"]) for r in episode_rows),
     )
 
 
@@ -227,6 +236,14 @@ async def _store_fine_refresh(
     async with pool.acquire() as conn, conn.transaction():
         if reseed:
             await conn.execute("DELETE FROM fine_trades WHERE address = $1", address)
+        # The open episodes are the whole current set (a Trader holds few coins),
+        # so rewrite them wholesale rather than diff (issue #48).
+        await conn.execute("DELETE FROM fine_open_episodes WHERE address = $1", address)
+        if state.open_episodes:
+            await conn.executemany(
+                "INSERT INTO fine_open_episodes (address, coin, opened_at) VALUES ($1, $2, $3)",
+                [(address, coin, opened_at) for coin, opened_at in state.open_episodes],
+            )
         if delta_trades:
             await conn.executemany(
                 """
@@ -243,9 +260,10 @@ async def _store_fine_refresh(
             """
             INSERT INTO fine_metrics
                 (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
-                 avg_leverage, maker_share, realized_pnl, window_start, window_end,
-                 maker_fill_count, perp_fill_count, computed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                 avg_leverage, maker_share, avg_hold_seconds, realized_pnl,
+                 window_start, window_end, maker_fill_count, perp_fill_count,
+                 hold_seconds_sum, hold_episode_count, computed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (address) DO UPDATE
                 SET trade_count = EXCLUDED.trade_count,
                     win_rate = EXCLUDED.win_rate,
@@ -255,11 +273,14 @@ async def _store_fine_refresh(
                     max_drawdown = EXCLUDED.max_drawdown,
                     avg_leverage = EXCLUDED.avg_leverage,
                     maker_share = EXCLUDED.maker_share,
+                    avg_hold_seconds = EXCLUDED.avg_hold_seconds,
                     realized_pnl = EXCLUDED.realized_pnl,
                     window_start = EXCLUDED.window_start,
                     window_end = EXCLUDED.window_end,
                     maker_fill_count = EXCLUDED.maker_fill_count,
                     perp_fill_count = EXCLUDED.perp_fill_count,
+                    hold_seconds_sum = EXCLUDED.hold_seconds_sum,
+                    hold_episode_count = EXCLUDED.hold_episode_count,
                     computed_at = EXCLUDED.computed_at
             """,
             address,
@@ -271,11 +292,14 @@ async def _store_fine_refresh(
             metrics.max_drawdown,
             metrics.avg_leverage,
             metrics.maker_share,
+            metrics.avg_hold_seconds,
             metrics.realized_pnl,
             metrics.window_start,
             metrics.window_end,
             state.maker_fill_count,
             state.perp_fill_count,
+            state.hold_seconds_sum,
+            state.hold_episode_count,
             computed_at,
         )
         # A flag keeps its original timestamp while the reason stays fresh; a

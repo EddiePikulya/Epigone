@@ -7,6 +7,7 @@ once per Trader from its recent fill history, so a fine filter quietly opts
 the Criteria into fully-analyzed Traders only.
 """
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
@@ -19,6 +20,7 @@ class Unit(Enum):
     USD = "usd"
     COUNT = "count"
     NUMBER = "number"
+    DURATION = "duration"  # User types 2d / 12h / 90m, we store seconds
 
 
 class Scope(Enum):
@@ -167,14 +169,64 @@ _SPECS = [
         ),
         example="80 for 80%",
     ),
+    MetricSpec(
+        key="avg_hold_seconds",
+        label="Avg hold",
+        unit=Unit.DURATION,
+        scope=Scope.FINE,
+        sql="fm.avg_hold_seconds",
+        explanation=(
+            "how long the account typically holds a position before closing it — "
+            "short means scalping, long means swinging."
+        ),
+        example="2d, 12h, or 90m",
+    ),
 ]
 
 METRICS: dict[str, MetricSpec] = {spec.key: spec for spec in _SPECS}
 
 
+_DURATION_UNITS = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+_DURATION_TOKEN = re.compile(r"(\d+)\s*([dhms])")
+
+
+def parse_duration(text: str) -> Decimal | None:
+    """A holding-time threshold → seconds. Accepts one or more `<n><unit>` terms
+    (`2d`, `12h`, `90m`, `1d 6h`); None if nothing parses. `m` is minutes here —
+    never the millions shorthand the numeric units use."""
+    matches = _DURATION_TOKEN.findall(text.strip().lower())
+    if not matches:
+        return None
+    # Reject stray characters so "2dabc" or "2days" don't silently parse to 2d.
+    if _DURATION_TOKEN.sub("", text.strip().lower()).strip():
+        return None
+    return Decimal(sum(int(n) * _DURATION_UNITS[unit] for n, unit in matches))
+
+
+def format_duration(seconds: int) -> str:
+    """A span at one or two units of resolution: 45s / 12m / 3h 20m / 2d 5h.
+
+    The canonical compact-duration formatter — the holding-time label, the
+    track-record line and the position ages (epigone.bot.format) all render
+    through it, so a `2d 4h` looks the same everywhere."""
+    seconds = max(0, seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h {minutes % 60}m" if minutes % 60 else f"{hours}h"
+    days = hours // 24
+    return f"{days}d {hours % 24}h" if hours % 24 else f"{days}d"
+
+
 def parse_threshold(spec: MetricSpec, text: str) -> Decimal | None:
     """A User-typed threshold → the stored value, or None when unparseable.
     Forgiving on the way in: $ , % x and k/m suffixes are all accepted."""
+    if spec.unit is Unit.DURATION:
+        return parse_duration(text)
     raw = text.strip().lower().replace(",", "").replace("$", "").replace("%", "").replace(" ", "")
     multiplier = Decimal(1)
     if raw.endswith("k"):
@@ -205,6 +257,8 @@ def format_value(spec: MetricSpec, value: Decimal) -> str:
         return f"{sign}${_trim(abs(value), grouped=True)}"
     if spec.unit is Unit.COUNT:
         return f"{value:,.0f}"
+    if spec.unit is Unit.DURATION:
+        return format_duration(int(value))
     return _trim(value)
 
 
