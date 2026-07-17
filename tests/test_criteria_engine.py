@@ -81,6 +81,12 @@ async def add_fine(
     )
 
 
+async def set_hold(pool: asyncpg.Pool, address: str, seconds: int) -> None:
+    await pool.execute(
+        "UPDATE fine_metrics SET avg_hold_seconds = $2 WHERE address = $1", address, seconds
+    )
+
+
 def gte(metric: str, threshold: str) -> Filter:
     return Filter(metric=metric, op=Op.GTE, threshold=Decimal(threshold))
 
@@ -113,6 +119,35 @@ async def test_lte_filters_work(pool: asyncpg.Pool) -> None:
     rows = await run_criteria(pool, Criteria(filters=(lte("avg_leverage", "5"),)))
 
     assert [r.address for r in rows] == ["0xcalm"]
+
+
+async def test_filtering_by_holding_time_keeps_swing_traders(pool: asyncpg.Pool) -> None:
+    await add_trader(pool, "0xswing", roi="0.2")
+    await add_fine(pool, "0xswing")
+    await add_trader(pool, "0xscalp", roi="0.8")
+    await add_fine(pool, "0xscalp")
+    await set_hold(pool, "0xswing", 3 * 86400)
+    await set_hold(pool, "0xscalp", 2 * 3600)
+    await add_trader(pool, "0xcoarse", roi="9.9")  # no fine row: NULL never clears the filter
+
+    # "holds >= 2 days": stored as seconds by the DURATION unit.
+    rows = await run_criteria(pool, Criteria(filters=(gte("avg_hold_seconds", str(2 * 86400)),)))
+
+    assert [r.address for r in rows] == ["0xswing"]
+
+
+async def test_sorting_by_holding_time_orders_longest_first(pool: asyncpg.Pool) -> None:
+    await add_trader(pool, "0xslow", roi="0.1")
+    await add_fine(pool, "0xslow")
+    await add_trader(pool, "0xfast", roi="0.2")
+    await add_fine(pool, "0xfast")
+    await set_hold(pool, "0xslow", 5 * 86400)
+    await set_hold(pool, "0xfast", 4 * 3600)
+    await add_trader(pool, "0xpending", roi="9.9")  # no fine row: sorts last, still visible
+
+    rows = await run_criteria(pool, Criteria(sort_key="avg_hold_seconds", sort_desc=True))
+
+    assert [r.address for r in rows] == ["0xslow", "0xfast", "0xpending"]
 
 
 async def test_a_fine_filter_excludes_coarse_only_traders(pool: asyncpg.Pool) -> None:
@@ -348,3 +383,26 @@ def test_counts_must_be_whole_numbers() -> None:
 def test_garbage_thresholds_parse_to_none() -> None:
     assert parse_threshold(METRICS["pnl"], "lots") is None
     assert parse_threshold(METRICS["pnl"], "") is None
+
+
+def test_duration_thresholds_parse_naturally() -> None:
+    avg_hold = METRICS["avg_hold_seconds"]
+    assert parse_threshold(avg_hold, "2d") == Decimal(2 * 86400)
+    assert parse_threshold(avg_hold, "12h") == Decimal(12 * 3600)
+    assert parse_threshold(avg_hold, "90m") == Decimal(90 * 60)  # minutes, not millions
+    assert parse_threshold(avg_hold, "1d 6h") == Decimal(86400 + 6 * 3600)
+    assert parse_threshold(avg_hold, "") is None
+    assert parse_threshold(avg_hold, "soon") is None
+    assert parse_threshold(avg_hold, "2days") is None  # stray text, not a clean 2d
+
+
+def test_duration_format_is_stable_and_round_trips() -> None:
+    avg_hold = METRICS["avg_hold_seconds"]
+    assert format_value(avg_hold, Decimal(2 * 86400 + 4 * 3600)) == "2d 4h"
+    assert format_value(avg_hold, Decimal(12 * 3600)) == "12h"
+    assert format_value(avg_hold, Decimal(90 * 60)) == "1h 30m"
+    # A formatted value parses back to the same seconds it came from.
+    for seconds in (2 * 86400, 12 * 3600, 90 * 60, 86400 + 6 * 3600):
+        assert parse_threshold(avg_hold, format_value(avg_hold, Decimal(seconds))) == Decimal(
+            seconds
+        )

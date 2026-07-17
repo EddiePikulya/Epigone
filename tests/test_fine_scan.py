@@ -401,6 +401,40 @@ async def test_incremental_refresh_settles_only_the_new_fills_surcharge(
     assert budget.settles == [3, 1]  # full pull's surcharge, then just the new fills'
 
 
+async def test_holding_time_folds_across_an_incremental_refresh(pool: asyncpg.Pool) -> None:
+    # A position opened before the checkpoint and closed in the next batch: the
+    # open-time survived the fold in fine_open_episodes, so the incremental close
+    # resolves to the right holding time (issue #48).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    opened = fill("Open Long", order_id=1, at=T0, start_position="0")
+    gateway.set_fills("0xaaa", [opened])
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    # Nothing has closed yet: no average, but the open episode persists.
+    assert (
+        await pool.fetchval("SELECT avg_hold_seconds FROM fine_metrics WHERE address = '0xaaa'")
+        is None
+    )
+    episodes = "SELECT count(*) FROM fine_open_episodes WHERE address = '0xaaa'"
+    assert await pool.fetchval(episodes) == 1
+
+    closed = fill("Close Long", order_id=2, at=T0 + timedelta(hours=3), start_position="1")
+    gateway.set_fills("0xaaa", [opened, closed])
+    clock.advance(2 * 24 * 3600)  # past the active cadence; only the close is new
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    row = await pool.fetchrow(
+        "SELECT avg_hold_seconds, hold_episode_count FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert row is not None
+    assert row["avg_hold_seconds"] == 3 * 3600  # T0 -> T0+3h, resolved across the fold
+    assert row["hold_episode_count"] == 1
+    assert await pool.fetchval(episodes) == 0  # the episode closed, its open row is gone
+
+
 async def test_a_refresh_with_no_new_fills_does_not_double_count(pool: asyncpg.Pool) -> None:
     # A boundary re-fetch (nothing new since the checkpoint) must leave the
     # accumulators untouched — the counters are running totals (#11).

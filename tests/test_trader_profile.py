@@ -33,8 +33,9 @@ async def add_fine(pool: asyncpg.Pool, address: str = WHALE) -> None:
         """
         INSERT INTO fine_metrics
             (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
-             avg_leverage, maker_share, realized_pnl, window_start, window_end, computed_at)
-        VALUES ($1, 161, 0.708, 3951, 841, 12.97, 13893, 2.5, 0.94, 531967, $2, $2, $2)
+             avg_leverage, maker_share, avg_hold_seconds, realized_pnl,
+             window_start, window_end, computed_at)
+        VALUES ($1, 161, 0.708, 3951, 841, 12.97, 13893, 2.5, 0.94, 187200, 531967, $2, $2, $2)
         """,
         address,
         NOW,
@@ -55,7 +56,23 @@ async def test_profile_shows_fine_metrics_when_available(
     assert "avg win $3,951 · avg loss $841" in text
     assert "Sharpe 13.0 · max drawdown $13,893" in text
     assert "94% maker · ~2.5x leverage" in text
+    assert "⏱ Avg hold: 2d 4h" in text
     assert "coarse" not in text.lower()
+
+
+async def test_profile_omits_holding_time_when_absent(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # A trader with too little history for a completed episode shows no hold line
+    # at all — never a misleading 0 (docs/metrics.md NULL convention).
+    await follow(dp, bot)
+    await add_fine(pool)
+    await pool.execute("UPDATE fine_metrics SET avg_hold_seconds = NULL WHERE address = $1", WHALE)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Avg hold" not in text
 
 
 async def test_a_coarse_only_trader_is_visibly_coarse_only(

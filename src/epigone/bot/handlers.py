@@ -22,6 +22,7 @@ from epigone.gateway import (
     Window,
     fetch_open_positions,
 )
+from epigone.metrics.library import format_duration
 from epigone.screener import ScreenerRow, run_screener
 
 SCREENER_PAGE_SIZE = 5
@@ -614,7 +615,7 @@ async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
         """
         SELECT t.bot_reason, fm.address IS NOT NULL AS fine_available,
                fm.trade_count, fm.win_rate, fm.avg_win, fm.avg_loss, fm.sharpe,
-               fm.max_drawdown, fm.avg_leverage, fm.maker_share,
+               fm.max_drawdown, fm.avg_leverage, fm.maker_share, fm.avg_hold_seconds,
                cm.pnl AS month_pnl, cm.roi AS month_roi
         FROM traders t
         LEFT JOIN fine_metrics fm ON fm.address = t.address
@@ -655,6 +656,8 @@ def _fine_lines(row: asyncpg.Record) -> list[str]:
     ]
     if any(style):
         lines.append(" · ".join(part for part in style if part is not None))
+    if row["avg_hold_seconds"] is not None:
+        lines.append(f"⏱ Avg hold: {format_duration(row['avg_hold_seconds'])}")
     return lines
 
 
