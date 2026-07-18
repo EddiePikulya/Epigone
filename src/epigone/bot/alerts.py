@@ -139,12 +139,16 @@ def _new_leg(row: asyncpg.Record) -> str:
 
 
 def _scale_leg(row: asyncpg.Record) -> str:
-    """A scale alert (issue #10): the size it grew from → to, with the % change
-    so a User sees at a glance how big a conviction move it was."""
+    """A scale alert (issue #10): the size it grew from → to at what leverage,
+    plus the position's live PnL — return on margin (issue #35) — so a User sees
+    at a glance whether the trade is actually winning, not just how much bigger
+    it got. PnL is omitted only when it isn't available."""
     prev: Decimal = row["prev_size_usd"]
     new: Decimal = row["size_usd"]
-    change = (new - prev) / prev if prev else Decimal(0)
-    return f"${prev:,.0f} → ${new:,.0f} ({signed_pct(change)}) at {row['leverage']}x"
+    leg = f"${prev:,.0f} → ${new:,.0f} at {row['leverage']}x"
+    if row["pct_return"] is not None:
+        leg += f", PnL {signed_pct(row['pct_return'])}"
+    return leg
 
 
 def _closed_leg(row: asyncpg.Record) -> str:
