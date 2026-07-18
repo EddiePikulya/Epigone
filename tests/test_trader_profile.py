@@ -100,6 +100,36 @@ async def test_an_unscanned_trader_says_so(
     assert "No metrics yet" in text
 
 
+async def test_the_positions_view_offers_an_unfollow_button(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    await follow(dp, bot)
+    await add_fine(pool)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    markup = session.sent_messages()[-1].reply_markup
+    assert markup is not None
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    assert any(b.callback_data == f"posunfollow:{WHALE}" for b in buttons)
+
+
+async def test_unfollow_from_the_positions_view_drops_the_track_in_place(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    await follow(dp, bot)
+    assert await pool.fetchval("SELECT count(*) FROM tracks WHERE trader_address = $1", WHALE) == 1
+
+    await feed_callback(dp, bot, f"posunfollow:{WHALE}", user_id=111)
+
+    # the Track is gone, confirmed in place (button removed) and via the toast
+    assert await pool.fetchval("SELECT count(*) FROM tracks WHERE trader_address = $1", WHALE) == 0
+    edited = session.edited_messages()[-1]
+    assert "Unfollowed" in (edited.text or "")
+    assert edited.reply_markup is None
+    assert "Unfollowed" in (session.callback_answers()[-1].text or "")
+
+
 async def test_a_tracked_bot_carries_its_flag(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:

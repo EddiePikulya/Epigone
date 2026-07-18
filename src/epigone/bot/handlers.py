@@ -5,6 +5,7 @@ from enum import Enum
 
 import asyncpg
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
@@ -188,11 +189,42 @@ async def on_positions(
         + "\n\n"
         + await _render_track_record(pool, address)
     )
+    # An unfollow escape hatch right here: seeing a Trader's positions is exactly
+    # when a User decides they've gone bad and wants out (posunfollow drops the
+    # Track in place, no jump to the list or profile).
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")]
+        ]
+    )
     if isinstance(callback.message, Message):
-        await callback.message.answer(view)  # the chat the button lives in
+        await callback.message.answer(view, reply_markup=markup)  # the chat the button lives in
     else:
-        await bot.send_message(chat_id=callback.from_user.id, text=view)
+        await bot.send_message(chat_id=callback.from_user.id, text=view, reply_markup=markup)
     await callback.answer()
+
+
+async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool) -> None:
+    """Unfollow straight from the positions view (📊): drop the Track, confirm in
+    place, and remove the button — no jump to the list or profile. For the
+    "their positions look bad now, I'm out" moment."""
+    address = (callback.data or "").removeprefix("posunfollow:")
+    status = await pool.execute(
+        "DELETE FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
+        callback.from_user.id,
+        address,
+    )
+    removed = status != "DELETE 0"  # a stale button tap deletes nothing
+    if removed and isinstance(callback.message, Message):
+        body = callback.message.text or ""
+        try:
+            await callback.message.edit_text(
+                f"{body}\n\n✖️ Unfollowed — you'll no longer get alerts for this trader.",
+                reply_markup=None,
+            )
+        except TelegramBadRequest:
+            pass  # the unfollow itself succeeded; only the in-place confirmation is stale
+    await callback.answer(_unfollow_toast(removed, address))
 
 
 async def on_unfollow(
@@ -764,6 +796,7 @@ def build_router() -> Router:
     router.callback_query.register(on_profile, F.data.startswith("profile:"))
     router.callback_query.register(on_profile_follow, F.data.startswith("pfollow:"))
     router.callback_query.register(on_profile_unfollow, F.data.startswith("punfollow:"))
+    router.callback_query.register(on_positions_unfollow, F.data.startswith("posunfollow:"))
     router.callback_query.register(on_positions, F.data.startswith("positions:"))
     router.callback_query.register(on_unfollow, F.data.startswith("unfollow:"))
     return router
