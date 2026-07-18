@@ -11,6 +11,7 @@ from decimal import Decimal
 import asyncpg
 from aiogram import Bot
 
+from epigone.budget import record_rate_limit
 from epigone.monitor.alerting import Monitor
 from epigone.monitor.checks import CheckThresholds
 from epigone.monitor.config import MonitorConfig
@@ -39,6 +40,8 @@ def _config() -> MonitorConfig:
             ingest_stall=timedelta(minutes=30),
             coarse_stale=timedelta(minutes=120),
             alert_backlog=timedelta(minutes=5),
+            rate_window=timedelta(minutes=15),
+            rate_max_events=5,
             disk_percent=85,
         ),
         disk_path="/",
@@ -169,6 +172,54 @@ async def test_a_delivery_backlog_is_reported_with_its_count(
     assert len(messages) == 1
     (sent,) = session.sent_messages()
     assert "Alert delivery" in sent.text and "1 undelivered" in sent.text
+
+
+async def test_a_rate_limit_spike_is_reported_from_the_recorded_events(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # The full read side of issue #54: escaped-429 events the passes stamped in
+    # rate_limit_events, counted over the window, trip the rate check.
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(minutes=1),
+        computed_at=clock.now() - timedelta(minutes=1),
+    )
+    for i in range(5):  # threshold is 5 within the 15-minute window
+        await record_rate_limit(pool, clock.now() - timedelta(minutes=i))
+
+    messages = await _cycle(pool, bot, _monitor(), clock)
+
+    assert len(messages) == 1
+    (sent,) = session.sent_messages()
+    assert "Rate limiting" in sent.text and "throttling" in sent.text
+
+
+async def test_isolated_rate_limit_events_below_the_threshold_do_not_alarm(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # A couple of absorbed-but-escaped 429s are normal pacing (user story #2):
+    # under the count threshold, the cycle stays silent.
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(minutes=1),
+        computed_at=clock.now() - timedelta(minutes=1),
+    )
+    for _ in range(2):
+        await record_rate_limit(pool, clock.now())
+
+    assert await _cycle(pool, bot, _monitor(), clock) == []
+
+
+async def test_rate_events_outside_the_window_are_not_counted(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # Events older than the window subsided long ago and must not keep alarming.
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(minutes=1),
+        computed_at=clock.now() - timedelta(minutes=1),
+    )
+    for _ in range(5):
+        await record_rate_limit(pool, clock.now() - timedelta(minutes=30))
+
+    assert await _cycle(pool, bot, _monitor(), clock) == []
 
 
 async def test_a_full_disk_is_reported(

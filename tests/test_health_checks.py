@@ -14,6 +14,7 @@ from epigone.monitor.checks import (
     DATABASE,
     DISK,
     INGEST,
+    RATE,
     WARNING,
     CheckResult,
     CheckThresholds,
@@ -29,6 +30,8 @@ THRESHOLDS = CheckThresholds(
     ingest_stall=timedelta(minutes=30),
     coarse_stale=timedelta(minutes=120),
     alert_backlog=timedelta(minutes=5),
+    rate_window=timedelta(minutes=15),
+    rate_max_events=5,
     disk_percent=85,
 )
 
@@ -42,6 +45,7 @@ HEALTHY = HealthSnapshot(
     last_coarse_compute=NOW - timedelta(minutes=12),
     undelivered_alerts=0,
     oldest_undelivered_alert=None,
+    recent_rate_limits=0,
     disk_percent_used=47.0,
 )
 
@@ -53,7 +57,7 @@ def _by_name(results: list[CheckResult], name: str) -> CheckResult:
 def test_a_healthy_system_trips_no_check() -> None:
     results = evaluate_checks(HEALTHY, THRESHOLDS)
     assert all(r.ok for r in results)
-    assert {r.name for r in results} == {DATABASE, INGEST, COARSE, ALERTS, DISK}
+    assert {r.name for r in results} == {DATABASE, INGEST, COARSE, ALERTS, RATE, DISK}
 
 
 def test_ingest_is_flagged_when_no_refresh_in_window_and_traders_are_due() -> None:
@@ -105,6 +109,26 @@ def test_a_fresh_undelivered_alert_within_the_window_is_not_a_backlog() -> None:
     assert _by_name(evaluate_checks(snapshot, THRESHOLDS), ALERTS).ok
 
 
+def test_a_sustained_rate_limit_spike_is_flagged() -> None:
+    # At or past the count threshold within the window (issue #54): real limiting.
+    snapshot = replace(HEALTHY, recent_rate_limits=5)
+    rate = _by_name(evaluate_checks(snapshot, THRESHOLDS), RATE)
+    assert not rate.ok
+    assert rate.severity == WARNING
+    assert "5" in rate.detail and "throttling" in rate.detail
+
+
+def test_isolated_rate_limit_events_below_the_threshold_do_not_alarm() -> None:
+    # A few escaped-429s under the count are normal pacing, not an outage (user
+    # story #2): the check stays healthy.
+    assert _by_name(evaluate_checks(replace(HEALTHY, recent_rate_limits=4), THRESHOLDS), RATE).ok
+
+
+def test_a_missing_rate_reading_is_treated_as_healthy() -> None:
+    # None only happens on a read miss — never a false alarm, like the disk probe.
+    assert _by_name(evaluate_checks(replace(HEALTHY, recent_rate_limits=None), THRESHOLDS), RATE).ok
+
+
 def test_disk_is_flagged_at_the_threshold_and_escalates_when_critical() -> None:
     warn = _by_name(evaluate_checks(replace(HEALTHY, disk_percent_used=90.0), THRESHOLDS), DISK)
     assert not warn.ok and warn.severity == WARNING and "90%" in warn.detail
@@ -130,4 +154,5 @@ def test_heartbeat_digest_carries_the_key_liveness_numbers() -> None:
     assert "41,203 wallets" in digest
     assert "312 fine-refreshed today" in digest
     assert "coarse fresh 12m ago" in digest
+    assert "0 rate errors" in digest
     assert "disk 47%" in digest

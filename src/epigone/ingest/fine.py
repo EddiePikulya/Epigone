@@ -22,7 +22,7 @@ from decimal import Decimal
 
 import asyncpg
 
-from epigone.budget import Budget
+from epigone.budget import Budget, record_rate_limit
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, HyperliquidGateway, RateLimitedError
 from epigone.ingest.scan import (
@@ -100,6 +100,10 @@ async def run_fine_pass(
             # a 429 streak must never abort the pass.
             log.warning("fine pass: rate limited fetching fills for %s", trader.address)
             await _stamp_attempt(pool, trader.address, clock.now())
+            # Surface the sustained-limiting signal for the health monitor (#54):
+            # this 429 streak survived the gateway's backoff, so it is real
+            # limiting worth alerting on, not the normal single-429 pacing.
+            await record_rate_limit(pool, clock.now())
             failed += 1
             continue
         except GatewayError:

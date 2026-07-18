@@ -52,7 +52,7 @@ from decimal import Decimal
 
 import asyncpg
 
-from epigone.budget import Budget
+from epigone.budget import Budget, record_rate_limit
 from epigone.clock import Clock
 from epigone.gateway import (
     POSITION_VENUES,
@@ -126,6 +126,9 @@ async def run_poll_pass(
             # and retried; the wallet just polls again next pass. Never counts
             # toward the abort streak.
             log.warning("poll pass: rate limited polling %s; retrying next pass", address)
+            # Feed the health monitor's sustained-limiting signal (#54): a streak
+            # that outlasted the gateway's backoff is real limiting, not pacing.
+            await record_rate_limit(pool, clock.now())
             failed += 1
             continue
         except GatewayError:

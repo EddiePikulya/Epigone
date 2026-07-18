@@ -21,6 +21,12 @@ DEFAULT_REMINDER_HOURS = 6
 DEFAULT_HEARTBEAT_HOUR = 9  # UTC; the server runs on UTC (deploy.md)
 DEFAULT_INGEST_STALL_MINUTES = 30
 DEFAULT_ALERT_BACKLOG_MINUTES = 5
+# Sustained rate limiting (issue #54): fail when at least this many escaped-429
+# events land within the window. Post-#41 the steady state is ~0 escaped 429s,
+# so a handful over a quarter-hour is a real regression, not pacing — while a
+# lone unlucky call staying under the count keeps quiet (user story #2).
+DEFAULT_RATE_WINDOW_MINUTES = 15
+DEFAULT_RATE_MAX_EVENTS = 5
 DEFAULT_DISK_PERCENT = 85
 DEFAULT_DISK_PATH = "/"
 # Coarse metrics older than this multiple of the seed interval mean the re-seed
@@ -78,6 +84,18 @@ class MonitorConfig:
                         default=DEFAULT_ALERT_BACKLOG_MINUTES,
                         name="HEALTHCHECK_ALERT_BACKLOG_MINUTES",
                     )
+                ),
+                rate_window=timedelta(
+                    minutes=parse_positive_int(
+                        os.environ.get("HEALTHCHECK_RATE_WINDOW_MINUTES"),
+                        default=DEFAULT_RATE_WINDOW_MINUTES,
+                        name="HEALTHCHECK_RATE_WINDOW_MINUTES",
+                    )
+                ),
+                rate_max_events=parse_positive_int(
+                    os.environ.get("HEALTHCHECK_RATE_MAX_EVENTS"),
+                    default=DEFAULT_RATE_MAX_EVENTS,
+                    name="HEALTHCHECK_RATE_MAX_EVENTS",
                 ),
                 disk_percent=_parse_disk_percent(os.environ.get("HEALTHCHECK_DISK_PERCENT")),
             ),

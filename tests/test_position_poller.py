@@ -363,6 +363,8 @@ async def test_rate_limit_streaks_do_not_abort_the_pass(
 
     assert not result.aborted
     assert result.failed == 6 and result.polled == 1
+    # Each escaped RateLimitedError feeds the health monitor's signal (issue #54).
+    assert await pool.fetchval("SELECT count(*) FROM rate_limit_events") == 6
 
 
 async def test_the_pass_is_paced_by_the_weight_budget(

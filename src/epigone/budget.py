@@ -82,6 +82,12 @@ METER_WINDOW_SECONDS = 60.0
 # minute — reset silently rather than log a figure diluted over hours.
 METER_STALE_SECONDS = 120.0
 
+# Rate-limit events (issue #54) older than this are pruned as new ones land: the
+# health monitor only ever asks about a recent window (default 15m), so a day of
+# retention is ample and keeps the append-only log tiny without a separate
+# sweeper. Comfortably larger than any sane HEALTHCHECK_RATE_WINDOW_MINUTES.
+RATE_EVENT_RETENTION = timedelta(days=1)
+
 
 class Budget(Protocol):
     """The pacing seam the passes spend against.
@@ -245,6 +251,29 @@ class SharedWeightBudget:
             meter_started_at,
             meter_spent,
         )
+
+
+async def record_rate_limit(pool: asyncpg.Pool, occurred_at: datetime) -> None:
+    """Stamp a sustained rate-limit event for the health monitor (issue #54).
+
+    Called only when a `RateLimitedError` escapes the gateway — the gateway
+    already backed off and retried through a full 429 streak (issue #28), so each
+    event is real limiting, never a lone backoff-absorbed 429 (which never gets
+    here; user story #2). Writes an append-only `rate_limit_events` row rather
+    than touching the hot `rate_budget` bucket every spender locks, and prunes
+    stale rows as it goes. Best-effort by design: a failed health-signal write
+    must never disturb the ingest/stream pass it rides on."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO rate_limit_events (occurred_at) VALUES ($1)", occurred_at
+            )
+            await conn.execute(
+                "DELETE FROM rate_limit_events WHERE occurred_at < $1",
+                occurred_at - RATE_EVENT_RETENTION,
+            )
+    except Exception:
+        log.warning("failed to record rate-limit event", exc_info=True)
 
 
 def _gate_window(weight: int) -> timedelta:

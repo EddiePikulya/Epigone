@@ -16,7 +16,7 @@ nominal pre-call estimate.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import asyncpg
 import pytest
@@ -24,10 +24,12 @@ import pytest
 from epigone.budget import (
     BURST_WEIGHT,
     PER_IP_WEIGHT_PER_MINUTE,
+    RATE_EVENT_RETENTION,
     SHARED_WEIGHT_PER_MINUTE,
     SMOOTHING_WEIGHT_PER_SECOND,
     STREAM_RESERVE_WEIGHT,
     SharedWeightBudget,
+    record_rate_limit,
 )
 from tests.support.clock import FakeClock
 
@@ -263,3 +265,36 @@ async def test_a_stale_minute_window_resets_silently(
     with caplog.at_level(logging.INFO, logger="epigone.budget"):
         await budget.spend(20)
     assert not [r for r in caplog.records if "rate budget" in r.getMessage()]
+
+
+# --- Rate-limit signal for the health monitor (issue #54) --------------------
+
+
+async def test_record_rate_limit_stamps_an_event(pool: asyncpg.Pool, clock: FakeClock) -> None:
+    await record_rate_limit(pool, clock.now())
+    rows = await pool.fetch("SELECT occurred_at FROM rate_limit_events")
+    assert [r["occurred_at"] for r in rows] == [clock.now()]
+
+
+async def test_record_rate_limit_prunes_events_past_the_retention(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    # Old events subsided long ago; a new one prunes them so the log stays tiny.
+    stale = clock.now() - RATE_EVENT_RETENTION - timedelta(minutes=1)
+    await pool.execute("INSERT INTO rate_limit_events (occurred_at) VALUES ($1)", stale)
+    await record_rate_limit(pool, clock.now())
+    remaining = await pool.fetchval("SELECT count(*) FROM rate_limit_events")
+    assert remaining == 1  # the stale row pruned, only the fresh event kept
+
+
+async def test_record_rate_limit_never_disturbs_the_budget_row(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    # The signal rides its own table, off the hot rate_budget bucket every
+    # spender locks: recording must not touch the pacing state.
+    budget = SharedWeightBudget(pool, clock)
+    await budget.spend(BURST_WEIGHT)
+    before = dict(await pool.fetchrow("SELECT * FROM rate_budget"))
+    await record_rate_limit(pool, clock.now())
+    after = dict(await pool.fetchrow("SELECT * FROM rate_budget"))
+    assert before == after

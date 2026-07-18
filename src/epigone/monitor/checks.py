@@ -8,15 +8,18 @@ feed synthetic snapshots and assert on which checks fail and what text they
 carry, never touching the wall clock or the live server.
 
 Checks split by what's observable (issue #52):
-- DB-observable — ingest progress, coarse freshness, alert-delivery backlog, and
-  DB reachability itself; a single connection answers all of them.
+- DB-observable — ingest progress, coarse freshness, alert-delivery backlog,
+  rate health, and DB reachability itself; a single connection answers all.
 - Host-observable — disk headroom, read via an injected `DiskProbe` so the
   container needs only the host filesystem mounted, not the docker socket.
 
-Rate health (429 spike, user story #5) is a deliberate V1 omission: it lives in
-the ingest logs, not the DB, and the issue explicitly permits shipping it as a
-fast-follow rather than coupling the monitor to the docker socket or widening the
-ingest write-path. It is the one gap; the other five checks are complete.
+Rate health (the 429 spike, user story #5) landed as the #52 fast-follow (issue
+#54): rather than coupling the monitor to the docker socket to scrape ingest
+logs, the ingest/stream passes stamp a `rate_limit_events` row whenever a
+`RateLimitedError` escapes the gateway's backoff (epigone.budget), and this
+check counts those events over a recent window. That keeps the monitor a pure
+DB+Telegram process and distinguishes sustained limiting from the normal
+single-429 backoff pacing (issues #28/#41), which never reaches the signal.
 """
 
 from dataclasses import dataclass
@@ -36,6 +39,7 @@ DATABASE = "database"
 INGEST = "ingest"
 COARSE = "coarse"
 ALERTS = "alerts"
+RATE = "rate"
 DISK = "disk"
 
 WARNING = "warning"
@@ -62,6 +66,11 @@ class CheckThresholds:
     ingest_stall: timedelta
     coarse_stale: timedelta
     alert_backlog: timedelta
+    # Sustained rate limiting (issue #54): fail once at least `rate_max_events`
+    # escaped-429 events land within `rate_window`. The count threshold is what
+    # separates a sustained spike from an isolated backoff-absorbed 429.
+    rate_window: timedelta
+    rate_max_events: int
     disk_percent: float
 
 
@@ -79,6 +88,9 @@ class HealthSnapshot:
     last_coarse_compute: datetime | None = None
     undelivered_alerts: int | None = None
     oldest_undelivered_alert: datetime | None = None
+    # Escaped-429 events (issue #54) within the rate window — the count is taken
+    # at gather time so the pure check only compares it to the threshold.
+    recent_rate_limits: int | None = None
     disk_percent_used: float | None = None
 
 
@@ -95,11 +107,15 @@ class CheckResult:
 
 
 async def gather_snapshot(
-    pool: asyncpg.Pool, clock: Clock, disk: DiskProbe
+    pool: asyncpg.Pool, clock: Clock, disk: DiskProbe, thresholds: CheckThresholds
 ) -> HealthSnapshot:
     """Read every liveness signal in one pass. A query failure is itself the
     loudest signal (DB down), so the caller catches it and reports it — see
-    `db_down`. `now` is stamped from the injected clock, not the wall clock."""
+    `db_down`. `now` is stamped from the injected clock, not the wall clock.
+
+    `thresholds.rate_window` scopes the escaped-429 count read here (issue #54),
+    the way `delivered_at IS NULL` scopes the alert backlog — a raw observation
+    of "how many recently", leaving the threshold decision to `evaluate_checks`."""
     now = clock.now()
     row = await pool.fetchrow(
         """
@@ -113,10 +129,13 @@ async def gather_snapshot(
                 WHERE delivered_at IS NULL AND attempts < $2) AS undelivered_alerts,
             (SELECT min(created_at) FROM position_alerts
                 WHERE delivered_at IS NULL AND attempts < $2)
-                AS oldest_undelivered_alert
+                AS oldest_undelivered_alert,
+            (SELECT count(*) FROM rate_limit_events WHERE occurred_at >= $3)
+                AS recent_rate_limits
         """,
         _start_of_day(now),
         MAX_DELIVERY_ATTEMPTS,
+        now - thresholds.rate_window,
     )
     assert row is not None
     return HealthSnapshot(
@@ -129,6 +148,7 @@ async def gather_snapshot(
         last_coarse_compute=row["last_coarse_compute"],
         undelivered_alerts=row["undelivered_alerts"],
         oldest_undelivered_alert=row["oldest_undelivered_alert"],
+        recent_rate_limits=row["recent_rate_limits"],
         disk_percent_used=disk.percent_used(),
     )
 
@@ -163,6 +183,7 @@ def evaluate_checks(
         _ingest_check(snapshot, thresholds.ingest_stall),
         _coarse_check(snapshot, thresholds.coarse_stale),
         _alerts_check(snapshot, thresholds.alert_backlog),
+        _rate_check(snapshot, thresholds.rate_max_events),
         _disk_check(snapshot, thresholds.disk_percent),
     ]
 
@@ -233,6 +254,30 @@ def _alerts_check(snapshot: HealthSnapshot, backlog: timedelta) -> CheckResult:
     )
 
 
+def _rate_check(snapshot: HealthSnapshot, max_events: int) -> CheckResult:
+    """Sustained rate limiting (user story #5). Each counted event is a
+    RateLimitedError that outlasted the gateway's backoff-and-retry (issue #28)
+    — ~30s of 429s on one call — so an isolated backoff-absorbed 429 never
+    reaches the signal (user story #2). At or past the threshold over the window
+    means limiting is back and likely starving the fine pass or alerts. A None
+    count (only on a DB read miss) reads as healthy, never a false alarm."""
+    count = snapshot.recent_rate_limits or 0
+    if count >= max_events:
+        return CheckResult(
+            RATE,
+            "Rate limiting",
+            ok=False,
+            severity=WARNING,
+            detail=(
+                f"Rate limiting: {count:,} sustained rate-limit event(s) in the recent window "
+                f"(threshold {max_events:,}) — Hyperliquid is throttling us"
+            ),
+        )
+    return CheckResult(
+        RATE, "Rate limiting", ok=True, severity=WARNING, detail="Rate limiting normal"
+    )
+
+
 def _disk_check(snapshot: HealthSnapshot, limit: float) -> CheckResult:
     """Disk headroom on the host: backups plus the growing fine_trades table are
     the real risk. A probe that returns None (no host visibility) is treated as
@@ -260,6 +305,7 @@ def heartbeat_digest(snapshot: HealthSnapshot) -> str:
         "coarse never computed" if coarse_age is None else f"coarse fresh {_ago(coarse_age)} ago"
     )
     parts.append(f"{_count(snapshot.undelivered_alerts)} alerts pending")
+    parts.append(f"{_count(snapshot.recent_rate_limits)} rate errors")
     if snapshot.disk_percent_used is not None:
         parts.append(f"disk {snapshot.disk_percent_used:.0f}%")
     return "✅ Epigone healthy · " + " · ".join(parts)
