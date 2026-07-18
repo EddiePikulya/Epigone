@@ -54,26 +54,25 @@ class Settings:
         return self.admin_telegram_id
 
 
-def _parse_seed_interval_minutes(raw: str | None) -> int:
-    """Parse SEED_INTERVAL_MINUTES, falling back to the 60-min default (with a
-    logged warning) on anything non-numeric or non-positive — a misconfiguration
-    must never wedge or hammer ingestion (issue #50)."""
+def parse_positive_int(raw: str | None, *, default: int, name: str) -> int:
+    """Parse a positive-int env var, falling back to `default` (with a logged
+    warning naming the var) on anything non-numeric or non-positive. The house
+    convention for operator-tunable knobs (issues #50, #52): a misconfiguration
+    must degrade to the safe default, never wedge or hammer a process."""
     if raw is None:
-        return DEFAULT_SEED_INTERVAL_MINUTES
+        return default
     try:
-        minutes = int(raw)
+        value = int(raw)
     except ValueError:
-        log.warning(
-            "SEED_INTERVAL_MINUTES=%r is not an integer; using %d",
-            raw,
-            DEFAULT_SEED_INTERVAL_MINUTES,
-        )
-        return DEFAULT_SEED_INTERVAL_MINUTES
-    if minutes <= 0:
-        log.warning(
-            "SEED_INTERVAL_MINUTES=%r is not positive; using %d",
-            raw,
-            DEFAULT_SEED_INTERVAL_MINUTES,
-        )
-        return DEFAULT_SEED_INTERVAL_MINUTES
-    return minutes
+        log.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if value <= 0:
+        log.warning("%s=%r is not positive; using %d", name, raw, default)
+        return default
+    return value
+
+
+def _parse_seed_interval_minutes(raw: str | None) -> int:
+    return parse_positive_int(
+        raw, default=DEFAULT_SEED_INTERVAL_MINUTES, name="SEED_INTERVAL_MINUTES"
+    )

@@ -140,25 +140,50 @@ async def _stamp_attempt(pool: asyncpg.Pool, address: str, now: datetime) -> Non
     await pool.execute("UPDATE traders SET fine_attempted_at = $2 WHERE address = $1", address, now)
 
 
+# The fine-pass eligibility predicate, single-sourced so the health monitor
+# (issue #52) can count *due* Traders with the exact same rule the pass rotates
+# on — "idle because caught up" must read as healthy, not as a stuck pass. Reads
+# `traders t LEFT JOIN coarse_metrics cm (month)`; $1 = active cutoff, $2 =
+# dormant cutoff. Tracked Traders may predate their first coarse scan (NULL
+# tier/coarse row); they refresh on the active cadence.
+DUE_ELIGIBILITY = """
+    (
+        EXISTS (SELECT 1 FROM tracks WHERE trader_address = t.address)
+        OR (cm.pnl > 0 AND cm.volume > 0)
+    )
+    AND (
+        t.fine_refreshed_at IS NULL
+        OR t.fine_refreshed_at <=
+            CASE WHEN t.refresh_tier = 'dormant'
+                 THEN $2::timestamptz ELSE $1::timestamptz END
+    )
+"""
+
+
+async def count_due_traders(pool: asyncpg.Pool, now: datetime) -> int:
+    """How many eligible Traders are due a fine refresh right now — the same
+    predicate `_due_traders` rotates on (issue #52's ingest-progress check)."""
+    count = await pool.fetchval(
+        f"""
+        SELECT count(*)
+        FROM traders t
+        LEFT JOIN coarse_metrics cm ON cm.address = t.address AND cm.time_window = 'month'
+        WHERE {DUE_ELIGIBILITY}
+        """,
+        now - ACTIVE_REFRESH_INTERVAL,
+        now - DORMANT_REFRESH_INTERVAL,
+    )
+    return int(count)
+
+
 async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
     # Same rotation as the coarse pass: least-recently-attempted first.
-    # Tracked Traders may predate their first coarse scan (NULL tier/coarse
-    # row); they refresh on the active cadence.
     rows = await pool.fetch(
-        """
+        f"""
         SELECT t.address, t.fine_checkpoint_at, cm.account_value, cm.pnl AS month_pnl
         FROM traders t
         LEFT JOIN coarse_metrics cm ON cm.address = t.address AND cm.time_window = 'month'
-        WHERE (
-            EXISTS (SELECT 1 FROM tracks WHERE trader_address = t.address)
-            OR (cm.pnl > 0 AND cm.volume > 0)
-        )
-        AND (
-            t.fine_refreshed_at IS NULL
-            OR t.fine_refreshed_at <=
-                CASE WHEN t.refresh_tier = 'dormant'
-                     THEN $2::timestamptz ELSE $1::timestamptz END
-        )
+        WHERE {DUE_ELIGIBILITY}
         ORDER BY t.fine_attempted_at ASC NULLS FIRST, t.address
         """,
         now - ACTIVE_REFRESH_INTERVAL,
