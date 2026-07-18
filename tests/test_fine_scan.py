@@ -233,6 +233,22 @@ async def test_rate_limit_streaks_do_not_abort_the_pass(pool: asyncpg.Pool) -> N
     assert attempted == clock.now()
 
 
+async def test_rate_limits_are_recorded_for_the_health_monitor(pool: asyncpg.Pool) -> None:
+    # Each escaped RateLimitedError stamps a rate_limit_events row (issue #54) so
+    # the monitor can alert on sustained limiting; the healthy fetch stamps none.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    for address in ("0xaaa", "0xbbb"):
+        await add_trader(pool, clock, address)
+        gateway.fills_errors[address] = RateLimitedError("still 429 after retries")
+    await add_trader(pool, clock, "0xhealthy")
+    gateway.set_fills("0xhealthy", human_fills())
+
+    await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert await pool.fetchval("SELECT count(*) FROM rate_limit_events") == 2
+
+
 async def test_the_pass_is_paced_by_the_weight_budget(pool: asyncpg.Pool) -> None:
     gateway = FakeHyperliquidGateway()
     clock = FakeClock()

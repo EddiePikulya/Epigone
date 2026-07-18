@@ -58,7 +58,7 @@ async def run_monitor_cycle(
     reported as the critical DB-down check (the monitor can still DM). Returns
     the messages sent, for tests and logging."""
     try:
-        snapshot = await gather_snapshot(pool, clock, disk)
+        snapshot = await gather_snapshot(pool, clock, disk, config.thresholds)
     except Exception:
         log.warning("monitor: snapshot gather failed; reporting DB unreachable", exc_info=True)
         snapshot = db_down_snapshot(clock.now())
