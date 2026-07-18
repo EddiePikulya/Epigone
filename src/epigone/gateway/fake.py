@@ -22,6 +22,7 @@ class FakeHyperliquidGateway:
         self.positions_calls: list[tuple[str, str | None]] = []
         self.leaderboard: list[LeaderboardEntry] = []
         self.leaderboard_error: Exception | None = None
+        self.leaderboard_calls = 0
         self.fills: dict[str, list[Fill]] = {}
         self.fills_errors: dict[str, Exception] = {}
         self.fills_calls: list[str] = []
@@ -36,6 +37,7 @@ class FakeHyperliquidGateway:
         return self.positions.get((key, dex), [])
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
+        self.leaderboard_calls += 1
         if self.leaderboard_error is not None:
             raise self.leaderboard_error
         return list(self.leaderboard)
