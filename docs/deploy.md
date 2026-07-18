@@ -67,6 +67,11 @@ cd ~/epigone
 cat > .env <<'EOF'
 TELEGRAM_BOT_TOKEN=<paste token>
 ADMIN_TELEGRAM_ID=370818090
+# Optional. Coarse Universe re-seed cadence in minutes (issue #50); defaults to
+# 60 if unset. It's a single free CDN download that doesn't touch the per-IP
+# rate budget, so lowering it (e.g. 30 or 15) only adds DB churn. A non-numeric
+# or non-positive value falls back to 60 with a logged warning.
+# SEED_INTERVAL_MINUTES=60
 EOF
 chmod 600 .env
 ```
