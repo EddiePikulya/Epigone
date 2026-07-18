@@ -158,7 +158,7 @@ async def test_a_flip_alert_shows_both_legs(
     assert "entry 110" in message.text
 
 
-async def test_a_scale_in_alert_shows_the_size_growth(
+async def test_a_scale_in_alert_shows_size_and_the_positions_pnl(
     pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     await queue_alert(
@@ -168,17 +168,20 @@ async def test_a_scale_in_alert_shows_the_size_growth(
         size_usd="25000",
         prev_size_usd="10000",
         leverage="5",
+        pct_return="0.32",  # the position's return on margin, not the size growth
     )
 
     await deliver_pending(pool, bot, clock)
 
     (message,) = session.sent_messages()
     assert "added to BTC LONG" in message.text
-    assert "$10,000 → $25,000" in message.text
-    assert "+150%" in message.text  # doubled-and-a-half
+    assert "$10,000 → $25,000" in message.text  # size change still shown, in dollars
+    assert "at 5x" in message.text
+    assert "PnL +32%" in message.text  # is the trade winning?
+    assert "+150%" not in message.text  # no longer the size-growth %
 
 
-async def test_a_scale_out_alert_shows_the_size_reduction(
+async def test_a_scale_out_alert_shows_size_and_the_positions_pnl(
     pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
     await queue_alert(
@@ -188,6 +191,7 @@ async def test_a_scale_out_alert_shows_the_size_reduction(
         size_usd="4000",
         prev_size_usd="10000",
         leverage="5",
+        pct_return="-0.08",  # trimming a losing position
     )
 
     await deliver_pending(pool, bot, clock)
@@ -195,7 +199,22 @@ async def test_a_scale_out_alert_shows_the_size_reduction(
     (message,) = session.sent_messages()
     assert "trimmed BTC SHORT" in message.text
     assert "$10,000 → $4,000" in message.text
-    assert "-60%" in message.text
+    assert "PnL -8%" in message.text
+
+
+async def test_a_scale_alert_without_pnl_data_just_shows_the_size(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # pct_return is nullable; a scale alert missing it degrades to size-only.
+    await queue_alert(
+        pool, kind="scale_in", side="long", size_usd="25000", prev_size_usd="10000", leverage="5"
+    )
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    assert "$10,000 → $25,000 at 5x" in message.text
+    assert "PnL" not in message.text
 
 
 async def test_an_xyz_market_alert_names_the_dex_qualified_coin(

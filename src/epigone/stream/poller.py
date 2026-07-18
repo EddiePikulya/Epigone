@@ -299,6 +299,9 @@ def _scale_event(snapshot: asyncpg.Record, pos: Position) -> _Event | None:
         prev_size_usd=old,
         leverage=pos.leverage,
         entry_price=pos.entry_price,
+        # The position's live return on margin (issue #35), so the alert can say
+        # whether the trade is winning — more useful than the size-growth %.
+        pct_return=pos.return_on_margin,
         opened_at=snapshot["opened_at"],
     )
 

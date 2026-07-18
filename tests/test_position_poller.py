@@ -572,13 +572,15 @@ async def _scale_from(
     *,
     before: str,
     after: str,
+    pnl: str = "0",
 ) -> list[asyncpg.Record]:
-    """Baseline a BTC-long at `before`, then repoll it at `after`; return alerts."""
+    """Baseline a BTC-long at `before`, then repoll it at `after` (carrying `pnl`
+    of unrealized PnL); return alerts."""
     await track(pool, clock, "0xaaa", 42)
     gateway.set_positions("0xaaa", [position(size_usd=before)])
     await baseline(pool, gateway, clock)
     clock.advance(30)
-    gateway.set_positions("0xaaa", [position(size_usd=after)])
+    gateway.set_positions("0xaaa", [position(size_usd=after, unrealized_pnl=pnl)])
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
     return await alerts(pool)
 
@@ -586,7 +588,7 @@ async def _scale_from(
 async def test_a_large_add_emits_a_scale_in_with_both_sizes(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
-    rows = await _scale_from(pool, gateway, clock, before="10000", after="20000")
+    rows = await _scale_from(pool, gateway, clock, before="10000", after="20000", pnl="3000")
 
     (row,) = rows
     assert row["kind"] == "scale_in"
@@ -594,6 +596,9 @@ async def test_a_large_add_emits_a_scale_in_with_both_sizes(
     assert row["side"] == "long"
     assert row["prev_size_usd"] == Decimal("10000")
     assert row["size_usd"] == Decimal("20000")
+    # The position's live return on margin rides along (3000 against 20000/5x),
+    # so the alert can show whether the trade is winning (issue #35).
+    assert row["pct_return"] == Decimal("3000") / Decimal("4000")
     # The snapshot now carries the new size but keeps the original opened_at.
     snapshot = await pool.fetchrow("SELECT * FROM position_snapshots")
     assert snapshot is not None
