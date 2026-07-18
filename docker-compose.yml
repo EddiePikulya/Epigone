@@ -53,5 +53,30 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Proactive health-check (issue #52): evaluates liveness/freshness signals on a
+  # short cadence and DMs the admin on Telegram — problem alerts, recoveries, and
+  # a daily "all good" heartbeat. Send-only (no polling), so it shares the bot
+  # token with `bot` without the two-poller conflict. All HEALTHCHECK_* knobs are
+  # optional and default safely (see epigone.monitor.config).
+  monitor:
+    build: .
+    command: ["/app/.venv/bin/python", "-m", "epigone.monitor.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID}
+      # Sets the default coarse-staleness window (2× this); matches ingest's cadence.
+      SEED_INTERVAL_MINUTES: ${SEED_INTERVAL_MINUTES:-60}
+      # The disk-headroom check reads the host root mounted read-only below.
+      HEALTHCHECK_DISK_PATH: /host
+    volumes:
+      # Host filesystem, read-only: gives the disk check real server headroom
+      # (backups + fine_trades growth), not the container image's view.
+      - /:/host:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:

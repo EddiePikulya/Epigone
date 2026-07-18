@@ -1,8 +1,8 @@
 # Deploy runbook (V1, single VPS)
 
-Deploys Epigone's Docker Compose stack (postgres + bot + ingest + stream) onto a
-single Ubuntu server. Restores the current Universe from a `pg_dump` so there's
-no ~8h fine re-fill. Issue #12.
+Deploys Epigone's Docker Compose stack (postgres + bot + ingest + stream +
+monitor) onto a single Ubuntu server. Restores the current Universe from a
+`pg_dump` so there's no ~8h fine re-fill. Issue #12.
 
 **Roles:** you run these on the **server** (via `ssh root@<IP>`) unless a step is
 marked **[on your Mac]**. Paste output back at the `✅ verify` checkpoints.
@@ -72,6 +72,17 @@ ADMIN_TELEGRAM_ID=370818090
 # rate budget, so lowering it (e.g. 30 or 15) only adds DB churn. A non-numeric
 # or non-positive value falls back to 60 with a logged warning.
 # SEED_INTERVAL_MINUTES=60
+#
+# Optional. Health-check (issue #52), all with safe defaults — a bad value falls
+# back with a logged warning. The monitor reuses the token/admin above (send-only)
+# and DMs the admin on problems, recoveries, and a daily heartbeat.
+# HEALTHCHECK_INTERVAL_MINUTES=15        # how often the checks run
+# HEALTHCHECK_HEARTBEAT_HOUR=9           # UTC hour for the daily "all good" digest
+# HEALTHCHECK_REMINDER_HOURS=6           # cadence of reminders while a check stays failing
+# HEALTHCHECK_INGEST_STALL_MINUTES=30    # no fine refresh in this window (with traders due) → alert
+# HEALTHCHECK_COARSE_STALE_MINUTES=      # default = 2× SEED_INTERVAL_MINUTES
+# HEALTHCHECK_ALERT_BACKLOG_MINUTES=5    # undelivered Position Alerts older than this → alert
+# HEALTHCHECK_DISK_PERCENT=85            # host disk used-% that trips the disk check
 EOF
 chmod 600 .env
 ```
@@ -100,7 +111,7 @@ Expect ~40k traders, ~10k fine, migration = 3.
 ## 6. Bring up the whole stack
 
 ```sh
-docker compose up -d --build   # builds the image + starts bot/ingest/stream
+docker compose up -d --build   # builds the image + starts bot/ingest/stream/monitor
 docker compose ps              # all Up; postgres healthy
 ```
 The app processes call `migrate()` at startup, see v1–v3 already applied (from the restore), and skip. Bot boots gated (ADMIN_TELEGRAM_ID present).
@@ -114,7 +125,7 @@ docker compose logs stream --tail=3
 ## 7. Cut over
 
 - Test in Telegram: the bot on the server now responds (you're the admin). It's the **same bot token**, so **stop the Mac copy first** to avoid two instances polling one token (double responses):
-  **[on your Mac]** `docker compose -p epigone stop bot stream ingest` (leave Mac Postgres if you want it as a spare; it's independent).
+  **[on your Mac]** `docker compose -p epigone stop bot stream ingest monitor` (leave Mac Postgres if you want it as a spare; it's independent). Stop `monitor` too — send-only, so it won't double-poll, but two monitors would double the alerts/heartbeat.
 - Reboot test: `reboot` the server, `ssh` back, `docker compose ps` → everything `Up` on its own (restart: unless-stopped + Docker on boot).
 
 ## Updating later (after a merge to main)
