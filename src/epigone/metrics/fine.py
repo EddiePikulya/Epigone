@@ -95,6 +95,22 @@ class Continuation:
 
 
 @dataclass(frozen=True)
+class BatchLead:
+    """Delta-only transient: where a batch's walk first touched a coin. The
+    fold's boundary-continuity evidence (#63 review): a coin whose batch
+    starts FLAT produces no Continuation, so without the lead a stored open
+    episode was never compared against the batch at all — it survived as a
+    zombie (its close was missed, or a cross-source same-ms interleave was
+    merged wrong at the batch head) waiting to chain a later continuation
+    into a chimera trade. fold_states demotes the stored episode whenever a
+    lead arrives for its coin without a matching continuation, and distrusts
+    what the walk minted inside that first millisecond (see _fold_episodes)."""
+
+    coin: str
+    first_fill_at: datetime
+
+
+@dataclass(frozen=True)
 class FineMetrics:
     """Fills-derived Metric Library values. None means "not computable from
     this fill history" (no trades, no losses, one active day, …) — the
@@ -134,9 +150,11 @@ class FineState:
     closed across later ones — so `open_episodes` carries each still-open
     episode (open-time plus the net PnL and peak notional accumulated so far)
     across refreshes; the batch that finally closes it completes the trade.
-    `continuations` is a *delta-only* transient: the leading segments of
-    episodes opened before this batch, which fold_states matches to the
-    prior's open_episodes; a persisted state always has it empty."""
+    `continuations` and `batch_leads` are *delta-only* transients:
+    fold_states matches the continuations (leading segments of episodes
+    opened before this batch) to the prior's open_episodes, and reconciles
+    the leads (each coin's first touch) against stored episodes the batch
+    contradicts (#63 review); a persisted state always has both empty."""
 
     round_trips: tuple[RoundTrip, ...]  # completed trades, time-sorted
     maker_fill_count: int  # maker (resting) perp fills seen
@@ -147,6 +165,7 @@ class FineState:
     last_fill_at: datetime | None  # newest fill of any kind: the fetch checkpoint
     open_episodes: tuple[OpenEpisode, ...] = ()  # coins held non-flat, with accumulators
     continuations: tuple[Continuation, ...] = ()  # delta-only; resolved on fold
+    batch_leads: tuple[BatchLead, ...] = ()  # delta-only; reconciled on fold
 
 
 EMPTY_STATE = FineState(round_trips=(), maker_fill_count=0, perp_fill_count=0,
@@ -164,7 +183,7 @@ def extract_state(fills: list[Fill]) -> FineState:
     timestamp, so the sort cannot break those ties, and _episodes reconstructs
     positions from the sequence."""
     perp = sorted((f for f in fills if f.is_perp), key=lambda f: f.time)
-    round_trips, open_episodes, continuations = _episodes(perp)
+    round_trips, open_episodes, continuations, batch_leads = _episodes(perp)
     return FineState(
         round_trips=round_trips,
         maker_fill_count=sum(1 for f in perp if not f.crossed),
@@ -175,6 +194,7 @@ def extract_state(fills: list[Fill]) -> FineState:
         last_fill_at=max((f.time for f in fills), default=None),
         open_episodes=open_episodes,
         continuations=continuations,
+        batch_leads=batch_leads,
     )
 
 
@@ -186,12 +206,16 @@ def fold_states(prior: FineState, delta: FineState) -> FineState:
     pass guarantees this by fetching only fills strictly after
     `prior.last_fill_at`, so the sums add cleanly and no fill is
     double-counted. The delta's continuations resolve against the prior's open
-    episodes (see _fold_episodes); a delta round-trip replaces any prior one
-    with the same (coin, closed_at, seq) identity, keeping a boundary re-fetch
+    episodes and its batch leads demote the stored episodes the batch
+    contradicts (see _fold_episodes) — trips the delta minted inside a
+    contradicted coin's first millisecond are dropped with the episode, never
+    upserted. A delta round-trip otherwise replaces any prior one with the
+    same (coin, closed_at, seq) identity, keeping a boundary re-fetch
     idempotent (the closing fill lands wholly on one side of the checkpoint)."""
     trips = {(t.coin, t.closed_at, t.seq): t for t in prior.round_trips}
-    resolved, open_episodes = _fold_episodes(prior, delta)
-    for trip in (*resolved, *delta.round_trips):
+    resolved, open_episodes, demoted_heads = _fold_episodes(prior, delta)
+    kept = (t for t in delta.round_trips if demoted_heads.get(t.coin) != t.closed_at)
+    for trip in (*resolved, *kept):
         trips[(trip.coin, trip.closed_at, trip.seq)] = trip
     return FineState(
         round_trips=tuple(sorted(trips.values(), key=lambda t: (t.closed_at, t.coin, t.seq))),
@@ -202,9 +226,10 @@ def fold_states(prior: FineState, delta: FineState) -> FineState:
         window_end=_latest(prior.window_end, delta.window_end),
         last_fill_at=_latest(prior.last_fill_at, delta.last_fill_at),
         open_episodes=open_episodes,
-        # The delta's continuations are resolved above; only the prior's own
+        # The delta's transients are resolved above; only the prior's own
         # (pre-history, unresolvable) ones ride forward.
         continuations=prior.continuations,
+        batch_leads=prior.batch_leads,
     )
 
 
@@ -273,6 +298,15 @@ def _breaks_continuity(walked: Decimal, start: Decimal) -> bool:
     return abs(walked - start) > max(abs(start), Decimal(1)) * POSITION_DUST
 
 
+def _is_flat(position: Decimal) -> bool:
+    """Flat within dust: a full close from a dusty startPosition leaves a
+    numerically non-zero residue (e.g. -2e-10) that is an artifact of the
+    API's own float strings, not a real position — exact-zero flatness would
+    read it as a flip and persist a phantom dust episode (#63 review). The
+    absolute floor matches _breaks_continuity's tolerance near zero."""
+    return abs(position) <= POSITION_DUST
+
+
 def _post_position(f: Fill) -> Decimal:
     """The signed position after a perp fill. A closing fill moves toward (or
     through) 0 by its size; an opening fill moves away on its named side —
@@ -284,7 +318,12 @@ def _post_position(f: Fill) -> Decimal:
 
 def _episodes(
     perp_fills_in_time_order: list[Fill],
-) -> tuple[tuple[RoundTrip, ...], tuple[OpenEpisode, ...], tuple[Continuation, ...]]:
+) -> tuple[
+    tuple[RoundTrip, ...],
+    tuple[OpenEpisode, ...],
+    tuple[Continuation, ...],
+    tuple[BatchLead, ...],
+]:
     """Reduce a time-ordered perp batch to position-episode accounting
     (issues #48/#58).
 
@@ -313,9 +352,11 @@ def _episodes(
     trips: list[RoundTrip] = []
     open_episodes: list[OpenEpisode] = []
     continuations: list[Continuation] = []
+    leads: list[BatchLead] = []
     for coin, fills in by_coin.items():
+        leads.append(BatchLead(coin, fills[0].time))
         # A first fill on a non-flat position continues an episode from before.
-        continuing = fills[0].start_position != 0
+        continuing = not _is_flat(fills[0].start_position)
         cont_start = fills[0].start_position
         opened_at: datetime | None = None
         tracked = True  # False while walking a position whose episode was demoted
@@ -345,9 +386,9 @@ def _episodes(
                 opened_at = None
                 pnl = Decimal(0)
                 peak = Decimal(0)
-                tracked = start == 0  # flat re-anchors clean; mid-position stays demoted
+                tracked = _is_flat(start)  # flat re-anchors clean; mid-position stays demoted
             if not f.closes_position:
-                if start == 0 and opened_at is None and not continuing:
+                if _is_flat(start) and opened_at is None and not continuing:
                     opened_at = f.time  # the position leaves 0: an episode opens
                 walked = _post_position(f)
                 continue  # a same-side scale-in never crosses 0
@@ -355,7 +396,7 @@ def _episodes(
             peak = max(peak, abs(start) * f.price)
             end = _post_position(f)  # toward / through 0
             walked = end
-            if end != 0 and (end > 0) == (start > 0):
+            if not _is_flat(end) and (end > 0) == (start > 0):
                 continue  # a partial trim that stays non-flat: episode continues
             # The episode closes here (full close or flip through 0).
             seq = close_seq.get(f.time, 0)
@@ -370,7 +411,7 @@ def _episodes(
             # A flip immediately reopens on the far side; a full close goes
             # flat — either way the walk is at a verified position again, so
             # tracking resumes even after a demoted episode.
-            opened_at = f.time if end != 0 else None
+            opened_at = f.time if not _is_flat(end) else None
             tracked = True
             pnl = Decimal(0)
             peak = Decimal(0)
@@ -387,12 +428,13 @@ def _episodes(
             )
     trips.sort(key=lambda t: (t.closed_at, t.coin, t.seq))
     open_episodes.sort(key=lambda e: e.coin)
-    return tuple(trips), tuple(open_episodes), tuple(continuations)
+    leads.sort(key=lambda lead: lead.coin)
+    return tuple(trips), tuple(open_episodes), tuple(continuations), tuple(leads)
 
 
 def _fold_episodes(
     prior: FineState, delta: FineState
-) -> tuple[list[RoundTrip], tuple[OpenEpisode, ...]]:
+) -> tuple[list[RoundTrip], tuple[OpenEpisode, ...], dict[str, datetime]]:
     """Resolve the delta's continuations against the prior's open episodes
     (issues #48/#58). A continuation that closed completes a round-trip whose
     net PnL and peak notional span both sides of the checkpoint; one still
@@ -406,9 +448,32 @@ def _fold_episodes(
     truncated fetch) and the episode demotes — dropped like a pre-history
     continuation rather than completed from a walk that skipped executions. A
     segment that broke continuity inside its own batch (tracked=False) demotes
-    the same way."""
+    the same way.
+
+    The delta's batch leads close the guard's boundary blind spot (#63
+    review): a stored open episode whose coin the batch touched with a FLAT
+    first fill (so no continuation arrived) is contradicted — its close was
+    missed, or a cross-source same-ms interleave was merged wrong at the
+    batch head — and demotes instead of surviving as a zombie. What the walk
+    minted inside that contradicted first millisecond is equally
+    unverifiable (the interleave could have put a close first): its trips are
+    dropped by fold_states via the returned `demoted_heads` (coin → head
+    timestamp), and a same-ms reopen the head also produced is not carried.
+    A flat head at a LATER millisecond than any close it contradicts carries
+    no such ambiguity — its fills are API truth — so trips and episodes the
+    batch built beyond the head millisecond stand. The whole-history walk of
+    a mis-merged head cannot see this contradiction (the wrong order is
+    self-consistent), so the fold is deliberately better informed here than
+    extract_state on the union would be."""
     open_eps = {e.coin: e for e in prior.open_episodes}
     resolved: list[RoundTrip] = []
+    cont_coins = {c.coin for c in delta.continuations}
+    demoted_heads: dict[str, datetime] = {}
+    for lead in delta.batch_leads:
+        if lead.coin in cont_coins or lead.coin not in open_eps:
+            continue  # a non-flat head reconciles via its continuation below
+        del open_eps[lead.coin]
+        demoted_heads[lead.coin] = lead.first_fill_at
     for cont in delta.continuations:
         episode = open_eps.pop(cont.coin, None)
         if episode is None:
@@ -428,8 +493,22 @@ def _fold_episodes(
             resolved.append(
                 RoundTrip(cont.coin, pnl, peak, episode.opened_at, cont.closed_at, seq=0)
             )
-    open_eps.update({e.coin: e for e in delta.open_episodes})  # in-batch opens (incl. reopens)
-    return resolved, tuple(sorted(open_eps.values(), key=lambda e: e.coin))
+    # A trip dropped at a demoted head marks its whole millisecond as a
+    # possibly mis-merged close/reopen group: a reopen the head also minted is
+    # as unverifiable as the trip, so it is not carried. Head opens WITHOUT a
+    # same-ms completion carry no interleave ambiguity (a lone flat-start fill
+    # is API truth) and ride forward normally.
+    chimera_heads = {
+        t.coin for t in delta.round_trips if demoted_heads.get(t.coin) == t.closed_at
+    }
+    open_eps.update(
+        {
+            e.coin: e
+            for e in delta.open_episodes  # in-batch opens (incl. reopens)
+            if not (e.coin in chimera_heads and e.opened_at == demoted_heads[e.coin])
+        }
+    )
+    return resolved, tuple(sorted(open_eps.values(), key=lambda e: e.coin)), demoted_heads
 
 
 def _max_drawdown(trips: list[RoundTrip]) -> Decimal:

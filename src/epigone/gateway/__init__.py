@@ -179,9 +179,14 @@ class HyperliquidGateway(Protocol):
         history. Both endpoints are startTime-inclusive at millisecond
         resolution, so a caller stepping +1ms past its checkpoint gets a
         stream disjoint from everything already folded, across BOTH sources.
-        Same ~2000 cap per call per endpoint, so callers checkpoint forward
-        far enough that a window never overflows. Same execution-order
-        contract as get_fills. Raises GatewayError on failure."""
+        The returned stream must also be COMPLETE for the union of both
+        sources up to its own newest fill — implementations fetching sources
+        sequentially must bound them to a shared coverage horizon (#63
+        review), or a fill landing between the fetches would sit below the
+        advanced checkpoint and be skipped forever. Same ~2000 cap per call
+        per endpoint, so callers checkpoint forward far enough that a window
+        never overflows. Same execution-order contract as get_fills. Raises
+        GatewayError on failure."""
         ...
 
 

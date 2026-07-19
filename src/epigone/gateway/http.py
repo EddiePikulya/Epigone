@@ -20,7 +20,7 @@ import heapq
 import logging
 import random
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -44,6 +44,18 @@ LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# get_fills_since queries two endpoints sequentially, so a fill can execute
+# between the two HTTP calls; if the checkpoint then advanced past its
+# timestamp (because the OTHER source returned something newer), it would
+# never be fetched again. Both ByTime endpoints accept an INCLUSIVE endTime
+# (verified live 2026-07-19), so both requests are bounded to one shared
+# horizon slightly behind the wall clock: the merged stream is then complete
+# over [start, horizon] no matter how far apart the two calls land (even
+# across 429 backoff), and anything executing later is next pass's work. The
+# margin absorbs client-vs-exchange clock skew — NTP keeps it in
+# milliseconds, so two seconds is generous (#63 review).
+COVERAGE_HORIZON_MARGIN = timedelta(seconds=2)
 
 # Bounded 429 retries: 6 tries = up to 5 sleeps (1+2+4+8+16s at full jitter),
 # ~30s worst case — long enough to ride out a blip, short enough that a pass
@@ -81,7 +93,12 @@ class HttpHyperliquidGateway:
         # (verified live against the position-continuity invariant `end ==
         # next start`: ~0 violations reversed vs ~100% as served for userFills
         # and ~60% for the TWAP endpoint). The ByTime variants differ — see
-        # get_fills_since.
+        # get_fills_since. Neither full-history endpoint accepts a time bound,
+        # so a fill executing between the two calls can be missing from this
+        # one seed snapshot — the same class of incompleteness as the ~2000
+        # cap itself, one-shot (the pass seeds from here exactly once), and
+        # owned by the engine's continuity guard; the incremental path is the
+        # one that must be airtight, and is (see the horizon below).
         regular = list(reversed(parse_fills(await self._info_json("userFills", address))))
         twap = list(
             reversed(parse_twap_fills(await self._info_json("userTwapSliceFills", address)))
@@ -96,14 +113,26 @@ class HttpHyperliquidGateway:
         # within-ms included (verified live: ~0 continuity violations as
         # served, ~100% reversed). Served order is kept; reversing here would
         # corrupt the incremental path.
+        horizon = self._clock.now() - COVERAGE_HORIZON_MARGIN
+        if horizon < start:
+            return []  # the window hasn't opened yet; nothing is fully covered
         start_ms = int(start.timestamp() * 1000)
+        horizon_ms = int(horizon.timestamp() * 1000)
         regular = parse_fills(
-            await self._info_json("userFillsByTime", address, startTime=start_ms)
+            await self._info_json(
+                "userFillsByTime", address, startTime=start_ms, endTime=horizon_ms
+            )
         )
         twap = parse_twap_fills(
-            await self._info_json("userTwapSliceFillsByTime", address, startTime=start_ms)
+            await self._info_json(
+                "userTwapSliceFillsByTime", address, startTime=start_ms, endTime=horizon_ms
+            )
         )
-        return _merge_execution_order(regular, twap)
+        merged = _merge_execution_order(regular, twap)
+        # Defensive re-clamp: completeness over [start, horizon] — and with it
+        # the safety of checkpointing +1ms past the newest returned fill — must
+        # hold even if the endpoints' inclusive-endTime convention ever drifts.
+        return [f for f in merged if f.time <= horizon]
 
     async def _info_json(self, request_type: str, address: str, **extra: Any) -> Any:
         try:

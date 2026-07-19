@@ -712,6 +712,126 @@ def test_a_pre_guard_stored_episode_with_unknown_position_demotes() -> None:
     assert state.open_episodes == ()
 
 
+# --- Batch-boundary reconciliation (#63 adversarial review of PR #64) ---------
+# The guard's blind spot was the batch head: a coin's first fill of a batch has
+# no walked position to check against, and a stored open episode was only ever
+# compared against a Continuation (a non-flat first fill). A batch whose first
+# fill starts FLAT while the store holds an open episode is a contradiction —
+# either the episode's close was missed, or a cross-source same-millisecond
+# interleave was merged in the wrong order at the head — and both must demote
+# rather than mint trips from an unverifiable walk.
+
+
+def test_a_mis_merged_batch_head_millisecond_cannot_mint_a_trip() -> None:
+    # True execution order at t1: TWAP close (5 -> 0), regular reopen (0 -> 5).
+    # The merge has no cross-source within-ms signal and puts the regular fill
+    # first, so the walk sees reopen-then-close — a self-consistent fabrication
+    # that used to mint a zero-length trip and strand the stored episode.
+    early = [_open(at=T0, size="5")]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _open(at=t1, size="5"),  # regular reopen, merged first
+        _close(at=t1, pnl="100", start="5", size="5"),  # TWAP close, truly first
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0  # no trip from an unverifiable head millisecond
+    assert metrics.realized_pnl == Decimal("100")  # the close still banks
+    assert state.open_episodes == ()  # the stored episode demotes, not survives
+
+
+def test_the_demoted_batch_head_leaves_no_zombie_episode_to_resurrect() -> None:
+    # The stored episode's net_position (5) coincidentally matches the real
+    # position after the head millisecond; before the fix it survived the fold
+    # and a later close chained it into a chimera trip spanning the wrong open.
+    early = [_open(at=T0, size="5")]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _open(at=t1, size="5"),
+        _close(at=t1, pnl="100", start="5", size="5"),
+    ]
+    mid = fold_state(extract_state(early), late)
+    final = fold_state(mid, [_close(at=T0 + timedelta(hours=2), pnl="7", start="5", size="5")])
+    metrics = metrics_from_state(final, None)
+    assert metrics.trade_count == 0  # the t2 close matches no carried episode: dropped
+    assert metrics.realized_pnl == Decimal("107")
+    assert final.open_episodes == ()
+
+
+def test_a_stored_episode_whose_close_was_missed_demotes_when_the_batch_starts_flat() -> None:
+    # No interleave needed: any missed close (2000-cap truncation, a TWAP-blind
+    # prior fold) leaves the next batch's first fill flat. The stored episode
+    # used to survive as a zombie — stale opened_at/pnl/peak waiting to chain
+    # into a chimera; now the flat head demotes it.
+    early = [_open(at=T0, size="2")]
+    late = [
+        _open(at=T0 + timedelta(hours=2)),  # first fill starts flat: contradiction
+        _close(at=T0 + timedelta(hours=3), pnl="10", start="1"),
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    # The fresh open-from-flat is API truth (a different millisecond, so no
+    # interleave ambiguity): its round-trip counts, with its own open time.
+    assert metrics.trade_count == 1
+    assert metrics.avg_hold_seconds == 3600
+    assert metrics.realized_pnl == Decimal("10")
+    assert state.open_episodes == ()  # the stale stored episode is gone
+    # Demoting at the fold equals what one batch would have concluded.
+    assert metrics == compute(early + late)
+
+
+def test_a_clean_head_open_still_carries_forward_after_a_missed_close() -> None:
+    early = [_open(at=T0, size="2")]  # stored episode, close never seen
+    t1 = T0 + timedelta(hours=2)
+    late = [_open(at=t1)]  # flat head, position still open at batch end
+    state = fold_state(extract_state(early), late)
+    # The stale episode demotes; the fresh open is truth and rides forward.
+    (episode,) = state.open_episodes
+    assert episode.opened_at == t1
+    assert episode.net_position == Decimal("1")
+
+
+def test_a_chimera_head_reopen_is_not_carried_as_an_open_episode() -> None:
+    # Head millisecond mints a trip AND leaves a same-ms reopen: the reopen's
+    # open time is as unverifiable as the trip (the interleave could have put
+    # the close first), so neither survives the fold.
+    early = [_open(at=T0, size="1")]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _open(at=t1),  # possibly the mis-merged half of a close/reopen pair
+        _close(at=t1, pnl="5", start="1"),
+        _open(at=t1),  # same-ms reopen
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0
+    assert state.open_episodes == ()
+    assert metrics.realized_pnl == Decimal("5")
+
+
+def test_a_full_close_into_dust_goes_flat_without_a_phantom_episode() -> None:
+    # A dusty full close (start 3472099.9999999998, the API's own float dust)
+    # leaves end = -2e-10 — numerically non-zero, actually flat. Exact-zero
+    # checks used to read that as a flip and persist a phantom dust-short
+    # episode; flatness now tolerates the same dust the continuity check does.
+    state = extract_state(
+        [
+            _open(at=T0, size="3472100.0"),
+            _close(
+                at=T0 + timedelta(hours=1),
+                pnl="10",
+                start="3472099.9999999998",
+                size="3472099.9999999998",
+            ),
+        ]
+    )
+    assert len(state.round_trips) == 1
+    assert state.open_episodes == ()  # flat, not a phantom -2e-10 short
+    # And the dust-flat position anchors a clean next trip.
+    folded = fold_state(state, trip(pnl="4", at=T0 + timedelta(hours=2)))
+    assert metrics_from_state(folded, None).trade_count == 2
+
+
 # --- Within-millisecond ordering (issue #58 review) ---------------------------
 # Same-order and same-block fills share one millisecond, so timestamps cannot
 # order them: the engine's stable sort must honor the list's execution order
