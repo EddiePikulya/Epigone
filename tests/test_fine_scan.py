@@ -268,10 +268,11 @@ async def test_the_pass_is_paced_by_the_weight_budget(pool: asyncpg.Pool) -> Non
         gateway.set_fills(address, human_fills())
 
     start = clock.now()
-    # 30 userFills calls x 20 weight = 600 against a 400/min budget: >= 30s of refill.
+    # 30 fetches x 40 weight (two fills endpoints each, #63) = 1200 against a
+    # 400/min budget: >= 120s of refill.
     await run_fine_pass(pool, gateway, WeightBudget(400, clock), clock)
 
-    assert (clock.now() - start).total_seconds() >= 30
+    assert (clock.now() - start).total_seconds() >= 120
     assert await pool.fetchval("SELECT count(*) FROM fine_metrics") == 30
 
 
@@ -290,7 +291,8 @@ class RecordingBudget:
 
 
 async def test_the_fills_surcharge_is_settled_after_the_response(pool: asyncpg.Pool) -> None:
-    # userFills costs its nominal 20 plus weight per 20 fills returned (issue
+    # Each fills endpoint costs its nominal 20 — a fetch hits two (userFills
+    # plus userTwapSliceFills, #63) — plus weight per 20 fills returned (issue
     # #41): the size of the response is billed once it is known.
     gateway = FakeHyperliquidGateway()
     clock = FakeClock()
@@ -302,8 +304,10 @@ async def test_the_fills_surcharge_is_settled_after_the_response(pool: asyncpg.P
 
     await run_fine_pass(pool, gateway, budget, clock)
 
-    assert budget.spends == [20]
-    assert budget.settles == [3]  # 45 fills -> ceil(45 / 20)
+    assert budget.spends == [40]  # 20 per fills endpoint
+    # 45 fills -> ceil(45 / 20), plus one for the unknown two-endpoint split
+    # (each endpoint's own ceil can round up): the conservative settle.
+    assert budget.settles == [4]
 
 
 async def test_an_empty_fills_response_settles_nothing(pool: asyncpg.Pool) -> None:
@@ -315,7 +319,7 @@ async def test_an_empty_fills_response_settles_nothing(pool: asyncpg.Pool) -> No
 
     await run_fine_pass(pool, gateway, budget, clock)
 
-    assert budget.spends == [20]
+    assert budget.spends == [40]
     assert budget.settles == []
 
 
@@ -329,7 +333,7 @@ async def test_a_failed_fetch_settles_no_surcharge(pool: asyncpg.Pool) -> None:
 
     await run_fine_pass(pool, gateway, budget, clock)
 
-    assert budget.spends == [20]
+    assert budget.spends == [40]
     assert budget.settles == []
 
 
@@ -426,15 +430,15 @@ async def test_incremental_refresh_settles_only_the_new_fills_surcharge(
     initial = [fill(pnl="5", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 46)]
     gateway.set_fills("0xaaa", initial)
     budget = RecordingBudget()
-    await run_fine_pass(pool, gateway, budget, clock)  # full: settle ceil(45/20)=3
+    await run_fine_pass(pool, gateway, budget, clock)  # full: settle ceil(45/20)+1 = 4
 
     new = [fill(pnl="5", order_id=100 + i, at=T0 + timedelta(hours=45 + i)) for i in range(1, 4)]
     gateway.set_fills("0xaaa", initial + new)
     clock.advance(2 * 24 * 3600)
-    await run_fine_pass(pool, gateway, budget, clock)  # incremental: settle ceil(3/20)=1
+    await run_fine_pass(pool, gateway, budget, clock)  # incremental: ceil(3/20)+1 = 2
 
-    assert budget.spends == [20, 20]  # base weight each time
-    assert budget.settles == [3, 1]  # full pull's surcharge, then just the new fills'
+    assert budget.spends == [40, 40]  # base weight per fills endpoint, each time
+    assert budget.settles == [4, 2]  # full pull's surcharge, then just the new fills'
 
 
 async def test_holding_time_folds_across_an_incremental_refresh(pool: asyncpg.Pool) -> None:
@@ -521,6 +525,71 @@ async def test_a_round_trip_accumulates_net_pnl_across_refreshes(pool: asyncpg.P
     assert trade["pnl"] == Decimal("-30")
     assert trade["opened_at"] == T0
     assert trade["closed_at"] == T0 + timedelta(hours=2)
+    assert await pool.fetchval("SELECT count(*) FROM fine_open_episodes") == 0
+
+
+async def test_a_twap_built_round_trip_is_captured(pool: asyncpg.Pool) -> None:
+    # A position accumulated by TWAP slices and closed by one regular order.
+    # The gateway contract (#63) delivers the union of both fill endpoints as
+    # one execution-order stream — the fake's set_fills list — so the engine
+    # walks the whole life: without the slices this history would read as a
+    # lone pre-window close and yield no trade at all.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa", account_value="1000")
+    slices = [
+        fill("Open Long", order_id=i, at=T0 + timedelta(minutes=i), start_position=str(i), size="1")
+        for i in range(3)  # three TWAP slices: 0 -> 3
+    ]
+    close = fill(pnl="90", order_id=9, at=T0 + timedelta(hours=1), start_position="3", size="3")
+    gateway.set_fills("0xaaa", [*slices, close])
+
+    await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    row = await pool.fetchrow(
+        "SELECT trade_count, win_rate, realized_pnl, avg_leverage "
+        "FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert row is not None
+    assert row["trade_count"] == 1
+    assert row["win_rate"] == Decimal(1)
+    assert row["realized_pnl"] == Decimal("90")
+    assert row["avg_leverage"] == Decimal("30") / Decimal("1000")  # peak 3 x price 10
+
+
+async def test_a_stored_episode_that_missed_executions_demotes_across_refreshes(
+    pool: asyncpg.Pool,
+) -> None:
+    # The #63 self-healing path: a stored open episode whose walk missed
+    # executions (folded TWAP-blind before the merged stream shipped, or
+    # history truncated at the cap). The next incremental's first fill
+    # startPosition disagrees with the persisted net_position, so the episode
+    # demotes to untracked — no round-trip is credited, the money still banks,
+    # and no checkpoint reset was needed.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    opened = fill("Open Long", at=T0, start_position="0")  # walked net: 1
+    gateway.set_fills("0xaaa", [opened])
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    # The next batch says the position was 5 when it closed: four coins of
+    # executions this pass never saw (they were TWAP slices, pre-#63).
+    closed = fill(pnl="50", at=T0 + timedelta(hours=1), start_position="5", size="5")
+    gateway.set_fills("0xaaa", [opened, closed])
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    row = await pool.fetchrow(
+        "SELECT trade_count, win_rate, realized_pnl FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert row is not None
+    assert row["trade_count"] == 0  # demoted, never a reconstructed trade
+    assert row["win_rate"] is None
+    assert row["realized_pnl"] == Decimal("50")  # closes still bank
+    assert await pool.fetchval("SELECT count(*) FROM fine_trades WHERE address = '0xaaa'") == 0
+    # The corrupt episode is dropped, not carried to poison later folds.
     assert await pool.fetchval("SELECT count(*) FROM fine_open_episodes") == 0
 
 

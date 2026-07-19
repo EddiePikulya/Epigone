@@ -4,8 +4,10 @@ The undocumented stats-data leaderboard is quarantined to Universe seeding —
 every failure surfaces as GatewayError so callers can degrade gracefully. The
 single leaderboard download also carries the coarse Metric Library, so no
 per-account call feeds coarse (issue #26). `clearinghouseState` costs weight 2;
-`userFills` weight 20 plus weight per 20 fills returned (issue #41), against
-the shared weight budget (epigone.budget) — callers settle the response-size
+each fills endpoint weight 20 plus weight per 20 fills returned (issue #41),
+against the shared weight budget (epigone.budget) — and a fill fetch hits
+FILL_ENDPOINTS of them (userFills plus userTwapSliceFills, issue #63), so
+callers bill one base weight per endpoint and settle the response-size
 surcharge once they see the payload.
 
 A 429 backs off and retries here rather than surfacing (issue #28): sleep the
@@ -14,10 +16,11 @@ Only a persistent streak escapes, as RateLimitedError, which callers treat as
 pacing — retry the item later, never abort a whole pass over it.
 """
 
+import heapq
 import logging
 import random
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -41,6 +44,18 @@ LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
+# get_fills_since queries two endpoints sequentially, so a fill can execute
+# between the two HTTP calls; if the checkpoint then advanced past its
+# timestamp (because the OTHER source returned something newer), it would
+# never be fetched again. Both ByTime endpoints accept an INCLUSIVE endTime
+# (verified live 2026-07-19), so both requests are bounded to one shared
+# horizon slightly behind the wall clock: the merged stream is then complete
+# over [start, horizon] no matter how far apart the two calls land (even
+# across 429 backoff), and anything executing later is next pass's work. The
+# margin absorbs client-vs-exchange clock skew — NTP keeps it in
+# milliseconds, so two seconds is generous (#63 review).
+COVERAGE_HORIZON_MARGIN = timedelta(seconds=2)
 
 # Bounded 429 retries: 6 tries = up to 5 sleeps (1+2+4+8+16s at full jitter),
 # ~30s worst case — long enough to ride out a blip, short enough that a pass
@@ -70,42 +85,64 @@ class HttpHyperliquidGateway:
         return parse_leaderboard(payload)
 
     async def get_fills(self, address: str) -> list[Fill]:
-        try:
-            payload = await self._request_json(
-                "POST", INFO_URL, json_body={"type": "userFills", "user": address.lower()}
-            )
-        except aiohttp.ClientError as exc:
-            raise GatewayError(f"userFills request failed for {address}: {exc}") from exc
-        # userFills serves newest-first, and same-order / same-block fills all
-        # share one millisecond timestamp — array position is the only
-        # within-ms execution-order signal, and the round-trip engine (#58)
-        # mis-reconstructs positions without it. Reverse the whole response to
-        # the protocol's execution order (verified live against the
-        # position-continuity invariant `end == next start`: ~0 violations
-        # reversed vs ~100% as served). userFillsByTime differs — see below.
-        return list(reversed(parse_fills(payload)))
+        # userFills and userTwapSliceFills both serve newest-first, and
+        # same-order / same-block fills all share one millisecond timestamp —
+        # array position is the only within-ms execution-order signal, and the
+        # round-trip engine (#58) mis-reconstructs positions without it.
+        # Reverse each whole response to the protocol's execution order
+        # (verified live against the position-continuity invariant `end ==
+        # next start`: ~0 violations reversed vs ~100% as served for userFills
+        # and ~60% for the TWAP endpoint). The ByTime variants differ — see
+        # get_fills_since. Neither full-history endpoint accepts a time bound,
+        # so a fill executing between the two calls can be missing from this
+        # one seed snapshot — the same class of incompleteness as the ~2000
+        # cap itself, one-shot (the pass seeds from here exactly once), and
+        # owned by the engine's continuity guard; the incremental path is the
+        # one that must be airtight, and is (see the horizon below).
+        regular = list(reversed(parse_fills(await self._info_json("userFills", address))))
+        twap = list(
+            reversed(parse_twap_fills(await self._info_json("userTwapSliceFills", address)))
+        )
+        return _merge_execution_order(regular, twap)
 
     async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
-        # userFillsByTime is inclusive on startTime (ms); the pass passes the ms
-        # just past its checkpoint so a fill is never re-folded (issue #11).
+        # Both ByTime endpoints are inclusive on startTime (ms); the pass sends
+        # the ms just past its checkpoint so no fill from either source is ever
+        # re-folded (issue #11). Unlike their full-history counterparts, they
+        # serve OLDEST-first — already the protocol's execution order,
+        # within-ms included (verified live: ~0 continuity violations as
+        # served, ~100% reversed). Served order is kept; reversing here would
+        # corrupt the incremental path.
+        horizon = self._clock.now() - COVERAGE_HORIZON_MARGIN
+        if horizon < start:
+            return []  # the window hasn't opened yet; nothing is fully covered
         start_ms = int(start.timestamp() * 1000)
+        horizon_ms = int(horizon.timestamp() * 1000)
+        regular = parse_fills(
+            await self._info_json(
+                "userFillsByTime", address, startTime=start_ms, endTime=horizon_ms
+            )
+        )
+        twap = parse_twap_fills(
+            await self._info_json(
+                "userTwapSliceFillsByTime", address, startTime=start_ms, endTime=horizon_ms
+            )
+        )
+        merged = _merge_execution_order(regular, twap)
+        # Defensive re-clamp: completeness over [start, horizon] — and with it
+        # the safety of checkpointing +1ms past the newest returned fill — must
+        # hold even if the endpoints' inclusive-endTime convention ever drifts.
+        return [f for f in merged if f.time <= horizon]
+
+    async def _info_json(self, request_type: str, address: str, **extra: Any) -> Any:
         try:
-            payload = await self._request_json(
+            return await self._request_json(
                 "POST",
                 INFO_URL,
-                json_body={
-                    "type": "userFillsByTime",
-                    "user": address.lower(),
-                    "startTime": start_ms,
-                },
+                json_body={"type": request_type, "user": address.lower(), **extra},
             )
         except aiohttp.ClientError as exc:
-            raise GatewayError(f"userFillsByTime request failed for {address}: {exc}") from exc
-        # Unlike userFills, userFillsByTime serves OLDEST-first — already the
-        # protocol's execution order, within-ms included (verified live: ~0
-        # continuity violations as served, ~100% reversed). Served order is
-        # kept; reversing here would corrupt the incremental path.
-        return parse_fills(payload)
+            raise GatewayError(f"{request_type} request failed for {address}: {exc}") from exc
 
     async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
         body: dict[str, str] = {"type": "clearinghouseState", "user": address.lower()}
@@ -179,6 +216,17 @@ def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
         raise GatewayError(f"unexpected leaderboard payload shape: {exc!r}") from exc
 
 
+def _merge_execution_order(regular: list[Fill], twap: list[Fill]) -> list[Fill]:
+    """Merge two already-execution-ordered fill streams into one by timestamp.
+
+    The merge is stable — a within-ms tie across the two sources keeps regular
+    fills first. No signal orders a regular fill against a TWAP slice inside
+    one millisecond (they live in separate arrays); if that guess is ever
+    wrong, the engine's startPosition continuity guard (#63) demotes the
+    affected episode rather than let it corrupt the round-trip metrics."""
+    return list(heapq.merge(regular, twap, key=lambda f: f.time))
+
+
 def parse_fills(payload: Any) -> list[Fill]:
     """Map a userFills/userFillsByTime payload to Fills, PRESERVING the array
     order — the payload's order is the only within-millisecond execution-order
@@ -202,6 +250,17 @@ def parse_fills(payload: Any) -> list[Fill]:
         ]
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected userFills payload shape: {exc!r}") from exc
+
+
+def parse_twap_fills(payload: Any) -> list[Fill]:
+    """Map a userTwapSliceFills(ByTime) payload to Fills, preserving array
+    order like parse_fills. The TWAP endpoints nest each execution as
+    {"fill": {...}, "twapId": N}; the inner object is a regular fill row."""
+    try:
+        nested = [item["fill"] for item in payload]
+    except (KeyError, TypeError) as exc:
+        raise GatewayError(f"unexpected userTwapSliceFills payload shape: {exc!r}") from exc
+    return parse_fills(nested)
 
 
 def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:

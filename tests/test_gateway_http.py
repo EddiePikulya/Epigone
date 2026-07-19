@@ -22,6 +22,7 @@ from aiohttp.test_utils import TestServer
 import epigone.gateway.http as gateway_http
 from epigone.gateway import GatewayError, RateLimitedError, Side
 from epigone.gateway.http import (
+    COVERAGE_HORIZON_MARGIN,
     RATE_LIMIT_MAX_TRIES,
     HttpHyperliquidGateway,
     parse_positions,
@@ -39,22 +40,28 @@ RECORDED: dict[str, Any] = json.loads(
 async def replaying_gateway(
     payload: Any,  # a JSON body: clearinghouseState dict or a userFills array
     *,
+    by_type: dict[str, Any] | None = None,  # per info-request-type payloads
     clock: FakeClock | None = None,
     rng: Callable[[], float] = lambda: 1.0,
     rate_limited: int = 0,
     retry_after: str | None = None,
 ) -> AsyncGenerator[tuple[HttpHyperliquidGateway, list[Any]], None]:
-    """A real gateway whose INFO_URL points at a local server replaying `payload`,
-    after answering the first `rate_limited` requests with a 429."""
+    """A real gateway whose INFO_URL points at a local server replaying `payload`
+    (or, for calls that hit several info endpoints, the `by_type` entry matching
+    the request's `type`), after answering the first `rate_limited` requests
+    with a 429."""
     received: list[Any] = []
     remaining_429s = [rate_limited]
 
     async def info(request: web.Request) -> web.Response:
-        received.append(await request.json())
+        body = await request.json()
+        received.append(body)
         if remaining_429s[0] > 0:
             remaining_429s[0] -= 1
             headers = {"Retry-After": retry_after} if retry_after is not None else {}
             return web.Response(status=429, headers=headers)
+        if by_type is not None:
+            return web.json_response(by_type[body["type"]])
         return web.json_response(payload)
 
     app = web.Application()
@@ -235,7 +242,9 @@ async def test_get_fills_reverses_the_newest_first_payload_to_execution_order() 
         _fill_row(1_000, oid=2, start="2"),
         _fill_row(1_000, oid=1, start="3"),
     ]
-    async with replaying_gateway(payload) as (gateway, received):
+    async with replaying_gateway(
+        None, by_type={"userFills": payload, "userTwapSliceFills": []}
+    ) as (gateway, received):
         fills = await gateway.get_fills(WHALE)
 
     assert received[0]["type"] == "userFills"
@@ -250,8 +259,136 @@ async def test_get_fills_since_keeps_the_oldest_first_payload_order() -> None:
         _fill_row(1_000, oid=2, start="2"),
         _fill_row(2_000, oid=3, start="1"),
     ]
-    async with replaying_gateway(payload) as (gateway, received):
+    async with replaying_gateway(
+        None, by_type={"userFillsByTime": payload, "userTwapSliceFillsByTime": []}
+    ) as (gateway, received):
         fills = await gateway.get_fills_since(WHALE, datetime(1970, 1, 1, tzinfo=UTC))
 
     assert received[0]["type"] == "userFillsByTime"
     assert [f.order_id for f in fills] == [1, 2, 3]
+
+
+# --- TWAP slice fills merged into the stream (issue #63) ----------------------
+# Hyperliquid serves TWAP slice executions ONLY from userTwapSliceFills /
+# userTwapSliceFillsByTime — they never appear in userFills (verified live
+# 2026-07-19 on a TWAP whale: zero tid overlap) — nesting each fill as
+# {"fill": {...}, "twapId": N}. Both TWAP endpoints mirror the regular pair's
+# directions (verified live against the position-continuity invariant: full is
+# newest-first, ByTime oldest-first and startTime-inclusive; ~0 violations in
+# the normalized order vs ~60% as-served for the full endpoint).
+
+
+def _twap_row(time_ms: int, oid: int, start: str) -> dict[str, Any]:
+    return {"fill": _fill_row(time_ms, oid, start), "twapId": 7}
+
+
+async def test_get_fills_merges_twap_slices_into_one_execution_order_stream() -> None:
+    regular = [_fill_row(3_000, oid=4, start="1"), _fill_row(1_000, oid=1, start="3")]
+    twap = [  # newest-first as served, the same-ms pair in reverse execution order
+        _twap_row(2_000, oid=3, start="1"),
+        _twap_row(2_000, oid=2, start="2"),
+    ]
+    async with replaying_gateway(
+        None, by_type={"userFills": regular, "userTwapSliceFills": twap}
+    ) as (gateway, received):
+        fills = await gateway.get_fills(WHALE)
+
+    assert {r["type"] for r in received} == {"userFills", "userTwapSliceFills"}
+    assert {r["user"] for r in received} == {WHALE.lower()}
+    # One merged stream, oldest first; the TWAP pair reversed to execution order.
+    assert [f.order_id for f in fills] == [1, 2, 3, 4]
+
+
+async def test_get_fills_since_fetches_twap_slices_from_the_same_start() -> None:
+    regular = [_fill_row(1_000, oid=1, start="2")]  # ByTime endpoints: oldest first
+    twap = [_twap_row(2_000, oid=2, start="1"), _twap_row(3_000, oid=3, start="1")]
+    async with replaying_gateway(
+        None, by_type={"userFillsByTime": regular, "userTwapSliceFillsByTime": twap}
+    ) as (gateway, received):
+        fills = await gateway.get_fills_since(WHALE, datetime(1970, 1, 1, 0, 0, 1, tzinfo=UTC))
+
+    # Both endpoints get the same inclusive startTime, so the +1ms checkpoint
+    # step (issue #11) keeps the union of both sources disjoint across passes.
+    assert {r["type"] for r in received} == {"userFillsByTime", "userTwapSliceFillsByTime"}
+    assert {r["startTime"] for r in received} == {1_000}
+    assert [f.order_id for f in fills] == [1, 2, 3]
+
+
+async def test_a_same_millisecond_cross_stream_tie_keeps_regular_fills_first() -> None:
+    # No signal orders a regular fill against a TWAP slice inside one
+    # millisecond (separate arrays); the merge is stable with regular first,
+    # and the engine's continuity guard (#63) demotes rather than corrupts if
+    # that guess is ever wrong.
+    regular = [_fill_row(1_000, oid=1, start="1")]
+    twap = [_twap_row(1_000, oid=2, start="1")]
+    async with replaying_gateway(
+        None, by_type={"userFills": regular, "userTwapSliceFills": twap}
+    ) as (gateway, _):
+        fills = await gateway.get_fills(WHALE)
+
+    assert [f.order_id for f in fills] == [1, 2]
+
+
+async def test_a_malformed_twap_payload_raises_gateway_error() -> None:
+    async with replaying_gateway(
+        None, by_type={"userFills": [], "userTwapSliceFills": [{"twapId": 7}]}  # no "fill"
+    ) as (gateway, _):
+        with pytest.raises(GatewayError):
+            await gateway.get_fills(WHALE)
+
+
+# --- Cross-source checkpoint safety (#63 adversarial review of PR #64) --------
+# The two ByTime requests are sequential HTTP calls: a fill executing between
+# them, older than the other source's newest returned fill, would sit below the
+# advanced checkpoint and never be fetched again. Both endpoints accept an
+# INCLUSIVE endTime (verified live 2026-07-19), so get_fills_since bounds both
+# requests to one shared coverage horizon slightly behind the wall clock: the
+# merged stream is then complete over [start, horizon] no matter how far apart
+# the two calls land, and anything executing later is simply next pass's work.
+
+
+async def test_get_fills_since_bounds_both_requests_to_one_coverage_horizon() -> None:
+    clock = FakeClock()
+    horizon_ms = int((clock.now() - COVERAGE_HORIZON_MARGIN).timestamp() * 1000)
+    async with replaying_gateway(
+        None,
+        by_type={"userFillsByTime": [], "userTwapSliceFillsByTime": []},
+        clock=clock,
+    ) as (gateway, received):
+        fills = await gateway.get_fills_since(WHALE, datetime(2026, 7, 1, tzinfo=UTC))
+
+    assert fills == []
+    assert {r["type"] for r in received} == {"userFillsByTime", "userTwapSliceFillsByTime"}
+    assert {r["endTime"] for r in received} == {horizon_ms}
+
+
+async def test_get_fills_since_drops_fills_past_the_horizon() -> None:
+    # Defensive against the inclusive-endTime convention ever drifting server
+    # side: a fill past the horizon must not reach the fold, or the checkpoint
+    # could advance beyond what the other endpoint is known to have covered.
+    clock = FakeClock()
+    horizon_ms = int((clock.now() - COVERAGE_HORIZON_MARGIN).timestamp() * 1000)
+    async with replaying_gateway(
+        None,
+        by_type={
+            "userFillsByTime": [_fill_row(horizon_ms, oid=1, start="1")],
+            "userTwapSliceFillsByTime": [_twap_row(horizon_ms + 1, oid=2, start="1")],
+        },
+        clock=clock,
+    ) as (gateway, _):
+        fills = await gateway.get_fills_since(WHALE, datetime(2026, 7, 1, tzinfo=UTC))
+
+    assert [f.order_id for f in fills] == [1]  # the at-horizon fill stays, the later one waits
+
+
+async def test_get_fills_since_makes_no_request_before_the_window_opens() -> None:
+    # A checkpoint within the margin of now: nothing can be completely covered
+    # yet, so fetch nothing rather than risk an unbounded window.
+    clock = FakeClock()
+    async with replaying_gateway(
+        None, by_type={"userFillsByTime": [], "userTwapSliceFillsByTime": []}, clock=clock
+    ) as (gateway, received):
+        fills = await gateway.get_fills_since(WHALE, clock.now())
+
+    assert fills == []
+    assert received == []

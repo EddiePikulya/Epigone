@@ -17,6 +17,8 @@ import pytest
 from epigone.gateway import Fill
 from epigone.metrics.fine import (
     FineMetrics,
+    FineState,
+    OpenEpisode,
     compute_fine_metrics,
     extract_state,
     fold_state,
@@ -527,6 +529,307 @@ def test_folding_an_empty_batch_leaves_the_state_unchanged() -> None:
         ]
     )
     assert fold_state(prior, []) == prior
+
+
+# --- startPosition continuity guard (issue #63) -------------------------------
+# Every fill carries the position size before it executed. When the engine's
+# walked net position disagrees with an incoming fill's startPosition beyond
+# float dust, executions were missed (a fill source the fetch didn't cover, or
+# history truncated by the ~2000 cap): the episode is demoted to untracked —
+# the same treatment as a pre-window open — rather than credited as a
+# round-trip reconstructed from a walk that skipped executions.
+
+
+def test_a_gap_in_the_walk_demotes_the_episode_to_untracked() -> None:
+    metrics = compute(
+        [
+            _open(at=T0),  # 0 -> 1
+            # The close says the position was 5, not the walked 1: four coins
+            # of executions are missing. Banked money, but never a trade.
+            _close(at=T0 + timedelta(hours=1), pnl="50", start="5", size="5"),
+        ]
+    )
+    assert metrics.trade_count == 0
+    assert metrics.win_rate is None
+    assert metrics.avg_hold_seconds is None
+    assert metrics.realized_pnl == Decimal("50")
+
+
+def test_a_clean_trip_after_a_demoted_episode_counts() -> None:
+    metrics = compute(
+        [
+            _open(at=T0),
+            _close(at=T0 + timedelta(hours=1), pnl="50", start="5", size="5"),  # demoted
+            *trip(pnl="10", at=T0 + timedelta(hours=2)),  # clean open-from-flat: counts
+        ]
+    )
+    assert metrics.trade_count == 1
+    assert metrics.win_rate == Decimal(1)
+    assert metrics.realized_pnl == Decimal("60")
+
+
+def test_float_representation_dust_does_not_demote() -> None:
+    # The API's own startPosition strings carry ~1e-10 relative dust (a real
+    # example: "3472099.9999999998" following a 3472100.0 position); a genuine
+    # missed execution is off by a whole fill, so dust must not demote.
+    metrics = compute(
+        [
+            _open(at=T0, size="3472100.0"),
+            _close(
+                at=T0 + timedelta(hours=1),
+                pnl="10",
+                start="3472099.9999999998",
+                size="3472099.9999999998",
+            ),
+        ]
+    )
+    assert metrics.trade_count == 1
+
+
+def test_missed_closes_demote_the_old_episode_and_the_flat_open_starts_clean() -> None:
+    metrics = compute(
+        [
+            _open(at=T0),  # 0 -> 1
+            # A fresh open from flat while the walk says 1: the old episode's
+            # closes were missed. It is dropped; this open anchors clean.
+            _open(at=T0 + timedelta(hours=1)),
+            _close(at=T0 + timedelta(hours=2), pnl="10", start="1"),
+        ]
+    )
+    assert metrics.trade_count == 1
+    assert metrics.avg_hold_seconds == 3600  # the clean reopen's hold, not T0's
+    assert metrics.realized_pnl == Decimal("10")
+
+
+def test_after_a_mid_position_gap_the_tail_stays_untracked_until_flat() -> None:
+    metrics = compute(
+        [
+            _open(at=T0, size="2"),  # 0 -> 2
+            _close(at=T0 + timedelta(hours=1), pnl="5", start="5"),  # gap: demoted, 5 -> 4
+            # The rest of the demoted position's life stays untracked...
+            _close(at=T0 + timedelta(hours=2), pnl="20", start="4", size="4"),  # 4 -> flat
+            # ...but the next open-from-flat is a clean, counted trip.
+            *trip(pnl="7", at=T0 + timedelta(hours=3)),
+        ]
+    )
+    assert metrics.trade_count == 1
+    assert metrics.avg_win == Decimal("7")
+    assert metrics.realized_pnl == Decimal("32")
+
+
+def test_an_untracked_flip_reopens_a_tracked_episode() -> None:
+    # A flip's far side opens at a position the walk knows exactly, even when
+    # the flipped-away episode was demoted — the new episode is clean.
+    metrics = compute(
+        [
+            _open(at=T0),  # 0 -> 1
+            # Long > Short from a startPosition of 3 (walked: 1): demoted flip,
+            # but it leaves a known -2 short opened here.
+            fill(
+                "Long > Short",
+                pnl="15",
+                at=T0 + timedelta(hours=1),
+                start_position="3",
+                size="5",
+            ),
+            fill(
+                "Close Short",
+                pnl="-4",
+                at=T0 + timedelta(hours=3),
+                start_position="-2",
+                size="2",
+            ),
+        ]
+    )
+    assert metrics.trade_count == 1  # only the short leg
+    assert metrics.avg_loss == Decimal("4")
+    assert metrics.avg_hold_seconds == 2 * 3600
+    assert metrics.realized_pnl == Decimal("11")
+
+
+def test_a_checkpoint_gap_between_stored_position_and_next_fill_demotes() -> None:
+    # The self-healing path for TWAP-blind stored state (#63): the carried open
+    # episode says the position is 2, the next batch's first fill says 5 —
+    # executions were missed across the checkpoint, so no round-trip.
+    early = [_open(at=T0, size="2")]
+    late = [_close(at=T0 + timedelta(hours=1), pnl="50", start="5", size="5")]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0
+    assert metrics.realized_pnl == Decimal("50")
+    assert state.open_episodes == ()  # the corrupt episode is dropped, not carried
+    # Demoting across the fold equals demoting inside one batch.
+    assert metrics == compute(early + late)
+
+
+def test_a_broken_leading_segment_never_completes_the_carried_episode() -> None:
+    early = [_open(at=T0, size="2")]
+    late = [
+        _close(at=T0 + timedelta(hours=1), pnl="10", start="2"),  # trim 2 -> 1, matches
+        _close(at=T0 + timedelta(hours=2), pnl="30", start="3", size="3"),  # gap: demoted
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0
+    assert metrics.realized_pnl == Decimal("40")
+    assert state.open_episodes == ()
+    assert metrics == compute(early + late)
+
+
+def test_an_open_episode_carries_its_walked_net_position() -> None:
+    # The stored fold state must know where the walk left the position, or the
+    # next batch's continuity check has nothing to compare against (#63).
+    state = extract_state(
+        [
+            _open(at=T0, size="3"),
+            _close(at=T0 + timedelta(hours=1), pnl="5", start="3"),  # trim 3 -> 2
+        ]
+    )
+    (episode,) = state.open_episodes
+    assert episode.net_position == Decimal("2")
+
+
+def test_a_pre_guard_stored_episode_with_unknown_position_demotes() -> None:
+    # Rows persisted before #63 carry net_position 0 (the migration default) —
+    # a position the walk never verified. A real continuation always starts
+    # non-flat, so the mismatch demotes exactly like any other gap: TWAP-blind
+    # stored episodes heal on their next incremental without a data reset.
+    stored = FineState(
+        round_trips=(),
+        maker_fill_count=1,
+        perp_fill_count=1,
+        realized_pnl=Decimal(0),
+        window_start=T0,
+        window_end=T0,
+        last_fill_at=T0,
+        open_episodes=(OpenEpisode("HYPE", T0, Decimal(0), Decimal(0)),),  # net defaults to 0
+    )
+    late = [_close(at=T0 + timedelta(hours=1), pnl="10", start="1")]
+    state = fold_state(stored, late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0
+    assert metrics.realized_pnl == Decimal("10")
+    assert state.open_episodes == ()
+
+
+# --- Batch-boundary reconciliation (#63 adversarial review of PR #64) ---------
+# The guard's blind spot was the batch head: a coin's first fill of a batch has
+# no walked position to check against, and a stored open episode was only ever
+# compared against a Continuation (a non-flat first fill). A batch whose first
+# fill starts FLAT while the store holds an open episode is a contradiction —
+# either the episode's close was missed, or a cross-source same-millisecond
+# interleave was merged in the wrong order at the head — and both must demote
+# rather than mint trips from an unverifiable walk.
+
+
+def test_a_mis_merged_batch_head_millisecond_cannot_mint_a_trip() -> None:
+    # True execution order at t1: TWAP close (5 -> 0), regular reopen (0 -> 5).
+    # The merge has no cross-source within-ms signal and puts the regular fill
+    # first, so the walk sees reopen-then-close — a self-consistent fabrication
+    # that used to mint a zero-length trip and strand the stored episode.
+    early = [_open(at=T0, size="5")]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _open(at=t1, size="5"),  # regular reopen, merged first
+        _close(at=t1, pnl="100", start="5", size="5"),  # TWAP close, truly first
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0  # no trip from an unverifiable head millisecond
+    assert metrics.realized_pnl == Decimal("100")  # the close still banks
+    assert state.open_episodes == ()  # the stored episode demotes, not survives
+
+
+def test_the_demoted_batch_head_leaves_no_zombie_episode_to_resurrect() -> None:
+    # The stored episode's net_position (5) coincidentally matches the real
+    # position after the head millisecond; before the fix it survived the fold
+    # and a later close chained it into a chimera trip spanning the wrong open.
+    early = [_open(at=T0, size="5")]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _open(at=t1, size="5"),
+        _close(at=t1, pnl="100", start="5", size="5"),
+    ]
+    mid = fold_state(extract_state(early), late)
+    final = fold_state(mid, [_close(at=T0 + timedelta(hours=2), pnl="7", start="5", size="5")])
+    metrics = metrics_from_state(final, None)
+    assert metrics.trade_count == 0  # the t2 close matches no carried episode: dropped
+    assert metrics.realized_pnl == Decimal("107")
+    assert final.open_episodes == ()
+
+
+def test_a_stored_episode_whose_close_was_missed_demotes_when_the_batch_starts_flat() -> None:
+    # No interleave needed: any missed close (2000-cap truncation, a TWAP-blind
+    # prior fold) leaves the next batch's first fill flat. The stored episode
+    # used to survive as a zombie — stale opened_at/pnl/peak waiting to chain
+    # into a chimera; now the flat head demotes it.
+    early = [_open(at=T0, size="2")]
+    late = [
+        _open(at=T0 + timedelta(hours=2)),  # first fill starts flat: contradiction
+        _close(at=T0 + timedelta(hours=3), pnl="10", start="1"),
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    # The fresh open-from-flat is API truth (a different millisecond, so no
+    # interleave ambiguity): its round-trip counts, with its own open time.
+    assert metrics.trade_count == 1
+    assert metrics.avg_hold_seconds == 3600
+    assert metrics.realized_pnl == Decimal("10")
+    assert state.open_episodes == ()  # the stale stored episode is gone
+    # Demoting at the fold equals what one batch would have concluded.
+    assert metrics == compute(early + late)
+
+
+def test_a_clean_head_open_still_carries_forward_after_a_missed_close() -> None:
+    early = [_open(at=T0, size="2")]  # stored episode, close never seen
+    t1 = T0 + timedelta(hours=2)
+    late = [_open(at=t1)]  # flat head, position still open at batch end
+    state = fold_state(extract_state(early), late)
+    # The stale episode demotes; the fresh open is truth and rides forward.
+    (episode,) = state.open_episodes
+    assert episode.opened_at == t1
+    assert episode.net_position == Decimal("1")
+
+
+def test_a_chimera_head_reopen_is_not_carried_as_an_open_episode() -> None:
+    # Head millisecond mints a trip AND leaves a same-ms reopen: the reopen's
+    # open time is as unverifiable as the trip (the interleave could have put
+    # the close first), so neither survives the fold.
+    early = [_open(at=T0, size="1")]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _open(at=t1),  # possibly the mis-merged half of a close/reopen pair
+        _close(at=t1, pnl="5", start="1"),
+        _open(at=t1),  # same-ms reopen
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 0
+    assert state.open_episodes == ()
+    assert metrics.realized_pnl == Decimal("5")
+
+
+def test_a_full_close_into_dust_goes_flat_without_a_phantom_episode() -> None:
+    # A dusty full close (start 3472099.9999999998, the API's own float dust)
+    # leaves end = -2e-10 — numerically non-zero, actually flat. Exact-zero
+    # checks used to read that as a flip and persist a phantom dust-short
+    # episode; flatness now tolerates the same dust the continuity check does.
+    state = extract_state(
+        [
+            _open(at=T0, size="3472100.0"),
+            _close(
+                at=T0 + timedelta(hours=1),
+                pnl="10",
+                start="3472099.9999999998",
+                size="3472099.9999999998",
+            ),
+        ]
+    )
+    assert len(state.round_trips) == 1
+    assert state.open_episodes == ()  # flat, not a phantom -2e-10 short
+    # And the dust-flat position anchors a clean next trip.
+    folded = fold_state(state, trip(pnl="4", at=T0 + timedelta(hours=2)))
+    assert metrics_from_state(folded, None).trade_count == 2
 
 
 # --- Within-millisecond ordering (issue #58 review) ---------------------------

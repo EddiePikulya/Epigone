@@ -70,6 +70,17 @@ metrics until their positions turn over under our watch; that is the honest
 reading, not a gap. (The 15 golden wallets are pinned on this basis in
 `tests/test_golden_wallets.py`.)
 
+The same exclusion applies when the history we hold has **holes** (issue
+#63): every fill carries the position size before it executed, and when the
+engine's own walked position disagrees with that beyond float dust,
+executions were missed — a fill source the fetch didn't cover, or history
+truncated at the API's ~2000-fill cap. The episode is then *demoted*: no
+round-trip credit from a walk that skipped executions, though its closes
+still bank into total realized PnL. The fill stream itself is the union of
+the regular and TWAP-slice endpoints (Hyperliquid serves TWAP executions
+only from `userTwapSliceFills`), without which a TWAP-heavy Trader's
+position lives would never be walkable in the first place.
+
 **Total realized PnL stays comprehensive**: it sums *all* realized
 `closedPnl` in the window, including trims of positions whose opens we never
 saw, so it can exceed the sum of the counted round-trips' PnLs by exactly
