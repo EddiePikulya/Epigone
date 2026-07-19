@@ -40,6 +40,7 @@ INGEST = "ingest"
 COARSE = "coarse"
 ALERTS = "alerts"
 RATE = "rate"
+FINE_SUCCESS = "fine_success"
 DISK = "disk"
 
 WARNING = "warning"
@@ -71,6 +72,12 @@ class CheckThresholds:
     # separates a sustained spike from an isolated backoff-absorbed 429.
     rate_window: timedelta
     rate_max_events: int
+    # Fine-pass success starvation (issue #61): fail when the due backlog is at
+    # least `starvation_min_due` and no successful fine refresh has landed within
+    # `starvation_window` *while attempts keep advancing* — every refresh failing,
+    # not a stopped or a caught-up pass.
+    starvation_window: timedelta
+    starvation_min_due: int
     disk_percent: float
 
 
@@ -84,6 +91,10 @@ class HealthSnapshot:
     wallet_count: int | None = None
     due_traders: int | None = None
     last_fine_refresh: datetime | None = None
+    # Last time *any* fine attempt was stamped (success or failure, issue #61).
+    # A recent attempt with a stale refresh is the signature of a pass that is
+    # alive and looping but never succeeding.
+    last_fine_attempt: datetime | None = None
     fine_refreshed_today: int | None = None
     last_coarse_compute: datetime | None = None
     undelivered_alerts: int | None = None
@@ -122,6 +133,7 @@ async def gather_snapshot(
         SELECT
             (SELECT count(*) FROM traders) AS wallet_count,
             (SELECT max(fine_refreshed_at) FROM traders) AS last_fine_refresh,
+            (SELECT max(fine_attempted_at) FROM traders) AS last_fine_attempt,
             (SELECT count(*) FROM traders WHERE fine_refreshed_at >= $1)
                 AS fine_refreshed_today,
             (SELECT max(computed_at) FROM coarse_metrics) AS last_coarse_compute,
@@ -144,6 +156,7 @@ async def gather_snapshot(
         wallet_count=row["wallet_count"],
         due_traders=await count_due_traders(pool, now),
         last_fine_refresh=row["last_fine_refresh"],
+        last_fine_attempt=row["last_fine_attempt"],
         fine_refreshed_today=row["fine_refreshed_today"],
         last_coarse_compute=row["last_coarse_compute"],
         undelivered_alerts=row["undelivered_alerts"],
@@ -184,6 +197,9 @@ def evaluate_checks(
         _coarse_check(snapshot, thresholds.coarse_stale),
         _alerts_check(snapshot, thresholds.alert_backlog),
         _rate_check(snapshot, thresholds.rate_max_events),
+        _fine_success_check(
+            snapshot, thresholds.starvation_window, thresholds.starvation_min_due
+        ),
         _disk_check(snapshot, thresholds.disk_percent),
     ]
 
@@ -278,6 +294,47 @@ def _rate_check(snapshot: HealthSnapshot, max_events: int) -> CheckResult:
     )
 
 
+def _fine_success_check(
+    snapshot: HealthSnapshot, window: timedelta, min_due: int
+) -> CheckResult:
+    """Fine-pass success starvation (issue #61). The 20h outage this closes: the
+    `userFills` endpoint 500'd on every call, so each attempt failed-but-stamped
+    `fine_attempted_at` while zero refreshes landed — a plain `GatewayError` that
+    the 429-only rate check (#54) never sees. The signature is three conditions
+    at once, distinguishing "constantly failing" from both healthy and idle:
+
+    - the due backlog is large (≥ `min_due`) — a caught-up pass (small backlog)
+      has nothing to succeed at, so it stays quiet like the ingest check does;
+    - no successful refresh within `window` — successes landing means healthy;
+    - attempts are still advancing within `window` — a *stopped* pass (no recent
+      attempt) is the ingest check's province, not this one.
+    """
+    due = snapshot.due_traders or 0
+    success_age = _age(snapshot.now, snapshot.last_fine_refresh)
+    attempt_age = _age(snapshot.now, snapshot.last_fine_attempt)
+    attempts_advancing = attempt_age is not None and attempt_age <= window
+    no_recent_success = success_age is None or success_age > window
+    if due >= min_due and attempts_advancing and no_recent_success:
+        gap = (
+            "no successful refresh ever recorded"
+            if snapshot.last_fine_refresh is None
+            else f"no successful refresh in {_ago(success_age)}"
+        )
+        return CheckResult(
+            FINE_SUCCESS,
+            "Fine success",
+            ok=False,
+            severity=WARNING,
+            detail=(
+                f"Fine success: {due:,} due and attempts advancing but {gap} — "
+                f"every fine refresh is failing"
+            ),
+        )
+    return CheckResult(
+        FINE_SUCCESS, "Fine success", ok=True, severity=WARNING, detail="Fine refreshes landing"
+    )
+
+
 def _disk_check(snapshot: HealthSnapshot, limit: float) -> CheckResult:
     """Disk headroom on the host: backups plus the growing fine_trades table are
     the real risk. A probe that returns None (no host visibility) is treated as
@@ -300,6 +357,9 @@ def heartbeat_digest(snapshot: HealthSnapshot) -> str:
     missing ping."""
     parts = [f"{_count(snapshot.wallet_count)} wallets"]
     parts.append(f"{_count(snapshot.fine_refreshed_today)} fine-refreshed today")
+    # The due backlog (issue #61): a large number here beside a low refreshed-today
+    # is the starvation signal in digest form.
+    parts.append(f"{_count(snapshot.due_traders)} due")
     coarse_age = _age(snapshot.now, snapshot.last_coarse_compute)
     parts.append(
         "coarse never computed" if coarse_age is None else f"coarse fresh {_ago(coarse_age)} ago"

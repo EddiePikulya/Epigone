@@ -27,6 +27,11 @@ DEFAULT_ALERT_BACKLOG_MINUTES = 5
 # lone unlucky call staying under the count keeps quiet (user story #2).
 DEFAULT_RATE_WINDOW_MINUTES = 15
 DEFAULT_RATE_MAX_EVENTS = 5
+# Fine-pass success starvation (issue #61): a due backlog past this floor with
+# zero successful refreshes over the window (while attempts keep advancing) is
+# real starvation — the 20h 500-storm shape — not the normal handful-due churn.
+DEFAULT_STARVATION_WINDOW_MINUTES = 45
+DEFAULT_STARVATION_MIN_DUE = 50
 DEFAULT_DISK_PERCENT = 85
 DEFAULT_DISK_PATH = "/"
 # Coarse metrics older than this multiple of the seed interval mean the re-seed
@@ -96,6 +101,18 @@ class MonitorConfig:
                     os.environ.get("HEALTHCHECK_RATE_MAX_EVENTS"),
                     default=DEFAULT_RATE_MAX_EVENTS,
                     name="HEALTHCHECK_RATE_MAX_EVENTS",
+                ),
+                starvation_window=timedelta(
+                    minutes=parse_positive_int(
+                        os.environ.get("HEALTHCHECK_STARVATION_WINDOW_MINUTES"),
+                        default=DEFAULT_STARVATION_WINDOW_MINUTES,
+                        name="HEALTHCHECK_STARVATION_WINDOW_MINUTES",
+                    )
+                ),
+                starvation_min_due=parse_positive_int(
+                    os.environ.get("HEALTHCHECK_STARVATION_MIN_DUE"),
+                    default=DEFAULT_STARVATION_MIN_DUE,
+                    name="HEALTHCHECK_STARVATION_MIN_DUE",
                 ),
                 disk_percent=_parse_disk_percent(os.environ.get("HEALTHCHECK_DISK_PERCENT")),
             ),

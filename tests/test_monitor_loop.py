@@ -5,6 +5,7 @@ outgoing sendMessage calls (recipient = admin, text names the failing check and
 its numbers), the house convention used by test_alert_delivery.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -43,22 +44,32 @@ def _config() -> MonitorConfig:
             rate_window=timedelta(minutes=15),
             rate_max_events=5,
             disk_percent=85,
+            starvation_window=timedelta(minutes=45),
+            starvation_min_due=50,
         ),
         disk_path="/",
     )
 
 
 async def _add_trader(
-    pool: asyncpg.Pool, address: str, *, fine_refreshed_at: datetime | None, computed_at: datetime
+    pool: asyncpg.Pool,
+    address: str,
+    *,
+    fine_refreshed_at: datetime | None,
+    computed_at: datetime,
+    fine_attempted_at: datetime | None = None,
 ) -> None:
     """An eligible Trader (positive coarse month) with a given last fine refresh.
-    NULL fine_refreshed_at (or one older than the active cadence) makes it due."""
+    NULL fine_refreshed_at (or one older than the active cadence) makes it due.
+    `fine_attempted_at` is stamped on every attempt (success *or* failure), so a
+    recent value with a stale refresh is the signature of a failing fine pass."""
     await pool.execute(
-        "INSERT INTO traders (address, first_seen_at, last_seen_at, fine_refreshed_at) "
-        "VALUES ($1, $2, $2, $3)",
+        "INSERT INTO traders (address, first_seen_at, last_seen_at, fine_refreshed_at, "
+        "fine_attempted_at) VALUES ($1, $2, $2, $3, $4)",
         address,
         T0,
         fine_refreshed_at,
+        fine_attempted_at,
     )
     await pool.execute(
         "INSERT INTO coarse_metrics (address, time_window, pnl, roi, volume, account_value, "
@@ -145,6 +156,49 @@ async def test_a_wedged_ingest_alerts_once_then_recovers(
     )
     recovered = await _cycle(pool, bot, monitor, clock)
     assert recovered == ["✅ Ingest recovered"]
+
+
+async def test_a_constantly_failing_fine_pass_is_reported_then_recovers(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # The #61 outage shape end-to-end: a due backlog past the floor, attempts
+    # still advancing (recent fine_attempted_at), but every refresh is failing
+    # (last success is ancient). A low min_due keeps the fixture small.
+    config = replace(
+        _config(),
+        thresholds=replace(_config().thresholds, starvation_min_due=2),
+    )
+    for i in range(3):
+        await _add_trader(
+            pool,
+            f"0x{i:03d}",
+            fine_refreshed_at=clock.now() - timedelta(days=2),
+            computed_at=clock.now() - timedelta(minutes=5),
+            fine_attempted_at=clock.now() - timedelta(minutes=1),
+        )
+    monitor = _monitor()
+
+    first = await run_monitor_cycle(
+        pool, bot, ADMIN_ID, monitor, config, clock, FakeDiskProbe(47.0)
+    )
+    starvation = [m for m in first if "Fine success" in m]
+    assert len(starvation) == 1
+    assert "failing" in starvation[0] and "3 due" in starvation[0]
+    assert any(s.text == starvation[0] and s.chat_id == ADMIN_ID for s in session.sent_messages())
+
+    # Still failing next cycle: silent (no re-alert before the reminder interval).
+    clock.advance(15 * 60)
+    repeat = await run_monitor_cycle(
+        pool, bot, ADMIN_ID, monitor, config, clock, FakeDiskProbe(47.0)
+    )
+    assert not any("Fine success" in m for m in repeat)
+
+    # The API recovers and refreshes land → the check clears with a recovery notice.
+    await pool.execute("UPDATE traders SET fine_refreshed_at = $1", clock.now())
+    recovered = await run_monitor_cycle(
+        pool, bot, ADMIN_ID, monitor, config, clock, FakeDiskProbe(47.0)
+    )
+    assert "✅ Fine success recovered" in recovered
 
 
 async def test_a_delivery_backlog_is_reported_with_its_count(
