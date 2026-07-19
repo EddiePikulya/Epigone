@@ -9,6 +9,7 @@ replays it so the real gateway code runs an actual request/response cycle.
 import json
 from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -36,7 +37,7 @@ RECORDED: dict[str, Any] = json.loads(
 
 @asynccontextmanager
 async def replaying_gateway(
-    payload: dict[str, Any],
+    payload: Any,  # a JSON body: clearinghouseState dict or a userFills array
     *,
     clock: FakeClock | None = None,
     rng: Callable[[], float] = lambda: 1.0,
@@ -203,3 +204,54 @@ async def test_persistent_429s_surface_as_rate_limited_after_bounded_retries() -
     assert len(received) == RATE_LIMIT_MAX_TRIES
     # A GatewayError subclass: callers that degrade gracefully keep doing so.
     assert issubclass(RateLimitedError, GatewayError)
+
+
+# --- Fills execution-order normalization (issue #58 review) -------------------
+# Same-order and same-block fills share one millisecond timestamp, so array
+# position is the only within-ms execution-order signal — and the two fills
+# endpoints serve OPPOSITE directions (verified live 2026-07-19): userFills is
+# newest-first, userFillsByTime oldest-first. Each must normalize to the
+# protocol's execution order without corrupting the other.
+
+
+def _fill_row(time_ms: int, oid: int, start: str) -> dict[str, Any]:
+    return {
+        "coin": "HYPE",
+        "px": "10",
+        "sz": "1",
+        "dir": "Close Long",
+        "closedPnl": "1",
+        "startPosition": start,
+        "crossed": True,
+        "oid": oid,
+        "time": time_ms,
+    }
+
+
+async def test_get_fills_reverses_the_newest_first_payload_to_execution_order() -> None:
+    # As served: newest first, the two same-ms fills in reverse execution order.
+    payload = [
+        _fill_row(2_000, oid=3, start="1"),
+        _fill_row(1_000, oid=2, start="2"),
+        _fill_row(1_000, oid=1, start="3"),
+    ]
+    async with replaying_gateway(payload) as (gateway, received):
+        fills = await gateway.get_fills(WHALE)
+
+    assert received[0]["type"] == "userFills"
+    # Execution order out: oldest first, and the same-ms pair by array position.
+    assert [f.order_id for f in fills] == [1, 2, 3]
+
+
+async def test_get_fills_since_keeps_the_oldest_first_payload_order() -> None:
+    # As served: already oldest first — reversing here would corrupt it.
+    payload = [
+        _fill_row(1_000, oid=1, start="3"),
+        _fill_row(1_000, oid=2, start="2"),
+        _fill_row(2_000, oid=3, start="1"),
+    ]
+    async with replaying_gateway(payload) as (gateway, received):
+        fills = await gateway.get_fills_since(WHALE, datetime(1970, 1, 1, tzinfo=UTC))
+
+    assert received[0]["type"] == "userFillsByTime"
+    assert [f.order_id for f in fills] == [1, 2, 3]

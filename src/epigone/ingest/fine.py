@@ -33,9 +33,10 @@ from epigone.ingest.scan import (
 from epigone.metrics.bots import classify_bot
 from epigone.metrics.fine import (
     EMPTY_STATE,
-    ClosedTrade,
     FineMetrics,
     FineState,
+    OpenEpisode,
+    RoundTrip,
     extract_state,
     fold_states,
     metrics_from_state,
@@ -126,12 +127,19 @@ async def run_fine_pass(
         surcharge = math.ceil(len(fetched) / FILLS_PER_SURCHARGE_WEIGHT)
         if surcharge:
             await budget.settle(surcharge)
-        delta = extract_state(fetched)  # reduce the batch once; reuse for fold + upsert
-        state = fold_states(prior or EMPTY_STATE, delta)
+        prior_state = prior or EMPTY_STATE
+        state = fold_states(prior_state, extract_state(fetched))
         metrics = metrics_from_state(state, account_value=trader.account_value)
         bot_reason = classify_bot(metrics, month_pnl=trader.month_pnl)
+        # The fold can complete a round-trip the batch alone couldn't (a close
+        # resolving a carried open episode), so the incremental upsert is "new
+        # since the prior state", not the batch's own trades.
+        prior_keys = {(t.coin, t.closed_at, t.seq) for t in prior_state.round_trips}
+        new_trips = tuple(
+            t for t in state.round_trips if (t.coin, t.closed_at, t.seq) not in prior_keys
+        )
         await _store_fine_refresh(
-            pool, trader.address, metrics, state, delta.trades, bot_reason, clock.now(),
+            pool, trader.address, metrics, state, new_trips, bot_reason, clock.now(),
             reseed=full_pull,
         )
         refreshed += 1
@@ -208,42 +216,54 @@ async def _load_fine_state(
     pool: asyncpg.Pool, address: str, checkpoint: datetime | None
 ) -> FineState:
     """Rebuild the fold state from storage for an incremental refresh (issue
-    #11): the persisted closed trades plus the maker/perp accumulators and the
-    fill window, with `checkpoint` (fine_checkpoint_at) as `last_fill_at`."""
+    #11): the persisted round-trips plus the maker/perp/realized accumulators
+    and the fill window, with `checkpoint` (fine_checkpoint_at) as
+    `last_fill_at`."""
     counters = await pool.fetchrow(
-        "SELECT maker_fill_count, perp_fill_count, window_start, window_end, "
-        "hold_seconds_sum, hold_episode_count "
+        "SELECT maker_fill_count, perp_fill_count, realized_pnl, window_start, window_end "
         "FROM fine_metrics WHERE address = $1",
         address,
     )
     trade_rows = await pool.fetch(
-        "SELECT order_id, pnl, peak_notional, closed_at FROM fine_trades WHERE address = $1",
+        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq "
+        "FROM fine_trades WHERE address = $1 ORDER BY closed_at, coin, seq",
         address,
     )
     trades = tuple(
-        ClosedTrade(
-            order_id=r["order_id"],
+        RoundTrip(
+            coin=r["coin"],
             pnl=r["pnl"],
             peak_notional=r["peak_notional"],
+            opened_at=r["opened_at"],
             closed_at=r["closed_at"],
+            seq=r["seq"],
         )
         for r in trade_rows
     )
-    # The open episodes (issue #48): each coin held non-flat at the checkpoint,
-    # so a close arriving in the next batch resolves against its stored open-time.
+    # The open episodes (issues #48/#58): each coin held non-flat at the
+    # checkpoint, with the net PnL and peak notional its trims have realized so
+    # far, so a close arriving in a later batch completes the whole round-trip.
     episode_rows = await pool.fetch(
-        "SELECT coin, opened_at FROM fine_open_episodes WHERE address = $1", address
+        "SELECT coin, opened_at, pnl, peak_notional FROM fine_open_episodes WHERE address = $1",
+        address,
     )
     return FineState(
-        trades=trades,
+        round_trips=trades,
         maker_fill_count=counters["maker_fill_count"] if counters else 0,
         perp_fill_count=counters["perp_fill_count"] if counters else 0,
+        realized_pnl=counters["realized_pnl"] if counters else Decimal(0),
         window_start=counters["window_start"] if counters else None,
         window_end=counters["window_end"] if counters else None,
         last_fill_at=checkpoint,
-        hold_seconds_sum=counters["hold_seconds_sum"] if counters else 0,
-        hold_episode_count=counters["hold_episode_count"] if counters else 0,
-        open_episodes=tuple((r["coin"], r["opened_at"]) for r in episode_rows),
+        open_episodes=tuple(
+            OpenEpisode(
+                coin=r["coin"],
+                opened_at=r["opened_at"],
+                pnl=r["pnl"],
+                peak_notional=r["peak_notional"],
+            )
+            for r in episode_rows
+        ),
     )
 
 
@@ -252,7 +272,7 @@ async def _store_fine_refresh(
     address: str,
     metrics: FineMetrics,
     state: FineState,
-    delta_trades: tuple[ClosedTrade, ...],
+    new_trips: tuple[RoundTrip, ...],
     bot_reason: str | None,
     computed_at: datetime,
     *,
@@ -260,8 +280,9 @@ async def _store_fine_refresh(
 ) -> None:
     """Persist a refresh: the reduced metrics plus the fold state that feeds the
     next incremental pass. `reseed` (a full pull, checkpoint was NULL) rebuilds
-    the trade store from scratch; otherwise only this batch's `delta_trades` are
-    upserted, keeping a fast-tier refresh a small write (issue #11)."""
+    the trade store from scratch; otherwise only the round-trips new since the
+    prior state (`new_trips`) are upserted, keeping a fast-tier refresh a small
+    write (issue #11)."""
     async with pool.acquire() as conn, conn.transaction():
         if reseed:
             await conn.execute("DELETE FROM fine_trades WHERE address = $1", address)
@@ -270,29 +291,36 @@ async def _store_fine_refresh(
         await conn.execute("DELETE FROM fine_open_episodes WHERE address = $1", address)
         if state.open_episodes:
             await conn.executemany(
-                "INSERT INTO fine_open_episodes (address, coin, opened_at) VALUES ($1, $2, $3)",
-                [(address, coin, opened_at) for coin, opened_at in state.open_episodes],
+                "INSERT INTO fine_open_episodes (address, coin, opened_at, pnl, peak_notional) "
+                "VALUES ($1, $2, $3, $4, $5)",
+                [
+                    (address, e.coin, e.opened_at, e.pnl, e.peak_notional)
+                    for e in state.open_episodes
+                ],
             )
-        if delta_trades:
+        if new_trips:
             await conn.executemany(
                 """
-                INSERT INTO fine_trades (address, order_id, pnl, peak_notional, closed_at)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (address, order_id) DO UPDATE
+                INSERT INTO fine_trades
+                    (address, coin, pnl, peak_notional, opened_at, closed_at, seq)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (address, coin, closed_at, seq) DO UPDATE
                     SET pnl = EXCLUDED.pnl,
                         peak_notional = EXCLUDED.peak_notional,
-                        closed_at = EXCLUDED.closed_at
+                        opened_at = EXCLUDED.opened_at
                 """,
-                [(address, t.order_id, t.pnl, t.peak_notional, t.closed_at) for t in delta_trades],
+                [
+                    (address, t.coin, t.pnl, t.peak_notional, t.opened_at, t.closed_at, t.seq)
+                    for t in new_trips
+                ],
             )
         await conn.execute(
             """
             INSERT INTO fine_metrics
                 (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
                  avg_leverage, maker_share, avg_hold_seconds, realized_pnl,
-                 window_start, window_end, maker_fill_count, perp_fill_count,
-                 hold_seconds_sum, hold_episode_count, computed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                 window_start, window_end, maker_fill_count, perp_fill_count, computed_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (address) DO UPDATE
                 SET trade_count = EXCLUDED.trade_count,
                     win_rate = EXCLUDED.win_rate,
@@ -308,8 +336,6 @@ async def _store_fine_refresh(
                     window_end = EXCLUDED.window_end,
                     maker_fill_count = EXCLUDED.maker_fill_count,
                     perp_fill_count = EXCLUDED.perp_fill_count,
-                    hold_seconds_sum = EXCLUDED.hold_seconds_sum,
-                    hold_episode_count = EXCLUDED.hold_episode_count,
                     computed_at = EXCLUDED.computed_at
             """,
             address,
@@ -327,8 +353,6 @@ async def _store_fine_refresh(
             metrics.window_end,
             state.maker_fill_count,
             state.perp_fill_count,
-            state.hold_seconds_sum,
-            state.hold_episode_count,
             computed_at,
         )
         # A flag keeps its original timestamp while the reason stays fresh; a

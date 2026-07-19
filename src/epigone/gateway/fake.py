@@ -69,4 +69,10 @@ class FakeHyperliquidGateway:
         self.leaderboard = list(entries)
 
     def set_fills(self, address: str, fills: list[Fill]) -> None:
+        """Provide fills in **execution order** — oldest first, same-millisecond
+        fills in the sequence they executed — the protocol contract the real
+        gateway normalizes to (get_fills reverses userFills' newest-first;
+        get_fills_since keeps userFillsByTime's oldest-first). The round-trip
+        engine (#58) depends on within-ms order, so a newest-first list here
+        would silently exercise the wrong order."""
         self.fills[address.lower()] = list(fills)

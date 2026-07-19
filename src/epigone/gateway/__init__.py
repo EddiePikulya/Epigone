@@ -157,8 +157,12 @@ class HyperliquidGateway(Protocol):
         ...
 
     async def get_fills(self, address: str) -> list[Fill]:
-        """A Trader's recent fills, newest first (the info API caps at ~2000).
-        Raises GatewayError on failure."""
+        """A Trader's recent fills in EXECUTION ORDER — oldest first, and
+        same-millisecond fills in the sequence they executed (the info API caps
+        at ~2000). Same-order fills share one timestamp, so list order is the
+        only within-ms signal and the round-trip engine (#58) depends on it;
+        implementations must normalize whatever the API serves. Raises
+        GatewayError on failure."""
         ...
 
     async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
@@ -166,7 +170,8 @@ class HyperliquidGateway(Protocol):
         incremental fine refresh (issue #11): a fast-tier pass fetches only what
         is new since its checkpoint instead of re-pulling the full ~2000-fill
         history. Same ~2000 cap per call, so callers checkpoint forward far
-        enough that a window never overflows. Raises GatewayError on failure."""
+        enough that a window never overflows. Same execution-order contract as
+        get_fills. Raises GatewayError on failure."""
         ...
 
 

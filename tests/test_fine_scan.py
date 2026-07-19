@@ -66,11 +66,14 @@ async def add_trader(
 
 
 def human_fills() -> list:
-    """A modest human profile: 3 trades, 2 wins, one maker fill."""
+    """A modest human profile: 3 completed round-trips, 2 wins, one maker fill."""
     return [
-        fill(pnl="100", order_id=1, at=T0, crossed=False, start_position="50"),
-        fill(pnl="-40", order_id=2, at=T0 + timedelta(days=1)),
-        fill(pnl="60", order_id=3, at=T0 + timedelta(days=2)),
+        fill("Open Long", order_id=1, at=T0, start_position="0", size="50", crossed=False),
+        fill(pnl="100", order_id=2, at=T0 + timedelta(hours=1), start_position="50", size="50"),
+        fill("Open Long", order_id=3, at=T0 + timedelta(days=1), start_position="0"),
+        fill(pnl="-40", order_id=4, at=T0 + timedelta(days=1, hours=1)),
+        fill("Open Long", order_id=5, at=T0 + timedelta(days=2), start_position="0"),
+        fill(pnl="60", order_id=6, at=T0 + timedelta(days=2, hours=1)),
     ]
 
 
@@ -90,7 +93,7 @@ async def test_fine_pass_stores_metrics_for_a_coarse_survivor(pool: asyncpg.Pool
     assert row["avg_win"] == Decimal("80")
     assert row["avg_loss"] == Decimal("40")
     assert row["realized_pnl"] == Decimal("120")
-    assert row["maker_share"] == Decimal(1) / Decimal(3)
+    assert row["maker_share"] == Decimal(1) / Decimal(6)
     # peak notionals 500, 10, 10 against the $1000 coarse account value
     assert row["avg_leverage"] == Decimal("520") / Decimal("3000")
     assert row["window_start"] == T0
@@ -121,10 +124,17 @@ async def test_a_market_maker_is_flagged_as_bot_but_keeps_its_rows(pool: asyncpg
     gateway = FakeHyperliquidGateway()
     clock = FakeClock()
     await add_trader(pool, clock, "0xbot")
-    # 150 exits, every one a winner: the ~100%-win-rate heuristic.
+    # 150 completed round-trips, every one a winner: the ~100%-win-rate heuristic.
     gateway.set_fills(
         "0xbot",
-        [fill(pnl="5", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 151)],
+        [
+            f
+            for i in range(1, 151)
+            for f in (
+                fill("Open Long", at=T0 + timedelta(hours=2 * i), start_position="0"),
+                fill(pnl="5", at=T0 + timedelta(hours=2 * i + 1)),
+            )
+        ],
     )
 
     await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
@@ -332,18 +342,18 @@ async def test_incremental_refresh_folds_new_fills_into_the_stored_metrics(
     gateway = FakeHyperliquidGateway()
     clock = FakeClock()
     await add_trader(pool, clock, "0xaaa", account_value="1000")
-    initial = [
-        fill(pnl="100", order_id=1, at=T0, crossed=False, start_position="50"),
-        fill(pnl="-40", order_id=2, at=T0 + timedelta(days=1)),
-    ]
+    initial = human_fills()[:4]  # two completed round-trips (+100, -40)
     gateway.set_fills("0xaaa", initial)
     budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
     await run_fine_pass(pool, gateway, budget, clock)
 
-    # A new closing trade lands after the checkpoint; the next pass folds it in
+    # A new round-trip lands after the checkpoint; the next pass folds it in
     # without re-pulling the earlier fills.
-    new_fill = fill(pnl="60", order_id=3, at=T0 + timedelta(days=1, hours=2))
-    gateway.set_fills("0xaaa", initial + [new_fill])
+    new_trip = [
+        fill("Open Long", order_id=5, at=T0 + timedelta(days=2), start_position="0"),
+        fill(pnl="60", order_id=6, at=T0 + timedelta(days=2, hours=1)),
+    ]
+    gateway.set_fills("0xaaa", initial + new_trip)
     clock.advance(2 * 24 * 3600)  # past the active cadence
     result = await run_fine_pass(pool, gateway, budget, clock)
 
@@ -351,7 +361,7 @@ async def test_incremental_refresh_folds_new_fills_into_the_stored_metrics(
     # Full pull happened once; the second refresh fetched only fills since the
     # checkpoint (one fill-tick past the last folded fill).
     assert gateway.fills_calls == ["0xaaa"]
-    assert gateway.fills_since_calls == [("0xaaa", T0 + timedelta(days=1, milliseconds=1))]
+    assert gateway.fills_since_calls == [("0xaaa", T0 + timedelta(days=1, hours=1, milliseconds=1))]
 
     row = await pool.fetchrow("SELECT * FROM fine_metrics WHERE address = '0xaaa'")
     assert row is not None
@@ -363,7 +373,7 @@ async def test_incremental_refresh_folds_new_fills_into_the_stored_metrics(
     checkpoint = await pool.fetchval(
         "SELECT fine_checkpoint_at FROM traders WHERE address = '0xaaa'"
     )
-    assert checkpoint == T0 + timedelta(days=1, hours=2)
+    assert checkpoint == T0 + timedelta(days=2, hours=1)
 
 
 async def test_incremental_refresh_preserves_history_beyond_a_single_pull(
@@ -375,15 +385,25 @@ async def test_incremental_refresh_preserves_history_beyond_a_single_pull(
     gateway = FakeHyperliquidGateway()
     clock = FakeClock()
     await add_trader(pool, clock, "0xaaa")
-    seeded = [fill(pnl="10", order_id=i, at=T0 + timedelta(hours=i)) for i in range(1, 6)]
+    seeded = [
+        f
+        for i in range(1, 6)
+        for f in (
+            fill("Open Long", at=T0 + timedelta(hours=2 * i), start_position="0"),
+            fill(pnl="10", at=T0 + timedelta(hours=2 * i + 1)),
+        )
+    ]
     gateway.set_fills("0xaaa", seeded)
     budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
     await run_fine_pass(pool, gateway, budget, clock)
 
-    # The incremental window returns ONLY the single new fill (the fake filters
+    # The incremental window returns ONLY the new round-trip (the fake filters
     # by time, exactly as userFillsByTime would) — the five seeded ones are gone.
-    late = fill(pnl="10", order_id=6, at=T0 + timedelta(hours=6))
-    gateway.set_fills("0xaaa", [late])
+    late = [
+        fill("Open Long", at=T0 + timedelta(hours=12), start_position="0"),
+        fill(pnl="10", at=T0 + timedelta(hours=13)),
+    ]
+    gateway.set_fills("0xaaa", late)
     clock.advance(2 * 24 * 3600)
     await run_fine_pass(pool, gateway, budget, clock)
 
@@ -443,12 +463,65 @@ async def test_holding_time_folds_across_an_incremental_refresh(pool: asyncpg.Po
     await run_fine_pass(pool, gateway, budget, clock)
 
     row = await pool.fetchrow(
-        "SELECT avg_hold_seconds, hold_episode_count FROM fine_metrics WHERE address = '0xaaa'"
+        "SELECT avg_hold_seconds, trade_count FROM fine_metrics WHERE address = '0xaaa'"
     )
     assert row is not None
     assert row["avg_hold_seconds"] == 3 * 3600  # T0 -> T0+3h, resolved across the fold
-    assert row["hold_episode_count"] == 1
+    assert row["trade_count"] == 1  # the resolved episode is a completed round-trip
     assert await pool.fetchval(episodes) == 0  # the episode closed, its open row is gone
+
+
+async def test_a_round_trip_accumulates_net_pnl_across_refreshes(pool: asyncpg.Pool) -> None:
+    # Opened in one refresh, trimmed in the next, fully closed in a third: one
+    # trade whose net PnL spans all three batches (issue #58) — the open
+    # episode's PnL/peak accumulators persist in fine_open_episodes between
+    # passes, so the final close completes the whole round-trip.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    opened = fill("Open Long", at=T0, start_position="0", size="2")
+    gateway.set_fills("0xaaa", [opened])
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    trim = fill(pnl="20", at=T0 + timedelta(hours=1), start_position="2")
+    gateway.set_fills("0xaaa", [opened, trim])
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    # Mid-life: the trim banked into the open episode, not into any trade.
+    episode = await pool.fetchrow(
+        "SELECT pnl, peak_notional FROM fine_open_episodes WHERE address = '0xaaa'"
+    )
+    assert episode is not None
+    assert episode["pnl"] == Decimal("20")
+    assert episode["peak_notional"] == Decimal("20")  # |start 2| x price 10
+    mid = await pool.fetchrow(
+        "SELECT trade_count, win_rate, realized_pnl FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert mid is not None
+    assert mid["trade_count"] == 0  # still open: not a trade yet
+    assert mid["win_rate"] is None
+    assert mid["realized_pnl"] == Decimal("20")  # but the money is banked
+
+    closed = fill(pnl="-50", at=T0 + timedelta(hours=2), start_position="1")
+    gateway.set_fills("0xaaa", [opened, trim, closed])
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    row = await pool.fetchrow("SELECT * FROM fine_metrics WHERE address = '0xaaa'")
+    assert row is not None
+    assert row["trade_count"] == 1
+    assert row["win_rate"] == Decimal(0)  # trimmed in profit, net a loss
+    assert row["avg_loss"] == Decimal("30")
+    assert row["realized_pnl"] == Decimal("-30")
+    assert row["avg_hold_seconds"] == 2 * 3600
+    trade = await pool.fetchrow("SELECT * FROM fine_trades WHERE address = '0xaaa'")
+    assert trade is not None
+    assert trade["pnl"] == Decimal("-30")
+    assert trade["opened_at"] == T0
+    assert trade["closed_at"] == T0 + timedelta(hours=2)
+    assert await pool.fetchval("SELECT count(*) FROM fine_open_episodes") == 0
 
 
 async def test_a_refresh_with_no_new_fills_does_not_double_count(pool: asyncpg.Pool) -> None:
@@ -478,3 +551,33 @@ async def test_a_refresh_with_no_new_fills_does_not_double_count(pool: asyncpg.P
         "SELECT fine_checkpoint_at FROM traders WHERE address = '0xaaa'"
     )
     assert checkpoint_after == checkpoint_before  # nothing new, checkpoint holds
+
+
+async def test_same_ms_trades_both_persist(pool: asyncpg.Pool) -> None:
+    # A same-block close->reopen->close completes two round-trips on one
+    # timestamp; the fine_trades primary key carries the seq ordinal so
+    # neither row silently vanishes (issue #58 review).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    t1 = T0 + timedelta(hours=1)
+    gateway.set_fills(
+        "0xaaa",
+        [
+            fill("Open Long", at=T0, start_position="0"),
+            fill(pnl="10", at=t1),
+            fill("Open Long", at=t1, start_position="0"),
+            fill(pnl="-5", at=t1),
+        ],
+    )
+
+    await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    rows = await pool.fetch("SELECT pnl, seq FROM fine_trades WHERE address = '0xaaa' ORDER BY seq")
+    assert [(r["pnl"], r["seq"]) for r in rows] == [(Decimal("10"), 0), (Decimal("-5"), 1)]
+    metrics = await pool.fetchrow(
+        "SELECT trade_count, win_rate FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert metrics is not None
+    assert metrics["trade_count"] == 2
+    assert metrics["win_rate"] == Decimal("0.5")

@@ -2,25 +2,34 @@
 
 A Bot (CONTEXT.md) stays in the database but never reaches a screener result.
 Heuristics and thresholds come from the ansem-bullpen vetting R&D, calibrated
-against its real exclusions and the 15 vetted wallets (docs/metrics.md):
-every vetted human clears each threshold with wide margin (max observed:
-95.6% win rate, 25 exits/day)."""
+against its real exclusions and the 15 vetted wallets (docs/metrics.md), and
+re-based on round-trip trades (issue #58): every vetted human still clears
+each threshold with wide margin (their round-trip maxima: 57 trades, ~2.5
+trades/day; perfect win rates appear only over tiny samples the min-exits
+guard forgives)."""
 
 from decimal import Decimal
 
 from epigone.metrics.fine import FineMetrics
 
 # ~100% win rate sustained over many exits means losses are never realized —
-# the 0x8af700ba exclusion ran 100% over 637 exits.
+# the 0x8af700ba exclusion ran 100% over 637 exits. Exits are completed
+# round-trips now (#58): a market-maker cycles flat constantly, so its perfect
+# exits stay numerous, while no vetted human tops 57 round-trips in view.
 BOT_WIN_RATE = Decimal("0.98")
 BOT_WIN_RATE_MIN_EXITS = 100
 
-# Exit cadence no human sustains: the excluded market-makers ran ~440/day.
+# Exit cadence no human sustains: the excluded market-makers cycled flat ~440
+# times a day; the busiest vetted human completes ~2.5 round-trips per day.
 BOT_EXITS_PER_DAY = 200
 
-# Big monthly PnL with almost no closed trades: the money is made by holding,
-# not trading — nothing there to copy.
-STATIC_HOLDINGS_MAX_TRADES = 5
+# Big monthly PnL with almost no trading activity: the money is made by
+# holding, not trading — nothing there to copy. Activity is judged by fills
+# seen, not completed round-trips (#58): a long-hold human whose opens predate
+# our fill window shows few round-trips yet 1600+ fills across the vetted
+# wallets, while the excluded $13M/month whale (a handful of closing orders)
+# barely filled at all.
+STATIC_HOLDINGS_MAX_FILLS = 50
 STATIC_HOLDINGS_MIN_MONTH_PNL = Decimal("100000")
 
 
@@ -42,7 +51,7 @@ def classify_bot(metrics: FineMetrics, month_pnl: Decimal | None) -> str | None:
     if (
         month_pnl is not None
         and abs(month_pnl) >= STATIC_HOLDINGS_MIN_MONTH_PNL
-        and metrics.trade_count <= STATIC_HOLDINGS_MAX_TRADES
+        and metrics.perp_fill_count <= STATIC_HOLDINGS_MAX_FILLS
     ):
-        return f"${month_pnl:,.0f} month PnL from static holdings ({metrics.trade_count} exits)"
+        return f"${month_pnl:,.0f} month PnL from static holdings ({metrics.perp_fill_count} fills)"
     return None

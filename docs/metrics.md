@@ -50,62 +50,86 @@ A metric can be **unavailable (NULL)** when the fill history can't support it
 Sharpe. Unavailable never means zero, and screener surfaces must show
 coarse-only Traders as such.
 
-## The closed trade
+## The trade: a completed round-trip
 
-Most fine metrics are per **closed trade**: all closing fills that share one
-closing order, with the trade's PnL being the sum of their `closedPnl`
-(before fees). Closing fills are position closes, flips (long→short or
-reverse), liquidations, and market settlements. This is the same grouping the
-ansem-bullpen vetting used, so the golden wallets reproduce their
-independently verified win rates (`tests/test_golden_wallets.py`).
+Most fine metrics are per **trade**, and a trade is a completed **position
+round-trip** (issue #58): it opens when a coin's position leaves flat and
+completes when the position returns to flat — via a full close, a flip
+(long→short or reverse), a liquidation, or a market settlement. Its PnL is
+the **net** realized `closedPnl` (before fees) over the position's whole
+life. A partial trim realizes money *inside* one trade, never as a trade of
+its own — so a wallet cannot look prolific and accurate just by trimming a
+single winner many times.
+
+A round-trip only counts when **both** its open and its full close are in the
+fill history we hold. A position opened before our history begins is excluded
+outright — never given partial credit — and a position still open contributes
+nothing yet (its trade completes, with full totals, when it eventually
+closes). Long-hold Traders can therefore show few or no trade-quality
+metrics until their positions turn over under our watch; that is the honest
+reading, not a gap. (The 15 golden wallets are pinned on this basis in
+`tests/test_golden_wallets.py`.)
+
+**Total realized PnL stays comprehensive**: it sums *all* realized
+`closedPnl` in the window, including trims of positions whose opens we never
+saw, so it can exceed the sum of the counted round-trips' PnLs by exactly
+those unattributable partials. It is banked money — a magnitude sum, not a
+per-trade quality signal — so trims cannot game it.
 
 ## Fine metrics
 
 ### Win rate
-- **In plain words:** out of the trades this account closed, the share that
-  ended in profit.
-- **Definition:** closed trades with PnL > 0 divided by all closed trades.
-  Breakeven trades count against the win rate. Unavailable without closed
-  trades.
+- **In plain words:** out of the positions this account opened and fully
+  closed, the share that ended in net profit.
+- **Definition:** completed round-trips with net PnL > 0 divided by all
+  completed round-trips. A trade trimmed in profit but ultimately closed at
+  a net loss is a loss. Breakeven trades count against the win rate.
+  Unavailable without completed round-trips — never 0 or 100% for a wallet
+  that has only trimmed.
 
 ### Average win / average loss
 - **In plain words (average win):** the typical profit on this account's
   winning trades, in dollars.
 - **In plain words (average loss):** the typical damage of this account's
   losing trades, in dollars (a positive number — smaller is better).
-- **Definition:** mean PnL of winning trades; mean absolute PnL of losing
-  trades (reported positive). Breakeven trades join neither. Each side is
-  unavailable until it has at least one trade.
+- **Definition:** mean net PnL of winning round-trips; mean absolute net PnL
+  of losing round-trips (reported positive). Breakeven trades join neither.
+  Each side is unavailable until it has at least one trade.
 
 ### Sharpe
 - **In plain words:** how steady the daily profits are — high means smooth
   earning, low means a rollercoaster that happens to end up positive.
-- **Definition:** mean ÷ standard deviation of **daily realized PnL** (UTC
-  calendar days from first to last perp fill; quiet days count as zero),
-  annualized by √365. Unavailable when the window is a single day or the
-  daily PnL never varies.
+- **Definition:** mean ÷ standard deviation of **daily realized PnL** — each
+  round-trip's net PnL lands on the UTC calendar day it completed, spanning
+  first to last completed trade; quiet days count as zero — annualized by
+  √365. Unavailable when the trades span a single day or the daily PnL never
+  varies.
 
 ### Max drawdown
 - **In plain words:** the deepest hole the account dug from its own peak —
   how much giveback you'd have sat through at worst.
 - **Definition:** largest peak-to-trough fall of the cumulative realized-PnL
-  curve over the fill window, in USD. Unrealized swings don't move it (fills
-  only realize PnL).
+  curve over the fill window, in USD — the curve steps once per completed
+  round-trip, at its close. Unrealized swings don't move it (fills only
+  realize PnL). Unlike the other trade metrics it reads 0 (not NULL) with no
+  completed round-trips: an empty curve never fell.
 
 ### Trade count
-- **In plain words:** how many trades the account closed in its recent
-  history — more trades, more evidence the other numbers are real.
-- **Definition:** number of closed trades (as grouped above) in the fill
-  window.
+- **In plain words:** how many positions the account opened and fully closed
+  in its recent history — more trades, more evidence the other numbers are
+  real.
+- **Definition:** number of completed round-trips (as defined above) in the
+  fill window. Partial trims never inflate it: 78 trims of one still-open
+  position are 0 trades.
 
 ### Average leverage (estimated)
 - **In plain words:** roughly how many times the account's own money it puts
   into a typical trade.
-- **Definition:** mean over closed trades of peak position value (largest
-  `|startPosition| × price` among the trade's closing fills) ÷ the account
-  value recorded by the coarse pass. Fills carry no margin data, so this is a
-  copyability signal, not the exchange's leverage setting. Unavailable
-  without a coarse account value.
+- **Definition:** mean over completed round-trips of peak position value
+  (largest `|startPosition| × price` among the trade's closing fills) ÷ the
+  account value recorded by the coarse pass. Fills carry no margin data, so
+  this is a copyability signal, not the exchange's leverage setting.
+  Unavailable without a coarse account value.
 
 ### Maker/taker share
 - **In plain words:** how often the account waits with resting orders (maker)
@@ -117,19 +141,17 @@ independently verified win rates (`tests/test_golden_wallets.py`).
 ### Average holding time
 - **In plain words:** how long the account typically holds a position before
   closing it — short means scalping, long means swinging.
-- **Definition:** mean duration of **completed position episodes** over the
-  fill window (issue #48). An *episode* is the span a coin's position stays
-  non-flat: it opens when the signed position leaves 0 and closes when it
-  returns to 0; a flip through 0 closes one episode and opens the next.
-  Duration is `close_time − open_time`, and the metric is the mean over
-  episodes that closed within the window. An episode still open at window end
-  is excluded (no close time yet), so an in-progress position never skews it.
-  Unavailable (NULL) until at least one episode has completed. Because an
-  episode can straddle an incremental checkpoint — opened in one refresh,
-  closed in a later one — the open-times persist across refreshes and the mean
-  accumulates as a running sum + count, so it stays correct under the #11 fold.
-  Thresholds are typed naturally (`2d`, `12h`, `90m`, `1d 6h`) and displayed
-  the same compact way (`2d 4h`).
+- **Definition:** mean duration (`close_time − open_time`) of **completed
+  round-trips** over the fill window (issue #48) — a trade's holding time is
+  the span its position stayed non-flat, so this metric shares the trade
+  definition above, including the pre-window exclusion. A position still open
+  at window end is excluded (no close time yet), so an in-progress position
+  never skews it. Unavailable (NULL) until at least one trade has completed.
+  Because a position can straddle an incremental checkpoint — opened in one
+  refresh, closed in a later one — the open episode (open-time plus the PnL
+  and peak notional banked so far) persists across refreshes, so the trade's
+  totals stay correct under the #11 fold. Thresholds are typed naturally
+  (`2d`, `12h`, `90m`, `1d 6h`) and displayed the same compact way (`2d 4h`).
 
 ## Bot exclusion
 
@@ -139,13 +161,19 @@ keep their rows and metrics in the database but never appear in screener
 results; a profile that stops matching the heuristics is unflagged on its
 next fine refresh. Thresholds are calibrated against the ansem-bullpen R&D:
 every real excluded account is caught, and all 15 vetted wallets clear each
-threshold with wide margin (their maxima: 95.6% win rate, ~25 exits/day).
+threshold with wide margin (their round-trip maxima: 57 completed trades,
+~2.5 trades/day; perfect win rates appear only over samples far below the
+min-exits guard).
 
 1. **Near-perfect win rate over many exits** — win rate ≥ 98% across ≥ 100
-   closed trades. Humans realize losses; market-makers don't.
-2. **Extreme exit frequency** — ≥ 200 closed trades per day across the fill
-   window (bursts inside a single day are measured against a full day). The
-   excluded HFT accounts ran ~440/day.
+   completed round-trips. Humans realize losses; market-makers don't.
+2. **Extreme exit frequency** — ≥ 200 completed round-trips per day across
+   the fill window (bursts inside a single day are measured against a full
+   day). The excluded HFT accounts cycled flat ~440 times a day.
 3. **PnL from static holdings** — ≥ $100k absolute month PnL (coarse pass)
-   with ≤ 5 closed trades. The money is made by holding, not trading —
-   nothing to copy. Skipped until the Trader has coarse metrics.
+   with ≤ 50 perp fills in the whole visible history. The money is made by
+   holding, not trading — nothing to copy. Judged by fills seen rather than
+   completed round-trips (issue #58): a long-hold human whose opens predate
+   our fill window shows few round-trips yet thousands of fills, and must
+   never be mistaken for a holdings whale. Skipped until the Trader has
+   coarse metrics.
