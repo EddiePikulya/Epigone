@@ -161,15 +161,20 @@ async def _stamp_attempt(pool: asyncpg.Pool, address: str, now: datetime) -> Non
     await pool.execute("UPDATE traders SET fine_attempted_at = $2 WHERE address = $1", address, now)
 
 
+# Whether Trader `t` is tracked by a User — single-sourced because it gates both
+# eligibility (below) and due-queue priority (issue #65's ORDER BY), which must
+# stay in lockstep on what "tracked" means.
+IS_TRACKED = "EXISTS (SELECT 1 FROM tracks WHERE trader_address = t.address)"
+
 # The fine-pass eligibility predicate, single-sourced so the health monitor
 # (issue #52) can count *due* Traders with the exact same rule the pass rotates
 # on — "idle because caught up" must read as healthy, not as a stuck pass. Reads
 # `traders t LEFT JOIN coarse_metrics cm (month)`; $1 = active cutoff, $2 =
 # dormant cutoff. Tracked Traders may predate their first coarse scan (NULL
 # tier/coarse row); they refresh on the active cadence.
-DUE_ELIGIBILITY = """
+DUE_ELIGIBILITY = f"""
     (
-        EXISTS (SELECT 1 FROM tracks WHERE trader_address = t.address)
+        {IS_TRACKED}
         OR (cm.pnl > 0 AND cm.volume > 0)
     )
     AND (
@@ -198,14 +203,24 @@ async def count_due_traders(pool: asyncpg.Pool, now: datetime) -> int:
 
 
 async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
-    # Same rotation as the coarse pass: least-recently-attempted first.
+    # Drain a backlog best-first without breaking rotation fairness (issue #65):
+    # tracked Traders lead (formalizing the post-wipe hand-seed), then least-
+    # recently-attempted (rotation still dominates — a low-PnL wallet's timestamp
+    # keeps aging until it reaches the front, so nothing starves), and coarse
+    # month PnL only tiebreaks among equals — in practice the never-attempted
+    # pile, whose NULL timestamps would otherwise drain in address-hex order.
+    # PnL over ROI deliberately: ROI crowns tiny lucky accounts.
     rows = await pool.fetch(
         f"""
         SELECT t.address, t.fine_checkpoint_at, cm.account_value, cm.pnl AS month_pnl
         FROM traders t
         LEFT JOIN coarse_metrics cm ON cm.address = t.address AND cm.time_window = 'month'
         WHERE {DUE_ELIGIBILITY}
-        ORDER BY t.fine_attempted_at ASC NULLS FIRST, t.address
+        ORDER BY
+            {IS_TRACKED} DESC,
+            t.fine_attempted_at ASC NULLS FIRST,
+            cm.pnl DESC NULLS LAST,
+            t.address
         """,
         now - ACTIVE_REFRESH_INTERVAL,
         now - DORMANT_REFRESH_INTERVAL,
