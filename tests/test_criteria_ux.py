@@ -117,7 +117,7 @@ async def test_guided_flow_builds_and_runs_a_criteria(
     await feed_callback(dp, bot, "cfm:win_rate", user_id=111)
     operators = session.edited_messages()[-1]
     # The metric's one-line explanation appears the moment it is picked.
-    assert "share that ended in profit" in (operators.text or "")
+    assert "share that ended in net profit" in (operators.text or "")
     assert "cfo:win_rate:gte" in _callback_data(operators.reply_markup)
 
     await feed_callback(dp, bot, "cfo:win_rate:gte", user_id=111)

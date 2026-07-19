@@ -87,7 +87,10 @@ _SPECS = [
         unit=Unit.PERCENT,
         scope=Scope.FINE,
         sql="fm.win_rate",
-        explanation="out of the trades this account closed, the share that ended in profit.",
+        explanation=(
+            "out of the positions this account opened and fully closed, "
+            "the share that ended in net profit."
+        ),
         example="60 for 60%",
     ),
     MetricSpec(
@@ -97,8 +100,8 @@ _SPECS = [
         scope=Scope.FINE,
         sql="fm.trade_count",
         explanation=(
-            "how many trades the account closed in its recent history — "
-            "more trades, more evidence the other numbers are real."
+            "how many positions the account opened and fully closed in its recent "
+            "history — more trades, more evidence the other numbers are real."
         ),
         example="100",
     ),
