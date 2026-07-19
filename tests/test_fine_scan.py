@@ -276,6 +276,51 @@ async def test_the_pass_is_paced_by_the_weight_budget(pool: asyncpg.Pool) -> Non
     assert await pool.fetchval("SELECT count(*) FROM fine_metrics") == 30
 
 
+async def test_the_due_queue_orders_tracked_first_then_rotation_then_pnl(
+    pool: asyncpg.Pool,
+) -> None:
+    # A backlog (never-attempted pile) must drain best-first without breaking
+    # rotation fairness (issue #65): tracked ahead of everyone, then least-
+    # recently-attempted, then higher coarse month PnL as the tiebreak.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    now = clock.now()
+    # Tracked with the *most recent* attempt: still refreshes first.
+    await add_trader(pool, clock, "0xtracked", month_pnl="1", tracked_by=42)
+    # Never attempted (NULL): the pile, tiebroken by month PnL DESC. Addresses
+    # are chosen so hex order would rank them the other way — pnl must win.
+    await add_trader(pool, clock, "0xzz_never_hi", month_pnl="9000")
+    await add_trader(pool, clock, "0xaa_never_lo", month_pnl="1000")
+    # Attempted (non-NULL): rotation orders these by staleness, ignoring PnL.
+    await add_trader(pool, clock, "0xold_attempt", month_pnl="100")
+    await add_trader(pool, clock, "0xnew_attempt", month_pnl="8000")
+    await pool.execute(
+        "UPDATE traders SET fine_attempted_at = $2 WHERE address = $1",
+        "0xtracked",
+        now,
+    )
+    await pool.execute(
+        "UPDATE traders SET fine_attempted_at = $2 WHERE address = $1",
+        "0xold_attempt",
+        now - timedelta(days=10),
+    )
+    await pool.execute(
+        "UPDATE traders SET fine_attempted_at = $2 WHERE address = $1",
+        "0xnew_attempt",
+        now - timedelta(days=5),
+    )
+
+    await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert gateway.fills_calls == [
+        "0xtracked",  # tracked first, despite the freshest attempt
+        "0xzz_never_hi",  # never-attempted pile, higher PnL first
+        "0xaa_never_lo",
+        "0xold_attempt",  # rotation: stalest before...
+        "0xnew_attempt",  # ...newer, even though its PnL is far higher
+    ]
+
+
 class RecordingBudget:
     """Grants everything instantly, recording the billing calls."""
 
