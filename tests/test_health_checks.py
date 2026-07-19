@@ -13,6 +13,7 @@ from epigone.monitor.checks import (
     CRITICAL,
     DATABASE,
     DISK,
+    FINE_SUCCESS,
     INGEST,
     RATE,
     WARNING,
@@ -33,6 +34,8 @@ THRESHOLDS = CheckThresholds(
     rate_window=timedelta(minutes=15),
     rate_max_events=5,
     disk_percent=85,
+    starvation_window=timedelta(minutes=45),
+    starvation_min_due=50,
 )
 
 HEALTHY = HealthSnapshot(
@@ -41,6 +44,7 @@ HEALTHY = HealthSnapshot(
     wallet_count=41_203,
     due_traders=0,
     last_fine_refresh=NOW - timedelta(minutes=2),
+    last_fine_attempt=NOW - timedelta(minutes=1),
     fine_refreshed_today=312,
     last_coarse_compute=NOW - timedelta(minutes=12),
     undelivered_alerts=0,
@@ -57,7 +61,15 @@ def _by_name(results: list[CheckResult], name: str) -> CheckResult:
 def test_a_healthy_system_trips_no_check() -> None:
     results = evaluate_checks(HEALTHY, THRESHOLDS)
     assert all(r.ok for r in results)
-    assert {r.name for r in results} == {DATABASE, INGEST, COARSE, ALERTS, RATE, DISK}
+    assert {r.name for r in results} == {
+        DATABASE,
+        INGEST,
+        COARSE,
+        ALERTS,
+        RATE,
+        DISK,
+        FINE_SUCCESS,
+    }
 
 
 def test_ingest_is_flagged_when_no_refresh_in_window_and_traders_are_due() -> None:
@@ -84,6 +96,90 @@ def test_ingest_flags_a_never_refreshed_system_with_due_traders() -> None:
     ingest = _by_name(evaluate_checks(snapshot, THRESHOLDS), INGEST)
     assert not ingest.ok
     assert "never" in ingest.detail
+
+
+def test_fine_success_starvation_is_flagged_when_attempts_advance_but_none_succeed() -> None:
+    # The #61 outage shape: a large due backlog, the fine pass is actively
+    # attempting (recent fine_attempted_at), yet no successful refresh has landed
+    # in the window — every refresh is failing (e.g. a 500 storm).
+    snapshot = replace(
+        HEALTHY,
+        due_traders=1_200,
+        last_fine_refresh=NOW - timedelta(minutes=90),
+        last_fine_attempt=NOW - timedelta(minutes=1),
+    )
+    fine = _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS)
+    assert not fine.ok
+    assert fine.severity == WARNING
+    assert "1,200" in fine.detail and "failing" in fine.detail
+
+
+def test_fine_success_flags_a_never_succeeded_pass_that_is_actively_attempting() -> None:
+    # No successful refresh has *ever* landed, but attempts are advancing and the
+    # backlog is large — starving from the first cycle.
+    snapshot = replace(
+        HEALTHY,
+        due_traders=1_200,
+        last_fine_refresh=None,
+        last_fine_attempt=NOW - timedelta(minutes=1),
+    )
+    fine = _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS)
+    assert not fine.ok
+    assert "ever" in fine.detail
+
+
+def test_fine_success_is_healthy_when_caught_up_even_without_a_recent_success() -> None:
+    # Backlog ≈ 0 → nothing to succeed at; a quiet caught-up pass is idle by
+    # design, never starvation (mirrors the ingest caught-up nuance).
+    snapshot = replace(
+        HEALTHY,
+        due_traders=0,
+        last_fine_refresh=NOW - timedelta(hours=6),
+        last_fine_attempt=NOW - timedelta(minutes=1),
+    )
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS).ok
+
+
+def test_fine_success_is_healthy_when_the_backlog_is_below_the_min_due_floor() -> None:
+    # A handful due is normal churn, not a starving pass worth paging on.
+    snapshot = replace(
+        HEALTHY,
+        due_traders=10,
+        last_fine_refresh=NOW - timedelta(minutes=90),
+        last_fine_attempt=NOW - timedelta(minutes=1),
+    )
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS).ok
+
+
+def test_fine_success_is_healthy_when_a_recent_success_landed() -> None:
+    # Successes landing within the window → not starving, even with a big backlog.
+    snapshot = replace(
+        HEALTHY,
+        due_traders=1_200,
+        last_fine_refresh=NOW - timedelta(minutes=5),
+        last_fine_attempt=NOW - timedelta(minutes=1),
+    )
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS).ok
+
+
+def test_fine_success_defers_to_ingest_when_attempts_are_not_advancing() -> None:
+    # A *stopped* pass (last attempt long ago) is the ingest check's province, not
+    # this one — the attempts-advancing guard (issue #61).
+    snapshot = replace(
+        HEALTHY,
+        due_traders=1_200,
+        last_fine_refresh=NOW - timedelta(minutes=90),
+        last_fine_attempt=NOW - timedelta(hours=3),
+    )
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS).ok
+
+
+def test_fine_success_stays_quiet_when_no_attempts_were_ever_recorded() -> None:
+    # A brand-new never-run pass (no attempts at all) is not "constantly failing".
+    snapshot = replace(
+        HEALTHY, due_traders=1_200, last_fine_refresh=None, last_fine_attempt=None
+    )
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), FINE_SUCCESS).ok
 
 
 def test_coarse_is_flagged_when_metrics_are_stale() -> None:
@@ -153,6 +249,7 @@ def test_heartbeat_digest_carries_the_key_liveness_numbers() -> None:
     digest = heartbeat_digest(HEALTHY)
     assert "41,203 wallets" in digest
     assert "312 fine-refreshed today" in digest
+    assert "0 due" in digest
     assert "coarse fresh 12m ago" in digest
     assert "0 rate errors" in digest
     assert "disk 47%" in digest

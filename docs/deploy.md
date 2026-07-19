@@ -80,6 +80,8 @@ ADMIN_TELEGRAM_ID=370818090
 # HEALTHCHECK_HEARTBEAT_HOUR=9           # UTC hour for the daily "all good" digest
 # HEALTHCHECK_REMINDER_HOURS=6           # cadence of reminders while a check stays failing
 # HEALTHCHECK_INGEST_STALL_MINUTES=30    # no fine refresh in this window (with traders due) → alert
+# HEALTHCHECK_STARVATION_WINDOW_MINUTES=45  # attempts advancing but zero successes this long → alert
+# HEALTHCHECK_STARVATION_MIN_DUE=50      # only starve-alert once the due backlog is at least this big
 # HEALTHCHECK_COARSE_STALE_MINUTES=      # default = 2× SEED_INTERVAL_MINUTES
 # HEALTHCHECK_ALERT_BACKLOG_MINUTES=5    # undelivered Position Alerts older than this → alert
 # HEALTHCHECK_DISK_PERCENT=85            # host disk used-% that trips the disk check
