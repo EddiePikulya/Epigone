@@ -7,8 +7,10 @@ fills' closedPnl (before fees). Partial trims realize PnL *inside* one trade,
 never as trades of their own — so a wallet can't look prolific and accurate by
 trimming a single winner many times. A round-trip only counts when both its
 open and its full close are in captured history; a position opened before the
-fill window is excluded rather than given partial credit. Definitions in plain
-language: docs/metrics.md.
+fill window is excluded rather than given partial credit — and the same
+demotion applies when the walked net position disagrees with a fill's
+startPosition (#63): missed executions never earn a reconstructed trade.
+Definitions in plain language: docs/metrics.md.
 """
 
 from collections import defaultdict
@@ -50,12 +52,18 @@ class OpenEpisode:
     """A coin still held non-flat: the accumulating first half of a possible
     future round-trip. Carries the net PnL its trims have realized so far and
     the peak notional revealed, so the trade's totals are complete when it
-    finally closes — possibly many refreshes later (#11/#58)."""
+    finally closes — possibly many refreshes later (#11/#58). `net_position`
+    is the signed size the walk left the position at, the anchor the next
+    batch's continuity guard checks against (#63); 0 (the pre-#63 storage
+    default) means "never verified" and can match no real continuation, so
+    legacy episodes demote on their next fold instead of trusting a walk that
+    may have been TWAP-blind."""
 
     coin: str
     opened_at: datetime
     pnl: Decimal
     peak_notional: Decimal
+    net_position: Decimal = Decimal(0)
 
 
 @dataclass(frozen=True)
@@ -66,12 +74,24 @@ class Continuation:
     coin — into a completed RoundTrip when `closed_at` is set, or into merged
     accumulators when the position is still open at batch end. A continuation
     with no matching open episode predates all captured history: excluded from
-    the trade metrics, never partial credit (issue #58)."""
+    the trade metrics, never partial credit (issue #58).
+
+    `start_position` is the position before the segment's first fill; the fold
+    only completes the carried episode when it equals the episode's stored
+    net_position — anything else means executions were missed across the
+    checkpoint, and the episode demotes to untracked (#63). `tracked` is False
+    when the segment broke continuity *inside* the batch: the carried episode
+    must still be popped (its position walk is dead), but never credited.
+    `net_position` is where the walk left the coin when still open at batch
+    end — the merged episode's new anchor."""
 
     coin: str
     pnl: Decimal
     peak_notional: Decimal
     closed_at: datetime | None  # None: still open at batch end
+    start_position: Decimal = Decimal(0)
+    net_position: Decimal = Decimal(0)
+    tracked: bool = True
 
 
 @dataclass(frozen=True)
@@ -239,6 +259,29 @@ def _earliest(a: datetime | None, b: datetime | None) -> datetime | None:
     return min(a, b) if a is not None and b is not None else (a or b)
 
 
+# The API's own startPosition strings carry float-representation dust (~1e-10
+# relative, e.g. "3472099.9999999998" after a 3472100.0 position); a genuine
+# missed execution is off by a whole fill. 1e-6 relative separates them —
+# shared with the golden-wallet continuity check, which asserts through
+# _breaks_continuity so the two can never diverge.
+POSITION_DUST = Decimal("0.000001")
+
+
+def _breaks_continuity(walked: Decimal, start: Decimal) -> bool:
+    """True when a fill's startPosition disagrees with the walked net position
+    beyond float dust — executions between the two were missed (#63)."""
+    return abs(walked - start) > max(abs(start), Decimal(1)) * POSITION_DUST
+
+
+def _post_position(f: Fill) -> Decimal:
+    """The signed position after a perp fill. A closing fill moves toward (or
+    through) 0 by its size; an opening fill moves away on its named side —
+    the only place a direction string decides arithmetic."""
+    if f.closes_position:
+        return f.start_position + (f.size if f.start_position < 0 else -f.size)
+    return f.start_position + (f.size if "Long" in f.direction else -f.size)
+
+
 def _episodes(
     perp_fills_in_time_order: list[Fill],
 ) -> tuple[tuple[RoundTrip, ...], tuple[OpenEpisode, ...], tuple[Continuation, ...]]:
@@ -253,7 +296,17 @@ def _episodes(
     OpenEpisode; the leading segment of an episode already open at batch start
     (its first fill is non-flat) is a Continuation for fold_states to resolve.
     Only closing fills can end an episode, and a closing fill's post position
-    is `start − sign(start)·size` — so no direction string is parsed here."""
+    is `start − sign(start)·size` (_post_position — which consults the
+    direction string only for opens, where no other side signal exists).
+
+    The walk carries each coin's net position fill to fill, and every fill's
+    startPosition must agree with it (#63): a disagreement beyond float dust
+    means executions were missed (a fill source the fetch didn't cover, or
+    history truncated at the ~2000 cap), so the in-flight episode demotes to
+    untracked — the pre-window-open treatment: its closes bank realized_pnl,
+    but it never completes a RoundTrip. The walk re-anchors at the offending
+    fill's startPosition; tracking resumes at the next verified flat (a fresh
+    open from 0, or a flip's far side, whose position the walk knows exactly)."""
     by_coin: dict[str, list[Fill]] = defaultdict(list)
     for f in perp_fills_in_time_order:  # already time-sorted, so each coin's is too
         by_coin[f.coin].append(f)
@@ -263,9 +316,12 @@ def _episodes(
     for coin, fills in by_coin.items():
         # A first fill on a non-flat position continues an episode from before.
         continuing = fills[0].start_position != 0
+        cont_start = fills[0].start_position
         opened_at: datetime | None = None
+        tracked = True  # False while walking a position whose episode was demoted
         pnl = Decimal(0)
         peak = Decimal(0)
+        walked: Decimal | None = None  # net position after the previous fill
         # Ordinal per completion millisecond (RoundTrip.seq): a same-block
         # close→reopen→close completes two episodes on one timestamp. The
         # continuation's close — always the coin's first — consumes ordinal 0,
@@ -273,31 +329,62 @@ def _episodes(
         close_seq: dict[datetime, int] = {}
         for f in fills:
             start = f.start_position
+            if walked is not None and _breaks_continuity(walked, start):
+                # Missed executions: demote the in-flight episode (#63). A
+                # broken leading segment still rides the fold flagged
+                # untracked, so the carried episode is popped but never
+                # completed; an in-batch episode just drops.
+                if continuing:
+                    continuations.append(
+                        Continuation(
+                            coin, pnl, peak, closed_at=None,
+                            start_position=cont_start, tracked=False,
+                        )
+                    )
+                    continuing = False
+                opened_at = None
+                pnl = Decimal(0)
+                peak = Decimal(0)
+                tracked = start == 0  # flat re-anchors clean; mid-position stays demoted
             if not f.closes_position:
                 if start == 0 and opened_at is None and not continuing:
                     opened_at = f.time  # the position leaves 0: an episode opens
+                walked = _post_position(f)
                 continue  # a same-side scale-in never crosses 0
             pnl += f.closed_pnl
             peak = max(peak, abs(start) * f.price)
-            end = start + (f.size if start < 0 else -f.size)  # toward / through 0
+            end = _post_position(f)  # toward / through 0
+            walked = end
             if end != 0 and (end > 0) == (start > 0):
                 continue  # a partial trim that stays non-flat: episode continues
             # The episode closes here (full close or flip through 0).
             seq = close_seq.get(f.time, 0)
             close_seq[f.time] = seq + 1
             if continuing:
-                continuations.append(Continuation(coin, pnl, peak, closed_at=f.time))
+                continuations.append(
+                    Continuation(coin, pnl, peak, closed_at=f.time, start_position=cont_start)
+                )
                 continuing = False
-            elif opened_at is not None:
+            elif tracked and opened_at is not None:
                 trips.append(RoundTrip(coin, pnl, peak, opened_at, f.time, seq))
-            # A flip immediately reopens on the far side; a full close goes flat.
+            # A flip immediately reopens on the far side; a full close goes
+            # flat — either way the walk is at a verified position again, so
+            # tracking resumes even after a demoted episode.
             opened_at = f.time if end != 0 else None
+            tracked = True
             pnl = Decimal(0)
             peak = Decimal(0)
         if continuing:  # never closed in this batch: the accumulators ride the fold
-            continuations.append(Continuation(coin, pnl, peak, closed_at=None))
-        elif opened_at is not None:
-            open_episodes.append(OpenEpisode(coin, opened_at, pnl, peak))
+            continuations.append(
+                Continuation(
+                    coin, pnl, peak, closed_at=None,
+                    start_position=cont_start, net_position=walked or Decimal(0),
+                )
+            )
+        elif tracked and opened_at is not None:
+            open_episodes.append(
+                OpenEpisode(coin, opened_at, pnl, peak, net_position=walked or Decimal(0))
+            )
     trips.sort(key=lambda t: (t.closed_at, t.coin, t.seq))
     open_episodes.sort(key=lambda e: e.coin)
     return tuple(trips), tuple(open_episodes), tuple(continuations)
@@ -311,17 +398,29 @@ def _fold_episodes(
     net PnL and peak notional span both sides of the checkpoint; one still
     open merges its accumulators into the carried episode. A continuation with
     no matching open episode predates all known history and is dropped —
-    excluded, never partial credit (realized_pnl still banked its fills)."""
+    excluded, never partial credit (realized_pnl still banked its fills).
+
+    The match must also survive the continuity guard (#63): the continuation's
+    start_position has to equal the episode's stored net_position, or
+    executions were missed across the checkpoint (a TWAP-blind prior fold, a
+    truncated fetch) and the episode demotes — dropped like a pre-history
+    continuation rather than completed from a walk that skipped executions. A
+    segment that broke continuity inside its own batch (tracked=False) demotes
+    the same way."""
     open_eps = {e.coin: e for e in prior.open_episodes}
     resolved: list[RoundTrip] = []
     for cont in delta.continuations:
         episode = open_eps.pop(cont.coin, None)
         if episode is None:
             continue
+        if not cont.tracked or _breaks_continuity(episode.net_position, cont.start_position):
+            continue  # missed executions across the checkpoint: demote (#63)
         pnl = episode.pnl + cont.pnl
         peak = max(episode.peak_notional, cont.peak_notional)
         if cont.closed_at is None:
-            open_eps[cont.coin] = OpenEpisode(cont.coin, episode.opened_at, pnl, peak)
+            open_eps[cont.coin] = OpenEpisode(
+                cont.coin, episode.opened_at, pnl, peak, net_position=cont.net_position
+            )
         else:
             # seq 0: the continuation's close is by definition the coin's first
             # episode completion in its batch, so it held ordinal 0 there and

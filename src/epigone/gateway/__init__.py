@@ -158,22 +158,38 @@ class HyperliquidGateway(Protocol):
 
     async def get_fills(self, address: str) -> list[Fill]:
         """A Trader's recent fills in EXECUTION ORDER — oldest first, and
-        same-millisecond fills in the sequence they executed (the info API caps
-        at ~2000). Same-order fills share one timestamp, so list order is the
-        only within-ms signal and the round-trip engine (#58) depends on it;
-        implementations must normalize whatever the API serves. Raises
-        GatewayError on failure."""
+        same-millisecond fills in the sequence they executed. The stream is the
+        UNION of regular and TWAP slice executions: Hyperliquid serves TWAP
+        slices only from userTwapSliceFills, never from userFills (issue #63),
+        so a single-endpoint read walks a TWAP-heavy Trader's positions wrong.
+        Same-order fills share one timestamp, so list order is the only
+        within-ms signal and the round-trip engine (#58) depends on it;
+        implementations must normalize whatever the APIs serve. Each endpoint
+        caps at ~2000 fills, so the two sources' windows can differ — for a
+        TWAP whale the slice history is hours where the regular history is
+        days; the engine's continuity guard (#63) owns that truncation.
+        Raises GatewayError on failure."""
         ...
 
     async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
-        """A Trader's fills at or after `start` (userFillsByTime), for the
-        incremental fine refresh (issue #11): a fast-tier pass fetches only what
-        is new since its checkpoint instead of re-pulling the full ~2000-fill
-        history. Same ~2000 cap per call, so callers checkpoint forward far
-        enough that a window never overflows. Same execution-order contract as
-        get_fills. Raises GatewayError on failure."""
+        """A Trader's fills at or after `start` — the same regular ∪ TWAP-slice
+        union as get_fills (userFillsByTime plus userTwapSliceFillsByTime) —
+        for the incremental fine refresh (issue #11): a fast-tier pass fetches
+        only what is new since its checkpoint instead of re-pulling full
+        history. Both endpoints are startTime-inclusive at millisecond
+        resolution, so a caller stepping +1ms past its checkpoint gets a
+        stream disjoint from everything already folded, across BOTH sources.
+        Same ~2000 cap per call per endpoint, so callers checkpoint forward
+        far enough that a window never overflows. Same execution-order
+        contract as get_fills. Raises GatewayError on failure."""
         ...
 
+
+# Every info endpoint one fill fetch hits: the regular fills endpoint plus the
+# TWAP slice endpoint (issue #63). The fine pass bills its base weight per
+# endpoint from this same count — the POSITION_VENUES billing pattern below —
+# so changing what a fetch hits means changing this number in the same file.
+FILL_ENDPOINTS = 2
 
 # The single HIP-3 builder DEX Epigone covers: xyz hosts ~90% of non-core
 # activity (equity/"stock" perps: xyz:META, xyz:BB, …) at 2x the poll cost,

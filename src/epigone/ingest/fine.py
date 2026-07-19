@@ -24,7 +24,7 @@ import asyncpg
 
 from epigone.budget import Budget, record_rate_limit
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway, RateLimitedError
+from epigone.gateway import FILL_ENDPOINTS, GatewayError, HyperliquidGateway, RateLimitedError
 from epigone.ingest.scan import (
     ACTIVE_REFRESH_INTERVAL,
     DORMANT_REFRESH_INTERVAL,
@@ -44,19 +44,26 @@ from epigone.metrics.fine import (
 
 log = logging.getLogger(__name__)
 
-FILLS_WEIGHT = 20  # one userFills call, against the shared budget (epigone.budget)
+# One fill fetch hits FILL_ENDPOINTS info endpoints (userFills plus
+# userTwapSliceFills, issue #63) at base weight 20 each, against the shared
+# budget (epigone.budget) — billed per endpoint so the accounting can never
+# drift from the calls the gateway actually makes.
+FILLS_WEIGHT = 20 * FILL_ENDPOINTS
 
 # The incremental pass fetches fills strictly after the checkpoint. userFillsByTime
 # is inclusive on startTime, so start one fill-timestamp tick (1ms, the API's
 # resolution) past the last folded fill — never re-folding it (issue #11).
 CHECKPOINT_STEP = timedelta(milliseconds=1)
 
-# userFills really costs its base 20 *plus* weight per 20 fills returned
-# (Hyperliquid rate-limit docs; issue #41) — up to ~+100 on a full ~2000-fill
-# response. The surcharge is only known once the response arrives, so the pass
-# settles it post-hoc against the budget; billing it flat at 20 was why "under
-# budget" load still tripped a steady trickle of 429s. Ceil is the conservative
-# read of "per 20 items"; recalibrate here if production metering disagrees.
+# A fills endpoint really costs its base 20 *plus* weight per 20 fills
+# returned (Hyperliquid rate-limit docs; issue #41) — up to ~+100 on a full
+# ~2000-fill response. The surcharge is only known once the response arrives,
+# so the pass settles it post-hoc against the budget; billing it flat was why
+# "under budget" load still tripped a steady trickle of 429s. The gateway
+# hands back the two endpoints' responses already merged, so the per-endpoint
+# split is unknown: the settle bills the worst-case split (each endpoint's
+# ceil can round up once), staying conservative rather than under-billing by
+# up to FILL_ENDPOINTS − 1. Recalibrate if production metering disagrees.
 FILLS_PER_SURCHARGE_WEIGHT = 20
 
 
@@ -124,8 +131,10 @@ async def run_fine_pass(
         consecutive_failures = 0
         # The surcharge bills only the fills actually returned — an incremental
         # pull of a few new fills settles far less than a full ~2000-fill pull.
-        surcharge = math.ceil(len(fetched) / FILLS_PER_SURCHARGE_WEIGHT)
-        if surcharge:
+        if fetched:
+            surcharge = (
+                math.ceil(len(fetched) / FILLS_PER_SURCHARGE_WEIGHT) + FILL_ENDPOINTS - 1
+            )
             await budget.settle(surcharge)
         prior_state = prior or EMPTY_STATE
         state = fold_states(prior_state, extract_state(fetched))
@@ -242,9 +251,12 @@ async def _load_fine_state(
     )
     # The open episodes (issues #48/#58): each coin held non-flat at the
     # checkpoint, with the net PnL and peak notional its trims have realized so
-    # far, so a close arriving in a later batch completes the whole round-trip.
+    # far, so a close arriving in a later batch completes the whole round-trip —
+    # plus the walked net position the next batch's continuity guard verifies
+    # against (issue #63).
     episode_rows = await pool.fetch(
-        "SELECT coin, opened_at, pnl, peak_notional FROM fine_open_episodes WHERE address = $1",
+        "SELECT coin, opened_at, pnl, peak_notional, net_position "
+        "FROM fine_open_episodes WHERE address = $1",
         address,
     )
     return FineState(
@@ -261,6 +273,7 @@ async def _load_fine_state(
                 opened_at=r["opened_at"],
                 pnl=r["pnl"],
                 peak_notional=r["peak_notional"],
+                net_position=r["net_position"],
             )
             for r in episode_rows
         ),
@@ -291,10 +304,11 @@ async def _store_fine_refresh(
         await conn.execute("DELETE FROM fine_open_episodes WHERE address = $1", address)
         if state.open_episodes:
             await conn.executemany(
-                "INSERT INTO fine_open_episodes (address, coin, opened_at, pnl, peak_notional) "
-                "VALUES ($1, $2, $3, $4, $5)",
+                "INSERT INTO fine_open_episodes "
+                "(address, coin, opened_at, pnl, peak_notional, net_position) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
                 [
-                    (address, e.coin, e.opened_at, e.pnl, e.peak_notional)
+                    (address, e.coin, e.opened_at, e.pnl, e.peak_notional, e.net_position)
                     for e in state.open_episodes
                 ],
             )
