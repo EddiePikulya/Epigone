@@ -527,3 +527,43 @@ def test_folding_an_empty_batch_leaves_the_state_unchanged() -> None:
         ]
     )
     assert fold_state(prior, []) == prior
+
+
+# --- Within-millisecond ordering (issue #58 review) ---------------------------
+# Same-order and same-block fills share one millisecond, so timestamps cannot
+# order them: the engine's stable sort must honor the list's execution order
+# (the gateway contract), and simultaneous completions need distinct identities.
+
+
+def test_same_millisecond_fills_resolve_in_execution_order() -> None:
+    t1 = T0 + timedelta(hours=1)
+    metrics = compute(
+        [
+            _open(at=T0, size="2"),
+            _close(at=t1, pnl="10", start="2"),  # trim...
+            _close(at=t1, pnl="20", start="1"),  # ...and full close, same ms
+            _open(at=t1),  # reopen in the same ms
+            _close(at=t1 + timedelta(hours=1), pnl="-5"),
+        ]
+    )
+    assert metrics.trade_count == 2
+    assert metrics.win_rate == Decimal("0.5")  # +30 net win, then the -5 loss
+    assert metrics.realized_pnl == Decimal("25")
+
+
+def test_same_ms_close_reopen_close_keeps_both_trades_across_a_fold() -> None:
+    # Two round-trips completing on one timestamp must not collide in the
+    # fold's keyed upsert — the (coin, closed_at, seq) identity keeps both.
+    early = [_open(at=T0)]
+    t1 = T0 + timedelta(hours=1)
+    late = [
+        _close(at=t1, pnl="10"),  # completes the carried episode (seq 0)
+        _open(at=t1),  # reopen in the same ms
+        _close(at=t1, pnl="-5"),  # and close again in the same ms (seq 1)
+    ]
+    state = fold_state(extract_state(early), late)
+    metrics = metrics_from_state(state, None)
+    assert metrics.trade_count == 2
+    assert metrics.win_rate == Decimal("0.5")
+    assert metrics.realized_pnl == Decimal("5")
+    assert [t.seq for t in state.round_trips] == [0, 1]

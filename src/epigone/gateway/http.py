@@ -76,7 +76,14 @@ class HttpHyperliquidGateway:
             )
         except aiohttp.ClientError as exc:
             raise GatewayError(f"userFills request failed for {address}: {exc}") from exc
-        return parse_fills(payload)
+        # userFills serves newest-first, and same-order / same-block fills all
+        # share one millisecond timestamp — array position is the only
+        # within-ms execution-order signal, and the round-trip engine (#58)
+        # mis-reconstructs positions without it. Reverse the whole response to
+        # the protocol's execution order (verified live against the
+        # position-continuity invariant `end == next start`: ~0 violations
+        # reversed vs ~100% as served). userFillsByTime differs — see below.
+        return list(reversed(parse_fills(payload)))
 
     async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
         # userFillsByTime is inclusive on startTime (ms); the pass passes the ms
@@ -94,6 +101,10 @@ class HttpHyperliquidGateway:
             )
         except aiohttp.ClientError as exc:
             raise GatewayError(f"userFillsByTime request failed for {address}: {exc}") from exc
+        # Unlike userFills, userFillsByTime serves OLDEST-first — already the
+        # protocol's execution order, within-ms included (verified live: ~0
+        # continuity violations as served, ~100% reversed). Served order is
+        # kept; reversing here would corrupt the incremental path.
         return parse_fills(payload)
 
     async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
@@ -169,6 +180,11 @@ def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
 
 
 def parse_fills(payload: Any) -> list[Fill]:
+    """Map a userFills/userFillsByTime payload to Fills, PRESERVING the array
+    order — the payload's order is the only within-millisecond execution-order
+    signal (same-order fills share a timestamp), and the two endpoints serve
+    opposite directions, so each caller normalizes to execution order itself
+    (see get_fills / get_fills_since)."""
     try:
         return [
             Fill(

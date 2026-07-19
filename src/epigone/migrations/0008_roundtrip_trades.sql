@@ -8,8 +8,11 @@
 -- The trade store becomes a round-trip store. Old rows are per-closing-order
 -- fragments that cannot be regrouped into round-trips (the opening fills were
 -- never persisted), so the table is rebuilt and reseeded from a full re-pull
--- rather than converted. Identity is (address, coin, closed_at): the fill that
--- returned the position to flat, stable across a boundary re-fetch (#11).
+-- rather than converted. Identity is (address, coin, closed_at, seq): the fill
+-- that returned the position to flat, stable across a boundary re-fetch (#11).
+-- seq disambiguates same-millisecond completions — a same-block
+-- close->reopen->close makes two trades sharing a closed_at, and without the
+-- ordinal the primary key would silently keep only one.
 DROP TABLE fine_trades;
 CREATE TABLE fine_trades (
     address       TEXT NOT NULL REFERENCES traders (address),
@@ -18,7 +21,8 @@ CREATE TABLE fine_trades (
     peak_notional NUMERIC NOT NULL,
     opened_at     TIMESTAMPTZ NOT NULL,
     closed_at     TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (address, coin, closed_at)
+    seq           INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (address, coin, closed_at, seq)
 );
 
 -- A still-open episode accumulates its trims' net PnL and peak notional across

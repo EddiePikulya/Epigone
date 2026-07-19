@@ -30,7 +30,15 @@ class RoundTrip:
     pnl: Decimal  # net over the episode: the sum of its closing fills' closedPnl
     peak_notional: Decimal  # largest position value the episode's closing fills reveal
     opened_at: datetime
-    closed_at: datetime  # with coin, the trade's identity across refreshes (#11)
+    closed_at: datetime
+    # (coin, closed_at, seq) is the trade's identity across refreshes (#11).
+    # seq is the ordinal among the coin's episodes completing in the SAME
+    # millisecond — a same-block close→reopen→close makes two trades sharing a
+    # closed_at, and without the ordinal one would vanish in the fold's keyed
+    # upsert (and the DB primary key). Same-ms groups never straddle a
+    # checkpoint (the incremental fetch cuts on millisecond boundaries), so the
+    # ordinal is stable across refreshes.
+    seq: int = 0
 
     @property
     def hold_seconds(self) -> int:
@@ -127,9 +135,14 @@ EMPTY_STATE = FineState(round_trips=(), maker_fill_count=0, perp_fill_count=0,
 
 
 def extract_state(fills: list[Fill]) -> FineState:
-    """Reduce a raw fill batch (any order; the engine sorts) to a FineState.
-    On its own this is a full history; folded onto a prior state it is a
-    delta."""
+    """Reduce a raw fill batch to a FineState. On its own this is a full
+    history; folded onto a prior state it is a delta.
+
+    Any macro order is fine — the engine sorts stably by time — but
+    same-millisecond fills MUST already be in execution order relative to one
+    another (the gateway contract): same-order and same-block fills share a
+    timestamp, so the sort cannot break those ties, and _episodes reconstructs
+    positions from the sequence."""
     perp = sorted((f for f in fills if f.is_perp), key=lambda f: f.time)
     round_trips, open_episodes, continuations = _episodes(perp)
     return FineState(
@@ -154,14 +167,14 @@ def fold_states(prior: FineState, delta: FineState) -> FineState:
     `prior.last_fill_at`, so the sums add cleanly and no fill is
     double-counted. The delta's continuations resolve against the prior's open
     episodes (see _fold_episodes); a delta round-trip replaces any prior one
-    with the same (coin, closed_at) identity, keeping a boundary re-fetch
+    with the same (coin, closed_at, seq) identity, keeping a boundary re-fetch
     idempotent (the closing fill lands wholly on one side of the checkpoint)."""
-    trips = {(t.coin, t.closed_at): t for t in prior.round_trips}
+    trips = {(t.coin, t.closed_at, t.seq): t for t in prior.round_trips}
     resolved, open_episodes = _fold_episodes(prior, delta)
     for trip in (*resolved, *delta.round_trips):
-        trips[(trip.coin, trip.closed_at)] = trip
+        trips[(trip.coin, trip.closed_at, trip.seq)] = trip
     return FineState(
-        round_trips=tuple(sorted(trips.values(), key=lambda t: (t.closed_at, t.coin))),
+        round_trips=tuple(sorted(trips.values(), key=lambda t: (t.closed_at, t.coin, t.seq))),
         maker_fill_count=prior.maker_fill_count + delta.maker_fill_count,
         perp_fill_count=prior.perp_fill_count + delta.perp_fill_count,
         realized_pnl=prior.realized_pnl + delta.realized_pnl,
@@ -253,6 +266,11 @@ def _episodes(
         opened_at: datetime | None = None
         pnl = Decimal(0)
         peak = Decimal(0)
+        # Ordinal per completion millisecond (RoundTrip.seq): a same-block
+        # close→reopen→close completes two episodes on one timestamp. The
+        # continuation's close — always the coin's first — consumes ordinal 0,
+        # which _fold_episodes assigns to the trade it resolves.
+        close_seq: dict[datetime, int] = {}
         for f in fills:
             start = f.start_position
             if not f.closes_position:
@@ -265,11 +283,13 @@ def _episodes(
             if end != 0 and (end > 0) == (start > 0):
                 continue  # a partial trim that stays non-flat: episode continues
             # The episode closes here (full close or flip through 0).
+            seq = close_seq.get(f.time, 0)
+            close_seq[f.time] = seq + 1
             if continuing:
                 continuations.append(Continuation(coin, pnl, peak, closed_at=f.time))
                 continuing = False
             elif opened_at is not None:
-                trips.append(RoundTrip(coin, pnl, peak, opened_at, f.time))
+                trips.append(RoundTrip(coin, pnl, peak, opened_at, f.time, seq))
             # A flip immediately reopens on the far side; a full close goes flat.
             opened_at = f.time if end != 0 else None
             pnl = Decimal(0)
@@ -278,7 +298,7 @@ def _episodes(
             continuations.append(Continuation(coin, pnl, peak, closed_at=None))
         elif opened_at is not None:
             open_episodes.append(OpenEpisode(coin, opened_at, pnl, peak))
-    trips.sort(key=lambda t: (t.closed_at, t.coin))
+    trips.sort(key=lambda t: (t.closed_at, t.coin, t.seq))
     open_episodes.sort(key=lambda e: e.coin)
     return tuple(trips), tuple(open_episodes), tuple(continuations)
 
@@ -303,7 +323,12 @@ def _fold_episodes(
         if cont.closed_at is None:
             open_eps[cont.coin] = OpenEpisode(cont.coin, episode.opened_at, pnl, peak)
         else:
-            resolved.append(RoundTrip(cont.coin, pnl, peak, episode.opened_at, cont.closed_at))
+            # seq 0: the continuation's close is by definition the coin's first
+            # episode completion in its batch, so it held ordinal 0 there and
+            # any same-ms in-batch trades were numbered after it.
+            resolved.append(
+                RoundTrip(cont.coin, pnl, peak, episode.opened_at, cont.closed_at, seq=0)
+            )
     open_eps.update({e.coin: e for e in delta.open_episodes})  # in-batch opens (incl. reopens)
     return resolved, tuple(sorted(open_eps.values(), key=lambda e: e.coin))
 

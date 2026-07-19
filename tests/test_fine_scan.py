@@ -551,3 +551,33 @@ async def test_a_refresh_with_no_new_fills_does_not_double_count(pool: asyncpg.P
         "SELECT fine_checkpoint_at FROM traders WHERE address = '0xaaa'"
     )
     assert checkpoint_after == checkpoint_before  # nothing new, checkpoint holds
+
+
+async def test_same_ms_trades_both_persist(pool: asyncpg.Pool) -> None:
+    # A same-block close->reopen->close completes two round-trips on one
+    # timestamp; the fine_trades primary key carries the seq ordinal so
+    # neither row silently vanishes (issue #58 review).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    t1 = T0 + timedelta(hours=1)
+    gateway.set_fills(
+        "0xaaa",
+        [
+            fill("Open Long", at=T0, start_position="0"),
+            fill(pnl="10", at=t1),
+            fill("Open Long", at=t1, start_position="0"),
+            fill(pnl="-5", at=t1),
+        ],
+    )
+
+    await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    rows = await pool.fetch("SELECT pnl, seq FROM fine_trades WHERE address = '0xaaa' ORDER BY seq")
+    assert [(r["pnl"], r["seq"]) for r in rows] == [(Decimal("10"), 0), (Decimal("-5"), 1)]
+    metrics = await pool.fetchrow(
+        "SELECT trade_count, win_rate FROM fine_metrics WHERE address = '0xaaa'"
+    )
+    assert metrics is not None
+    assert metrics["trade_count"] == 2
+    assert metrics["win_rate"] == Decimal("0.5")

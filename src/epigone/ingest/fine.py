@@ -134,9 +134,9 @@ async def run_fine_pass(
         # The fold can complete a round-trip the batch alone couldn't (a close
         # resolving a carried open episode), so the incremental upsert is "new
         # since the prior state", not the batch's own trades.
-        prior_keys = {(t.coin, t.closed_at) for t in prior_state.round_trips}
+        prior_keys = {(t.coin, t.closed_at, t.seq) for t in prior_state.round_trips}
         new_trips = tuple(
-            t for t in state.round_trips if (t.coin, t.closed_at) not in prior_keys
+            t for t in state.round_trips if (t.coin, t.closed_at, t.seq) not in prior_keys
         )
         await _store_fine_refresh(
             pool, trader.address, metrics, state, new_trips, bot_reason, clock.now(),
@@ -225,8 +225,8 @@ async def _load_fine_state(
         address,
     )
     trade_rows = await pool.fetch(
-        "SELECT coin, pnl, peak_notional, opened_at, closed_at "
-        "FROM fine_trades WHERE address = $1 ORDER BY closed_at, coin",
+        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq "
+        "FROM fine_trades WHERE address = $1 ORDER BY closed_at, coin, seq",
         address,
     )
     trades = tuple(
@@ -236,6 +236,7 @@ async def _load_fine_state(
             peak_notional=r["peak_notional"],
             opened_at=r["opened_at"],
             closed_at=r["closed_at"],
+            seq=r["seq"],
         )
         for r in trade_rows
     )
@@ -300,15 +301,16 @@ async def _store_fine_refresh(
         if new_trips:
             await conn.executemany(
                 """
-                INSERT INTO fine_trades (address, coin, pnl, peak_notional, opened_at, closed_at)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (address, coin, closed_at) DO UPDATE
+                INSERT INTO fine_trades
+                    (address, coin, pnl, peak_notional, opened_at, closed_at, seq)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (address, coin, closed_at, seq) DO UPDATE
                     SET pnl = EXCLUDED.pnl,
                         peak_notional = EXCLUDED.peak_notional,
                         opened_at = EXCLUDED.opened_at
                 """,
                 [
-                    (address, t.coin, t.pnl, t.peak_notional, t.opened_at, t.closed_at)
+                    (address, t.coin, t.pnl, t.peak_notional, t.opened_at, t.closed_at, t.seq)
                     for t in new_trips
                 ],
             )
