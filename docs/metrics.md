@@ -111,7 +111,8 @@ per-trade quality signal — so trims cannot game it.
 - **Definition:** largest peak-to-trough fall of the cumulative realized-PnL
   curve over the fill window, in USD — the curve steps once per completed
   round-trip, at its close. Unrealized swings don't move it (fills only
-  realize PnL).
+  realize PnL). Unlike the other trade metrics it reads 0 (not NULL) with no
+  completed round-trips: an empty curve never fell.
 
 ### Trade count
 - **In plain words:** how many positions the account opened and fully closed
