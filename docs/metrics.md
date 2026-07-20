@@ -108,13 +108,24 @@ per-trade quality signal — so trims cannot game it.
   Each side is unavailable until it has at least one trade.
 
 ### Sharpe
-- **In plain words:** how steady the daily profits are — high means smooth
-  earning, low means a rollercoaster that happens to end up positive.
+- **In plain words:** how steady the daily profits are — profit per unit of
+  daily wobble; high means smooth earning, low means a rollercoaster that
+  happens to end up positive.
 - **Definition:** mean ÷ standard deviation of **daily realized PnL** — each
   round-trip's net PnL lands on the UTC calendar day it completed, spanning
   first to last completed trade; quiet days count as zero — annualized by
   √365. Unavailable when the trades span a single day or the daily PnL never
   varies.
+- **Using it well:** the value is unbounded and **blind to size** — a wallet
+  realizing $10/day like clockwork outscores a whale with normal swings, so
+  the universe's most extreme values (hundreds+) are dust-scale bots or
+  handfuls of trades, not great traders. The short fill window plus √365
+  annualization also inflates every value well past textbook intuitions
+  ("2 is world-class" does not apply); calibrate against this universe
+  instead — observed 2026-07: **> 3 ≈ steadiest quartile, > 7 ≈ steadiest
+  decile**. Use it as a floor together with a PnL (or ROI) floor and a
+  Closed-trades floor (≥ 10): each alone finds something degenerate (lottery
+  winners, dust bots, churners); together they find big, steady, and proven.
 
 ### Max drawdown
 - **In plain words:** the deepest hole the account dug from its own peak —
