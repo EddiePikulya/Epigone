@@ -38,6 +38,8 @@ services:
       DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
       # Coarse Universe re-seed cadence (issue #50); unset → 60-min default.
       SEED_INTERVAL_MINUTES: ${SEED_INTERVAL_MINUTES:-60}
+      # Fine-pass chunk per cycle (issue #66); unset → 500 default.
+      FINE_CHUNK_SIZE: ${FINE_CHUNK_SIZE:-500}
     depends_on:
       postgres:
         condition: service_healthy
