@@ -133,10 +133,14 @@ _SPECS = [
         scope=Scope.FINE,
         sql="fm.sharpe",
         explanation=(
-            "how steady the daily profits are — high means smooth earning, "
-            "low means a rollercoaster that happens to end up positive."
+            "how steady the daily profits are — profit per unit of daily wobble, "
+            "blind to size: a bot earning $10 like clockwork outscores a whale with "
+            "normal swings, so sky-high values usually mean dust, not skill. "
+            "Rough guide: above 3 is the steadiest quarter of this universe, above 7 "
+            "the steadiest tenth. Works best as a floor alongside PnL and "
+            "Closed-trades floors — big, steady, and proven."
         ),
-        example="2",
+        example="3",
     ),
     MetricSpec(
         key="max_drawdown",
