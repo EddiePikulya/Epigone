@@ -321,6 +321,96 @@ async def test_the_due_queue_orders_tracked_first_then_rotation_then_pnl(
     ]
 
 
+async def test_the_pass_processes_only_a_leading_chunk_of_the_due_queue(
+    pool: asyncpg.Pool,
+) -> None:
+    # A due backlog larger than the chunk: the pass fetches only the most-due
+    # leading chunk (#65's order) and returns, so control returns to the loop
+    # between chunks (issue #66). The rest stay due for the next cycle's re-query.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    addresses = [f"0x{i:03d}" for i in range(5)]
+    for address in addresses:
+        await add_trader(pool, clock, address)
+        gateway.set_fills(address, human_fills())
+
+    result = await run_fine_pass(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, chunk_size=2
+    )
+
+    assert result.refreshed == 2 and result.failed == 0 and not result.aborted
+    # Equal PnL, never attempted: the two lowest addresses lead the queue.
+    assert gateway.fills_calls == ["0x000", "0x001"]
+    remaining = await pool.fetch(
+        "SELECT address FROM traders WHERE fine_refreshed_at IS NULL ORDER BY address"
+    )
+    assert [r["address"] for r in remaining] == ["0x002", "0x003", "0x004"]
+
+
+async def test_a_chunk_at_least_the_due_count_processes_the_whole_queue(
+    pool: asyncpg.Pool,
+) -> None:
+    # Acceptance: a caught-up universe (chunk >= due count) behaves exactly as an
+    # unbounded pass — one pass over everything, nothing left over.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    addresses = [f"0x{i:03d}" for i in range(3)]
+    for address in addresses:
+        await add_trader(pool, clock, address)
+        gateway.set_fills(address, human_fills())
+
+    result = await run_fine_pass(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, chunk_size=10
+    )
+
+    assert result.refreshed == 3 and not result.aborted
+    assert sorted(gateway.fills_calls) == addresses
+    assert await pool.fetchval("SELECT count(*) FROM traders WHERE fine_refreshed_at IS NULL") == 0
+
+
+async def test_the_failure_streak_is_scoped_to_the_chunk(pool: asyncpg.Pool) -> None:
+    # The abort streak is per-pass, so it resets naturally between chunks: a
+    # chunk that aborts on a streak doesn't poison the next cycle's chunk (issue
+    # #66). An abort still aborts the *current* chunk; a persistent storm still
+    # surfaces via the success-starvation check (#61).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    failing = [f"0x{i:03d}" for i in range(5)]
+    for address in failing:
+        await add_trader(pool, clock, address)
+        gateway.fills_errors[address] = GatewayError("outage")
+
+    first = await run_fine_pass(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, chunk_size=5
+    )
+    assert first.aborted and first.failed == 5 and first.refreshed == 0
+
+    # The outage clears; the next chunk re-queries and starts a fresh streak.
+    gateway.fills_errors.clear()
+    for address in failing:
+        gateway.set_fills(address, human_fills())
+    second = await run_fine_pass(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, chunk_size=5
+    )
+    assert not second.aborted and second.refreshed == 5
+
+
+async def test_an_unbounded_chunk_processes_the_whole_queue(pool: asyncpg.Pool) -> None:
+    # chunk_size=None (the default) is the pre-chunking behavior: no LIMIT, the
+    # whole due queue in one pass.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    addresses = [f"0x{i:03d}" for i in range(4)]
+    for address in addresses:
+        await add_trader(pool, clock, address)
+        gateway.set_fills(address, human_fills())
+
+    result = await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.refreshed == 4
+    assert sorted(gateway.fills_calls) == addresses
+
+
 class RecordingBudget:
     """Grants everything instantly, recording the billing calls."""
 

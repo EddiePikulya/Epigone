@@ -83,10 +83,22 @@ class _DueTrader:
 
 
 async def run_fine_pass(
-    pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: Budget, clock: Clock
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    budget: Budget,
+    clock: Clock,
+    *,
+    chunk_size: int | None = None,
 ) -> FineScanResult:
-    """One fills call per due eligible Trader, stale-first, paced by the budget."""
-    due = await _due_traders(pool, clock.now())
+    """One fills call per due eligible Trader, stale-first, paced by the budget.
+
+    `chunk_size` bounds the pass to the leading `chunk_size` of the due queue and
+    returns, so `ingest_loop` re-seeds and re-reads the queue between chunks
+    (issue #66) — the failure-streak abort is scoped to the chunk (it resets
+    per pass) and a persistent storm still surfaces via the success-starvation
+    check (#61). `None` (the default) is the pre-chunking whole-queue pass; a
+    chunk at least the due count is likewise one full pass, unchanged."""
+    due = await _due_traders(pool, clock.now(), chunk_size)
     refreshed = failed = consecutive_failures = 0
     for trader in due:
         checkpoint = trader.checkpoint
@@ -202,7 +214,9 @@ async def count_due_traders(pool: asyncpg.Pool, now: datetime) -> int:
     return int(count)
 
 
-async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
+async def _due_traders(
+    pool: asyncpg.Pool, now: datetime, chunk_size: int | None
+) -> list[_DueTrader]:
     # Drain a backlog best-first without breaking rotation fairness (issue #65):
     # tracked Traders lead (formalizing the post-wipe hand-seed), then least-
     # recently-attempted (rotation still dominates — a low-PnL wallet's timestamp
@@ -210,6 +224,9 @@ async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
     # month PnL only tiebreaks among equals — in practice the never-attempted
     # pile, whose NULL timestamps would otherwise drain in address-hex order.
     # PnL over ROI deliberately: ROI crowns tiny lucky accounts.
+    #
+    # `chunk_size` caps the queue to that most-due prefix (issue #66); Postgres
+    # treats LIMIT NULL as no limit, so `None` returns the whole due list.
     rows = await pool.fetch(
         f"""
         SELECT t.address, t.fine_checkpoint_at, cm.account_value, cm.pnl AS month_pnl
@@ -221,9 +238,11 @@ async def _due_traders(pool: asyncpg.Pool, now: datetime) -> list[_DueTrader]:
             t.fine_attempted_at ASC NULLS FIRST,
             cm.pnl DESC NULLS LAST,
             t.address
+        LIMIT $3
         """,
         now - ACTIVE_REFRESH_INTERVAL,
         now - DORMANT_REFRESH_INTERVAL,
+        chunk_size,
     )
     return [
         _DueTrader(

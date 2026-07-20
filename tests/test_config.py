@@ -4,7 +4,11 @@ import logging
 
 import pytest
 
-from epigone.config import DEFAULT_SEED_INTERVAL_MINUTES, Settings
+from epigone.config import (
+    DEFAULT_FINE_CHUNK_SIZE,
+    DEFAULT_SEED_INTERVAL_MINUTES,
+    Settings,
+)
 
 
 def _settings(admin_telegram_id: int | None) -> Settings:
@@ -13,6 +17,7 @@ def _settings(admin_telegram_id: int | None) -> Settings:
         telegram_bot_token="token",
         admin_telegram_id=admin_telegram_id,
         seed_interval_minutes=DEFAULT_SEED_INTERVAL_MINUTES,
+        fine_chunk_size=DEFAULT_FINE_CHUNK_SIZE,
     )
 
 
@@ -62,3 +67,27 @@ def test_seed_interval_falls_back_to_60_on_invalid(
     with caplog.at_level(logging.WARNING):
         assert Settings.from_env().seed_interval_minutes == 60
     assert "SEED_INTERVAL_MINUTES" in caplog.text
+
+
+def test_fine_chunk_size_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.delenv("FINE_CHUNK_SIZE", raising=False)
+    assert Settings.from_env().fine_chunk_size == DEFAULT_FINE_CHUNK_SIZE
+
+
+def test_fine_chunk_size_honours_a_valid_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.setenv("FINE_CHUNK_SIZE", "250")
+    assert Settings.from_env().fine_chunk_size == 250
+
+
+@pytest.mark.parametrize("bad", ["nonsense", "", "0", "-5"])
+def test_fine_chunk_size_falls_back_on_invalid(
+    bad: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A bad chunk size must degrade to the safe default, never wedge the pass.
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.setenv("FINE_CHUNK_SIZE", bad)
+    with caplog.at_level(logging.WARNING):
+        assert Settings.from_env().fine_chunk_size == DEFAULT_FINE_CHUNK_SIZE
+    assert "FINE_CHUNK_SIZE" in caplog.text
