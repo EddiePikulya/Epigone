@@ -11,6 +11,16 @@ log = logging.getLogger(__name__)
 # free. Operator-tunable via SEED_INTERVAL_MINUTES; a bad value falls back here.
 DEFAULT_SEED_INTERVAL_MINUTES = 60
 
+# How many due Traders one fine-pass cycle processes before returning control to
+# the ingest loop (issue #66). The fine pass ran over the *entire* due list, so
+# under a big backlog a single pass took hours and the hourly re-seed (#50)
+# degraded to once-per-pass. Bounding each pass to a chunk returns control to the
+# loop between chunks, so the seed keeps its cadence and the due queue's ordering
+# (#65) is re-read every chunk. Sized for ~an hour of work at the observed
+# ~450/hr budget-limited rate; operator-tunable via FINE_CHUNK_SIZE. A caught-up
+# universe (due count <= chunk) is one full pass, unchanged from before.
+DEFAULT_FINE_CHUNK_SIZE = 500
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -27,6 +37,9 @@ class Settings:
     # How often the ingest loop re-seeds the Universe from the leaderboard
     # (issue #50). Only the ingest process reads it.
     seed_interval_minutes: int
+    # How many due Traders each fine-pass cycle processes before returning to the
+    # loop (issue #66). Only the ingest process reads it.
+    fine_chunk_size: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -38,6 +51,7 @@ class Settings:
             seed_interval_minutes=_parse_seed_interval_minutes(
                 os.environ.get("SEED_INTERVAL_MINUTES")
             ),
+            fine_chunk_size=_parse_fine_chunk_size(os.environ.get("FINE_CHUNK_SIZE")),
         )
 
     def require_bot_token(self) -> str:
@@ -76,3 +90,7 @@ def _parse_seed_interval_minutes(raw: str | None) -> int:
     return parse_positive_int(
         raw, default=DEFAULT_SEED_INTERVAL_MINUTES, name="SEED_INTERVAL_MINUTES"
     )
+
+
+def _parse_fine_chunk_size(raw: str | None) -> int:
+    return parse_positive_int(raw, default=DEFAULT_FINE_CHUNK_SIZE, name="FINE_CHUNK_SIZE")

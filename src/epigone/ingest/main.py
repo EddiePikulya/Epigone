@@ -33,7 +33,9 @@ CYCLE_PAUSE_SECONDS = 60
 log = logging.getLogger(__name__)
 
 
-async def run(pool_url: str, clock: Clock, seed_interval: timedelta) -> None:
+async def run(
+    pool_url: str, clock: Clock, seed_interval: timedelta, chunk_size: int
+) -> None:
     pool = await create_pool(pool_url)
     await migrate(pool)
     # Ingest is the background spender: it draws the shared budget (issue #28)
@@ -41,7 +43,7 @@ async def run(pool_url: str, clock: Clock, seed_interval: timedelta) -> None:
     budget = SharedWeightBudget(pool, clock, reserve=STREAM_RESERVE_WEIGHT)
     async with aiohttp.ClientSession() as session:
         gateway = HttpHyperliquidGateway(session, clock)
-        await ingest_loop(pool, gateway, budget, clock, seed_interval)
+        await ingest_loop(pool, gateway, budget, clock, seed_interval, chunk_size=chunk_size)
 
 
 async def ingest_loop(
@@ -52,11 +54,17 @@ async def ingest_loop(
     seed_interval: timedelta,
     *,
     max_cycles: int | None = None,
+    chunk_size: int | None = None,
 ) -> None:
     """Seed → fine-pass each cycle, re-seeding once `seed_interval` has elapsed
-    since the last successful seed. `max_cycles` bounds the otherwise-infinite
-    loop so tests can drive a finite number of cycles against the injected clock;
-    production leaves it None."""
+    since the last successful seed. Each cycle's fine pass is bounded to
+    `chunk_size` due Traders (issue #66), so under a backlog control returns to
+    this loop between chunks — the seed keeps its cadence and the due queue is
+    re-read (ordering #65, freshly due wallets) every chunk instead of once per
+    multi-hour pass. `None` runs the whole due queue in one pass (pre-chunking
+    behavior); production passes the configured size. `max_cycles` bounds the
+    otherwise-infinite loop so tests can drive a finite number of cycles against
+    the injected clock; production leaves it None."""
     last_seeded: datetime | None = None
     cycles = 0
     while max_cycles is None or cycles < max_cycles:
@@ -64,7 +72,7 @@ async def ingest_loop(
             seeded = await seed_universe(pool, gateway, clock)
             if seeded is not None:
                 last_seeded = clock.now()
-        fine = await run_fine_pass(pool, gateway, budget, clock)
+        fine = await run_fine_pass(pool, gateway, budget, clock, chunk_size=chunk_size)
         log.info(
             "ingest cycle: fine %d refreshed / %d failed%s",
             fine.refreshed,
@@ -82,6 +90,7 @@ async def main() -> None:
         settings.database_url,
         SystemClock(),
         timedelta(minutes=settings.seed_interval_minutes),
+        settings.fine_chunk_size,
     )
 
 
