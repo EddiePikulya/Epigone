@@ -89,5 +89,6 @@ def dp(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) ->
     dispatcher["admin_telegram_id"] = None
     dispatcher["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
     dispatcher["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
+    dispatcher["rename_pending"] = {}  # per-User wallet-rename prompts (bot/names.py)
     dispatcher.include_router(build_router())
     return dispatcher

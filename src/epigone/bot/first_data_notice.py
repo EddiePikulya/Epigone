@@ -16,7 +16,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from epigone.bot.delete import with_delete_button
-from epigone.bot.format import short_address
+from epigone.bot.format import short_address, trader_label
 from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
 from epigone.clock import Clock
 
@@ -44,27 +44,32 @@ async def deliver_first_data_notices(pool: asyncpg.Pool, bot: Bot, clock: Clock)
         table="first_data_notices",
         fetch=_fetch_ready_notices,
         build=lambda row: (
-            render_first_data_notice(row["trader_address"]),
+            render_first_data_notice(row["trader_address"], row["track_name"]),
             _profile_button(row["trader_address"]),
         ),
     )
 
 
 async def _fetch_ready_notices(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+    # The tracks join labels the notice with the recipient's own name for the
+    # wallet (#86); NULL if they've since unfollowed, so it reads as the address.
     rows: list[asyncpg.Record] = await pool.fetch(
         """
-        SELECT id, user_telegram_id, trader_address
-        FROM first_data_notices
-        WHERE status = 'ready' AND delivered_at IS NULL AND attempts < $1
-        ORDER BY id
+        SELECT n.id, n.user_telegram_id, n.trader_address, tr.name AS track_name
+        FROM first_data_notices n
+        LEFT JOIN tracks tr
+            ON tr.trader_address = n.trader_address
+            AND tr.user_telegram_id = n.user_telegram_id
+        WHERE n.status = 'ready' AND n.delivered_at IS NULL AND n.attempts < $1
+        ORDER BY n.id
         """,
         MAX_DELIVERY_ATTEMPTS,
     )
     return rows
 
 
-def render_first_data_notice(address: str) -> str:
-    return f"📊 {short_address(address)} now has full track-record data"
+def render_first_data_notice(address: str, name: str | None = None) -> str:
+    return f"📊 {trader_label(name, address)} now has full track-record data"
 
 
 def _profile_button(address: str) -> InlineKeyboardMarkup:

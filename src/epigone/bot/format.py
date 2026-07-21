@@ -11,11 +11,14 @@ def short_address(address: str) -> str:
     return f"{address[:6]}…{address[-4:]}"
 
 
-def trader_label(display_name: str | None, address: str) -> str:
-    """How alerts identify a Trader: leaderboard label plus short address,
-    or just the short address for unlabeled wallets."""
+def trader_label(label: str | None, address: str) -> str:
+    """A wallet's inline identity: a name plus its short address, or the bare
+    short address when there is no name. The name is the viewer's own per-Track
+    nickname where they set one (#86), else the leaderboard display name (#4) —
+    the caller resolves which to pass; None here means show just the address. The
+    short address always rides along so identity stays verifiable."""
     short = short_address(address)
-    return f"{display_name} ({short})" if display_name else short
+    return f"{label} ({short})" if label else short
 
 
 def signed_usd(amount: Decimal) -> str:
