@@ -55,8 +55,12 @@ async def test_profile_shows_fine_metrics_when_available(
     assert "71% win rate over 161 closed trades" in text
     assert "avg win $3,951 · avg loss $841" in text
     assert "Sharpe 13.0 · max drawdown $13,893" in text
-    assert "94% maker · ~2.5x leverage" in text
+    # Sizing language, not exchange leverage — positions already show "at 25x" (#85).
+    assert "94% maker · avg size ~2.5x of account" in text
+    assert "leverage" not in text.lower()
     assert "⏱ Avg hold: 2d 4h" in text
+    # Account value appears on the #72 activity line as the denominator (#85).
+    assert "account $13.4M" in text
     assert "coarse" not in text.lower()
 
 

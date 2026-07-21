@@ -144,14 +144,16 @@ per-trade quality signal — so trims cannot game it.
   fill window. Partial trims never inflate it: 78 trims of one still-open
   position are 0 trades.
 
-### Average leverage (estimated)
-- **In plain words:** roughly how many times the account's own money it puts
-  into a typical trade.
+### Avg size (of account), estimated
+- **In plain words:** how big a typical position is next to the whole account —
+  a sizing signal, not the exchange's leverage dial (the positions view shows
+  that separately as e.g. `at 25x`).
 - **Definition:** mean over completed round-trips of peak position value
   (largest `|startPosition| × price` among the trade's closing fills) ÷ the
   account value recorded by the coarse pass. Fills carry no margin data, so
   this is a copyability signal, not the exchange's leverage setting.
   Unavailable without a coarse account value.
+- **Metric key:** `avg_leverage` (unchanged — stored Criteria keep working).
 
 ### Maker/taker share
 - **In plain words:** how often the account waits with resting orders (maker)

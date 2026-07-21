@@ -9,7 +9,7 @@ age lookup and the live call sites are exercised in test_track_wallet.py.
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from epigone.bot.format import fills_open_age, held_for, open_age
+from epigone.bot.format import fills_open_age, held_for, open_age, usd_compact
 from epigone.bot.handlers import (
     FOLLOW_FOR_AGE_HINT,
     _render_most_played,
@@ -299,9 +299,10 @@ def test_render_handles_no_open_positions() -> None:
 def test_activity_shows_last_trade_and_month_performance() -> None:
     two_hours_ago = NOW - timedelta(hours=2)  # fresh scan, precise recency
     line = _render_recent_activity(
-        two_hours_ago, two_hours_ago, Decimal("48000"), Decimal("0.12"), NOW
+        two_hours_ago, two_hours_ago, Decimal("48000"), Decimal("0.12"), Decimal("1100000"), NOW
     )
-    assert line == "Last trade: 2h ago · month PnL +$48,000 (ROI +12%)"
+    # Account value is the denominator PnL/ROI/sizes all read against (#85).
+    assert line == "Last trade: 2h ago · month PnL +$48,000 (ROI +12%) · account $1.1M"
 
 
 def test_activity_marks_last_trade_as_of_last_scan_when_fills_knowledge_lags() -> None:
@@ -309,25 +310,49 @@ def test_activity_marks_last_trade_as_of_last_scan_when_fills_knowledge_lags() -
     # older than a day can't imply a live "last trade" time, so it hedges rather
     # than reading with false precision (same spirit as the ≥ open-age marker).
     three_days_ago = NOW - timedelta(days=3)
-    line = _render_recent_activity(three_days_ago, three_days_ago, None, None, NOW)
+    line = _render_recent_activity(three_days_ago, three_days_ago, None, None, None, NOW)
     assert line == "Last trade: 3d ago (as of last scan)"
 
 
 def test_activity_shows_only_recency_when_no_coarse_metrics() -> None:
     two_hours_ago = NOW - timedelta(hours=2)
-    line = _render_recent_activity(two_hours_ago, two_hours_ago, None, None, NOW)
+    line = _render_recent_activity(two_hours_ago, two_hours_ago, None, None, None, NOW)
     assert line == "Last trade: 2h ago"
+
+
+def test_activity_shows_account_value_even_without_month_pnl() -> None:
+    # Account value rides on the coarse row independently of PnL/ROI, so it can
+    # appear as the sole coarse addition to an otherwise recency-only line.
+    two_hours_ago = NOW - timedelta(hours=2)
+    line = _render_recent_activity(
+        two_hours_ago, two_hours_ago, None, None, Decimal("50000"), NOW
+    )
+    assert line == "Last trade: 2h ago · account $50k"
 
 
 def test_activity_says_no_fills_seen_but_still_shows_coarse_performance() -> None:
     # Coarse leaderboard data exists even for a wallet with no captured fills, so
     # the performance line must not depend on fine availability.
-    line = _render_recent_activity(None, None, Decimal("3000000"), Decimal("0.21"), NOW)
-    assert line == "No recent trading activity seen · month PnL +$3,000,000 (ROI +21%)"
+    line = _render_recent_activity(
+        None, None, Decimal("3000000"), Decimal("0.21"), Decimal("13400000"), NOW
+    )
+    assert line == (
+        "No recent trading activity seen · month PnL +$3,000,000 (ROI +21%) · account $13.4M"
+    )
 
 
 def test_activity_says_no_fills_seen_when_nothing_is_known() -> None:
-    assert _render_recent_activity(None, None, None, None, NOW) == "No recent trading activity seen"
+    assert (
+        _render_recent_activity(None, None, None, None, None, NOW)
+        == "No recent trading activity seen"
+    )
+
+
+def test_usd_compact_abbreviates_by_magnitude() -> None:
+    assert usd_compact(Decimal("1100000")) == "$1.1M"
+    assert usd_compact(Decimal("13400000")) == "$13.4M"
+    assert usd_compact(Decimal("50000")) == "$50k"
+    assert usd_compact(Decimal("940")) == "$940"
 
 
 # --- most-played tickers (#80) ----------------------------------------------
