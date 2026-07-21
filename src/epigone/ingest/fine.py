@@ -173,6 +173,37 @@ async def _stamp_attempt(pool: asyncpg.Pool, address: str, now: datetime) -> Non
     await pool.execute("UPDATE traders SET fine_attempted_at = $2 WHERE address = $1", address, now)
 
 
+# A Follow marks its wallet due-now for an immediate fine refresh (issue #82) —
+# unless the fine data was refreshed this recently. The floor is anti-spam (a
+# follow→unfollow→follow loop can't force pointless refresh spend) and a
+# guard against redundant work (a wallet another User already tracks is on the
+# active cadence, freshly scanned, so already current).
+FOLLOW_REFRESH_FRESHNESS = timedelta(minutes=15)
+
+
+async def mark_due_on_follow(
+    executor: asyncpg.Pool | asyncpg.Connection, address: str, now: datetime
+) -> bool:
+    """Bump `address` to the front of the fine-refresh queue on a Follow, unless
+    its fine data is still fresh. Clears fine_refreshed_at (making it due per
+    DUE_ELIGIBILITY) and fine_attempted_at (sorting it first per `_due_traders`'
+    ORDER BY), so the chunked, tracked-first pass (#65/#66) refreshes it within
+    minutes — no restart, no Hyperliquid call here (ADR-0002: processes meet in
+    Postgres). Skips a wallet refreshed within FOLLOW_REFRESH_FRESHNESS; returns
+    whether it bumped."""
+    status = await executor.execute(
+        """
+        UPDATE traders
+        SET fine_refreshed_at = NULL, fine_attempted_at = NULL
+        WHERE address = $1
+          AND (fine_refreshed_at IS NULL OR fine_refreshed_at <= $2)
+        """,
+        address,
+        now - FOLLOW_REFRESH_FRESHNESS,
+    )
+    return bool(status != "UPDATE 0")
+
+
 # Whether Trader `t` is tracked by a User — single-sourced because it gates both
 # eligibility (below) and due-queue priority (issue #65's ORDER BY), which must
 # stay in lockstep on what "tracked" means.

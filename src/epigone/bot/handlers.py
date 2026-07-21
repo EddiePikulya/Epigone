@@ -25,6 +25,7 @@ from epigone.gateway import (
     Window,
     fetch_open_positions,
 )
+from epigone.ingest.fine import mark_due_on_follow
 from epigone.metrics.library import format_duration
 from epigone.screener import ScreenerRow, run_screener
 
@@ -710,6 +711,10 @@ async def track_address(
         telegram_id,
         address,
     )
+    # A fresh Follow makes the wallet due now, so its fine data refreshes within
+    # minutes instead of on the daily cadence (issue #82) — a recently-scanned
+    # wallet is left alone. Postgres-only; the ingest picks it up (ADR-0002).
+    await mark_due_on_follow(conn, address, now)
     return TrackOutcome.FRESHLY_TRACKED
 
 
