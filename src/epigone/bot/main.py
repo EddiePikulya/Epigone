@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher
 
 from epigone.bot.access import install_allowlist_gate
 from epigone.bot.alerts import run_delivery_loop
+from epigone.bot.first_data_notice import run_first_data_notice_loop
 from epigone.bot.handlers import build_router
 from epigone.bot.menu import set_bot_commands
 from epigone.clock import SystemClock
@@ -41,11 +42,15 @@ async def main() -> None:
         await set_bot_commands(bot, settings.admin_telegram_id)
 
         delivery = asyncio.create_task(run_delivery_loop(pool, bot, clock))
+        # The one-time "first fine data landed" notices (issue #83) ride the same
+        # Postgres→bot seam as Position Alerts, on their own drain loop.
+        first_data = asyncio.create_task(run_first_data_notice_loop(pool, bot, clock))
         logging.getLogger(__name__).info("bot: starting polling and alert delivery")
         try:
             await dp.start_polling(bot)
         finally:
             delivery.cancel()
+            first_data.cancel()
 
 
 if __name__ == "__main__":

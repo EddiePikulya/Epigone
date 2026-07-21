@@ -17,6 +17,7 @@ from aiogram.types import (
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import fills_open_age, open_age, short_address, signed_pct, signed_usd
 from epigone.clock import Clock
+from epigone.first_data_notice import record_follow_notice_state
 from epigone.gateway import (
     GatewayError,
     HyperliquidGateway,
@@ -715,6 +716,11 @@ async def track_address(
     # minutes instead of on the daily cadence (issue #82) — a recently-scanned
     # wallet is left alone. Postgres-only; the ingest picks it up (ADR-0002).
     await mark_due_on_follow(conn, address, now)
+    # Settle this pair's one-time "first data landed" notice (issue #83): pending
+    # if the wallet is not yet scanned (notify when its first data lands),
+    # suppressed if the data is already there. Only on a genuinely new Track — a
+    # re-follow returned ALREADY_TRACKING above, so its row is never reset.
+    await record_follow_notice_state(conn, telegram_id, address, now)
     return TrackOutcome.FRESHLY_TRACKED
 
 
