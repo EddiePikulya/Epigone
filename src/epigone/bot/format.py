@@ -42,3 +42,19 @@ def open_age(opened_at: datetime, now: datetime, *, baselined: bool) -> str:
     position first seen opening reads plainly, `open 2d 4h`."""
     span = format_duration(int((now - opened_at).total_seconds()))
     return f"open ≥{span}" if baselined else f"open {span}"
+
+
+def fills_open_age(opened_at: datetime, now: datetime, *, stale: bool) -> str:
+    """How long a position has been open, derived from the fine store's open
+    episode rather than a live poller observation (#78).
+
+    Used for an untracked wallet, where no poller snapshot exists but the
+    continuity-verified fill history (#63) knows when the current position
+    opened. It is knowledge as of the last fills scan, not a live reading, so it
+    carries a `~` approximation marker — `open ~2d 4h` — distinct from the
+    poller's precise `open 2d 4h` and its `≥` baselined marker. When the scan is
+    older than the fresh window it also takes the activity line's "as of last
+    scan" hedge (#72): the wallet may have changed the position since."""
+    span = format_duration(int((now - opened_at).total_seconds()))
+    marked = f"open ~{span}"
+    return f"{marked} (as of last scan)" if stale else marked

@@ -5,7 +5,7 @@ freshness, current positions, follow/unfollow). A screener run is a database
 query only — zero Hyperliquid calls (the profile view is the one place that
 reaches the gateway, and only on an explicit tap)."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
@@ -83,6 +83,29 @@ async def add_fine(pool: asyncpg.Pool, address: str, *, win_rate: str = "0.76") 
         address,
         Decimal(win_rate),
         NOW,
+    )
+
+
+async def add_open_episode(
+    pool: asyncpg.Pool,
+    address: str,
+    coin: str,
+    *,
+    opened_at: datetime,
+    net_position: str,
+) -> None:
+    """A continuity-verified open episode in the fine store (#63): the fallback
+    age source (#78). `net_position` is the signed walked size (negative short,
+    positive long, 0 = never-verified/demoted)."""
+    await pool.execute(
+        """
+        INSERT INTO fine_open_episodes (address, coin, opened_at, net_position)
+        VALUES ($1, $2, $3, $4)
+        """,
+        address,
+        coin,
+        opened_at,
+        Decimal(net_position),
     )
 
 
@@ -353,6 +376,103 @@ async def test_profile_from_screener_merges_core_and_xyz_venues(
     text = session.sent_messages()[-1].text or ""
     assert "ETH" in text  # core, unchanged
     assert "xyz:SP500" in text  # the builder-DEX position
+
+
+# --- fills-derived open age on an untracked profile (issue #78) -------------
+#
+# The untracked profile has no poller snapshot, but the fine store's open
+# episode (#63) can supply the age when it matches the live position.
+
+
+async def test_profile_shows_fills_derived_age_for_a_matching_open_episode(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # Untracked wallet, live ETH short, and a fresh open episode that agrees on
+    # coin and direction (net_position < 0) → a fills-derived age.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    await add_fine(pool, "0xstar")  # fine_metrics.computed_at = NOW (fresh)
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    opened = clock.now() - timedelta(days=2)
+    await add_open_episode(pool, "0xstar", "ETH", opened_at=opened, net_position="-3.5")
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "open ~2d" in text  # fills-derived, approximate
+
+
+async def test_profile_hedges_fills_age_when_the_scan_is_stale(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # The fine scan (computed_at = NOW) is older than the fresh window once the
+    # clock advances, so the age is hedged rather than presented as live.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    await add_fine(pool, "0xstar")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    opened = clock.now() - timedelta(days=2)
+    await add_open_episode(pool, "0xstar", "ETH", opened_at=opened, net_position="-3.5")
+    clock.advance(3 * 86400)  # 3 days on — the fills knowledge is now stale
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "open ~5d (as of last scan)" in text
+
+
+async def test_profile_omits_age_when_the_episode_direction_contradicts(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # Live ETH short, but the stored episode is long (net_position > 0): the
+    # wallet flipped after the last refresh, so the episode is not this
+    # position and lends no age.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    await add_fine(pool, "0xstar")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    opened = clock.now() - timedelta(days=2)
+    await add_open_episode(pool, "0xstar", "ETH", opened_at=opened, net_position="4.0")
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "ETH" in text and "SHORT" in text  # position still renders
+    assert "open " not in text  # …but no invented age
+
+
+async def test_profile_omits_age_for_a_demoted_episode(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # A pre-#63 / demoted episode carries net_position 0 ("never verified") — it
+    # matches no direction, so the position shows no age.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    await add_fine(pool, "0xstar")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    opened = clock.now() - timedelta(days=2)
+    await add_open_episode(pool, "0xstar", "ETH", opened_at=opened, net_position="0")
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "open " not in text
 
 
 async def test_profile_degrades_when_only_the_xyz_venue_fails(

@@ -9,7 +9,7 @@ age lookup and the live call sites are exercised in test_track_wallet.py.
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from epigone.bot.format import held_for, open_age
+from epigone.bot.format import fills_open_age, held_for, open_age
 from epigone.bot.handlers import _render_positions, _render_recent_activity
 from epigone.gateway import Position, Side
 
@@ -70,6 +70,25 @@ def test_held_for_still_reads_a_closed_span() -> None:
     assert held_for(opened, NOW) == "3h 20m"
 
 
+# --- fills-derived open age (issue #78) -------------------------------------
+#
+# For an untracked wallet the poller never observed, the fine store's open
+# episode (#63) supplies the age instead — read as an approximation (`~`) and,
+# when the fills scan is stale, hedged like the activity line (#72).
+
+
+def test_fills_open_age_reads_as_an_approximation() -> None:
+    opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)  # 2d 4h before NOW
+    assert fills_open_age(opened, NOW, stale=False) == "open ~2d 4h"
+
+
+def test_fills_open_age_hedges_staleness_as_of_last_scan() -> None:
+    # Knowledge only as fresh as the last fills scan — if that scan is old the
+    # wallet may have changed the position since, so it must not read as live.
+    opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
+    assert fills_open_age(opened, NOW, stale=True) == "open ~2d 4h (as of last scan)"
+
+
 # --- the shared position renderer -------------------------------------------
 
 
@@ -98,6 +117,94 @@ def test_render_omits_age_when_no_snapshot_exists() -> None:
     # age to show — the line simply carries none rather than inventing one.
     text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
     assert "open " not in text
+
+
+# --- fills-derived age in the renderer (issue #78) --------------------------
+#
+# When no poller snapshot exists, a matching open episode (coin + direction)
+# supplies the age; a contradicting, demoted, or missing episode still shows
+# none. The `fills` map is coin → (opened_at, net_position, fills_seen_at).
+
+FILLS_OPENED = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)  # 2d 4h before NOW
+FRESH_SCAN = NOW - timedelta(hours=2)
+
+
+def test_render_shows_a_fills_derived_age_when_the_episode_matches() -> None:
+    # BTC_LONG has no snapshot but a long open episode (net_position > 0) — its
+    # age comes from the fills, read as an approximation.
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={},
+        now=NOW,
+        fills={"BTC": (FILLS_OPENED, Decimal("0.5"), FRESH_SCAN)},
+    )
+    assert "open ~2d 4h" in text
+
+
+def test_render_hedges_a_fills_derived_age_when_the_scan_is_stale() -> None:
+    stale_scan = NOW - timedelta(days=3)
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={},
+        now=NOW,
+        fills={"BTC": (FILLS_OPENED, Decimal("0.5"), stale_scan)},
+    )
+    assert "open ~2d 4h (as of last scan)" in text
+
+
+def test_render_omits_age_when_the_episode_direction_contradicts_the_position() -> None:
+    # The live position is long but the fills snapshot is short — the wallet
+    # flipped since the last refresh, so the episode is not this position.
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={},
+        now=NOW,
+        fills={"BTC": (FILLS_OPENED, Decimal("-0.5"), FRESH_SCAN)},
+    )
+    assert "open " not in text
+
+
+def test_render_omits_age_for_a_demoted_episode() -> None:
+    # net_position 0 is the pre-#63 "never verified" default: it matches no live
+    # direction, so it never lends an age.
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={},
+        now=NOW,
+        fills={"BTC": (FILLS_OPENED, Decimal("0"), FRESH_SCAN)},
+    )
+    assert "open " not in text
+
+
+def test_render_omits_age_when_no_episode_covers_the_position() -> None:
+    # A fills map that has other coins but not this one still shows no age.
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={},
+        now=NOW,
+        fills={"ETH": (FILLS_OPENED, Decimal("-1"), FRESH_SCAN)},
+    )
+    assert "open " not in text
+
+
+def test_render_prefers_the_poller_snapshot_over_the_fills_episode() -> None:
+    # A tracked wallet keeps its precise poller age even when a fills episode
+    # also exists — the snapshot is the fresher source.
+    snap_opened = datetime(2026, 7, 11, 8, 0, tzinfo=UTC)  # 4h before NOW
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={"BTC": (snap_opened, False)},
+        now=NOW,
+        fills={"BTC": (FILLS_OPENED, Decimal("0.5"), FRESH_SCAN)},
+    )
+    assert "open 4h" in text
+    assert "~" not in text
 
 
 def test_render_derives_return_on_margin_without_the_api_field() -> None:
