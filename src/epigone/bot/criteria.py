@@ -459,7 +459,11 @@ async def on_delete_preset(callback: CallbackQuery, pool: asyncpg.Pool, clock: C
 
 
 async def on_follow(
-    callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock, drafts: Drafts
+    callback: CallbackQuery,
+    pool: asyncpg.Pool,
+    clock: Clock,
+    drafts: Drafts,
+    admin_telegram_id: int | None,
 ) -> None:
     """Follow straight from a results row (cfw:ref:offset:address), then
     re-render the page so the row flips to Following. Same Track seam as the
@@ -468,7 +472,12 @@ async def on_follow(
     offset_raw, _, address = rest.partition(":")
     async with pool.acquire() as conn, conn.transaction():
         outcome = await track_address(
-            conn, callback.from_user.id, callback.from_user.username, address, clock.now()
+            conn,
+            callback.from_user.id,
+            callback.from_user.username,
+            address,
+            clock.now(),
+            cap_exempt=callback.from_user.id == admin_telegram_id,
         )
     await _show_results(
         callback,

@@ -156,14 +156,23 @@ async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT, reply_markup=with_delete_button())
 
 
-async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clock) -> None:
+async def follow_pasted_address(
+    message: Message, pool: asyncpg.Pool, clock: Clock, admin_telegram_id: int | None
+) -> None:
     """A pasted valid address Follows the Trader; re-following is idempotent."""
     user = message.from_user
     if user is None or message.text is None:
         return
     address = message.text.strip().lower()
     async with pool.acquire() as conn, conn.transaction():
-        outcome = await track_address(conn, user.id, user.username, address, clock.now())
+        outcome = await track_address(
+            conn,
+            user.id,
+            user.username,
+            address,
+            clock.now(),
+            cap_exempt=user.id == admin_telegram_id,
+        )
     if outcome is TrackOutcome.FRESHLY_TRACKED:
         await message.answer(
             f"Now tracking {short_address(address)}.\n"
@@ -308,7 +317,9 @@ async def on_screener_page(callback: CallbackQuery, pool: asyncpg.Pool, clock: C
     await callback.answer()
 
 
-async def on_screener_follow(callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock) -> None:
+async def on_screener_follow(
+    callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock, admin_telegram_id: int | None
+) -> None:
     """Follow straight from a results row, then re-render the page so the row
     flips to Following. The offset rides in the callback data so the re-render
     lands on the same page."""
@@ -316,7 +327,12 @@ async def on_screener_follow(callback: CallbackQuery, pool: asyncpg.Pool, clock:
     offset = _parse_offset(offset_str)
     async with pool.acquire() as conn, conn.transaction():
         outcome = await track_address(
-            conn, callback.from_user.id, callback.from_user.username, address, clock.now()
+            conn,
+            callback.from_user.id,
+            callback.from_user.username,
+            address,
+            clock.now(),
+            cap_exempt=callback.from_user.id == admin_telegram_id,
         )
     if isinstance(callback.message, Message):
         text, markup = await _render_screener_page(
@@ -351,12 +367,21 @@ async def on_profile(
 
 
 async def on_profile_follow(
-    callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
+    callback: CallbackQuery,
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
+    admin_telegram_id: int | None,
 ) -> None:
     address = (callback.data or "").removeprefix("pfollow:")
     async with pool.acquire() as conn, conn.transaction():
         outcome = await track_address(
-            conn, callback.from_user.id, callback.from_user.username, address, clock.now()
+            conn,
+            callback.from_user.id,
+            callback.from_user.username,
+            address,
+            clock.now(),
+            cap_exempt=callback.from_user.id == admin_telegram_id,
         )
     await _refresh_profile_in_place(
         callback, pool, gateway, clock, address, follow_toast(outcome, address)
@@ -702,7 +727,13 @@ def _is_command(message: Message) -> bool:
 
 
 async def track_address(
-    conn: asyncpg.Connection, telegram_id: int, username: str | None, address: str, now: datetime
+    conn: asyncpg.Connection,
+    telegram_id: int,
+    username: str | None,
+    address: str,
+    now: datetime,
+    *,
+    cap_exempt: bool = False,
 ) -> TrackOutcome:
     """Follow `address` for a User; idempotent. Returns the follow's outcome.
 
@@ -713,7 +744,10 @@ async def track_address(
     The per-User cap (#23) is enforced here so all three paths share one check.
     Re-touching an already-tracked wallet is always allowed (idempotent, never
     counts as a new follow), even at the cap — so the already-tracking test
-    comes before the count check."""
+    comes before the count check. `cap_exempt` waives the cap: callers pass
+    `cap_exempt=<follower> == admin_telegram_id`, so only the owner (#33)
+    follows without limit — every extra tracked wallet costs poller budget, so
+    the waiver stays admin-only rather than a tier anyone can reach."""
     await upsert_user(conn, telegram_id, username)
     already_tracking = await conn.fetchval(
         "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
@@ -726,7 +760,7 @@ async def track_address(
         "SELECT count(*) FROM tracks WHERE user_telegram_id = $1",
         telegram_id,
     )
-    if tracked_count >= MAX_TRACKED_WALLETS:
+    if not cap_exempt and tracked_count >= MAX_TRACKED_WALLETS:
         return TrackOutcome.LIMIT_REACHED
     await conn.execute(
         """
