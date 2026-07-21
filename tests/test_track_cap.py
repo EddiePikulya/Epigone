@@ -120,3 +120,34 @@ async def test_profile_follow_at_the_cap_is_refused_and_not_added(
     assert "limit" in (session.callback_answers()[-1].text or "").lower()
     # Still not tracked, so the profile keeps offering a Follow.
     assert "pfollow:0xstar" in _callback_data(session.edited_messages()[-1].reply_markup)
+
+
+async def test_the_admin_follows_past_the_cap(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The owner (#33) is cap-exempt: a sixteenth paste lands instead of being
+    refused. Only the admin id — the exemption follows the id, not a flag a
+    user could reach."""
+    dp["admin_telegram_id"] = USER
+    await _fill_to_cap(dp, bot)
+
+    await feed_text(dp, bot, _addr(99), user_id=USER)
+
+    tracked = await _tracked(pool, USER)
+    assert len(tracked) == MAX_TRACKED_WALLETS + 1
+    assert _addr(99) in tracked
+    assert "tracking" in (session.sent_messages()[-1].text or "").lower()
+
+
+async def test_a_non_admin_stays_capped_while_an_admin_exists(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    other = 222
+    dp["admin_telegram_id"] = USER  # someone else is the admin
+
+    await _fill_to_cap(dp, bot, user_id=other)
+    await feed_text(dp, bot, _addr(99), user_id=other)
+
+    tracked = await _tracked(pool, other)
+    assert len(tracked) == MAX_TRACKED_WALLETS  # still refused
+    assert _addr(99) not in tracked
