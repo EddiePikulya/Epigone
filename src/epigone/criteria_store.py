@@ -122,3 +122,37 @@ async def delete_criteria(pool: asyncpg.Pool, user_id: int, criteria_id: int) ->
     )
     assert name is None or isinstance(name, str)
     return name
+
+
+# --- Preset dismissals (issue #71) ---
+#
+# Presets themselves are defined in code (epigone.criteria_presets); only the
+# per-User "I deleted this one" state lives here. Deleting a preset is a
+# hide-for-me — one row per (User, preset) — keyed on the preset's stable code
+# key so a later threshold recalibration never resurrects a dismissed preset.
+
+
+async def hidden_preset_keys(pool: asyncpg.Pool, user_id: int) -> set[str]:
+    """The preset keys this User has deleted (hidden) for themselves."""
+    rows = await pool.fetch(
+        "SELECT preset_key FROM criteria_preset_dismissals WHERE user_telegram_id = $1",
+        user_id,
+    )
+    return {row["preset_key"] for row in rows}
+
+
+async def dismiss_preset(
+    pool: asyncpg.Pool, user_id: int, preset_key: str, now: datetime
+) -> None:
+    """Hide a preset for this User, permanently. Idempotent — deleting an
+    already-hidden preset keeps the original dismissal timestamp."""
+    await pool.execute(
+        """
+        INSERT INTO criteria_preset_dismissals (user_telegram_id, preset_key, dismissed_at)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_telegram_id, preset_key) DO NOTHING
+        """,
+        user_id,
+        preset_key,
+        now,
+    )

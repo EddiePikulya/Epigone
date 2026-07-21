@@ -13,10 +13,11 @@ the same UX with less machinery, so the FSM stays unused.
 
 Callback vocabulary (all criteria callbacks start with "c"): cnew/chome/cmenu
 navigate, cfadd→cfm:→cfo: adds a filter, cfdel: removes one, cwin→cw: sets the
-timeframe, csort→csm:→csd: the sort, crun:{d|id}:{offset} runs a draft or a
-saved Criteria, csave/cedit:/cdel: manage saved ones, cfw: follows a result.
+timeframe, csort→csm:→csd: the sort, crun:{d|id|p<key>}:{offset} runs a draft, a
+saved Criteria, or a starter preset, csave/cedit:/cdel: manage saved ones,
+cdelp:<key> hides a preset for the User (issue #71), cfw: follows a result.
 Callback payloads are client-forgeable, so every id is scoped to the tapping
-User and every metric/operator/window is looked up, never trusted.
+User and every metric/operator/window/preset key is looked up, never trusted.
 """
 
 from dataclasses import dataclass, field
@@ -37,10 +38,13 @@ from epigone.bot.handlers import (
     upsert_user,
 )
 from epigone.clock import Clock
+from epigone.criteria_presets import PRESETS, PRESETS_BY_KEY
 from epigone.criteria_store import (
     SavedCriteria,
     delete_criteria,
+    dismiss_preset,
     get_criteria,
+    hidden_preset_keys,
     list_criteria,
     save_criteria,
     update_criteria,
@@ -72,6 +76,12 @@ WINDOW_BUTTON_LABELS = {
 }
 
 HOME_HEADER = "🎯 Your saved criteria:"
+
+# Marks a starter preset in the list so it reads apart from a User's own saved
+# criteria (issue #71). The "p" ref prefix namespaces preset run/follow refs
+# away from the integer ids of saved Criteria.
+PRESET_MARKER = "⭐"
+PRESET_REF_PREFIX = "p"
 
 HOME_EMPTY_TEXT = (
     "You haven't saved any criteria yet.\n\n"
@@ -170,6 +180,7 @@ def register(router: Router) -> None:
     router.callback_query.register(on_run, F.data.startswith("crun:"))
     router.callback_query.register(on_save, F.data == "csave")
     router.callback_query.register(on_edit, F.data.startswith("cedit:"))
+    router.callback_query.register(on_delete_preset, F.data.startswith("cdelp:"))
     router.callback_query.register(on_delete, F.data.startswith("cdel:"))
     router.callback_query.register(on_follow, F.data.startswith("cfw:"))
 
@@ -427,6 +438,25 @@ async def on_delete(callback: CallbackQuery, pool: asyncpg.Pool) -> None:
     await _show(callback, *await _render_home(pool, callback.from_user.id), toast=toast)
 
 
+async def on_delete_preset(callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock) -> None:
+    """Delete a starter preset — a hide-for-me: it leaves this User's list only,
+    permanently (issue #71). Other Users are untouched, and a later version that
+    recalibrates the preset's thresholds keeps it hidden for this User."""
+    key = (callback.data or "").removeprefix("cdelp:")
+    preset = PRESETS_BY_KEY.get(key)
+    if preset is None:
+        await _show(
+            callback, *await _render_home(pool, callback.from_user.id), toast="Already gone."
+        )
+        return
+    await dismiss_preset(pool, callback.from_user.id, key, clock.now())
+    await _show(
+        callback,
+        *await _render_home(pool, callback.from_user.id),
+        toast=f"Removed ‘{preset.name}’ from your list",
+    )
+
+
 async def on_follow(
     callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock, drafts: Drafts
 ) -> None:
@@ -470,7 +500,9 @@ async def on_builder_text(
             return
         # Reusing a name must never silently destroy a saved Criteria — the
         # restart-survival promise (#7) would be defeatable by an innocent typo.
-        if any(s.name == name for s in await list_criteria(pool, user.id)):
+        # A visible starter preset's name is taken too, so the list never shows
+        # two identical names; deleting that preset frees the name (issue #71).
+        if name in await _taken_names(pool, user.id):
             await message.answer(
                 f"You already have a criteria called ‘{name}’ — send a different "
                 "name, or delete the old one from /criteria first."
@@ -503,16 +535,19 @@ async def on_builder_text(
 
 async def _render_home(pool: asyncpg.Pool, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     saved = await list_criteria(pool, user_id)
+    hidden = await hidden_preset_keys(pool, user_id)
+    presets = [p for p in PRESETS if p.key not in hidden]
     keyboard: list[list[InlineKeyboardButton]] = []
-    if saved:
+    if not saved and not presets:
+        # Every user starts with the three presets, so this is only reached once
+        # a user has deleted them all and saved nothing of their own.
+        text = HOME_EMPTY_TEXT
+    else:
         lines = [HOME_HEADER, ""]
+        # A User's own saved Criteria first — what they came back for — then the
+        # curated starters below, always available, each visibly marked.
         for s in saved:
-            count = len(s.criteria.filters)
-            noun = "filter" if count == 1 else "filters"
-            lines.append(
-                f"• {s.name} — {count} {noun} · {WINDOW_LABELS[s.criteria.time_window]} · "
-                f"sort: {METRICS[s.criteria.sort_key].label}"
-            )
+            lines.append(f"• {s.name} — {_summarize(s.criteria)}")
             keyboard.append(
                 [
                     InlineKeyboardButton(text=f"▶ {s.name}", callback_data=f"crun:{s.id}:0"),
@@ -520,11 +555,39 @@ async def _render_home(pool: asyncpg.Pool, user_id: int) -> tuple[str, InlineKey
                     InlineKeyboardButton(text="🗑 Delete", callback_data=f"cdel:{s.id}"),
                 ]
             )
+        for p in presets:
+            lines.append(f"{PRESET_MARKER} {p.name} — {_summarize(p.criteria)}  (starter)")
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"▶ {p.name}",
+                        callback_data=f"crun:{PRESET_REF_PREFIX}{p.key}:0",
+                    ),
+                    InlineKeyboardButton(text="🗑 Delete", callback_data=f"cdelp:{p.key}"),
+                ]
+            )
         text = "\n".join(lines)
-    else:
-        text = HOME_EMPTY_TEXT
     keyboard.append([InlineKeyboardButton(text="➕ New criteria", callback_data="cnew")])
     return text, InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _summarize(criteria: Criteria) -> str:
+    count = len(criteria.filters)
+    noun = "filter" if count == 1 else "filters"
+    return (
+        f"{count} {noun} · {WINDOW_LABELS[criteria.time_window]} · "
+        f"sort: {METRICS[criteria.sort_key].label}"
+    )
+
+
+async def _taken_names(pool: asyncpg.Pool, user_id: int) -> set[str]:
+    """The names already showing in this User's list — their own saved Criteria
+    plus any starter presets they haven't deleted. A new name must avoid all of
+    them so the list never carries two identical names (issue #71)."""
+    hidden = await hidden_preset_keys(pool, user_id)
+    names = {p.name for p in PRESETS if p.key not in hidden}
+    names.update(s.name for s in await list_criteria(pool, user_id))
+    return names
 
 
 def _render_builder(draft: Draft) -> tuple[str, InlineKeyboardMarkup]:
@@ -726,6 +789,13 @@ async def _resolve(
             return None
         back = InlineKeyboardButton(text="🛠 Back to builder", callback_data="cmenu")
         return draft.to_criteria(), draft.editing_name or "Your draft", back
+    if ref.startswith(PRESET_REF_PREFIX):
+        preset = PRESETS_BY_KEY.get(ref.removeprefix(PRESET_REF_PREFIX))
+        if preset is None:  # a preset retired since this keyboard was drawn
+            await _expired(callback, pool, toast=toast or CRITERIA_GONE_TOAST)
+            return None
+        back = InlineKeyboardButton(text="◀ Your criteria", callback_data="chome")
+        return preset.criteria, preset.name, back
     saved_id = _parse_int(ref)
     saved = (
         await get_criteria(pool, callback.from_user.id, saved_id) if saved_id is not None else None
