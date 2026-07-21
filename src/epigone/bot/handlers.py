@@ -118,6 +118,14 @@ _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 # with false precision — the same honesty spirit as the ≥ open-age marker (#72).
 FILLS_FRESH_WINDOW = timedelta(days=1)
 
+# Shown once under an untracked wallet's positions when we can't honestly date at
+# least one of them — no poller snapshot (never followed) and no verified fill
+# episode to fall back on (#78). A position's open time is knowable only by
+# observing the wallet over time, which is exactly what following starts, so the
+# honest move is to invent no age and point there. Untracked profiles only: a
+# follower already gets the poller's own age.
+FOLLOW_FOR_AGE_HINT = "↳ Follow to track how long these positions have been open"
+
 
 def _fills_stale(fills_seen_at: datetime | None, now: datetime) -> bool:
     """Is our fills knowledge older than the fresh window (or never scanned)?
@@ -487,7 +495,9 @@ async def _render_profile(
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     parts = [
-        _render_positions(address, positions, ages, clock.now(), fills),
+        _render_positions(
+            address, positions, ages, clock.now(), fills, offer_follow=not followed
+        ),
         await _recent_activity(pool, address, clock.now()),
         await _render_track_record(pool, address),
     ]
@@ -781,6 +791,8 @@ def _render_positions(
     ages: dict[str, tuple[datetime, bool]],
     now: datetime,
     fills: dict[str, tuple[datetime, Decimal, datetime | None]] | None = None,
+    *,
+    offer_follow: bool = False,
 ) -> str:
     """The shared per-position view (#31): notional plus the real margin at risk,
     return-on-margin, and holding time (#35).
@@ -791,11 +803,17 @@ def _render_positions(
     fills_seen_at) from the fine store's open episodes (#78) — the fallback for
     an untracked wallet, used only where the poller has no snapshot and only
     when the episode actually matches the live position (see `_fills_open_age`).
-    A coin covered by neither simply shows no age rather than a made-up one."""
+    A coin covered by neither simply shows no age rather than a made-up one.
+
+    `offer_follow` (an untracked profile) appends a single nudge to follow when
+    at least one position was left ageless — the honest way to explain the gap:
+    the open time is knowable only by observing the wallet, which following
+    starts. Suppressed for a follower, who already gets the poller's own age."""
     if not positions:
         return f"{short_address(address)} has no open positions right now."
     fills = fills or {}
     blocks = [f"{short_address(address)} — current positions:", ""]
+    any_ageless = False
     for p in positions:
         upnl = f"uPnL {signed_usd(p.unrealized_pnl)}"
         rom = p.return_on_margin
@@ -810,11 +828,16 @@ def _render_positions(
             fills_age = _fills_open_age(p, fills.get(p.coin), now)
             if fills_age is not None:
                 detail.append(fills_age)
+            else:
+                any_ageless = True
         blocks.append(
             f"{p.coin} {p.side.value.upper()} — "
             f"${p.size_usd:,.0f} notional · ${p.margin:,.0f} margin at {p.leverage}x\n"
             f"    " + " · ".join(detail)
         )
+    if offer_follow and any_ageless:
+        blocks.append("")
+        blocks.append(FOLLOW_FOR_AGE_HINT)
     return "\n".join(blocks)
 
 

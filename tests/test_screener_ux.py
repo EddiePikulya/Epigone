@@ -12,6 +12,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher
 from aiogram.types import InlineKeyboardMarkup
 
+from epigone.bot.handlers import FOLLOW_FOR_AGE_HINT
 from epigone.gateway import Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.clock import FakeClock
@@ -404,6 +405,7 @@ async def test_profile_shows_fills_derived_age_for_a_matching_open_episode(
 
     text = session.sent_messages()[-1].text or ""
     assert "open ~2d" in text  # fills-derived, approximate
+    assert FOLLOW_FOR_AGE_HINT not in text  # dated → no nudge needed
 
 
 async def test_profile_hedges_fills_age_when_the_scan_is_stale(
@@ -473,6 +475,51 @@ async def test_profile_omits_age_for_a_demoted_episode(
 
     text = session.sent_messages()[-1].text or ""
     assert "open " not in text
+
+
+async def test_profile_nudges_to_follow_when_an_untracked_position_has_no_age(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # Untracked wallet, a live position, and no episode to date it — show no
+    # invented age, but explain the gap once and point to following.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "ETH" in text and "SHORT" in text  # position still renders
+    assert "open " not in text  # …with no invented age
+    assert FOLLOW_FOR_AGE_HINT in text  # the honest nudge
+
+
+async def test_profile_shows_no_follow_nudge_for_a_wallet_you_track(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # A follower already gets the poller's own age, so the "follow to track age"
+    # nudge would be nonsense — it is suppressed once tracked.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+    await pool.execute("INSERT INTO users (telegram_id, username) VALUES (111, 'u')")
+    await pool.execute(
+        "INSERT INTO tracks (user_telegram_id, trader_address) VALUES (111, '0xstar')"
+    )
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "ETH" in text and "SHORT" in text
+    assert FOLLOW_FOR_AGE_HINT not in text
 
 
 async def test_profile_degrades_when_only_the_xyz_venue_fails(

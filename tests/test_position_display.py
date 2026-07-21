@@ -10,7 +10,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from epigone.bot.format import fills_open_age, held_for, open_age
-from epigone.bot.handlers import _render_positions, _render_recent_activity
+from epigone.bot.handlers import (
+    FOLLOW_FOR_AGE_HINT,
+    _render_positions,
+    _render_recent_activity,
+)
 from epigone.gateway import Position, Side
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
@@ -205,6 +209,65 @@ def test_render_prefers_the_poller_snapshot_over_the_fills_episode() -> None:
     )
     assert "open 4h" in text
     assert "~" not in text
+
+
+# --- follow nudge for ageless untracked positions (issue #78) ---------------
+#
+# On an untracked profile (offer_follow=True), a position we can't date gets no
+# invented age; instead one nudge under the block explains the gap and points to
+# following. A follower (offer_follow=False) never sees it.
+
+
+def test_render_offers_follow_when_an_untracked_position_is_ageless() -> None:
+    text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW, offer_follow=True)
+    assert FOLLOW_FOR_AGE_HINT in text
+    assert "age unknown" not in text  # no per-line text — one nudge only
+
+
+def test_render_shows_no_follow_nudge_for_a_follower() -> None:
+    # offer_follow defaults to False (the tracked positions view): an ageless
+    # position simply shows no age, exactly as before.
+    text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
+    assert FOLLOW_FOR_AGE_HINT not in text
+
+
+def test_render_omits_the_nudge_when_every_position_is_dated() -> None:
+    # An untracked profile where each position already has an age (here a fills
+    # episode) needs no nudge — nothing is missing.
+    opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG],
+        ages={},
+        now=NOW,
+        fills={"BTC": (opened, Decimal("0.5"), NOW - timedelta(hours=2))},
+        offer_follow=True,
+    )
+    assert "open ~2d 4h" in text
+    assert FOLLOW_FOR_AGE_HINT not in text
+
+
+def test_render_offers_follow_when_only_some_positions_are_dated() -> None:
+    # BTC dated from a fills episode, SOL ageless → the nudge still appears once.
+    sol = Position(
+        coin="SOL",
+        side=Side.LONG,
+        size_usd=Decimal("2000"),
+        leverage=Decimal("10"),
+        entry_price=Decimal("73"),
+        unrealized_pnl=Decimal("10"),
+    )
+    opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
+    text = _render_positions(
+        WHALE,
+        [BTC_LONG, sol],
+        ages={},
+        now=NOW,
+        fills={"BTC": (opened, Decimal("0.5"), NOW - timedelta(hours=2))},
+        offer_follow=True,
+    )
+    assert "open ~2d 4h" in text  # BTC dated
+    assert text.count(FOLLOW_FOR_AGE_HINT) == 1  # one nudge, not per-line
 
 
 def test_render_derives_return_on_margin_without_the_api_field() -> None:
