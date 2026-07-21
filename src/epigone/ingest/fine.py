@@ -24,6 +24,7 @@ import asyncpg
 
 from epigone.budget import Budget, record_rate_limit
 from epigone.clock import Clock
+from epigone.first_data_notice import mark_first_data_ready
 from epigone.gateway import FILL_ENDPOINTS, GatewayError, HyperliquidGateway, RateLimitedError
 from epigone.ingest.scan import (
     ACTIVE_REFRESH_INTERVAL,
@@ -457,3 +458,13 @@ async def _store_fine_refresh(
             bot_reason,
             state.last_fill_at,
         )
+        # First real fine data for this wallet has now landed: queue the one-time
+        # notice (issue #83) for any tracker still waiting on it. Gated on the
+        # wallet actually having fills (last_fill_at, == fine_checkpoint_at) —
+        # an empty scan writes a fine_metrics row but isn't "full track-record
+        # data", so it leaves waiting trackers 'pending' until real fills arrive.
+        # In the same transaction as the metrics write so "data landed" and
+        # "notices queued" commit together (restart-safe); a no-op for a wallet
+        # with no waiting trackers, which is every routine refresh.
+        if state.last_fill_at is not None:
+            await mark_first_data_ready(conn, address)

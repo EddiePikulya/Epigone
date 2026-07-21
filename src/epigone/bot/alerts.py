@@ -1,17 +1,12 @@
 """Position Alert delivery: the bot-side consumer of position_alerts (issue #4).
 
 The stream poller queues one row per event per follower (ADR-0002: the
-processes meet only in Postgres); this loop drains undelivered rows oldest
-first and stamps delivered_at only after Telegram accepts the send. Stamped
-rows are never resent, so bot restarts are duplicate-free; a crash in the
-instant between send and stamp re-sends that single alert — the at-least-once
-residue of an outbox without delivery receipts.
-
-Failures split by durability: transient trouble (network, flood control,
-Telegram 5xx) pauses the run and retries everything untouched next tick,
-while a per-chat reject (blocked bot, deleted chat) increments that row's
-attempts until MAX_DELIVERY_ATTEMPTS abandons it — one dead chat must not
-wedge the queue, but an outage must not shed alerts.
+processes meet only in Postgres); the shared outbox drain (epigone.bot.outbox)
+sends undelivered rows oldest first and stamps delivered_at only after Telegram
+accepts. Stamped rows are never resent, so bot restarts are duplicate-free; a
+crash in the instant between send and stamp re-sends that single alert — the
+at-least-once residue of an outbox without delivery receipts. This module
+supplies only what is alert-specific: which rows to drain and how to render one.
 """
 
 import logging
@@ -19,22 +14,16 @@ from decimal import Decimal
 
 import asyncpg
 from aiogram import Bot
-from aiogram.exceptions import (
-    TelegramAPIError,
-    TelegramNetworkError,
-    TelegramRetryAfter,
-    TelegramServerError,
-)
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import held_for, short_address, signed_pct, signed_usd, trader_label
+from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
 from epigone.clock import Clock
 
 log = logging.getLogger(__name__)
 
-DELIVERY_INTERVAL_SECONDS = 2.0
-MAX_DELIVERY_ATTEMPTS = 5
+__all__ = ["DELIVERY_INTERVAL_SECONDS", "MAX_DELIVERY_ATTEMPTS", "deliver_pending", "render_alert"]
 
 
 async def run_delivery_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> None:
@@ -51,7 +40,20 @@ async def run_delivery_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> None:
 
 async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
     """Send every undelivered alert, oldest first. Returns the delivered count."""
-    rows = await pool.fetch(
+    return await drain_outbox(
+        pool,
+        bot,
+        clock,
+        table="position_alerts",
+        fetch=_fetch_pending_alerts,
+        build=lambda row: (render_alert(row), _positions_button(row)),
+    )
+
+
+async def _fetch_pending_alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+    # The display_name join lets render_alert label the Trader without a second
+    # query per row.
+    rows: list[asyncpg.Record] = await pool.fetch(
         """
         SELECT a.*, t.display_name
         FROM position_alerts a
@@ -61,38 +63,7 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
         """,
         MAX_DELIVERY_ATTEMPTS,
     )
-    delivered = 0
-    for row in rows:
-        try:
-            await bot.send_message(
-                chat_id=row["user_telegram_id"],
-                text=render_alert(row),
-                reply_markup=_positions_button(row),
-            )
-        except (TelegramNetworkError, TelegramRetryAfter, TelegramServerError):
-            # Telegram itself is struggling, not this chat: touching attempts
-            # here would bleed alerts away during an outage. Leave every
-            # remaining row for the next tick.
-            log.warning("alert delivery paused: Telegram transient failure", exc_info=True)
-            break
-        except TelegramAPIError:
-            log.warning(
-                "alert %d: send to user %d rejected",
-                row["id"],
-                row["user_telegram_id"],
-                exc_info=True,
-            )
-            await pool.execute(
-                "UPDATE position_alerts SET attempts = attempts + 1 WHERE id = $1", row["id"]
-            )
-            continue
-        await pool.execute(
-            "UPDATE position_alerts SET delivered_at = $2 WHERE id = $1",
-            row["id"],
-            clock.now(),
-        )
-        delivered += 1
-    return delivered
+    return rows
 
 
 def _positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
