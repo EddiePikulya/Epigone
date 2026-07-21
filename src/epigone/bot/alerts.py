@@ -27,6 +27,7 @@ from aiogram.exceptions import (
 )
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from epigone.bot.delete import with_delete_button
 from epigone.bot.format import held_for, short_address, signed_pct, signed_usd, trader_label
 from epigone.clock import Clock
 
@@ -100,15 +101,17 @@ def _positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
     only ever fires for a Trader the recipient follows, which is exactly the
     relationship that handler checks, so the button always resolves."""
     address: str = row["trader_address"]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=f"📊 {short_address(address)} — positions",
-                    callback_data=f"positions:{address}",
-                )
+    return with_delete_button(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=f"📊 {short_address(address)} — positions",
+                        callback_data=f"positions:{address}",
+                    )
+                ]
             ]
-        ]
+        )
     )
 
 

@@ -18,6 +18,7 @@ import asyncpg
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 
+from epigone.bot.delete import with_delete_button
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
 from epigone.db import create_pool, migrate
@@ -73,7 +74,9 @@ async def _send(bot: Bot, admin_id: int, text: str) -> None:
     """Best-effort DM. A send failure must not kill the loop — the next cycle
     re-evaluates and, for a still-failing check, will try again on the reminder."""
     try:
-        await bot.send_message(chat_id=admin_id, text=text)
+        # The 🗑 delete button (#73): the monitor only sends, but its DMs' delete
+        # taps land in the bot process's polling loop, where the handler lives.
+        await bot.send_message(chat_id=admin_id, text=text, reply_markup=with_delete_button())
     except TelegramAPIError:
         log.warning("monitor: failed to send admin alert %r", text, exc_info=True)
 

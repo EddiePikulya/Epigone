@@ -12,6 +12,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import (
     AnswerCallbackQuery,
+    DeleteMessage,
     EditMessageText,
     GetMe,
     SendMessage,
@@ -50,7 +51,9 @@ class RecordingSession(BaseSession):
         if isinstance(method, GetMe):
             bot_user = TgUser(id=1, is_bot=True, first_name="Epigone", username="epigone_bot")
             return cast(TelegramType, bot_user)
-        if isinstance(method, AnswerCallbackQuery | EditMessageText | SetMyCommands):
+        if isinstance(
+            method, AnswerCallbackQuery | DeleteMessage | EditMessageText | SetMyCommands
+        ):
             return cast(TelegramType, True)
         raise AssertionError(f"Fake transport has no canned reply for {type(method).__name__}")
 
@@ -76,6 +79,9 @@ class RecordingSession(BaseSession):
 
     def callback_answers(self) -> list[AnswerCallbackQuery]:
         return [m for m in self.requests if isinstance(m, AnswerCallbackQuery)]
+
+    def deleted_messages(self) -> list[DeleteMessage]:
+        return [m for m in self.requests if isinstance(m, DeleteMessage)]
 
 
 def make_bot(session: RecordingSession) -> Bot:

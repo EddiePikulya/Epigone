@@ -49,3 +49,4 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # aiogram's BaseSession interface mandates `timeout` parameters.
 "tests/support/telegram.py" = ["ASYNC109"]
 "tests/test_alert_delivery.py" = ["ASYNC109"]
+"tests/test_delete_button.py" = ["ASYNC109"]
