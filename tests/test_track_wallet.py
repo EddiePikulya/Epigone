@@ -324,6 +324,113 @@ async def test_positions_view_says_no_trading_activity_when_no_fills_captured(
 
     text = session.sent_messages()[-1].text or ""
     assert "No recent trading activity seen" in text
+    # No fine data at all → no most-played line either (never an empty one).
+    assert "Most played" not in text
+
+
+# --- most-played tickers (issue #80) ----------------------------------------
+#
+# The positions view names the wallet's most-played coins — round-trips per coin
+# over the fill window plus current open exposure. This is the on_positions
+# view-assembly path; the profile path is covered in test_screener_ux.py (PR #77's
+# lesson: a line added to only one path).
+
+
+async def _seed_round_trip(
+    pool: asyncpg.Pool, address: str, coin: str, *, closed_at: object, seq: int = 0
+) -> None:
+    """One completed round-trip in the fine store (#58) — the unit the most-played
+    ranking counts per coin."""
+    await pool.execute(
+        """
+        INSERT INTO fine_trades
+            (address, coin, pnl, peak_notional, opened_at, closed_at, seq)
+        VALUES ($1, $2, 100, 10000, $3, $3, $4)
+        """,
+        address,
+        coin,
+        closed_at,
+        seq,
+    )
+
+
+async def _seed_open_episode(
+    pool: asyncpg.Pool, address: str, coin: str, *, opened_at: object, net_position: str
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO fine_open_episodes (address, coin, opened_at, net_position)
+        VALUES ($1, $2, $3, $4)
+        """,
+        address,
+        coin,
+        opened_at,
+        Decimal(net_position),
+    )
+
+
+async def test_positions_view_shows_most_played_tickers(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    await feed_text(dp, bot, WHALE, user_id=111)
+    now = clock.now()
+    for seq in range(3):
+        await _seed_round_trip(pool, WHALE, "SOL", closed_at=now - timedelta(hours=seq), seq=seq)
+    for seq in range(2):
+        await _seed_round_trip(pool, WHALE, "BTC", closed_at=now - timedelta(hours=seq), seq=seq)
+    await _seed_round_trip(pool, WHALE, "ETH", closed_at=now - timedelta(hours=1))
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Most played: SOL · BTC · ETH" in text
+
+
+async def test_positions_view_most_played_counts_a_currently_open_position(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    # A wallet parked in one big BTC short has no completed BTC trips, but the open
+    # position makes BTC its coin — it must rank even with zero round-trips.
+    await feed_text(dp, bot, WHALE, user_id=111)
+    now = clock.now()
+    await _seed_round_trip(pool, WHALE, "ETH", closed_at=now - timedelta(hours=1))
+    await _seed_open_episode(
+        pool, WHALE, "BTC", opened_at=now - timedelta(days=20), net_position="-5"
+    )
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Most played: BTC · ETH" in text
+
+
+async def test_positions_view_most_played_renders_dex_coins_cleanly(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    await feed_text(dp, bot, WHALE, user_id=111)
+    now = clock.now()
+    for seq in range(2):
+        await _seed_round_trip(
+            pool, WHALE, "xyz:SP500", closed_at=now - timedelta(hours=seq), seq=seq
+        )
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Most played: SP500" in text
+    assert "xyz:SP500" not in text.split("Most played:")[1].splitlines()[0]
 
 
 async def test_positions_view_shows_holding_time_from_the_poller_snapshots(

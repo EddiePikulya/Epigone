@@ -321,6 +321,63 @@ async def test_profile_from_screener_shows_metrics_freshness_positions_and_follo
     assert "pfollow:0xstar" in _callback_data(msg.reply_markup)
 
 
+async def add_round_trip(
+    pool: asyncpg.Pool, address: str, coin: str, *, closed_at: datetime, seq: int = 0
+) -> None:
+    """One completed round-trip in the fine store (#58) — the unit the #80
+    most-played ranking counts per coin."""
+    await pool.execute(
+        """
+        INSERT INTO fine_trades
+            (address, coin, pnl, peak_notional, opened_at, closed_at, seq)
+        VALUES ($1, $2, 100, 10000, $3, $3, $4)
+        """,
+        address,
+        coin,
+        closed_at,
+        seq,
+    )
+
+
+async def test_profile_shows_most_played_tickers(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    # The #80 most-played line on the *profile* view-assembly path (the other path,
+    # on_positions, is covered in test_track_wallet.py — PR #77's lesson that a
+    # line added to only one path regresses in the other).
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    for seq in range(3):
+        await add_round_trip(pool, "0xstar", "SOL", closed_at=NOW - timedelta(hours=seq), seq=seq)
+    await add_round_trip(pool, "0xstar", "BTC", closed_at=NOW)
+    await add_open_episode(
+        pool, "0xstar", "xyz:SP500", opened_at=NOW - timedelta(days=10), net_position="5"
+    )
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Most played: SOL · BTC · SP500" in text  # ranked, dex prefix stripped
+
+
+async def test_profile_omits_most_played_without_fine_data(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    await add_trader(pool, "0xcoarse", month_roi="0.21")
+
+    await feed_callback(dp, bot, "profile:0xcoarse", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Most played" not in text
+
+
 async def test_profile_follow_then_unfollow_toggles_in_place(
     dp: Dispatcher,
     bot: Bot,
