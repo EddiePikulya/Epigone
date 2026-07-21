@@ -477,6 +477,7 @@ async def _render_profile(
     ages = await _position_ages(pool, address)
     parts = [
         _render_positions(address, positions, ages, clock.now()),
+        await _recent_activity(pool, address, clock.now()),
         await _render_track_record(pool, address),
     ]
     freshness = await _metric_freshness(pool, clock, address)
