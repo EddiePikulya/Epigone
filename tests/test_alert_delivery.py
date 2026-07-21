@@ -256,8 +256,8 @@ async def test_an_alert_is_tap_through_to_the_traders_live_positions(
 
     (message,) = session.sent_messages()
     assert message.reply_markup is not None
-    (button_row,) = message.reply_markup.inline_keyboard
-    (button,) = button_row
+    # The tap-through row comes first; the 🗑 delete row (#73) is appended below it.
+    (button,) = message.reply_markup.inline_keyboard[0]
     assert button.callback_data == f"positions:{address}"
     assert "0x1116…3d0d" in button.text  # the wallet itself is the clickable element
 

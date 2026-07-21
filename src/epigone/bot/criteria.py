@@ -28,6 +28,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from epigone.bot.delete import with_delete_button
 from epigone.bot.format import short_address, signed_pct, signed_usd
 from epigone.bot.handlers import (
     SCREENER_PAGE_SIZE,
@@ -662,8 +663,8 @@ async def _render_results(
             pool, user_id, criteria, ref=ref, offset=0, title=title, back=back
         )
     if not rows:
-        return await _render_zero_results(pool, criteria), InlineKeyboardMarkup(
-            inline_keyboard=[[back]]
+        return await _render_zero_results(pool, criteria), with_delete_button(
+            InlineKeyboardMarkup(inline_keyboard=[[back]])
         )
 
     direction = "highest first" if criteria.sort_desc else "lowest first"
@@ -702,7 +703,7 @@ async def _render_results(
     if nav:
         keyboard.append(nav)
     keyboard.append([back])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return "\n".join(lines), with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 async def _render_zero_results(pool: asyncpg.Pool, criteria: Criteria) -> str:

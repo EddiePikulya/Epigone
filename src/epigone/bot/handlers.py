@@ -14,6 +14,7 @@ from aiogram.types import (
     Message,
 )
 
+from epigone.bot.delete import with_delete_button
 from epigone.bot.format import open_age, short_address, signed_pct, signed_usd
 from epigone.clock import Clock
 from epigone.gateway import (
@@ -121,11 +122,11 @@ async def cmd_start(message: Message, pool: asyncpg.Pool) -> None:
     user = message.from_user
     if user is not None:
         await upsert_user(pool, user.id, user.username)
-    await message.answer(START_TEXT)
+    await message.answer(START_TEXT, reply_markup=with_delete_button())
 
 
 async def cmd_help(message: Message) -> None:
-    await message.answer(HELP_TEXT)
+    await message.answer(HELP_TEXT, reply_markup=with_delete_button())
 
 
 async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clock) -> None:
@@ -139,20 +140,24 @@ async def follow_pasted_address(message: Message, pool: asyncpg.Pool, clock: Clo
     if outcome is TrackOutcome.FRESHLY_TRACKED:
         await message.answer(
             f"Now tracking {short_address(address)}.\n"
-            "Paste more addresses any time — /tracked shows your whole list."
+            "Paste more addresses any time — /tracked shows your whole list.",
+            reply_markup=with_delete_button(),
         )
     elif outcome is TrackOutcome.ALREADY_TRACKING:
-        await message.answer(f"You're already tracking {short_address(address)}.")
+        await message.answer(
+            f"You're already tracking {short_address(address)}.",
+            reply_markup=with_delete_button(),
+        )
     else:  # LIMIT_REACHED — the wallet was not added
-        await message.answer(TRACK_LIMIT_TEXT)
+        await message.answer(TRACK_LIMIT_TEXT, reply_markup=with_delete_button())
 
 
 async def reject_unknown_command(message: Message) -> None:
-    await message.answer(UNKNOWN_COMMAND_TEXT)
+    await message.answer(UNKNOWN_COMMAND_TEXT, reply_markup=with_delete_button())
 
 
 async def reject_unrecognized_input(message: Message) -> None:
-    await message.answer(INVALID_ADDRESS_TEXT)
+    await message.answer(INVALID_ADDRESS_TEXT, reply_markup=with_delete_button())
 
 
 async def cmd_tracked(message: Message, pool: asyncpg.Pool, gateway: HyperliquidGateway) -> None:
@@ -162,7 +167,7 @@ async def cmd_tracked(message: Message, pool: asyncpg.Pool, gateway: Hyperliquid
     try:
         text, markup = await _render_tracked_list(pool, gateway, user.id)
     except GatewayError:
-        await message.answer(DATA_DELAYED_TEXT)
+        await message.answer(DATA_DELAYED_TEXT, reply_markup=with_delete_button())
         return
     await message.answer(text, reply_markup=markup)
 
@@ -201,10 +206,12 @@ async def on_positions(
     # An unfollow escape hatch right here: seeing a Trader's positions is exactly
     # when a User decides they've gone bad and wants out (posunfollow drops the
     # Track in place, no jump to the list or profile).
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")]
-        ]
+    markup = with_delete_button(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")]
+            ]
+        )
     )
     if isinstance(callback.message, Message):
         await callback.message.answer(view, reply_markup=markup)  # the chat the button lives in
@@ -375,7 +382,7 @@ def _parse_offset(raw: str) -> int:
 
 async def _render_screener_page(
     pool: asyncpg.Pool, user_id: int, clock: Clock, *, offset: int
-) -> tuple[str, InlineKeyboardMarkup | None]:
+) -> tuple[str, InlineKeyboardMarkup]:
     # One extra row tells us whether a next page exists without a second query.
     rows = await run_screener(
         pool, window=Window.MONTH, limit=SCREENER_PAGE_SIZE + 1, offset=offset
@@ -383,7 +390,7 @@ async def _render_screener_page(
     has_next = len(rows) > SCREENER_PAGE_SIZE
     rows = rows[:SCREENER_PAGE_SIZE]
     if not rows:
-        return SCREENER_EMPTY_TEXT, None
+        return SCREENER_EMPTY_TEXT, with_delete_button()
 
     tracked = await tracked_set(pool, user_id, [r.address for r in rows])
     lines = [SCREENER_HEADER, ""]
@@ -415,7 +422,7 @@ async def _render_screener_page(
         )
     if nav:
         keyboard.append(nav)
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return "\n".join(lines), with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 def _screener_stats(row: ScreenerRow, now: datetime) -> str:
@@ -480,7 +487,7 @@ async def _render_profile(
         if followed
         else InlineKeyboardButton(text="➕ Follow", callback_data=f"pfollow:{address}")
     )
-    return "\n\n".join(parts), InlineKeyboardMarkup(inline_keyboard=[[button]])
+    return "\n\n".join(parts), with_delete_button(InlineKeyboardMarkup(inline_keyboard=[[button]]))
 
 
 async def _metric_freshness(pool: asyncpg.Pool, clock: Clock, address: str) -> str | None:
@@ -635,7 +642,7 @@ async def upsert_user(
 
 async def _render_tracked_list(
     pool: asyncpg.Pool, gateway: HyperliquidGateway, user_id: int
-) -> tuple[str, InlineKeyboardMarkup | None]:
+) -> tuple[str, InlineKeyboardMarkup]:
     rows = await pool.fetch(
         """
         SELECT trader_address, muted, min_size_usd
@@ -647,7 +654,7 @@ async def _render_tracked_list(
         "SELECT min_size_usd FROM users WHERE telegram_id = $1", user_id
     )
     if not rows:
-        return NOT_TRACKING_TEXT, None
+        return NOT_TRACKING_TEXT, with_delete_button()
 
     lines = ["Your tracked traders:", ""]
     keyboard: list[list[InlineKeyboardButton]] = []
@@ -675,7 +682,7 @@ async def _render_tracked_list(
     keyboard.append(
         [InlineKeyboardButton(text=_global_min_label(global_min), callback_data="gmin")]
     )
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
+    return "\n".join(lines), with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 def _controls_status(muted: bool, track_min: Decimal | None, global_min: Decimal | None) -> str:
@@ -835,7 +842,7 @@ def build_router() -> Router:
     # Deferred import: the criteria and controls flows build on this module's
     # shared seams (track_address, _render_tracked_list, …), so importing them
     # at the top would cycle.
-    from epigone.bot import access, controls, criteria
+    from epigone.bot import access, controls, criteria, delete
 
     router = Router()
     # Invite-only admin commands (#33). The gate is a dispatcher-level outer
@@ -862,4 +869,8 @@ def build_router() -> Router:
     router.callback_query.register(on_positions_unfollow, F.data.startswith("posunfollow:"))
     router.callback_query.register(on_positions, F.data.startswith("positions:"))
     router.callback_query.register(on_unfollow, F.data.startswith("unfollow:"))
+    # The one-tap 🗑 delete (#73). A bare-constant callback, so it never shadows
+    # (nor is shadowed by) the prefixed callbacks above; covers the monitor's DMs
+    # too — they share this polling loop (ADR-0002).
+    delete.register(router)
     return router
