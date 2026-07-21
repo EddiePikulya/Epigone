@@ -15,7 +15,14 @@ from aiogram.types import (
 )
 
 from epigone.bot.delete import with_delete_button
-from epigone.bot.format import fills_open_age, open_age, short_address, signed_pct, signed_usd
+from epigone.bot.format import (
+    fills_open_age,
+    open_age,
+    short_address,
+    signed_pct,
+    signed_usd,
+    usd_compact,
+)
 from epigone.clock import Clock
 from epigone.first_data_notice import record_follow_notice_state
 from epigone.gateway import (
@@ -559,7 +566,8 @@ async def _recent_activity(pool: asyncpg.Pool, address: str, now: datetime) -> s
         SELECT fm.window_end AS last_trade_at,
                fm.computed_at AS fills_seen_at,
                cm.pnl AS month_pnl,
-               cm.roi AS month_roi
+               cm.roi AS month_roi,
+               cm.account_value AS account_value
         FROM (SELECT $1::text AS address) a
         LEFT JOIN fine_metrics fm ON fm.address = a.address
         LEFT JOIN coarse_metrics cm ON cm.address = a.address AND cm.time_window = 'month'
@@ -571,6 +579,7 @@ async def _recent_activity(pool: asyncpg.Pool, address: str, now: datetime) -> s
         row["fills_seen_at"],
         row["month_pnl"],
         row["month_roi"],
+        row["account_value"],
         now,
     )
 
@@ -580,6 +589,7 @@ def _render_recent_activity(
     fills_seen_at: datetime | None,
     month_pnl: Decimal | None,
     month_roi: Decimal | None,
+    account_value: Decimal | None,
     now: datetime,
 ) -> str:
     """Render the last-trade + month-performance line from already-fetched values.
@@ -587,7 +597,10 @@ def _render_recent_activity(
     `last_trade_at` is the newest perp fill we've folded; `fills_seen_at` is when
     that fills knowledge was last refreshed. A wallet with no captured perp fills
     (`last_trade_at is None`) says so plainly. The month PnL/ROI ride along when the
-    coarse leaderboard has them — ROI is a fraction (0.12 == 12%)."""
+    coarse leaderboard has them — ROI is a fraction (0.12 == 12%). `account_value`
+    is the coarse denominator (#85): PnL, ROI and position sizes all read against
+    it, so it trails the line when the coarse row carries it and is omitted when
+    absent (it exists even without fine data)."""
     if last_trade_at is None:
         parts = ["No recent trading activity seen"]
     else:
@@ -596,6 +609,8 @@ def _render_recent_activity(
         parts = [f"Last trade: {age} (as of last scan)" if stale else f"Last trade: {age}"]
     if month_pnl is not None and month_roi is not None:
         parts.append(f"month PnL {signed_usd(month_pnl)} (ROI {signed_pct(month_roi)})")
+    if account_value is not None:
+        parts.append(f"account {usd_compact(account_value)}")
     return " · ".join(parts)
 
 
@@ -852,7 +867,11 @@ def _fine_lines(row: asyncpg.Record) -> list[str]:
         lines.append(f"{sharpe}max drawdown ${row['max_drawdown']:,.0f}")
     style = [
         f"{row['maker_share']:.0%} maker" if row["maker_share"] is not None else None,
-        f"~{row['avg_leverage']:.1f}x leverage" if row["avg_leverage"] is not None else None,
+        # Estimated sizing vs the account (peak position ÷ account value), NOT the
+        # exchange leverage dial the positions view shows as "at 25x" — #85.
+        f"avg size ~{row['avg_leverage']:.1f}x of account"
+        if row["avg_leverage"] is not None
+        else None,
     ]
     if any(style):
         lines.append(" · ".join(part for part in style if part is not None))

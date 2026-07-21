@@ -156,11 +156,15 @@ _SPECS = [
     ),
     MetricSpec(
         key="avg_leverage",
-        label="Average leverage",
+        label="Avg size (of account)",
         unit=Unit.NUMBER,
         scope=Scope.FINE,
         sql="fm.avg_leverage",
-        explanation="roughly how many times the account's own money it puts into a typical trade.",
+        explanation=(
+            "how big a typical position is next to the whole account — avg peak "
+            "position value ÷ account value. A sizing/copyability signal, not the "
+            "exchange's leverage dial."
+        ),
         example="3",
     ),
     MetricSpec(

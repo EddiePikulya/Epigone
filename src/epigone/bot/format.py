@@ -28,6 +28,18 @@ def signed_pct(ratio: Decimal) -> str:
     return f"{sign}{abs(ratio):.0%}"
 
 
+def usd_compact(amount: Decimal) -> str:
+    """A rough dollar magnitude for a denominator like account value: $1.1M,
+    $50k, $940. Abbreviated on purpose — the account line is a sense of scale,
+    not a precise balance, so it stays short next to the PnL it contextualizes."""
+    value = abs(amount)
+    if value >= 1_000_000:
+        return f"${value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"${value / 1_000:.0f}k"
+    return f"${value:,.0f}"
+
+
 def held_for(opened_at: datetime, closed_at: datetime) -> str:
     """Compact holding time between two instants: 45s / 12m / 3h 20m / 2d 5h."""
     return format_duration(int((closed_at - opened_at).total_seconds()))
