@@ -6,11 +6,11 @@ formatter (`open_age`), and the `Position` margin/return fallbacks; the DB-backe
 age lookup and the live call sites are exercised in test_track_wallet.py.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from epigone.bot.format import held_for, open_age
-from epigone.bot.handlers import _render_positions
+from epigone.bot.handlers import _render_positions, _render_recent_activity
 from epigone.gateway import Position, Side
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
@@ -116,3 +116,44 @@ def test_render_derives_return_on_margin_without_the_api_field() -> None:
 
 def test_render_handles_no_open_positions() -> None:
     assert "no open positions" in _render_positions(WHALE, [], ages={}, now=NOW)
+
+
+# --- recent-activity line (issue #72) ---------------------------------------
+#
+# Last-trade recency comes from the fine store's newest folded *perp* fill
+# (window_end); the month PnL/ROI ride alongside from the coarse leaderboard.
+# ROI is stored as a fraction (0.12 == 12%).
+
+
+def test_activity_shows_last_trade_and_month_performance() -> None:
+    two_hours_ago = NOW - timedelta(hours=2)  # fresh scan, precise recency
+    line = _render_recent_activity(
+        two_hours_ago, two_hours_ago, Decimal("48000"), Decimal("0.12"), NOW
+    )
+    assert line == "Last trade: 2h ago · month PnL +$48,000 (ROI +12%)"
+
+
+def test_activity_marks_last_trade_as_of_last_scan_when_fills_knowledge_lags() -> None:
+    # Our newest-fill knowledge is only as fresh as the last fine refresh; a scan
+    # older than a day can't imply a live "last trade" time, so it hedges rather
+    # than reading with false precision (same spirit as the ≥ open-age marker).
+    three_days_ago = NOW - timedelta(days=3)
+    line = _render_recent_activity(three_days_ago, three_days_ago, None, None, NOW)
+    assert line == "Last trade: 3d ago (as of last scan)"
+
+
+def test_activity_shows_only_recency_when_no_coarse_metrics() -> None:
+    two_hours_ago = NOW - timedelta(hours=2)
+    line = _render_recent_activity(two_hours_ago, two_hours_ago, None, None, NOW)
+    assert line == "Last trade: 2h ago"
+
+
+def test_activity_says_no_fills_seen_but_still_shows_coarse_performance() -> None:
+    # Coarse leaderboard data exists even for a wallet with no captured fills, so
+    # the performance line must not depend on fine availability.
+    line = _render_recent_activity(None, None, Decimal("3000000"), Decimal("0.21"), NOW)
+    assert line == "No recent trading activity seen · month PnL +$3,000,000 (ROI +21%)"
+
+
+def test_activity_says_no_fills_seen_when_nothing_is_known() -> None:
+    assert _render_recent_activity(None, None, None, None, NOW) == "No recent trading activity seen"

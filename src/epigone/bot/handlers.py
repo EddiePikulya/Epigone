@@ -1,5 +1,5 @@
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 
@@ -109,6 +109,13 @@ TRACK_LIMIT_TOAST = f"Limit reached — {MAX_TRACKED_WALLETS} wallets max. Unfol
 
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
+# Our newest-fill knowledge is only as fresh as the wallet's last fine refresh.
+# A tracked wallet is due a refresh every ACTIVE_REFRESH_INTERVAL (1 day, see
+# epigone.ingest.scan); once that scan is older than a day we can't imply a live
+# "last trade" time, so the line hedges ("as of last scan") rather than reading
+# with false precision — the same honesty spirit as the ≥ open-age marker (#72).
+FILLS_FRESH_WINDOW = timedelta(days=1)
+
 
 async def cmd_start(message: Message, pool: asyncpg.Pool) -> None:
     user = message.from_user
@@ -186,6 +193,8 @@ async def on_positions(
     ages = await _position_ages(pool, address)
     view = (
         _render_positions(address, positions, ages, clock.now())
+        + "\n"
+        + await _recent_activity(pool, address, clock.now())
         + "\n\n"
         + await _render_track_record(pool, address)
     )
@@ -489,6 +498,60 @@ async def _metric_freshness(pool: asyncpg.Pool, clock: Clock, address: str) -> s
     if latest is None:
         return None
     return f"🕒 Metrics updated {_relative_age(clock.now(), latest)}"
+
+
+async def _recent_activity(pool: asyncpg.Pool, address: str, now: datetime) -> str:
+    """The positions view's activity line: when the wallet last traded and how it
+    has been doing lately (issue #72).
+
+    Last trade is the fine store's newest folded *perp* fill (fine_metrics.window_end,
+    perp-only by construction — spot fills never advance it), qualified by how fresh
+    that fills scan is (computed_at). PnL/ROI are the coarse leaderboard month, which
+    exists even for wallets the fine pass hasn't reached, so the line never depends on
+    fine availability."""
+    row = await pool.fetchrow(
+        """
+        SELECT fm.window_end AS last_trade_at,
+               fm.computed_at AS fills_seen_at,
+               cm.pnl AS month_pnl,
+               cm.roi AS month_roi
+        FROM (SELECT $1::text AS address) a
+        LEFT JOIN fine_metrics fm ON fm.address = a.address
+        LEFT JOIN coarse_metrics cm ON cm.address = a.address AND cm.time_window = 'month'
+        """,
+        address,
+    )
+    return _render_recent_activity(
+        row["last_trade_at"],
+        row["fills_seen_at"],
+        row["month_pnl"],
+        row["month_roi"],
+        now,
+    )
+
+
+def _render_recent_activity(
+    last_trade_at: datetime | None,
+    fills_seen_at: datetime | None,
+    month_pnl: Decimal | None,
+    month_roi: Decimal | None,
+    now: datetime,
+) -> str:
+    """Render the last-trade + month-performance line from already-fetched values.
+
+    `last_trade_at` is the newest perp fill we've folded; `fills_seen_at` is when
+    that fills knowledge was last refreshed. A wallet with no captured perp fills
+    (`last_trade_at is None`) says so plainly. The month PnL/ROI ride along when the
+    coarse leaderboard has them — ROI is a fraction (0.12 == 12%)."""
+    if last_trade_at is None:
+        parts = ["No recent trading activity seen"]
+    else:
+        age = _relative_age(now, last_trade_at)
+        stale = fills_seen_at is None or now - fills_seen_at > FILLS_FRESH_WINDOW
+        parts = [f"Last trade: {age} (as of last scan)" if stale else f"Last trade: {age}"]
+    if month_pnl is not None and month_roi is not None:
+        parts.append(f"month PnL {signed_usd(month_pnl)} (ROI {signed_pct(month_roi)})")
+    return " · ".join(parts)
 
 
 def _relative_age(now: datetime, then: datetime) -> str:

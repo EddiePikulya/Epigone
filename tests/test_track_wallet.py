@@ -1,5 +1,6 @@
 """Ticket #3 acceptance: paste a wallet to Follow a Trader, view positions, unfollow."""
 
+from datetime import timedelta
 from decimal import Decimal
 
 import asyncpg
@@ -199,6 +200,130 @@ async def test_positions_view_for_a_trader_with_no_open_positions(
     text = session.sent_messages()[-1].text or ""
     assert WHALE_SHORT in text
     assert "no open positions" in text.lower()
+
+
+# --- last-trade recency + recent performance (issue #72) --------------------
+#
+# The positions view also says when the wallet last traded and how it's been
+# doing lately — most useful in the zero-position case, which otherwise gives no
+# sense of dormant-vs-resting. Last trade is the fine store's newest folded perp
+# fill (window_end, perp-only by construction); PnL/ROI are the coarse month.
+
+
+async def _seed_last_perp_fill(
+    pool: asyncpg.Pool, address: str, *, at: object, computed_at: object
+) -> None:
+    """The fine store's newest folded perp fill (window_end) and when we last
+    scanned this wallet's fills (computed_at) — the only two fields the last-trade
+    line reads."""
+    await pool.execute(
+        """
+        INSERT INTO fine_metrics
+            (address, trade_count, max_drawdown, realized_pnl,
+             window_start, window_end, computed_at)
+        VALUES ($1, 0, 0, 0, $2, $2, $3)
+        """,
+        address,
+        at,
+        computed_at,
+    )
+
+
+async def _seed_coarse_month(
+    pool: asyncpg.Pool, address: str, *, pnl: Decimal, roi: Decimal, computed_at: object
+) -> None:
+    await pool.execute(
+        """
+        INSERT INTO coarse_metrics
+            (address, time_window, pnl, roi, volume, account_value, computed_at)
+        VALUES ($1, 'month', $2, $3, 1000000, 500000, $4)
+        """,
+        address,
+        pnl,
+        roi,
+        computed_at,
+    )
+
+
+async def test_positions_view_shows_last_trade_and_recent_pnl_when_no_positions(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    # The motivating case: no open positions, but the wallet traded 2h ago and is
+    # up on the month — "resting", not "dormant".
+    await feed_text(dp, bot, WHALE, user_id=111)
+    now = clock.now()
+    await _seed_last_perp_fill(pool, WHALE, at=now - timedelta(hours=2), computed_at=now)
+    await _seed_coarse_month(
+        pool, WHALE, pnl=Decimal("48000"), roi=Decimal("0.12"), computed_at=now
+    )
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "no open positions" in text.lower()
+    assert "Last trade: 2h ago" in text
+    assert "month PnL +$48,000 (ROI +12%)" in text
+
+
+async def test_positions_view_shows_last_trade_alongside_open_positions(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+) -> None:
+    gateway.set_positions(WHALE, [ETH_SHORT_POS])
+    await feed_text(dp, bot, WHALE, user_id=111)
+    now = clock.now()
+    await _seed_last_perp_fill(pool, WHALE, at=now - timedelta(minutes=30), computed_at=now)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "ETH" in text and "SHORT" in text  # positions still render
+    assert "Last trade: 30m ago" in text
+
+
+async def test_positions_view_hedges_last_trade_when_fills_knowledge_is_stale(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    # The last fine refresh was 3 days ago, so we can't imply a live last-trade
+    # time — the wallet may have traded since our last scan.
+    await feed_text(dp, bot, WHALE, user_id=111)
+    now = clock.now()
+    stale = now - timedelta(days=3)
+    await _seed_last_perp_fill(pool, WHALE, at=stale, computed_at=stale)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Last trade: 3d ago (as of last scan)" in text
+
+
+async def test_positions_view_says_no_trading_activity_when_no_fills_captured(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    # No fine row at all — say so plainly rather than showing nothing.
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "No recent trading activity seen" in text
 
 
 async def test_positions_view_shows_holding_time_from_the_poller_snapshots(
