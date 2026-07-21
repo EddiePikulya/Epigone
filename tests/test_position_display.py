@@ -12,6 +12,7 @@ from decimal import Decimal
 from epigone.bot.format import fills_open_age, held_for, open_age
 from epigone.bot.handlers import (
     FOLLOW_FOR_AGE_HINT,
+    _render_most_played,
     _render_positions,
     _render_recent_activity,
 )
@@ -327,3 +328,52 @@ def test_activity_says_no_fills_seen_but_still_shows_coarse_performance() -> Non
 
 def test_activity_says_no_fills_seen_when_nothing_is_known() -> None:
     assert _render_recent_activity(None, None, None, None, NOW) == "No recent trading activity seen"
+
+
+# --- most-played tickers (#80) ----------------------------------------------
+#
+# Ranking is by completed round-trip count per coin over the fill window, with a
+# currently-open episode adding to its coin's weight (a wallet parked in one big
+# short has few trips but that coin is plainly its coin). Top 3, dex-prefixed
+# builder-DEX coins rendered as the bare ticker, and no line at all when the fine
+# store has nothing to rank.
+
+
+def test_most_played_ranks_by_round_trip_count_and_takes_the_top_three() -> None:
+    line = _render_most_played(
+        [
+            ("SOL", 9, False),
+            ("BTC", 5, False),
+            ("ETH", 3, False),
+            ("DOGE", 1, False),
+        ]
+    )
+    assert line == "Most played: SOL · BTC · ETH"
+
+
+def test_most_played_counts_open_exposure_toward_its_coin() -> None:
+    # A wallet sitting in one big BTC short for weeks has few completed BTC trips,
+    # but the open position makes BTC plainly its coin — the open episode counts.
+    line = _render_most_played(
+        [
+            ("ETH", 2, False),
+            ("BTC", 1, True),
+            ("SOL", 1, False),
+        ]
+    )
+    assert line == "Most played: BTC · ETH · SOL"
+
+
+def test_most_played_includes_a_coin_that_is_only_open() -> None:
+    # No completed trips yet, but a live episode is exposure worth surfacing.
+    line = _render_most_played([("BTC", 0, True)])
+    assert line == "Most played: BTC"
+
+
+def test_most_played_renders_dex_prefixed_coins_cleanly() -> None:
+    line = _render_most_played([("xyz:SP500", 4, False), ("BTC", 2, False)])
+    assert line == "Most played: SP500 · BTC"
+
+
+def test_most_played_is_omitted_when_there_is_nothing_to_rank() -> None:
+    assert _render_most_played([]) is None
