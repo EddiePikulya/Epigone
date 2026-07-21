@@ -15,12 +15,13 @@ from aiogram.types import (
 )
 
 from epigone.bot.delete import with_delete_button
-from epigone.bot.format import open_age, short_address, signed_pct, signed_usd
+from epigone.bot.format import fills_open_age, open_age, short_address, signed_pct, signed_usd
 from epigone.clock import Clock
 from epigone.gateway import (
     GatewayError,
     HyperliquidGateway,
     Position,
+    Side,
     Window,
     fetch_open_positions,
 )
@@ -117,6 +118,22 @@ _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 # with false precision — the same honesty spirit as the ≥ open-age marker (#72).
 FILLS_FRESH_WINDOW = timedelta(days=1)
 
+# Shown once under an untracked wallet's positions when we can't honestly date at
+# least one of them — no poller snapshot (never followed) and no verified fill
+# episode to fall back on (#78). A position's open time is knowable only by
+# observing the wallet over time, which is exactly what following starts, so the
+# honest move is to invent no age and point there. Untracked profiles only: a
+# follower already gets the poller's own age.
+FOLLOW_FOR_AGE_HINT = "↳ Follow to track how long these positions have been open"
+
+
+def _fills_stale(fills_seen_at: datetime | None, now: datetime) -> bool:
+    """Is our fills knowledge older than the fresh window (or never scanned)?
+    The one staleness test both fills-derived readings share — the activity
+    line's last-trade time (#72) and a position's fills-derived open age (#78) —
+    so the "as of last scan" hedge fires on the same rule in both."""
+    return fills_seen_at is None or now - fills_seen_at > FILLS_FRESH_WINDOW
+
 
 async def cmd_start(message: Message, pool: asyncpg.Pool) -> None:
     user = message.from_user
@@ -196,8 +213,9 @@ async def on_positions(
         await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
         return
     ages = await _position_ages(pool, address)
+    fills = await _fills_open_episodes(pool, address)
     view = (
-        _render_positions(address, positions, ages, clock.now())
+        _render_positions(address, positions, ages, clock.now(), fills)
         + "\n"
         + await _recent_activity(pool, address, clock.now())
         + "\n\n"
@@ -475,8 +493,11 @@ async def _render_profile(
         address,
     )
     ages = await _position_ages(pool, address)
+    fills = await _fills_open_episodes(pool, address)
     parts = [
-        _render_positions(address, positions, ages, clock.now()),
+        _render_positions(
+            address, positions, ages, clock.now(), fills, offer_follow=not followed
+        ),
         await _recent_activity(pool, address, clock.now()),
         await _render_track_record(pool, address),
     ]
@@ -555,7 +576,7 @@ def _render_recent_activity(
         parts = ["No recent trading activity seen"]
     else:
         age = _relative_age(now, last_trade_at)
-        stale = fills_seen_at is None or now - fills_seen_at > FILLS_FRESH_WINDOW
+        stale = _fills_stale(fills_seen_at, now)
         parts = [f"Last trade: {age} (as of last scan)" if stale else f"Last trade: {age}"]
     if month_pnl is not None and month_roi is not None:
         parts.append(f"month PnL {signed_usd(month_pnl)} (ROI {signed_pct(month_roi)})")
@@ -769,14 +790,30 @@ def _render_positions(
     positions: list[Position],
     ages: dict[str, tuple[datetime, bool]],
     now: datetime,
+    fills: dict[str, tuple[datetime, Decimal, datetime | None]] | None = None,
+    *,
+    offer_follow: bool = False,
 ) -> str:
     """The shared per-position view (#31): notional plus the real margin at risk,
-    return-on-margin, and holding time (#35). `ages` maps coin → (opened_at,
-    baselined) from the poller's snapshots; a coin absent from it (an untracked
-    wallet with no snapshot) simply shows no age rather than a made-up one."""
+    return-on-margin, and holding time (#35).
+
+    Age has two sources, in priority order. `ages` maps coin → (opened_at,
+    baselined) from the poller's snapshots — the source for a tracked wallet,
+    and always the fresher one. `fills` maps coin → (opened_at, net_position,
+    fills_seen_at) from the fine store's open episodes (#78) — the fallback for
+    an untracked wallet, used only where the poller has no snapshot and only
+    when the episode actually matches the live position (see `_fills_open_age`).
+    A coin covered by neither simply shows no age rather than a made-up one.
+
+    `offer_follow` (an untracked profile) appends a single nudge to follow when
+    at least one position was left ageless — the honest way to explain the gap:
+    the open time is knowable only by observing the wallet, which following
+    starts. Suppressed for a follower, who already gets the poller's own age."""
     if not positions:
         return f"{short_address(address)} has no open positions right now."
+    fills = fills or {}
     blocks = [f"{short_address(address)} — current positions:", ""]
+    any_ageless = False
     for p in positions:
         upnl = f"uPnL {signed_usd(p.unrealized_pnl)}"
         rom = p.return_on_margin
@@ -787,11 +824,20 @@ def _render_positions(
         if aged is not None:
             opened_at, baselined = aged
             detail.append(open_age(opened_at, now, baselined=baselined))
+        else:
+            fills_age = _fills_open_age(p, fills.get(p.coin), now)
+            if fills_age is not None:
+                detail.append(fills_age)
+            else:
+                any_ageless = True
         blocks.append(
             f"{p.coin} {p.side.value.upper()} — "
             f"${p.size_usd:,.0f} notional · ${p.margin:,.0f} margin at {p.leverage}x\n"
             f"    " + " · ".join(detail)
         )
+    if offer_follow and any_ageless:
+        blocks.append("")
+        blocks.append(FOLLOW_FOR_AGE_HINT)
     return "\n".join(blocks)
 
 
@@ -815,6 +861,67 @@ async def _position_ages(
         address,
     )
     return {r["coin"]: (r["opened_at"], r["baselined"]) for r in rows}
+
+
+def _fills_open_age(
+    position: Position,
+    episode: tuple[datetime, Decimal, datetime | None] | None,
+    now: datetime,
+) -> str | None:
+    """The fills-derived open age for `position`, or None when the fine store
+    can't honestly supply one (#78).
+
+    The episode is a candidate only if it actually corresponds to the live
+    position: it is already keyed on the coin, and its signed `net_position`
+    must agree with the position's side. The live position and the fills
+    snapshot can disagree — a wallet can open (or flip) a position after the
+    last fine refresh — so a contradicting or never-verified (demoted, #63)
+    episode lends no age, exactly like a missing snapshot. A matching episode
+    reads as fills-derived and hedges staleness when the scan is old."""
+    if episode is None:
+        return None
+    opened_at, net_position, fills_seen_at = episode
+    if not _episode_matches_side(position.side, net_position):
+        return None
+    return fills_open_age(opened_at, now, stale=_fills_stale(fills_seen_at, now))
+
+
+def _episode_matches_side(side: Side, net_position: Decimal) -> bool:
+    """Does an open episode's signed net position agree with the live side?
+    Positive is long, negative is short; 0 is "never verified" (the pre-#63
+    demotion default), which agrees with neither and so never lends an age."""
+    if net_position > 0:
+        return side is Side.LONG
+    if net_position < 0:
+        return side is Side.SHORT
+    return False
+
+
+async def _fills_open_episodes(
+    pool: asyncpg.Pool, address: str
+) -> dict[str, tuple[datetime, Decimal, datetime | None]]:
+    """coin → (opened_at, net_position, fills_seen_at) from the fine store's
+    open episodes (#78) — the fallback age source when the poller has no
+    snapshot (an untracked wallet).
+
+    `opened_at` is the continuity-verified position open (#63); `net_position`
+    is the signed size the walk left the coin at, so the caller can confirm the
+    episode matches the live position's direction; `fills_seen_at`
+    (fine_metrics.computed_at) dates the knowledge so a stale age can be hedged.
+    Empty for a wallet with no fine data — which simply omits fills-derived
+    ages."""
+    rows = await pool.fetch(
+        """
+        SELECT e.coin, e.opened_at, e.net_position, fm.computed_at AS fills_seen_at
+        FROM fine_open_episodes e
+        LEFT JOIN fine_metrics fm ON fm.address = e.address
+        WHERE e.address = $1
+        """,
+        address,
+    )
+    return {
+        r["coin"]: (r["opened_at"], r["net_position"], r["fills_seen_at"]) for r in rows
+    }
 
 
 def _summarize(positions: list[Position]) -> str:
