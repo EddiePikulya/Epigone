@@ -292,6 +292,7 @@ async def test_profile_from_screener_shows_metrics_freshness_positions_and_follo
     assert "$131,258 margin" in text  # money at risk, derived from notional/leverage (#35)
     assert "open " not in text  # untracked: no poller snapshot, so no invented age
     assert "3h ago" in text  # metric freshness
+    assert "Last trade:" in text and "month PnL" in text  # activity line (#72)
     # Not tracked yet: the profile offers a Follow.
     assert "pfollow:0xstar" in _callback_data(msg.reply_markup)
 
