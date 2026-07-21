@@ -31,6 +31,7 @@ async def main() -> None:
         dp["admin_telegram_id"] = settings.require_admin_telegram_id()  # invite-only owner (#33)
         dp["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
         dp["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
+        dp["rename_pending"] = {}  # per-User wallet-rename prompts (bot/names.py)
         # Invite-only gate (#33): the single outer-middleware seam every update
         # passes before any handler runs.
         install_allowlist_gate(dp)

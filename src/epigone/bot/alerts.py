@@ -52,12 +52,17 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
 
 async def _fetch_pending_alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     # The display_name join lets render_alert label the Trader without a second
-    # query per row.
+    # query per row. The tracks join adds the recipient's own per-Track nickname
+    # (#86), scoped to this alert's follower, which takes precedence over the
+    # leaderboard label; NULL when they've since unfollowed.
     rows: list[asyncpg.Record] = await pool.fetch(
         """
-        SELECT a.*, t.display_name
+        SELECT a.*, t.display_name, tr.name AS track_name
         FROM position_alerts a
         JOIN traders t ON t.address = a.trader_address
+        LEFT JOIN tracks tr
+            ON tr.trader_address = a.trader_address
+            AND tr.user_telegram_id = a.user_telegram_id
         WHERE a.delivered_at IS NULL AND a.attempts < $1
         ORDER BY a.id
         """,
@@ -87,7 +92,8 @@ def _positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
 
 
 def render_alert(row: asyncpg.Record) -> str:
-    label = trader_label(row["display_name"], row["trader_address"])
+    # The recipient's own name for the wallet wins over the leaderboard label (#86).
+    label = trader_label(row["track_name"] or row["display_name"], row["trader_address"])
     coin: str = row["coin"]
     kind: str = row["kind"]
     if kind == "open":

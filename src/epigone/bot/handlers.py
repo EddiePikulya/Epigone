@@ -21,6 +21,7 @@ from epigone.bot.format import (
     short_address,
     signed_pct,
     signed_usd,
+    trader_label,
     usd_compact,
 )
 from epigone.clock import Clock
@@ -208,12 +209,8 @@ async def on_positions(
     """On-demand profile for a tracked Trader: current positions + track record.
     Fine metrics where the fine pass has run; coarse-only Traders say so."""
     address = (callback.data or "").removeprefix("positions:")
-    tracked = await pool.fetchval(
-        "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
-        callback.from_user.id,
-        address,
-    )
-    if not tracked:
+    track = await fetch_track(pool, callback.from_user.id, address)
+    if track is None:
         await callback.answer("You're not tracking this trader.", show_alert=True)
         return
     try:
@@ -224,19 +221,20 @@ async def on_positions(
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     view = (
-        _render_positions(address, positions, ages, clock.now(), fills)
+        _render_positions(address, positions, ages, clock.now(), fills, name=track["name"])
         + "\n"
         + await _activity_block(pool, address, clock.now())
         + "\n\n"
         + await _render_track_record(pool, address)
     )
-    # An unfollow escape hatch right here: seeing a Trader's positions is exactly
-    # when a User decides they've gone bad and wants out (posunfollow drops the
-    # Track in place, no jump to the list or profile).
+    # Rename (✏️, #86) and an unfollow escape hatch right here: seeing a Trader's
+    # positions is exactly when a User names them or decides they've gone bad and
+    # wants out (posunfollow drops the Track in place, no jump to list/profile).
     markup = with_delete_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")]
+                [InlineKeyboardButton(text="✏️ Rename", callback_data=f"rename:{address}")],
+                [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")],
             ]
         )
     )
@@ -474,6 +472,21 @@ def _row_freshness(row: ScreenerRow) -> datetime:
     return row.coarse_computed_at
 
 
+async def fetch_track(
+    pool: asyncpg.Pool, user_id: int, address: str
+) -> asyncpg.Record | None:
+    """A User's Track for one wallet — the row (currently just the per-User name,
+    #86), or None when they don't track it. The one scoped (user, wallet) lookup
+    the positions view, the profile view, and the rename flow (bot/names.py) all
+    share, so "am I tracking this?" and "what did I name it?" answer from a single
+    query."""
+    return await pool.fetchrow(
+        "SELECT name FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
+        user_id,
+        address,
+    )
+
+
 async def tracked_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) -> set[str]:
     if not addresses:
         return set()
@@ -496,16 +509,14 @@ async def _render_profile(
     address: str,
 ) -> tuple[str, InlineKeyboardMarkup]:
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
-    followed = await pool.fetchval(
-        "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
-        user_id,
-        address,
-    )
+    track = await fetch_track(pool, user_id, address)
+    followed = track is not None
+    name: str | None = track["name"] if track is not None else None
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     parts = [
         _render_positions(
-            address, positions, ages, clock.now(), fills, offer_follow=not followed
+            address, positions, ages, clock.now(), fills, name=name, offer_follow=not followed
         ),
         await _activity_block(pool, address, clock.now()),
         await _render_track_record(pool, address),
@@ -513,12 +524,18 @@ async def _render_profile(
     freshness = await _metric_freshness(pool, clock, address)
     if freshness is not None:
         parts.append(freshness)
-    button = (
-        InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"punfollow:{address}")
-        if followed
-        else InlineKeyboardButton(text="➕ Follow", callback_data=f"pfollow:{address}")
-    )
-    return "\n\n".join(parts), with_delete_button(InlineKeyboardMarkup(inline_keyboard=[[button]]))
+    # Renaming needs a Track, so ✏️ shows only for a followed wallet (#86).
+    keyboard: list[list[InlineKeyboardButton]] = []
+    if followed:
+        keyboard.append([InlineKeyboardButton(text="✏️ Rename", callback_data=f"rename:{address}")])
+        keyboard.append(
+            [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"punfollow:{address}")]
+        )
+    else:
+        keyboard.append(
+            [InlineKeyboardButton(text="➕ Follow", callback_data=f"pfollow:{address}")]
+        )
+    return "\n\n".join(parts), with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 async def _metric_freshness(pool: asyncpg.Pool, clock: Clock, address: str) -> str | None:
@@ -758,7 +775,7 @@ async def _render_tracked_list(
 ) -> tuple[str, InlineKeyboardMarkup]:
     rows = await pool.fetch(
         """
-        SELECT trader_address, muted, min_size_usd
+        SELECT trader_address, muted, min_size_usd, name
         FROM tracks WHERE user_telegram_id = $1 ORDER BY tracked_at
         """,
         user_id,
@@ -774,7 +791,7 @@ async def _render_tracked_list(
     for row in rows:
         address: str = row["trader_address"]
         positions = await fetch_open_positions(gateway, address)
-        lines.append(f"{short_address(address)} — {_summarize(positions)}")
+        lines.append(f"{trader_label(row['name'], address)} — {_summarize(positions)}")
         # The alert controls (issue #10), so they are visible and editable
         # right where the User reviews the roster.
         lines.append(f"    {_controls_status(row['muted'], row['min_size_usd'], global_min)}")
@@ -887,10 +904,14 @@ def _render_positions(
     now: datetime,
     fills: dict[str, tuple[datetime, Decimal, datetime | None]] | None = None,
     *,
+    name: str | None = None,
     offer_follow: bool = False,
 ) -> str:
     """The shared per-position view (#31): notional plus the real margin at risk,
     return-on-margin, and holding time (#35).
+
+    `name` is the viewing User's own nickname for the wallet (#86); the header
+    reads `name (0xshort…)` when set, else the bare short address.
 
     Age has two sources, in priority order. `ages` maps coin → (opened_at,
     baselined) from the poller's snapshots — the source for a tracked wallet,
@@ -904,10 +925,11 @@ def _render_positions(
     at least one position was left ageless — the honest way to explain the gap:
     the open time is knowable only by observing the wallet, which following
     starts. Suppressed for a follower, who already gets the poller's own age."""
+    label = trader_label(name, address)
     if not positions:
-        return f"{short_address(address)} has no open positions right now."
+        return f"{label} has no open positions right now."
     fills = fills or {}
-    blocks = [f"{short_address(address)} — current positions:", ""]
+    blocks = [f"{label} — current positions:", ""]
     any_ageless = False
     for p in positions:
         upnl = f"uPnL {signed_usd(p.unrealized_pnl)}"
@@ -1045,7 +1067,7 @@ def build_router() -> Router:
     # Deferred import: the criteria and controls flows build on this module's
     # shared seams (track_address, _render_tracked_list, …), so importing them
     # at the top would cycle.
-    from epigone.bot import access, controls, criteria, delete
+    from epigone.bot import access, controls, criteria, delete, names
 
     router = Router()
     # Invite-only admin commands (#33). The gate is a dispatcher-level outer
@@ -1061,6 +1083,9 @@ def build_router() -> Router:
     # commands still cut through.
     criteria.register(router)
     controls.register(router)
+    # The rename flow (#86): consumes a pending typed wallet name before the
+    # paste handler, same as the criteria/min-size prompts above.
+    names.register(router)
     router.message.register(follow_pasted_address, _is_wallet_paste)
     router.message.register(reject_unknown_command, _is_command)
     router.message.register(reject_unrecognized_input)  # anything else: text, stickers, photos…
