@@ -19,10 +19,12 @@ from epigone.metrics.fine import (
     FineMetrics,
     FineState,
     OpenEpisode,
+    RoundTrip,
     compute_fine_metrics,
     extract_state,
     fold_state,
     metrics_from_state,
+    reduce_trips,
 )
 from tests.support.fills import T0, fill
 
@@ -914,3 +916,64 @@ def test_same_ms_close_reopen_close_keeps_both_trades_across_a_fold() -> None:
     assert metrics.win_rate == Decimal("0.5")
     assert metrics.realized_pnl == Decimal("5")
     assert [t.seq for t in state.round_trips] == [0, 1]
+
+
+def _trip(coin: str, pnl: str, *, opened: datetime, closed: datetime, peak: str = "0") -> RoundTrip:
+    return RoundTrip(
+        coin=coin,
+        pnl=Decimal(pnl),
+        peak_notional=Decimal(peak),
+        opened_at=opened,
+        closed_at=closed,
+    )
+
+
+def test_reduce_trips_matches_the_state_reduction_on_the_trip_derived_fields() -> None:
+    # The shared reducer is the single definition of the trip-derived metrics:
+    # reducing a state's own trips through it must equal metrics_from_state on
+    # every field a trip slice can produce (accumulators live only on the state).
+    fills = [
+        _open(at=T0),
+        _close(at=T0 + timedelta(days=1), pnl="30", price="20"),
+        _open(coin="SOL", at=T0 + timedelta(days=2)),
+        _close(coin="SOL", at=T0 + timedelta(days=3), pnl="-10", price="5"),
+    ]
+    state = extract_state(fills)
+    full = metrics_from_state(state, account_value=Decimal("1000"))
+    trip = reduce_trips(list(state.round_trips), account_value=Decimal("1000"))
+
+    assert trip.trade_count == full.trade_count
+    assert trip.win_rate == full.win_rate
+    assert trip.avg_win == full.avg_win
+    assert trip.avg_loss == full.avg_loss
+    assert trip.sharpe == full.sharpe
+    assert trip.max_drawdown == full.max_drawdown
+    assert trip.avg_leverage == full.avg_leverage
+    assert trip.avg_hold_seconds == full.avg_hold_seconds
+    assert trip.effective_coins == full.effective_coins
+
+
+def test_reduce_trips_reduces_over_only_the_trips_it_is_given() -> None:
+    # Windowing is just filtering the trip list: dropping the loss leaves a
+    # perfect win rate over the one remaining trip, reduced by the same formulas.
+    win = _trip("HYPE", "30", opened=T0, closed=T0 + timedelta(days=1))
+    loss = _trip("SOL", "-10", opened=T0 + timedelta(days=2), closed=T0 + timedelta(days=3))
+
+    both = reduce_trips([win, loss], None)
+    assert both.trade_count == 2
+    assert both.win_rate == Decimal("0.5")
+
+    recent = reduce_trips([win], None)
+    assert recent.trade_count == 1
+    assert recent.win_rate == Decimal("1")
+    assert recent.avg_loss is None
+
+
+def test_reduce_trips_over_nothing_is_all_none() -> None:
+    empty = reduce_trips([], None)
+    assert empty.trade_count == 0
+    assert empty.win_rate is None
+    assert empty.avg_win is None
+    assert empty.avg_hold_seconds is None
+    assert empty.effective_coins is None
+    assert empty.max_drawdown == Decimal("0")

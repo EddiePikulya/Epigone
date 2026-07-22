@@ -1,7 +1,10 @@
 import re
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from typing import Any
 
 import asyncpg
 from aiogram import Bot, F, Router
@@ -38,6 +41,7 @@ from epigone.gateway import (
     fetch_open_positions,
 )
 from epigone.ingest.fine import mark_due_on_follow
+from epigone.metrics.fine import RoundTrip, reduce_trips
 from epigone.metrics.library import format_duration
 from epigone.screener import ScreenerRow, run_screener
 
@@ -140,6 +144,95 @@ FILLS_FRESH_WINDOW = timedelta(days=1)
 FOLLOW_FOR_AGE_HINT = "↳ Follow to track how long these positions have been open"
 
 
+@dataclass(frozen=True)
+class TrackWindow:
+    """One span of the track-record toggle (#102): the callback token that
+    carries it, the span it reduces over, the button label, and the header
+    clause that keeps the #101 header honest for the window."""
+
+    key: str  # callback token; also the "all" sentinel's absence
+    span: timedelta
+    label: str  # button text
+    header: str  # the "(…)" clause after "Track record"
+
+
+# The windows the toggle offers, most-recent first. `all` is not in this list —
+# it is the default (window=None), always shown as its own button whenever any
+# window button is (see _track_window_row).
+TRACK_WINDOWS = (
+    TrackWindow("7d", timedelta(days=7), "7d", "trades from the last 7 days"),
+    TrackWindow("30d", timedelta(days=30), "30d", "trades from the last 30 days"),
+)
+_TRACK_WINDOWS_BY_KEY = {w.key: w for w in TRACK_WINDOWS}
+ALL_WINDOW_KEY = "all"
+
+
+def _parse_track_window(token: str) -> TrackWindow | None:
+    """A toggle callback token → its TrackWindow, or None for `all` (the default
+    all-time view) and for any unknown token (a stale/garbled callback degrades
+    to the safe default rather than erroring)."""
+    return _TRACK_WINDOWS_BY_KEY.get(token)
+
+
+async def _available_track_windows(
+    pool: asyncpg.Pool, address: str, now: datetime
+) -> list[TrackWindow]:
+    """Which window buttons are meaningful for this wallet (#102): a window
+    shows only when the stored history reaches beyond it (a round-trip closed
+    before the cutoff, so the window is a real subset) AND at least one
+    round-trip closed inside it (the window is non-empty). A wallet with five
+    days of history gets neither 7d nor 30d — they would equal All; a wallet
+    idle this week gets no 7d."""
+    closes: list[datetime] = [
+        r["closed_at"]
+        for r in await pool.fetch(
+            "SELECT closed_at FROM fine_trades WHERE address = $1", address
+        )
+    ]
+    available: list[TrackWindow] = []
+    for window in TRACK_WINDOWS:
+        cutoff = now - window.span
+        if any(c >= cutoff for c in closes) and any(c < cutoff for c in closes):
+            available.append(window)
+    return available
+
+
+async def _track_window_row(
+    pool: asyncpg.Pool, address: str, now: datetime, *, prefix: str, active: TrackWindow | None
+) -> list[InlineKeyboardButton]:
+    """The toggle row for a wallet view, or [] when no window is meaningful.
+    `prefix` is the view's callback namespace (positions vs profile) so a tap
+    re-renders the same view; `active` marks the currently-shown window so the
+    row reflects state and a re-tap of the same window is a real (non-identical)
+    edit. All is always present once any window is."""
+    available = await _available_track_windows(pool, address, now)
+    if not available:
+        return []
+    row: list[InlineKeyboardButton] = []
+    for window in available:
+        marked = active is not None and active.key == window.key
+        row.append(
+            InlineKeyboardButton(
+                text=f"• {window.label}" if marked else window.label,
+                callback_data=f"{prefix}:{window.key}:{address}",
+            )
+        )
+    row.append(
+        InlineKeyboardButton(
+            text="• All" if active is None else "All",
+            callback_data=f"{prefix}:{ALL_WINDOW_KEY}:{address}",
+        )
+    )
+    return row
+
+
+# Callback namespaces for the toggle row on each wallet-view path (#102). Kept
+# distinct so a tap re-renders the exact view it came from — the positions view
+# (a follower's) and the screener profile assemble different messages/keyboards.
+POSITIONS_WINDOW_PREFIX = "poswin"
+PROFILE_WINDOW_PREFIX = "profwin"
+
+
 def _fills_stale(fills_seen_at: datetime | None, now: datetime) -> bool:
     """Is our fills knowledge older than the fresh window (or never scanned)?
     The one staleness test both fills-derived readings share — the activity
@@ -219,17 +312,84 @@ async def on_positions(
     clock: Clock,
 ) -> None:
     """On-demand profile for a tracked Trader: current positions + track record.
-    Fine metrics where the fine pass has run; coarse-only Traders say so."""
+    Fine metrics where the fine pass has run; coarse-only Traders say so. Opens
+    on the all-time record; the toggle row windows it in place (#102)."""
     address = (callback.data or "").removeprefix("positions:")
-    track = await fetch_track(pool, callback.from_user.id, address)
-    if track is None:
-        await callback.answer("You're not tracking this trader.", show_alert=True)
-        return
     try:
-        positions = await fetch_open_positions(gateway, address)
+        rendered = await _render_positions_view(
+            pool, gateway, clock, callback.from_user.id, address, window=None
+        )
     except GatewayError:
         await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
         return
+    if rendered is None:
+        await callback.answer("You're not tracking this trader.", show_alert=True)
+        return
+    view, entities, markup = rendered
+    if isinstance(callback.message, Message):
+        # the chat the button lives in
+        await callback.message.answer(view, reply_markup=markup, entities=entities)
+    else:
+        await bot.send_message(
+            chat_id=callback.from_user.id, text=view, reply_markup=markup, entities=entities
+        )
+    await callback.answer()
+
+
+async def on_positions_window(
+    callback: CallbackQuery,
+    bot: Bot,
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
+) -> None:
+    """The track-record window toggle on the positions view (#102): re-render the
+    same view with the record reduced over the chosen window and edit it in
+    place, preserving every other button."""
+    token, _, address = (callback.data or "").removeprefix(
+        f"{POSITIONS_WINDOW_PREFIX}:"
+    ).partition(":")
+    window = _parse_track_window(token)
+    try:
+        rendered = await _render_positions_view(
+            pool, gateway, clock, callback.from_user.id, address, window=window
+        )
+    except GatewayError:
+        await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
+        return
+    if rendered is None:
+        await callback.answer("You're not tracking this trader.", show_alert=True)
+        return
+    view, entities, markup = rendered
+    if isinstance(callback.message, Message):
+        try:
+            await callback.message.edit_text(view, reply_markup=markup, entities=entities)
+        except TelegramBadRequest:
+            pass  # a re-tap of the current window is a no-op edit; nothing to redraw
+    await callback.answer()
+
+
+async def _render_positions_view(
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    clock: Clock,
+    user_id: int,
+    address: str,
+    *,
+    window: TrackWindow | None,
+) -> tuple[str, list[MessageEntity], InlineKeyboardMarkup] | None:
+    """Assemble the follower's positions view (#102 shares it between the first
+    open and every window toggle). None when the User no longer tracks the
+    wallet (a stale button). Raises GatewayError if positions can't be fetched.
+
+    Rename (✏️, #86) and an unfollow escape hatch sit right here: seeing a
+    Trader's positions is exactly when a User names them or decides they've gone
+    bad and wants out (posunfollow drops the Track in place). The window toggle
+    row leads the keyboard when any window is meaningful."""
+    track = await fetch_track(pool, user_id, address)
+    if track is None:
+        return None
+    positions = await fetch_open_positions(gateway, address)
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     positions_text, entities = _render_positions(
@@ -240,27 +400,19 @@ async def on_positions(
         + "\n"
         + await _activity_block(pool, address, clock.now())
         + "\n\n"
-        + await _render_track_record(pool, address, clock.now())
+        + await _render_track_record(pool, address, clock.now(), window=window)
     )
-    # Rename (✏️, #86) and an unfollow escape hatch right here: seeing a Trader's
-    # positions is exactly when a User names them or decides they've gone bad and
-    # wants out (posunfollow drops the Track in place, no jump to list/profile).
-    markup = with_delete_button(
-        InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="✏️ Rename", callback_data=f"rename:{address}")],
-                [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")],
-            ]
-        )
+    keyboard: list[list[InlineKeyboardButton]] = []
+    toggle = await _track_window_row(
+        pool, address, clock.now(), prefix=POSITIONS_WINDOW_PREFIX, active=window
     )
-    if isinstance(callback.message, Message):
-        # the chat the button lives in
-        await callback.message.answer(view, reply_markup=markup, entities=entities)
-    else:
-        await bot.send_message(
-            chat_id=callback.from_user.id, text=view, reply_markup=markup, entities=entities
-        )
-    await callback.answer()
+    if toggle:
+        keyboard.append(toggle)
+    keyboard.append([InlineKeyboardButton(text="✏️ Rename", callback_data=f"rename:{address}")])
+    keyboard.append(
+        [InlineKeyboardButton(text="✖️ Unfollow", callback_data=f"posunfollow:{address}")]
+    )
+    return view, entities, with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock) -> None:
@@ -371,6 +523,30 @@ async def on_profile(
         await bot.send_message(
             chat_id=callback.from_user.id, text=text, reply_markup=markup, entities=entities
         )
+    await callback.answer()
+
+
+async def on_profile_window(
+    callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
+) -> None:
+    """The track-record window toggle on the screener profile (#102): re-render
+    the profile with the record reduced over the chosen window and edit it in
+    place, keeping the follow/unfollow, rename and #93 header entity intact."""
+    token, _, address = (callback.data or "").removeprefix(
+        f"{PROFILE_WINDOW_PREFIX}:"
+    ).partition(":")
+    window = _parse_track_window(token)
+    if isinstance(callback.message, Message):
+        try:
+            text, entities, markup = await _render_profile(
+                pool, gateway, clock, callback.from_user.id, address, window=window
+            )
+            await callback.message.edit_text(text, reply_markup=markup, entities=entities)
+        except GatewayError:
+            await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
+            return
+        except TelegramBadRequest:
+            pass  # a re-tap of the current window is a no-op edit; nothing to redraw
     await callback.answer()
 
 
@@ -595,7 +771,13 @@ async def _render_profile(
     clock: Clock,
     user_id: int,
     address: str,
+    *,
+    window: TrackWindow | None = None,
 ) -> tuple[str, list[MessageEntity], InlineKeyboardMarkup]:
+    """The screener profile view. `window` is the track-record toggle (#102):
+    None opens on the all-time record, a TrackWindow windows it in place while
+    keeping every other button (follow/unfollow, rename, the #93 header
+    entity)."""
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
     track = await fetch_track(pool, user_id, address)
     followed = track is not None
@@ -615,14 +797,19 @@ async def _render_profile(
     parts.extend(
         [
             await _activity_block(pool, address, clock.now()),
-            await _render_track_record(pool, address, clock.now()),
+            await _render_track_record(pool, address, clock.now(), window=window),
         ]
     )
     freshness = await _metric_freshness(pool, clock, address)
     if freshness is not None:
         parts.append(freshness)
-    # Renaming needs a Track, so ✏️ shows only for a followed wallet (#86).
     keyboard: list[list[InlineKeyboardButton]] = []
+    toggle = await _track_window_row(
+        pool, address, clock.now(), prefix=PROFILE_WINDOW_PREFIX, active=window
+    )
+    if toggle:
+        keyboard.append(toggle)
+    # Renaming needs a Track, so ✏️ shows only for a followed wallet (#86).
     if followed:
         keyboard.append([InlineKeyboardButton(text="✏️ Rename", callback_data=f"rename:{address}")])
         keyboard.append(
@@ -1011,8 +1198,18 @@ def _global_min_label(global_min: Decimal | None) -> str:
     return "⚙️ Set global min size"
 
 
-async def _render_track_record(pool: asyncpg.Pool, address: str, now: datetime) -> str:
-    """The profile's metrics block. Metric definitions: docs/metrics.md."""
+async def _render_track_record(
+    pool: asyncpg.Pool, address: str, now: datetime, *, window: TrackWindow | None = None
+) -> str:
+    """The profile's metrics block (metric definitions: docs/metrics.md).
+
+    `window` is the track-record toggle (#102): None is the default all-time
+    record (unchanged — the #101 span header and every accumulator line), a
+    TrackWindow reduces the trip-derived stats over only the round-trips closed
+    inside that window, dropping the whole-history accumulator lines (maker
+    share) that no window can honestly reconstruct."""
+    if window is not None:
+        return await _render_windowed_track_record(pool, address, now, window)
     row = await pool.fetchrow(
         """
         SELECT t.bot_reason, fm.address IS NOT NULL AS fine_available,
@@ -1043,6 +1240,57 @@ async def _render_track_record(pool: asyncpg.Pool, address: str, now: datetime) 
     return "\n".join(lines)
 
 
+async def _render_windowed_track_record(
+    pool: asyncpg.Pool, address: str, now: datetime, window: TrackWindow
+) -> str:
+    """The track record reduced over the round-trips closed inside `window`
+    (#102). The trip-derived stats come from the shared engine reducer
+    (metrics.fine.reduce_trips) over the filtered trips, so a windowed reading
+    can never drift from the all-time definitions; maker share and the other
+    whole-history accumulators are omitted rather than shown mislabeled."""
+    cutoff = now - window.span
+    trade_rows = await pool.fetch(
+        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq "
+        "FROM fine_trades WHERE address = $1 AND closed_at >= $2 "
+        "ORDER BY closed_at, coin, seq",
+        address,
+        cutoff,
+    )
+    trips = [
+        RoundTrip(
+            coin=r["coin"],
+            pnl=r["pnl"],
+            peak_notional=r["peak_notional"],
+            opened_at=r["opened_at"],
+            closed_at=r["closed_at"],
+            seq=r["seq"],
+        )
+        for r in trade_rows
+    ]
+    # avg size is peak notional against today's account value (#85), so the
+    # windowed reduction needs the same coarse-month anchor the all-time row uses.
+    account_value = await pool.fetchval(
+        "SELECT account_value FROM coarse_metrics WHERE address = $1 AND time_window = 'month'",
+        address,
+    )
+    metrics = reduce_trips(trips, account_value)
+    bot_reason = await pool.fetchval("SELECT bot_reason FROM traders WHERE address = $1", address)
+    lines: list[str] = []
+    if bot_reason is not None:
+        lines.append(f"⚠️ Flagged as a market-maker bot: {bot_reason}")
+    lines.append(f"Track record ({window.header}):")
+    # The reduced TripMetrics feeds _fine_lines directly; maker_share is spliced
+    # in as None because it is an accumulator with no windowed value, so
+    # _fine_lines omits its clause exactly as it does when unavailable.
+    lines.extend(
+        _fine_lines(
+            {**asdict(metrics), "maker_share": None},
+            empty="No closed trades in this window",
+        )
+    )
+    return "\n".join(lines)
+
+
 def _trades_span_label(oldest_trade_at: datetime | None, now: datetime) -> str:
     """How far back the track record's trades reach, for its header: the age of
     the OLDEST completed round-trip in the store — so \"61% over 33 trades\" says
@@ -1060,12 +1308,19 @@ def _trades_span_label(oldest_trade_at: datetime | None, now: datetime) -> str:
     return f"trades from the last ~{round(days / 30)} months"
 
 
-def _fine_lines(row: asyncpg.Record) -> list[str]:
+def _fine_lines(
+    row: Mapping[str, Any], *, empty: str = "No closed trades in the recent fills"
+) -> list[str]:
+    """The metric lines shared by the all-time record (fed the fine_metrics row)
+    and the windowed record (fed a reduced TripMetrics as a mapping, #102). A
+    None `maker_share` drops the maker clause — which is how the windowed view
+    omits the un-windowable accumulator without a separate renderer. `empty` is
+    the no-completed-trades wording, which differs per window."""
     lines: list[str] = []
     if row["win_rate"] is not None:
         lines.append(f"{row['win_rate']:.0%} win rate over {row['trade_count']} closed trades")
     else:
-        lines.append("No closed trades in the recent fills")
+        lines.append(empty)
     if row["avg_win"] is not None and row["avg_loss"] is not None:
         lines.append(f"avg win ${row['avg_win']:,.0f} · avg loss ${row['avg_loss']:,.0f}")
     sharpe = f"Sharpe {row['sharpe']:.1f} · " if row["sharpe"] is not None else ""
@@ -1290,6 +1545,15 @@ def build_router() -> Router:
     router.callback_query.register(on_profile, F.data.startswith("profile:"))
     router.callback_query.register(on_profile_follow, F.data.startswith("pfollow:"))
     router.callback_query.register(on_profile_unfollow, F.data.startswith("punfollow:"))
+    # The track-record window toggles (#102). Distinct prefixes from every view's
+    # own callbacks (poswin/profwin never collide with positions/profile), so
+    # each tap re-renders the exact view it came from.
+    router.callback_query.register(
+        on_profile_window, F.data.startswith(f"{PROFILE_WINDOW_PREFIX}:")
+    )
+    router.callback_query.register(
+        on_positions_window, F.data.startswith(f"{POSITIONS_WINDOW_PREFIX}:")
+    )
     router.callback_query.register(on_positions_unfollow, F.data.startswith("posunfollow:"))
     router.callback_query.register(on_positions, F.data.startswith("positions:"))
     router.callback_query.register(on_unfollow, F.data.startswith("unfollow:"))
