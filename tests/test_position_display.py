@@ -341,17 +341,28 @@ def test_no_positions_header_also_carries_the_copy_entity() -> None:
 # --- recent-activity line (issue #72) ---------------------------------------
 #
 # Last-trade recency comes from the fine store's newest folded *perp* fill
-# (window_end); the month PnL/ROI ride alongside from the coarse leaderboard.
-# ROI is stored as a fraction (0.12 == 12%).
+# (window_end); the PnL/ROI ride alongside from the coarse leaderboard, labeled
+# by the window the toggle selects (#104: week/month/all-time). ROI is stored as
+# a fraction (0.12 == 12%).
 
 
-def test_activity_shows_last_trade_and_month_performance() -> None:
+def test_activity_labels_performance_by_the_selected_window() -> None:
     two_hours_ago = NOW - timedelta(hours=2)  # fresh scan, precise recency
-    line = _render_recent_activity(
-        two_hours_ago, two_hours_ago, Decimal("48000"), Decimal("0.12"), Decimal("1100000"), NOW
+    pnl, roi, account = Decimal("48000"), Decimal("0.12"), Decimal("1100000")
+    # The label names the coarse window (#104): the default view is all-time; the
+    # 7d/30d toggles read week/month. Account value is the denominator all of
+    # them read against (#85) and is window-independent.
+    assert _render_recent_activity(two_hours_ago, two_hours_ago, pnl, roi, account, NOW) == (
+        "Last trade: 2h ago · all-time PnL +$48,000 (ROI +12%) · account $1.1M"
     )
-    # Account value is the denominator PnL/ROI/sizes all read against (#85).
-    assert line == "Last trade: 2h ago · month PnL +$48,000 (ROI +12%) · account $1.1M"
+    assert (
+        _render_recent_activity(two_hours_ago, two_hours_ago, pnl, roi, account, NOW, "week")
+        == "Last trade: 2h ago · week PnL +$48,000 (ROI +12%) · account $1.1M"
+    )
+    assert (
+        _render_recent_activity(two_hours_ago, two_hours_ago, pnl, roi, account, NOW, "month")
+        == "Last trade: 2h ago · month PnL +$48,000 (ROI +12%) · account $1.1M"
+    )
 
 
 def test_activity_marks_last_trade_as_of_last_scan_when_fills_knowledge_lags() -> None:
@@ -369,7 +380,7 @@ def test_activity_shows_only_recency_when_no_coarse_metrics() -> None:
     assert line == "Last trade: 2h ago"
 
 
-def test_activity_shows_account_value_even_without_month_pnl() -> None:
+def test_activity_shows_account_value_even_without_window_pnl() -> None:
     # Account value rides on the coarse row independently of PnL/ROI, so it can
     # appear as the sole coarse addition to an otherwise recency-only line.
     two_hours_ago = NOW - timedelta(hours=2)
@@ -383,10 +394,10 @@ def test_activity_says_no_fills_seen_but_still_shows_coarse_performance() -> Non
     # Coarse leaderboard data exists even for a wallet with no captured fills, so
     # the performance line must not depend on fine availability.
     line = _render_recent_activity(
-        None, None, Decimal("3000000"), Decimal("0.21"), Decimal("13400000"), NOW
+        None, None, Decimal("3000000"), Decimal("0.21"), Decimal("13400000"), NOW, "all-time"
     )
     assert line == (
-        "No recent trading activity seen · month PnL +$3,000,000 (ROI +21%) · account $13.4M"
+        "No recent trading activity seen · all-time PnL +$3,000,000 (ROI +21%) · account $13.4M"
     )
 
 

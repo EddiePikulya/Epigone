@@ -303,6 +303,16 @@ async def test_profile_from_screener_shows_metrics_freshness_positions_and_follo
     clock: FakeClock,
 ) -> None:
     await add_trader(pool, "0xstar", month_roi="1.5", month_pnl="42000")
+    # The default profile view reads the all-time coarse row for its activity line
+    # (#104); the screener ranks on month, so seed both.
+    await pool.execute(
+        """
+        INSERT INTO coarse_metrics
+            (address, time_window, pnl, roi, volume, account_value, computed_at)
+        VALUES ('0xstar', 'allTime', 88000, 3.0, 50000, 10000, $1)
+        """,
+        NOW,
+    )
     await add_fine(pool, "0xstar", win_rate="0.71")
     gateway.set_positions("0xstar", [ETH_SHORT_POS])
     clock.advance(3 * 3600)  # metrics were computed three hours ago
@@ -319,7 +329,7 @@ async def test_profile_from_screener_shows_metrics_freshness_positions_and_follo
     assert "$131,258 margin" in text  # money at risk, derived from notional/leverage (#35)
     assert "open " not in text  # untracked: no poller snapshot, so no invented age
     assert "3h ago" in text  # metric freshness
-    assert "Last trade:" in text and "month PnL" in text  # activity line (#72)
+    assert "Last trade:" in text and "all-time PnL" in text  # activity line (#72, #104)
     # Not tracked yet: the profile offers a Follow.
     assert "pfollow:0xstar" in _callback_data(msg.reply_markup)
 

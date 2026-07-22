@@ -16,16 +16,22 @@ async def follow(dp: Dispatcher, bot: Bot, user_id: int = 111) -> None:
     await feed_text(dp, bot, WHALE, user_id=user_id)
 
 
-async def add_coarse_month(pool: asyncpg.Pool, address: str = WHALE) -> None:
-    await pool.execute(
-        """
-        INSERT INTO coarse_metrics
-            (address, time_window, pnl, roi, volume, account_value, computed_at)
-        VALUES ($1, 'month', 3000000, 0.21, 90000000, 13400000, $2)
-        """,
-        address,
-        NOW,
-    )
+async def add_coarse(pool: asyncpg.Pool, address: str = WHALE) -> None:
+    """Seed the coarse rows the views read: the all-time row the default view's
+    activity line shows (#104) and the month row the track record's coarse-only
+    path reads. One leaderboard entry ships every window, so they carry the same
+    account value (#85)."""
+    for window in ("month", "allTime"):
+        await pool.execute(
+            """
+            INSERT INTO coarse_metrics
+                (address, time_window, pnl, roi, volume, account_value, computed_at)
+            VALUES ($1, $2, 3000000, 0.21, 90000000, 13400000, $3)
+            """,
+            address,
+            window,
+            NOW,
+        )
 
 
 async def add_fine(pool: asyncpg.Pool, address: str = WHALE) -> None:
@@ -46,7 +52,7 @@ async def test_profile_shows_fine_metrics_when_available(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await follow(dp, bot)
-    await add_coarse_month(pool)
+    await add_coarse(pool)
     await add_fine(pool)
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
@@ -83,7 +89,7 @@ async def test_a_coarse_only_trader_is_visibly_coarse_only(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await follow(dp, bot)
-    await add_coarse_month(pool)
+    await add_coarse(pool)
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 

@@ -229,14 +229,16 @@ async def _seed_last_perp_fill(
     )
 
 
-async def _seed_coarse_month(
+async def _seed_coarse_all_time(
     pool: asyncpg.Pool, address: str, *, pnl: Decimal, roi: Decimal, computed_at: object
 ) -> None:
+    # The default wallet view reads the all-time coarse row for its activity line
+    # (#104), so that is the window this seeds.
     await pool.execute(
         """
         INSERT INTO coarse_metrics
             (address, time_window, pnl, roi, volume, account_value, computed_at)
-        VALUES ($1, 'month', $2, $3, 1000000, 500000, $4)
+        VALUES ($1, 'allTime', $2, $3, 1000000, 500000, $4)
         """,
         address,
         pnl,
@@ -254,11 +256,11 @@ async def test_positions_view_shows_last_trade_and_recent_pnl_when_no_positions(
     clock: FakeClock,
 ) -> None:
     # The motivating case: no open positions, but the wallet traded 2h ago and is
-    # up on the month — "resting", not "dormant".
+    # up all-time — "resting", not "dormant". The default view is all-time (#104).
     await feed_text(dp, bot, WHALE, user_id=111)
     now = clock.now()
     await _seed_last_perp_fill(pool, WHALE, at=now - timedelta(hours=2), computed_at=now)
-    await _seed_coarse_month(
+    await _seed_coarse_all_time(
         pool, WHALE, pnl=Decimal("48000"), roi=Decimal("0.12"), computed_at=now
     )
 
@@ -267,7 +269,7 @@ async def test_positions_view_shows_last_trade_and_recent_pnl_when_no_positions(
     text = session.sent_messages()[-1].text or ""
     assert "no open positions" in text.lower()
     assert "Last trade: 2h ago" in text
-    assert "month PnL +$48,000 (ROI +12%)" in text
+    assert "all-time PnL +$48,000 (ROI +12%)" in text
 
 
 async def test_positions_view_shows_last_trade_alongside_open_positions(

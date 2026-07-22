@@ -19,16 +19,41 @@ async def follow(dp: Dispatcher, bot: Bot, user_id: int = 111) -> None:
     await feed_text(dp, bot, WHALE, user_id=user_id)
 
 
-async def add_coarse_month(pool: asyncpg.Pool, address: str = WHALE) -> None:
+async def add_coarse(
+    pool: asyncpg.Pool,
+    time_window: str,
+    pnl: str,
+    roi: str,
+    *,
+    address: str = WHALE,
+    account_value: str = "1000",
+) -> None:
     await pool.execute(
         """
         INSERT INTO coarse_metrics
             (address, time_window, pnl, roi, volume, account_value, computed_at)
-        VALUES ($1, 'month', 3000000, 0.21, 90000000, 1000, $2)
+        VALUES ($1, $2, $3, $4, 90000000, $5, $6)
         """,
         address,
+        time_window,
+        pnl,
+        roi,
+        account_value,
         NOW,
     )
+
+
+async def add_coarse_month(pool: asyncpg.Pool, address: str = WHALE) -> None:
+    await add_coarse(pool, "month", "3000000", "0.21", address=address)
+
+
+async def add_all_coarse_windows(pool: asyncpg.Pool, address: str = WHALE) -> None:
+    """One distinct PnL/ROI per coarse window, same account value across them —
+    so a test can tell which window the activity line read, and confirm the
+    account denominator (#85) stays put across toggles."""
+    await add_coarse(pool, "week", "100000", "0.05", address=address)
+    await add_coarse(pool, "month", "3000000", "0.21", address=address)
+    await add_coarse(pool, "allTime", "9000000", "0.80", address=address)
 
 
 async def add_fine(pool: asyncpg.Pool, address: str = WHALE) -> None:
@@ -254,3 +279,113 @@ async def test_the_profile_header_copy_entity_survives_a_window_edit(
     edited = session.edited_messages()[-1]
     assert edited.entities is not None
     assert any(e.type == "code" for e in edited.entities)
+
+
+# --- The activity line follows the same window toggle (#104) -------------------
+
+
+async def test_the_activity_line_defaults_to_all_time_performance(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # A fresh open is the default (All) view, so the activity line reads the
+    # all-time coarse row — the deliberate default shift from month (#104).
+    await follow(dp, bot)
+    await add_fine(pool)
+    await _spanning_trades(pool)
+    await add_all_coarse_windows(pool)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "all-time PnL +$9,000,000 (ROI +80%)" in text
+    assert "month PnL" not in text
+    assert "week PnL" not in text
+
+
+async def test_tapping_7d_windows_the_activity_line_to_the_week_row(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    await follow(dp, bot)
+    await add_fine(pool)
+    await _spanning_trades(pool)
+    await add_all_coarse_windows(pool)
+
+    await feed_callback(dp, bot, f"poswin:7d:{WHALE}", user_id=111)
+
+    text = session.edited_messages()[-1].text or ""
+    assert "week PnL +$100,000 (ROI +5%)" in text
+    assert "all-time PnL" not in text
+
+
+async def test_tapping_30d_windows_the_activity_line_to_the_month_row(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    await follow(dp, bot)
+    await add_fine(pool)
+    await _spanning_trades(pool)
+    await add_all_coarse_windows(pool)
+
+    await feed_callback(dp, bot, f"poswin:30d:{WHALE}", user_id=111)
+
+    text = session.edited_messages()[-1].text or ""
+    assert "month PnL +$3,000,000 (ROI +21%)" in text
+    assert "all-time PnL" not in text
+
+
+async def test_the_profile_activity_line_follows_the_window_too(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # The profile is the second view path; it must window the activity line in
+    # step with the record beneath, same as the positions view.
+    await follow(dp, bot)
+    await add_fine(pool)
+    await _spanning_trades(pool)
+    await add_all_coarse_windows(pool)
+
+    await feed_callback(dp, bot, f"profile:{WHALE}", user_id=111)
+    opened = session.sent_messages()[-1].text or ""
+    assert "all-time PnL +$9,000,000 (ROI +80%)" in opened
+
+    await feed_callback(dp, bot, f"profwin:7d:{WHALE}", user_id=111)
+    edited = session.edited_messages()[-1].text or ""
+    assert "week PnL +$100,000 (ROI +5%)" in edited
+
+
+async def test_a_missing_selected_window_row_omits_the_activity_pnl(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # Default (All) reads the all-time coarse row; without one the PnL/ROI clause
+    # drops exactly as a missing month row drops it today — the line keeps only
+    # its window-independent parts.
+    await follow(dp, bot)
+    await add_fine(pool)
+    await _spanning_trades(pool)
+    await add_coarse(pool, "week", "100000", "0.05")
+    await add_coarse(pool, "month", "3000000", "0.21")  # no allTime row
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    activity = next(line for line in text.splitlines() if line.startswith("Last trade:"))
+    assert "PnL" not in activity  # neither an all-time clause nor any other window's
+    assert "account" not in activity  # account rides the same missing row
+
+
+async def test_the_account_value_is_unchanged_across_activity_toggles(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # Account value is window-independent (#85): the same leaderboard entry seeds
+    # every coarse window, so it reads identically whichever window is selected.
+    await follow(dp, bot)
+    await add_fine(pool)
+    await _spanning_trades(pool)
+    await add_all_coarse_windows(pool)
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+    assert "account $1k" in (session.sent_messages()[-1].text or "")
+
+    await feed_callback(dp, bot, f"poswin:7d:{WHALE}", user_id=111)
+    assert "account $1k" in (session.edited_messages()[-1].text or "")
+
+    await feed_callback(dp, bot, f"poswin:30d:{WHALE}", user_id=111)
+    assert "account $1k" in (session.edited_messages()[-1].text or "")
