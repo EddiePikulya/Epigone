@@ -177,6 +177,24 @@ per-trade quality signal — so trims cannot game it.
   totals stay correct under the #11 fold. Thresholds are typed naturally
   (`2d`, `12h`, `90m`, `1d 6h`) and displayed the same compact way (`2d 4h`).
 
+### Effective coins
+- **In plain words:** how many coins the wallet effectively plays — 1 = a
+  single-pair specialist, 2 = a dedicated pair or two, high = rotates
+  everything. Use as a ceiling (≤ 2 finds specialists) and pair with a
+  Closed-trades floor (≥10).
+- **Definition:** the inverse Herfindahl of the wallet's **completed
+  round-trips** per coin over the fill window (issue #95): with `s_i` each
+  coin's share of trips, `effective_coins = 1 / Σ s_i²`. One coin reads 1.0, a
+  50/50 pair 2.0, three coins evenly 3.0, ten coins evenly 10.0. Reduced from
+  the same per-coin round-trips behind Most played, so it shares the trade
+  definition above, including the pre-window exclusion. Chosen over a raw
+  top-coin share because it reads a two-ticker specialist as focused (2.0, not
+  an ambiguous 50%) and shrugs off dust probes — one stray trip among fifty
+  barely moves it (≈1.04). Stored as a plain number. Unavailable (NULL) until at
+  least one round-trip has completed — undefined over zero trades, never 0 or 1.
+  The track record shows it beside Most played, e.g. `Most played: SOL · ETH
+  (~2 coins)`.
+
 ## Bot exclusion
 
 A **Bot** (CONTEXT.md) is an account whose statistical profile indicates

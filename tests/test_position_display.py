@@ -422,7 +422,8 @@ def test_most_played_ranks_by_round_trip_count_and_takes_the_top_three() -> None
             ("DOGE", 1, False),
         ]
     )
-    assert line == "Most played: SOL · BTC · ETH"
+    # 18 trips over 9/5/3/1 → inverse HHI 324/116 ≈ 2.8 effective coins (#95).
+    assert line == "Most played: SOL · BTC · ETH (~2.8 coins)"
 
 
 def test_most_played_counts_open_exposure_toward_its_coin() -> None:
@@ -435,18 +436,26 @@ def test_most_played_counts_open_exposure_toward_its_coin() -> None:
             ("SOL", 1, False),
         ]
     )
-    assert line == "Most played: BTC · ETH · SOL"
+    # The open BTC ranks the coin, but the effective-coins annotation is trips
+    # only (4 trips over 2/1/1 → 16/6 ≈ 2.7), blind to the open episode.
+    assert line == "Most played: BTC · ETH · SOL (~2.7 coins)"
+
+
+def test_most_played_reads_a_fifty_fifty_pair_as_two_effective_coins() -> None:
+    line = _render_most_played([("SOL", 5, False), ("ETH", 5, False)])
+    assert line == "Most played: ETH · SOL (~2 coins)"  # equal weight ties break on coin name
 
 
 def test_most_played_includes_a_coin_that_is_only_open() -> None:
-    # No completed trips yet, but a live episode is exposure worth surfacing.
+    # No completed trips yet, but a live episode is exposure worth surfacing —
+    # and with zero trips the effective-coins annotation is dropped.
     line = _render_most_played([("BTC", 0, True)])
     assert line == "Most played: BTC"
 
 
 def test_most_played_renders_dex_prefixed_coins_cleanly() -> None:
     line = _render_most_played([("xyz:SP500", 4, False), ("BTC", 2, False)])
-    assert line == "Most played: SP500 · BTC"
+    assert line == "Most played: SP500 · BTC (~1.8 coins)"
 
 
 def test_most_played_is_omitted_when_there_is_nothing_to_rank() -> None:

@@ -243,6 +243,50 @@ def test_avg_win_is_none_without_wins_and_avg_loss_none_without_losses() -> None
     assert all_losses.avg_win is None
 
 
+def _trips_across_coins(counts: dict[str, int]) -> list[Fill]:
+    """Round-trips spread across coins by count — `{"SOL": 3, "BTC": 1}` is
+    three SOL trips and one BTC trip, each an isolated open→close."""
+    fills: list[Fill] = []
+    hour = 0
+    for coin, n in counts.items():
+        for _ in range(n):
+            fills += trip(coin=coin, at=T0 + timedelta(hours=hour))
+            hour += 1
+    return fills
+
+
+def test_effective_coins_is_one_for_a_single_pair_specialist() -> None:
+    metrics = compute(_trips_across_coins({"SOL": 4}))
+    assert metrics.effective_coins == Decimal(1)
+
+
+def test_effective_coins_reads_a_fifty_fifty_two_ticker_specialist_as_two() -> None:
+    # The revised metric's whole point (#95): a 50/50 pair is *focused*, so it
+    # must read 2.0 — a top-coin share would have called it an ambiguous 50%.
+    metrics = compute(_trips_across_coins({"SOL": 5, "ETH": 5}))
+    assert metrics.effective_coins == Decimal(2)
+
+
+def test_effective_coins_shrugs_off_a_single_dust_probe() -> None:
+    # One stray trip among fifty must stay ≈1, not read as a genuine second coin
+    # (top-coin share would have said 0.98; inverse HHI ≈ 1.04).
+    metrics = compute(_trips_across_coins({"SOL": 49, "BTC": 1}))
+    assert metrics.effective_coins == Decimal(2500) / Decimal(2402)
+    assert abs(metrics.effective_coins - Decimal("1.04")) < Decimal("0.01")
+
+
+def test_effective_coins_counts_an_even_spread_as_its_coin_count() -> None:
+    metrics = compute(_trips_across_coins(dict.fromkeys(["SOL", "BTC", "ETH"], 2)))
+    assert metrics.effective_coins == Decimal(3)
+
+
+def test_effective_coins_is_none_without_completed_round_trips() -> None:
+    # An open with no close banks no round-trip, so the spread is undefined.
+    metrics = compute([_open(at=T0)])
+    assert metrics.trade_count == 0
+    assert metrics.effective_coins is None
+
+
 def test_max_drawdown_is_the_deepest_fall_of_the_realized_pnl_curve() -> None:
     pnls = ["100", "-50", "-30", "200"]  # peak 100 -> trough 20 before recovering
     in_time_order = [
