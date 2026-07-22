@@ -312,6 +312,9 @@ async def test_profile_from_screener_shows_metrics_freshness_positions_and_follo
     msg = session.sent_messages()[-1]
     text = msg.text or ""
     assert "71% win rate over 104 closed trades" in text  # fine metrics
+    # No stored round-trips seeded here, so the header keeps the plain wording
+    # (the span variant is covered in test_profile_track_record_says_trade_span).
+    assert "Track record (from recent fills):" in text
     assert "ETH" in text and "SHORT" in text  # current positions
     assert "$131,258 margin" in text  # money at risk, derived from notional/leverage (#35)
     assert "open " not in text  # untracked: no poller snapshot, so no invented age
@@ -679,3 +682,23 @@ async def test_help_mentions_the_screener(
     await feed_text(dp, bot, "/help", user_id=111)
 
     assert "/screener" in (session.sent_messages()[-1].text or "")
+
+
+async def test_profile_track_record_says_trade_span(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    """The header dates the OLDEST stored round-trip, so "61% over 33 trades"
+    says whether those trades span a week or a year."""
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    await add_fine(pool, "0xstar")
+    await add_round_trip(pool, "0xstar", "SOL", closed_at=NOW - timedelta(days=10))
+    await add_round_trip(pool, "0xstar", "SOL", closed_at=NOW, seq=1)
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "Track record (trades from the last 10 days):" in text

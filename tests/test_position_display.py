@@ -460,3 +460,34 @@ def test_most_played_renders_dex_prefixed_coins_cleanly() -> None:
 
 def test_most_played_is_omitted_when_there_is_nothing_to_rank() -> None:
     assert _render_most_played([]) is None
+
+
+# --- the track-record header's trade-span label ------------------------------
+
+
+def test_trades_span_label_reads_days_under_two_months() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from epigone.bot.handlers import _trades_span_label
+
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    assert _trades_span_label(now - timedelta(days=10), now) == "trades from the last 10 days"
+    assert _trades_span_label(now - timedelta(hours=3), now) == "trades from the last 1 day"
+
+
+def test_trades_span_label_reads_months_beyond_two() -> None:
+    from datetime import UTC, datetime, timedelta
+
+    from epigone.bot.handlers import _trades_span_label
+
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    assert _trades_span_label(now - timedelta(days=250), now) == "trades from the last ~8 months"
+
+
+def test_trades_span_label_falls_back_without_trips() -> None:
+    from datetime import UTC, datetime
+
+    from epigone.bot.handlers import _trades_span_label
+
+    now = datetime(2026, 7, 22, 12, 0, tzinfo=UTC)
+    assert _trades_span_label(None, now) == "from recent fills"
