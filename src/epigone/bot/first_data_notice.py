@@ -16,7 +16,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from epigone.bot.delete import with_delete_button
-from epigone.bot.format import short_address, trader_label
+from epigone.bot.format import button_label, trader_label
 from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
 from epigone.clock import Clock
 
@@ -41,7 +41,7 @@ async def deliver_first_data_notices(pool: asyncpg.Pool, bot: Bot, clock: Clock)
         await bot.send_message(
             chat_id=row["user_telegram_id"],
             text=render_first_data_notice(row["trader_address"], row["track_name"]),
-            reply_markup=_profile_button(row["trader_address"]),
+            reply_markup=_profile_button(row["trader_address"], row["track_name"]),
         )
 
     return await drain_outbox(
@@ -76,15 +76,17 @@ def render_first_data_notice(address: str, name: str | None = None) -> str:
     return f"📊 {trader_label(name, address)} now has full track-record data"
 
 
-def _profile_button(address: str) -> InlineKeyboardMarkup:
+def _profile_button(address: str, name: str | None) -> InlineKeyboardMarkup:
     """Tap-through into the wallet's profile/positions view — the existing
-    profile:<address> callback, no new view (issue #83)."""
+    profile:<address> callback, no new view (issue #83). Labeled with the
+    recipient's own name for the wallet when set (#86); the notice text and the
+    profile carry the verifiable address."""
     return with_delete_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text=f"📊 {short_address(address)} — positions",
+                        text=f"📊 {button_label(name, address)} — positions",
                         callback_data=f"profile:{address}",
                     )
                 ]
