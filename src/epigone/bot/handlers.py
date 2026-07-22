@@ -263,17 +263,13 @@ async def on_positions(
     await callback.answer()
 
 
-async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool) -> None:
+async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool, clock: Clock) -> None:
     """Unfollow straight from the positions view (📊): drop the Track, confirm in
     place, and remove the button — no jump to the list or profile. For the
     "their positions look bad now, I'm out" moment."""
     address = (callback.data or "").removeprefix("posunfollow:")
-    status = await pool.execute(
-        "DELETE FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
-        callback.from_user.id,
-        address,
-    )
-    removed = status != "DELETE 0"  # a stale button tap deletes nothing
+    async with pool.acquire() as conn, conn.transaction():
+        removed = await untrack_address(conn, callback.from_user.id, address, clock.now())
     if removed and isinstance(callback.message, Message):
         body = callback.message.text or ""
         try:
@@ -290,16 +286,12 @@ async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool) -> 
 
 
 async def on_unfollow(
-    callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway
+    callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
 ) -> None:
     """One-tap unfollow: drop the Track and refresh the list in place."""
     address = (callback.data or "").removeprefix("unfollow:")
-    status = await pool.execute(
-        "DELETE FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
-        callback.from_user.id,
-        address,
-    )
-    removed = status != "DELETE 0"  # a stale button tap deletes nothing
+    async with pool.acquire() as conn, conn.transaction():
+        removed = await untrack_address(conn, callback.from_user.id, address, clock.now())
     if isinstance(callback.message, Message):
         try:
             text, markup = await _render_tracked_list(pool, gateway, callback.from_user.id)
@@ -408,12 +400,8 @@ async def on_profile_unfollow(
     callback: CallbackQuery, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
 ) -> None:
     address = (callback.data or "").removeprefix("punfollow:")
-    status = await pool.execute(
-        "DELETE FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
-        callback.from_user.id,
-        address,
-    )
-    removed = status != "DELETE 0"  # a stale button tap deletes nothing
+    async with pool.acquire() as conn, conn.transaction():
+        removed = await untrack_address(conn, callback.from_user.id, address, clock.now())
     await _refresh_profile_in_place(
         callback, pool, gateway, clock, address, _unfollow_toast(removed, address)
     )
@@ -458,13 +446,16 @@ async def _render_screener_page(
     if not rows:
         return SCREENER_EMPTY_TEXT, with_delete_button()
 
-    tracked = await tracked_set(pool, user_id, [r.address for r in rows])
+    addresses = [r.address for r in rows]
+    tracked = await tracked_set(pool, user_id, addresses)
+    unfollowed = await unfollowed_set(pool, user_id, addresses)
     lines = [SCREENER_HEADER, ""]
     keyboard: list[list[InlineKeyboardButton]] = []
     for rank, row in enumerate(rows, start=offset + 1):
-        lines.append(f"{rank}. {row.display_name or short_address(row.address)}")
-        lines.append(f"    {_screener_stats(row, clock.now())}")
         followed = row.address in tracked
+        name = row.display_name or short_address(row.address)
+        lines.append(f"{rank}. {name}{previously_marker(row.address, followed, unfollowed)}")
+        lines.append(f"    {_screener_stats(row, clock.now())}")
         keyboard.append(
             [
                 InlineKeyboardButton(
@@ -489,6 +480,17 @@ async def _render_screener_page(
     if nav:
         keyboard.append(nav)
     return "\n".join(lines), with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+def previously_marker(address: str, followed: bool, unfollowed: set[str]) -> str:
+    """The `↩` a results row carries when this User followed the wallet before and
+    dropped it (#99) — a nudge that it is a past experiment, with the detail on the
+    profile. Shared by the screener and criteria row renderers so the two never
+    drift. Empty while currently tracked: a live Track keeps its Following state,
+    so the marker is only for previously-but-not-currently-followed."""
+    if not followed and address in unfollowed:
+        return f" {PREVIOUSLY_FOLLOWED_MARKER}"
+    return ""
 
 
 def _screener_stats(row: ScreenerRow, now: datetime) -> str:
@@ -542,6 +544,51 @@ async def tracked_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) ->
     return {row["trader_address"] for row in rows}
 
 
+async def unfollowed_set(pool: asyncpg.Pool, user_id: int, addresses: list[str]) -> set[str]:
+    """The subset of `addresses` this User has unfollowed at some point (#99). The
+    screener/criteria rows mark these — but only the ones not *currently* tracked;
+    the caller subtracts `tracked_set`, since a re-followed wallet keeps its
+    Following state and hides the marker. Per-User: the log is user-scoped."""
+    if not addresses:
+        return set()
+    rows = await pool.fetch(
+        """
+        SELECT trader_address FROM unfollows
+        WHERE user_telegram_id = $1 AND trader_address = ANY($2::text[])
+        """,
+        user_id,
+        addresses,
+    )
+    return {row["trader_address"] for row in rows}
+
+
+# The glyph that flags a previously-but-not-currently-followed wallet, shared by
+# the profile line and the screener/criteria row marker so the two never drift.
+PREVIOUSLY_FOLLOWED_MARKER = "↩"
+
+
+async def _previously_followed_line(
+    pool: asyncpg.Pool, user_id: int, address: str, now: datetime
+) -> str | None:
+    """The profile's "you dropped this one" line (#99): `↩ Previously followed —
+    unfollowed 3d ago (as "avax")`, the name clause only when the wallet carried
+    one at unfollow. None when this User never unfollowed it — the caller also
+    suppresses it while the wallet is currently tracked."""
+    row = await pool.fetchrow(
+        "SELECT unfollowed_at, name FROM unfollows "
+        "WHERE user_telegram_id = $1 AND trader_address = $2",
+        user_id,
+        address,
+    )
+    if row is None:
+        return None
+    age = _relative_age(now, row["unfollowed_at"])
+    line = f"{PREVIOUSLY_FOLLOWED_MARKER} Previously followed — unfollowed {age}"
+    if row["name"] is not None:
+        line += f' (as "{row["name"]}")'
+    return line
+
+
 async def _render_profile(
     pool: asyncpg.Pool,
     gateway: HyperliquidGateway,
@@ -558,11 +605,19 @@ async def _render_profile(
     positions_text, entities = _render_positions(
         address, positions, ages, clock.now(), fills, name=name, offer_follow=not followed
     )
-    parts = [
-        positions_text,
-        await _activity_block(pool, address, clock.now()),
-        await _render_track_record(pool, address),
-    ]
+    parts = [positions_text]
+    # The "previously followed" note (#99) sits right under the header — but only
+    # for a wallet this User dropped and hasn't re-followed; a live Track hides it.
+    if not followed:
+        previously = await _previously_followed_line(pool, user_id, address, clock.now())
+        if previously is not None:
+            parts.append(previously)
+    parts.extend(
+        [
+            await _activity_block(pool, address, clock.now()),
+            await _render_track_record(pool, address),
+        ]
+    )
     freshness = await _metric_freshness(pool, clock, address)
     if freshness is not None:
         parts.append(freshness)
@@ -828,6 +883,44 @@ async def track_address(
     # re-follow returned ALREADY_TRACKING above, so its row is never reset.
     await record_follow_notice_state(conn, telegram_id, address, now)
     return TrackOutcome.FRESHLY_TRACKED
+
+
+async def untrack_address(
+    conn: asyncpg.Connection, telegram_id: int, address: str, now: datetime
+) -> bool:
+    """Drop a User's Track and remember the unfollow. Returns whether a Track was
+    actually removed — False on a stale button tap that deletes nothing.
+
+    The single write behind every Unfollow — the tracked-list button, the profile
+    toggle, and the positions view — the way `track_address` is the one Follow
+    seam. Remembering here means all three paths log the unfollow for free (#99).
+
+    `name` is the per-User nickname (#86) the wallet carried at this moment. #86
+    forgets it by design — it rides the tracks row, so the DELETE takes it with
+    it — so it is read out of the deleted row (RETURNING) and preserved into the
+    log. One row per (user, wallet): the upsert keeps only the latest unfollow, so
+    a re-follow → re-unfollow cycle updates the timestamp and name rather than
+    piling up history. Per-User and invisible to others (the log is user-scoped)."""
+    removed = await conn.fetchrow(
+        "DELETE FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2 RETURNING name",
+        telegram_id,
+        address,
+    )
+    if removed is None:
+        return False
+    await conn.execute(
+        """
+        INSERT INTO unfollows (user_telegram_id, trader_address, unfollowed_at, name)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (user_telegram_id, trader_address)
+        DO UPDATE SET unfollowed_at = EXCLUDED.unfollowed_at, name = EXCLUDED.name
+        """,
+        telegram_id,
+        address,
+        now,
+        removed["name"],
+    )
+    return True
 
 
 async def upsert_user(
