@@ -448,7 +448,44 @@ async def test_an_alert_is_tap_through_to_the_traders_live_positions(
     # The tap-through row comes first; the 🗑 delete row (#73) is appended below it.
     (button,) = message.reply_markup.inline_keyboard[0]
     assert button.callback_data == f"positions:{address}"
-    assert "0x1116…3d0d" in button.text  # the wallet itself is the clickable element
+    # The button labels the wallet by name (the leaderboard display name here);
+    # the address lives in the alert text and the detailed view, not the button.
+    assert "Ansem" in button.text
+    assert "0x1116" not in button.text
+
+
+async def test_the_tap_through_button_prefers_the_recipients_own_nickname(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The recipient's per-Track nickname (#86) beats the leaderboard display
+    name on the button — same precedence as the alert text."""
+    address = "0x1116b5fcc070945062e8879841c29807db373d0d"
+    await queue_alert(pool, address=address, display_name="Ansem")
+    await pool.execute(
+        "INSERT INTO tracks (user_telegram_id, trader_address, name) VALUES (42, $1, $2)",
+        address,
+        "silver guy",
+    )
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    (button,) = message.reply_markup.inline_keyboard[0]
+    assert "silver guy" in button.text
+    assert "Ansem" not in button.text
+
+
+async def test_the_tap_through_button_falls_back_to_the_short_address(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    address = "0x1116b5fcc070945062e8879841c29807db373d0d"
+    await queue_alert(pool, address=address, display_name=None)
+
+    await deliver_pending(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    (button,) = message.reply_markup.inline_keyboard[0]
+    assert "0x1116…3d0d" in button.text
 
 
 async def test_delivered_alerts_are_never_resent(

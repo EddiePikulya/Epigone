@@ -23,6 +23,15 @@ def trader_label(label: str | None, address: str) -> str:
     return f"{label} ({short})" if label else short
 
 
+def button_label(label: str | None, address: str) -> str:
+    """A wallet's identity on a BUTTON: the name alone when it has one, else the
+    short address. Buttons are tight and always sit on a message that carries
+    the verifiable address (the alert text, the notice text, the profile header
+    #93), so unlike trader_label the address doesn't ride along — the name is
+    the whole label."""
+    return label if label else short_address(address)
+
+
 def trader_header(label: str | None, address: str) -> tuple[str, MessageEntity]:
     """The positions/profile header identity with the *full* address (#93), plus
     a `code` MessageEntity over the address span so Telegram offers tap-to-copy.

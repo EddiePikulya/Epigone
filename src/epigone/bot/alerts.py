@@ -30,7 +30,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from epigone.bot.delete import with_delete_button
-from epigone.bot.format import held_for, short_address, signed_pct, signed_usd, trader_label
+from epigone.bot.format import button_label, held_for, short_address, signed_pct, signed_usd, trader_label
 from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
 from epigone.clock import Clock
 
@@ -193,14 +193,21 @@ def _positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
     """Make the alert tap-through to the trader's live positions — the same
     on-demand view /tracked offers (the positions:<address> callback). An alert
     only ever fires for a Trader the recipient follows, which is exactly the
-    relationship that handler checks, so the button always resolves."""
+    relationship that handler checks, so the button always resolves. The label
+    is the wallet's name when the recipient gave it one (#86, else the
+    leaderboard display name) — the address lives in the alert text and the
+    detailed view, not on the button."""
     address: str = row["trader_address"]
     return with_delete_button(
         InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text=f"📊 {short_address(address)} — positions",
+                        text=(
+                            "📊 "
+                            + button_label(row["track_name"] or row["display_name"], address)
+                            + " — positions"
+                        ),
                         callback_data=f"positions:{address}",
                     )
                 ]
