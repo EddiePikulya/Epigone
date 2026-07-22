@@ -125,6 +125,7 @@ class FineMetrics:
     avg_leverage: Decimal | None
     maker_share: Decimal | None
     avg_hold_seconds: int | None  # mean round-trip duration; None with no completed trades
+    effective_coins: Decimal | None  # inverse-HHI coin spread of round-trips; None with no trips
     realized_pnl: Decimal
     perp_fill_count: int  # all perp fills seen — activity evidence for Bot vetting (#58)
     window_start: datetime | None  # first and last perp fill the metrics saw
@@ -263,6 +264,7 @@ def metrics_from_state(state: FineState, account_value: Decimal | None) -> FineM
         avg_hold_seconds=(
             sum(t.hold_seconds for t in trips) // len(trips) if trips else None
         ),
+        effective_coins=_effective_coins(trips),
         realized_pnl=state.realized_pnl,
         perp_fill_count=state.perp_fill_count,
         window_start=state.window_start,
@@ -509,6 +511,25 @@ def _fold_episodes(
         }
     )
     return resolved, tuple(sorted(open_eps.values(), key=lambda e: e.coin)), demoted_heads
+
+
+def _effective_coins(trips: list[RoundTrip]) -> Decimal | None:
+    """How many coins the wallet *effectively* plays: the inverse Herfindahl of
+    its completed round-trips per coin (issue #95). With `s_i` each coin's share
+    of trips, `1 / sum(s_i**2) == total**2 / sum(trips_i**2)` — one coin reads
+    1.0, a 50/50 pair 2.0, ten coins evenly 10.0. Reduced from the per-coin round-trips
+    behind Most played (#80). Chosen over top-coin share because it reads a
+    two-ticker specialist as focused and shrugs off dust probes (one stray trip
+    among fifty barely moves it). None with no trips: undefined over zero
+    trades, never 0 or 1."""
+    if not trips:
+        return None
+    by_coin: dict[str, int] = defaultdict(int)
+    for trip in trips:
+        by_coin[trip.coin] += 1
+    total = len(trips)
+    sum_sq = sum(count * count for count in by_coin.values())
+    return Decimal(total * total) / sum_sq
 
 
 def _max_drawdown(trips: list[RoundTrip]) -> Decimal:

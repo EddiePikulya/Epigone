@@ -711,13 +711,32 @@ def _render_most_played(plays: list[tuple[str, int, bool]]) -> str | None:
     point for holding an open position, so a wallet parked in one long-held short
     still ranks that coin even with few completed trips. Ties break on the coin
     name for a stable order. Dex-prefixed builder-DEX coins (xyz:SP500) render as
-    the bare ticker (#21). None when there is nothing to rank — the line is then
-    omitted rather than shown empty."""
+    the bare ticker (#21). When completed round-trips exist, the effective-coins
+    spread (#95) trails as "(~2 coins)" — the coins and the number tell one
+    story. None when there is nothing to rank — the line is then omitted rather
+    than shown empty."""
     if not plays:
         return None
     ranked = sorted(plays, key=lambda p: (-(p[1] + (1 if p[2] else 0)), p[0]))
     top = [_display_coin(coin) for coin, _, _ in ranked[:MOST_PLAYED_LIMIT]]
-    return "Most played: " + " · ".join(top)
+    line = "Most played: " + " · ".join(top)
+    effective = _effective_coins([count for _, count, _ in plays])
+    if effective is not None:
+        line += f" (~{effective} coins)"
+    return line
+
+
+def _effective_coins(trip_counts: list[int]) -> str | None:
+    """The effective-coins annotation (#95): the inverse Herfindahl of the
+    round-trip counts (`total² / Σ counts²`, matching fine._effective_coins),
+    rendered to one decimal — "2", "1.6". None when there are no completed
+    round-trips (open-only coins contribute 0), so the caller drops the
+    annotation rather than dividing by zero."""
+    total = sum(trip_counts)
+    if not total:
+        return None
+    effective = total * total / sum(count * count for count in trip_counts)
+    return f"{effective:.1f}".rstrip("0").rstrip(".")
 
 
 def _display_coin(coin: str) -> str:

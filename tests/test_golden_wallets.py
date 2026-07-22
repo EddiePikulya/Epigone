@@ -73,6 +73,7 @@ def test_engine_reproduces_the_pinned_profile(address: str) -> None:
         ("sharpe", "0.0001"),
         ("max_drawdown", "0.01"),
         ("maker_share", "0.0001"),
+        ("effective_coins", "0.0001"),
         ("realized_pnl", "0.01"),
     ]:
         value: Decimal | None = getattr(m, metric)

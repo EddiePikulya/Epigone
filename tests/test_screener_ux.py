@@ -360,7 +360,9 @@ async def test_profile_shows_most_played_tickers(
     await feed_callback(dp, bot, "profile:0xstar", user_id=111)
 
     text = session.sent_messages()[-1].text or ""
-    assert "Most played: SOL · BTC · SP500" in text  # ranked, dex prefix stripped
+    # Ranked, dex prefix stripped, with the effective-coins annotation (#95):
+    # 3 SOL + 1 BTC trips (SP500 is open-only) → inverse HHI 16/10 = 1.6.
+    assert "Most played: SOL · BTC · SP500 (~1.6 coins)" in text
 
 
 async def test_profile_omits_most_played_without_fine_data(

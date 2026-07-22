@@ -192,6 +192,19 @@ _SPECS = [
         ),
         example="2d, 12h, or 90m",
     ),
+    MetricSpec(
+        key="effective_coins",
+        label="Effective coins",
+        unit=Unit.NUMBER,
+        scope=Scope.FINE,
+        sql="fm.effective_coins",
+        explanation=(
+            "how many coins the wallet effectively plays — 1 = single-pair specialist, "
+            "2 = a dedicated pair or two, high = rotates everything. Use as a ceiling "
+            "(≤ 2 finds specialists) and pair with a Closed-trades floor (≥10)."
+        ),
+        example="2",
+    ),
 ]
 
 METRICS: dict[str, MetricSpec] = {spec.key: spec for spec in _SPECS}

@@ -10,7 +10,8 @@
     "maker_share": "0.8781",
     "realized_pnl": "-1738.73",
     "window_start": "2026-07-06T15:02:51.140000+00:00",
-    "window_end": "2026-07-09T13:59:29.452000+00:00"
+    "window_end": "2026-07-09T13:59:29.452000+00:00",
+    "effective_coins": null
   },
   "0x3e41a8fa0032d635f02201053f1a5aa2a6967c81": {
     "wallets_md_win_rate": "0.565",
@@ -23,7 +24,8 @@
     "maker_share": "0.0000",
     "realized_pnl": "135886.11",
     "window_start": "2026-06-23T15:31:20.753000+00:00",
-    "window_end": "2026-07-09T10:26:37.545000+00:00"
+    "window_end": "2026-07-09T10:26:37.545000+00:00",
+    "effective_coins": null
   },
   "0x4f24303e0af2e4a94abcd516a3c80d38262bde6a": {
     "wallets_md_win_rate": "0.714",
@@ -36,7 +38,8 @@
     "maker_share": "0.1863",
     "realized_pnl": "207651.13",
     "window_start": "2026-07-01T19:40:45.485000+00:00",
-    "window_end": "2026-07-09T20:43:16.698000+00:00"
+    "window_end": "2026-07-09T20:43:16.698000+00:00",
+    "effective_coins": "4.1667"
   },
   "0x83b00972aafcc3d06d45b1b823079f9a414da46e": {
     "wallets_md_win_rate": "0.708",
@@ -49,7 +52,8 @@
     "maker_share": "0.0850",
     "realized_pnl": "156275.85",
     "window_start": "2026-05-26T09:30:30.505000+00:00",
-    "window_end": "2026-07-09T01:10:25.572000+00:00"
+    "window_end": "2026-07-09T01:10:25.572000+00:00",
+    "effective_coins": "8.6667"
   },
   "0x8bae3527e5a33fa0cf184f37bc112d071463ab6d": {
     "wallets_md_win_rate": "0.654",
@@ -62,7 +66,8 @@
     "maker_share": "0.5375",
     "realized_pnl": "968148.02",
     "window_start": "2026-05-06T07:39:21.395000+00:00",
-    "window_end": "2026-07-10T05:22:07.530000+00:00"
+    "window_end": "2026-07-10T05:22:07.530000+00:00",
+    "effective_coins": "9.0000"
   },
   "0x8cbe593aa5b6fffb5254429d1812abdbd1f06959": {
     "wallets_md_win_rate": "0.760",
@@ -75,7 +80,8 @@
     "maker_share": "0.7260",
     "realized_pnl": "12615.31",
     "window_start": "2026-06-14T07:40:12.817000+00:00",
-    "window_end": "2026-07-08T22:00:10.137000+00:00"
+    "window_end": "2026-07-08T22:00:10.137000+00:00",
+    "effective_coins": "11.1304"
   },
   "0xa3f9bb20d0837cbdf102c76ea2454b2484b1ba8e": {
     "wallets_md_win_rate": "0.763",
@@ -88,7 +94,8 @@
     "maker_share": "0.5496",
     "realized_pnl": "5202.23",
     "window_start": "2026-05-29T15:10:57.806000+00:00",
-    "window_end": "2026-07-10T00:24:40.366000+00:00"
+    "window_end": "2026-07-10T00:24:40.366000+00:00",
+    "effective_coins": "9.1746"
   },
   "0xa4add8273d7f47318675bdfbcce3e9648cdb4509": {
     "wallets_md_win_rate": "0.938",
@@ -101,7 +108,8 @@
     "maker_share": "0.9190",
     "realized_pnl": "129545.69",
     "window_start": "2026-07-02T15:27:37.553000+00:00",
-    "window_end": "2026-07-09T13:31:08.786000+00:00"
+    "window_end": "2026-07-09T13:31:08.786000+00:00",
+    "effective_coins": "1.8000"
   },
   "0xadd12adbbd5db87674b38af99b6dd34dd2a45e0d": {
     "wallets_md_win_rate": "0.631",
@@ -114,7 +122,8 @@
     "maker_share": "0.0105",
     "realized_pnl": "395080.71",
     "window_start": "2026-06-25T17:38:37.858000+00:00",
-    "window_end": "2026-07-09T10:00:47.719000+00:00"
+    "window_end": "2026-07-09T10:00:47.719000+00:00",
+    "effective_coins": null
   },
   "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e": {
     "wallets_md_win_rate": "0.708",
@@ -127,7 +136,8 @@
     "maker_share": "0.9867",
     "realized_pnl": "531967.44",
     "window_start": "2026-06-22T22:28:09.537000+00:00",
-    "window_end": "2026-07-09T19:14:27.208000+00:00"
+    "window_end": "2026-07-09T19:14:27.208000+00:00",
+    "effective_coins": "1.0000"
   },
   "0xcdd518dcba1e68d0781d4bd998beda2089d45211": {
     "wallets_md_win_rate": "0.881",
@@ -140,7 +150,8 @@
     "maker_share": "0.3671",
     "realized_pnl": "16441.11",
     "window_start": "2026-04-09T22:17:15.871000+00:00",
-    "window_end": "2026-07-09T15:06:55.138000+00:00"
+    "window_end": "2026-07-09T15:06:55.138000+00:00",
+    "effective_coins": "8.3599"
   },
   "0xf5b0af852e3dedc03b551f7050b616b5c77c7645": {
     "wallets_md_win_rate": "0.761",
@@ -153,7 +164,8 @@
     "maker_share": "0.3165",
     "realized_pnl": "10201.41",
     "window_start": "2025-10-21T07:30:45.235000+00:00",
-    "window_end": "2026-07-10T04:19:25.798000+00:00"
+    "window_end": "2026-07-10T04:19:25.798000+00:00",
+    "effective_coins": "6.9222"
   },
   "0xf97ad6704baec104d00b88e0c157e2b7b3a1ddd1": {
     "wallets_md_win_rate": "0.857",
@@ -166,7 +178,8 @@
     "maker_share": "0.5225",
     "realized_pnl": "58323.19",
     "window_start": "2026-06-19T06:37:41.163000+00:00",
-    "window_end": "2026-07-10T04:47:19.837000+00:00"
+    "window_end": "2026-07-10T04:47:19.837000+00:00",
+    "effective_coins": "5.4605"
   },
   "0xfb941d2344b72ea9101400392b818173772d0ddf": {
     "wallets_md_win_rate": "0.880",
@@ -179,7 +192,8 @@
     "maker_share": "0.5855",
     "realized_pnl": "497749.08",
     "window_start": "2026-06-27T16:11:27.183000+00:00",
-    "window_end": "2026-07-08T16:54:02.135000+00:00"
+    "window_end": "2026-07-08T16:54:02.135000+00:00",
+    "effective_coins": null
   },
   "0xfdf891f2b214a4c9374d26595ec6d4080262e381": {
     "wallets_md_win_rate": "0.831",
@@ -192,6 +206,7 @@
     "maker_share": "0.7685",
     "realized_pnl": "691084.82",
     "window_start": "2026-05-29T18:52:54.504000+00:00",
-    "window_end": "2026-07-05T07:22:01.626000+00:00"
+    "window_end": "2026-07-05T07:22:01.626000+00:00",
+    "effective_coins": "1.0000"
   }
 }
