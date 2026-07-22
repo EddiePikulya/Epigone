@@ -240,7 +240,7 @@ async def on_positions(
         + "\n"
         + await _activity_block(pool, address, clock.now())
         + "\n\n"
-        + await _render_track_record(pool, address)
+        + await _render_track_record(pool, address, clock.now())
     )
     # Rename (✏️, #86) and an unfollow escape hatch right here: seeing a Trader's
     # positions is exactly when a User names them or decides they've gone bad and
@@ -615,7 +615,7 @@ async def _render_profile(
     parts.extend(
         [
             await _activity_block(pool, address, clock.now()),
-            await _render_track_record(pool, address),
+            await _render_track_record(pool, address, clock.now()),
         ]
     )
     freshness = await _metric_freshness(pool, clock, address)
@@ -1011,13 +1011,15 @@ def _global_min_label(global_min: Decimal | None) -> str:
     return "⚙️ Set global min size"
 
 
-async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
+async def _render_track_record(pool: asyncpg.Pool, address: str, now: datetime) -> str:
     """The profile's metrics block. Metric definitions: docs/metrics.md."""
     row = await pool.fetchrow(
         """
         SELECT t.bot_reason, fm.address IS NOT NULL AS fine_available,
                fm.trade_count, fm.win_rate, fm.avg_win, fm.avg_loss, fm.sharpe,
                fm.max_drawdown, fm.avg_leverage, fm.maker_share, fm.avg_hold_seconds,
+               (SELECT min(ft.opened_at) FROM fine_trades ft WHERE ft.address = t.address)
+                   AS oldest_trade_at,
                cm.pnl AS month_pnl, cm.roi AS month_roi
         FROM traders t
         LEFT JOIN fine_metrics fm ON fm.address = t.address
@@ -1031,7 +1033,7 @@ async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
         # A User may track anything, but the vetting verdict travels with it.
         lines.append(f"⚠️ Flagged as a market-maker bot: {row['bot_reason']}")
     if row is not None and row["fine_available"]:
-        lines.append("Track record (from recent fills):")
+        lines.append(f"Track record ({_trades_span_label(row['oldest_trade_at'], now)}):")
         lines.extend(_fine_lines(row))
     elif row is not None and row["month_pnl"] is not None:
         lines.append("Coarse metrics only — fine stats haven't been computed yet.")
@@ -1039,6 +1041,23 @@ async def _render_track_record(pool: asyncpg.Pool, address: str) -> str:
     else:
         lines.append("No metrics yet — this trader hasn't been scanned.")
     return "\n".join(lines)
+
+
+def _trades_span_label(oldest_trade_at: datetime | None, now: datetime) -> str:
+    """How far back the track record's trades reach, for its header: the age of
+    the OLDEST completed round-trip in the store — so \"61% over 33 trades\" says
+    whether those 33 span a week or a year. Varies wildly per wallet (the
+    2000-fill API cap seeds days of history for a hyperactive wallet, a year+
+    for a quiet one; incremental folding grows it from there). Coarse-grained
+    on purpose: days under ~2 months, months beyond, so it reads at a glance.
+    Falls back to the old wording when there are no stored trips (metrics rows
+    whose trade_count is 0 still render the block)."""
+    if oldest_trade_at is None:
+        return "from recent fills"
+    days = max(1, round((now - oldest_trade_at).total_seconds() / 86400))
+    if days < 60:
+        return f"trades from the last {days} day{'s' if days > 1 else ''}"
+    return f"trades from the last ~{round(days / 30)} months"
 
 
 def _fine_lines(row: asyncpg.Record) -> list[str]:
