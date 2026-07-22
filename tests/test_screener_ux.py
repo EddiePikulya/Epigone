@@ -400,6 +400,57 @@ async def test_profile_follow_then_unfollow_toggles_in_place(
     assert "pfollow:0xstar" in _callback_data(session.edited_messages()[-1].reply_markup)
 
 
+def _address_copy_entity(msg: object) -> object | None:
+    """The header's tap-to-copy `code` entity over the full address (#93), if
+    the outgoing message carries one."""
+    for entity in getattr(msg, "entities", None) or []:
+        if entity.type == "code":
+            return entity
+    return None
+
+
+async def test_profile_header_carries_a_tap_to_copy_full_address(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    # The full address rides in the header text with a `code` entity over it, so
+    # a tap copies it (#93). The entity must land on exactly the address span.
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+
+    msg = session.sent_messages()[-1]
+    assert (msg.text or "").startswith("0xstar — current positions:")  # full address, not short
+    entity = _address_copy_entity(msg)
+    assert entity is not None
+    units = (msg.text or "").encode("utf-16-le")
+    covered = units[entity.offset * 2 : (entity.offset + entity.length) * 2].decode("utf-16-le")
+    assert covered == "0xstar"
+
+
+async def test_profile_follow_toggle_keeps_the_copy_entity(
+    dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    # The follow/unfollow re-render edits the message in place; the header's
+    # copy entity must survive the redraw (#93 acceptance).
+    await add_trader(pool, "0xstar", month_roi="1.5")
+    gateway.set_positions("0xstar", [ETH_SHORT_POS])
+
+    await feed_callback(dp, bot, "profile:0xstar", user_id=111)
+    await feed_callback(dp, bot, "pfollow:0xstar", user_id=111)
+
+    edited = session.edited_messages()[-1]
+    assert _address_copy_entity(edited) is not None
+
+
 async def test_profile_for_a_coarse_only_trader_is_visibly_coarse(
     dp: Dispatcher,
     bot: Bot,

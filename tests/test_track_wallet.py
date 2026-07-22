@@ -176,7 +176,7 @@ async def test_positions_button_shows_current_positions_on_demand(
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
     text = session.sent_messages()[-1].text or ""
-    assert WHALE_SHORT in text
+    assert f"{WHALE} — current positions:" in text  # full address in the header (#93)
     # coin, side, size, leverage, entry, unrealized PnL — all six alert fields
     assert "ETH" in text and "SOL" in text
     assert "SHORT" in text and "LONG" in text
@@ -198,7 +198,7 @@ async def test_positions_view_for_a_trader_with_no_open_positions(
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
     text = session.sent_messages()[-1].text or ""
-    assert WHALE_SHORT in text
+    assert f"{WHALE} has no open positions" in text  # full address in the header (#93)
     assert "no open positions" in text.lower()
 
 

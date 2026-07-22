@@ -12,6 +12,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageEntity,
 )
 
 from epigone.bot.delete import with_delete_button
@@ -21,6 +22,7 @@ from epigone.bot.format import (
     short_address,
     signed_pct,
     signed_usd,
+    trader_header,
     trader_label,
     usd_compact,
 )
@@ -229,8 +231,11 @@ async def on_positions(
         return
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
+    positions_text, entities = _render_positions(
+        address, positions, ages, clock.now(), fills, name=track["name"]
+    )
     view = (
-        _render_positions(address, positions, ages, clock.now(), fills, name=track["name"])
+        positions_text
         + "\n"
         + await _activity_block(pool, address, clock.now())
         + "\n\n"
@@ -248,9 +253,12 @@ async def on_positions(
         )
     )
     if isinstance(callback.message, Message):
-        await callback.message.answer(view, reply_markup=markup)  # the chat the button lives in
+        # the chat the button lives in
+        await callback.message.answer(view, reply_markup=markup, entities=entities)
     else:
-        await bot.send_message(chat_id=callback.from_user.id, text=view, reply_markup=markup)
+        await bot.send_message(
+            chat_id=callback.from_user.id, text=view, reply_markup=markup, entities=entities
+        )
     await callback.answer()
 
 
@@ -268,9 +276,12 @@ async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool) -> 
     if removed and isinstance(callback.message, Message):
         body = callback.message.text or ""
         try:
+            # Preserve the header's tap-to-copy entity (#93): the confirmation is
+            # appended after the header, so the existing offsets still hold.
             await callback.message.edit_text(
                 f"{body}\n\n✖️ Unfollowed — you'll no longer get alerts for this trader.",
                 reply_markup=None,
+                entities=callback.message.entities,
             )
         except TelegramBadRequest:
             pass  # the unfollow itself succeeded; only the in-place confirmation is stale
@@ -355,14 +366,18 @@ async def on_profile(
     on this explicit tap."""
     address = (callback.data or "").removeprefix("profile:")
     try:
-        text, markup = await _render_profile(pool, gateway, clock, callback.from_user.id, address)
+        text, entities, markup = await _render_profile(
+            pool, gateway, clock, callback.from_user.id, address
+        )
     except GatewayError:
         await callback.answer(DATA_DELAYED_TEXT, show_alert=True)
         return
     if isinstance(callback.message, Message):
-        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup, entities=entities)
     else:
-        await bot.send_message(chat_id=callback.from_user.id, text=text, reply_markup=markup)
+        await bot.send_message(
+            chat_id=callback.from_user.id, text=text, reply_markup=markup, entities=entities
+        )
     await callback.answer()
 
 
@@ -413,10 +428,10 @@ async def _refresh_profile_in_place(
 ) -> None:
     if isinstance(callback.message, Message):
         try:
-            text, markup = await _render_profile(
+            text, entities, markup = await _render_profile(
                 pool, gateway, clock, callback.from_user.id, address
             )
-            await callback.message.edit_text(text, reply_markup=markup)
+            await callback.message.edit_text(text, reply_markup=markup, entities=entities)
         except GatewayError:
             pass  # the follow/unfollow itself succeeded; only the redraw is stale
     await callback.answer(toast)
@@ -532,17 +547,18 @@ async def _render_profile(
     clock: Clock,
     user_id: int,
     address: str,
-) -> tuple[str, InlineKeyboardMarkup]:
+) -> tuple[str, list[MessageEntity], InlineKeyboardMarkup]:
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
     track = await fetch_track(pool, user_id, address)
     followed = track is not None
     name: str | None = track["name"] if track is not None else None
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
+    positions_text, entities = _render_positions(
+        address, positions, ages, clock.now(), fills, name=name, offer_follow=not followed
+    )
     parts = [
-        _render_positions(
-            address, positions, ages, clock.now(), fills, name=name, offer_follow=not followed
-        ),
+        positions_text,
         await _activity_block(pool, address, clock.now()),
         await _render_track_record(pool, address),
     ]
@@ -560,7 +576,11 @@ async def _render_profile(
         keyboard.append(
             [InlineKeyboardButton(text="➕ Follow", callback_data=f"pfollow:{address}")]
         )
-    return "\n\n".join(parts), with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard))
+    return (
+        "\n\n".join(parts),
+        entities,
+        with_delete_button(InlineKeyboardMarkup(inline_keyboard=keyboard)),
+    )
 
 
 async def _metric_freshness(pool: asyncpg.Pool, clock: Clock, address: str) -> str | None:
@@ -940,12 +960,18 @@ def _render_positions(
     *,
     name: str | None = None,
     offer_follow: bool = False,
-) -> str:
+) -> tuple[str, list[MessageEntity]]:
     """The shared per-position view (#31): notional plus the real margin at risk,
     return-on-margin, and holding time (#35).
 
+    Returns the rendered text and the header's `code` entities (#93) — a
+    tap-to-copy span over the full address. Callers render this at the start of
+    the message and pass the entities straight to the send/edit call, so the
+    UTF-16 offsets carry through unchanged; text appended after the header does
+    not shift them.
+
     `name` is the viewing User's own nickname for the wallet (#86); the header
-    reads `name (0xshort…)` when set, else the bare short address.
+    reads `name (0xfull…)` when set, else the bare full address.
 
     Age has two sources, in priority order. `ages` maps coin → (opened_at,
     baselined) from the poller's snapshots — the source for a tracked wallet,
@@ -959,11 +985,12 @@ def _render_positions(
     at least one position was left ageless — the honest way to explain the gap:
     the open time is knowable only by observing the wallet, which following
     starts. Suppressed for a follower, who already gets the poller's own age."""
-    label = trader_label(name, address)
+    header, addr_entity = trader_header(name, address)
+    entities = [addr_entity]
     if not positions:
-        return f"{label} has no open positions right now."
+        return f"{header} has no open positions right now.", entities
     fills = fills or {}
-    blocks = [f"{label} — current positions:", ""]
+    blocks = [f"{header} — current positions:", ""]
     any_ageless = False
     for p in positions:
         upnl = f"uPnL {signed_usd(p.unrealized_pnl)}"
@@ -989,7 +1016,7 @@ def _render_positions(
     if offer_follow and any_ageless:
         blocks.append("")
         blocks.append(FOLLOW_FOR_AGE_HINT)
-    return "\n".join(blocks)
+    return "\n".join(blocks), entities
 
 
 async def _position_ages(

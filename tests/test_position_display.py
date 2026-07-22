@@ -98,7 +98,7 @@ def test_fills_open_age_hedges_staleness_as_of_last_scan() -> None:
 
 
 def test_render_shows_margin_notional_and_return_on_margin() -> None:
-    text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
+    text, _ = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
     assert "$3,853 notional" in text  # the leveraged size, still shown
     assert "$96 margin" in text  # the real money at risk (issue #35)
     assert "40x" in text
@@ -107,20 +107,20 @@ def test_render_shows_margin_notional_and_return_on_margin() -> None:
 
 def test_render_shows_a_precise_age_for_a_freshly_opened_position() -> None:
     opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
-    text = _render_positions(WHALE, [BTC_LONG], ages={"BTC": (opened, False)}, now=NOW)
+    text, _ = _render_positions(WHALE, [BTC_LONG], ages={"BTC": (opened, False)}, now=NOW)
     assert "open 2d 4h" in text
 
 
 def test_render_marks_a_baselined_positions_age_as_at_least() -> None:
     opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
-    text = _render_positions(WHALE, [BTC_LONG], ages={"BTC": (opened, True)}, now=NOW)
+    text, _ = _render_positions(WHALE, [BTC_LONG], ages={"BTC": (opened, True)}, now=NOW)
     assert "open ≥2d 4h" in text
 
 
 def test_render_omits_age_when_no_snapshot_exists() -> None:
     # An untracked wallet's profile has no poller snapshot, so there's no honest
     # age to show — the line simply carries none rather than inventing one.
-    text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
+    text, _ = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
     assert "open " not in text
 
 
@@ -137,7 +137,7 @@ FRESH_SCAN = NOW - timedelta(hours=2)
 def test_render_shows_a_fills_derived_age_when_the_episode_matches() -> None:
     # BTC_LONG has no snapshot but a long open episode (net_position > 0) — its
     # age comes from the fills, read as an approximation.
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={},
@@ -149,7 +149,7 @@ def test_render_shows_a_fills_derived_age_when_the_episode_matches() -> None:
 
 def test_render_hedges_a_fills_derived_age_when_the_scan_is_stale() -> None:
     stale_scan = NOW - timedelta(days=3)
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={},
@@ -162,7 +162,7 @@ def test_render_hedges_a_fills_derived_age_when_the_scan_is_stale() -> None:
 def test_render_omits_age_when_the_episode_direction_contradicts_the_position() -> None:
     # The live position is long but the fills snapshot is short — the wallet
     # flipped since the last refresh, so the episode is not this position.
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={},
@@ -175,7 +175,7 @@ def test_render_omits_age_when_the_episode_direction_contradicts_the_position() 
 def test_render_omits_age_for_a_demoted_episode() -> None:
     # net_position 0 is the pre-#63 "never verified" default: it matches no live
     # direction, so it never lends an age.
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={},
@@ -187,7 +187,7 @@ def test_render_omits_age_for_a_demoted_episode() -> None:
 
 def test_render_omits_age_when_no_episode_covers_the_position() -> None:
     # A fills map that has other coins but not this one still shows no age.
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={},
@@ -201,7 +201,7 @@ def test_render_prefers_the_poller_snapshot_over_the_fills_episode() -> None:
     # A tracked wallet keeps its precise poller age even when a fills episode
     # also exists — the snapshot is the fresher source.
     snap_opened = datetime(2026, 7, 11, 8, 0, tzinfo=UTC)  # 4h before NOW
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={"BTC": (snap_opened, False)},
@@ -220,7 +220,7 @@ def test_render_prefers_the_poller_snapshot_over_the_fills_episode() -> None:
 
 
 def test_render_offers_follow_when_an_untracked_position_is_ageless() -> None:
-    text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW, offer_follow=True)
+    text, _ = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW, offer_follow=True)
     assert FOLLOW_FOR_AGE_HINT in text
     assert "age unknown" not in text  # no per-line text — one nudge only
 
@@ -228,7 +228,7 @@ def test_render_offers_follow_when_an_untracked_position_is_ageless() -> None:
 def test_render_shows_no_follow_nudge_for_a_follower() -> None:
     # offer_follow defaults to False (the tracked positions view): an ageless
     # position simply shows no age, exactly as before.
-    text = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
+    text, _ = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
     assert FOLLOW_FOR_AGE_HINT not in text
 
 
@@ -236,7 +236,7 @@ def test_render_omits_the_nudge_when_every_position_is_dated() -> None:
     # An untracked profile where each position already has an age (here a fills
     # episode) needs no nudge — nothing is missing.
     opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG],
         ages={},
@@ -259,7 +259,7 @@ def test_render_offers_follow_when_only_some_positions_are_dated() -> None:
         unrealized_pnl=Decimal("10"),
     )
     opened = datetime(2026, 7, 9, 8, 0, tzinfo=UTC)
-    text = _render_positions(
+    text, _ = _render_positions(
         WHALE,
         [BTC_LONG, sol],
         ages={},
@@ -280,13 +280,62 @@ def test_render_derives_return_on_margin_without_the_api_field() -> None:
         entry_price=Decimal("1677.9"),
         unrealized_pnl=Decimal("-50"),
     )
-    text = _render_positions(WHALE, [bare], ages={}, now=NOW)
+    text, _ = _render_positions(WHALE, [bare], ages={}, now=NOW)
     assert "$100 margin" in text
     assert "-$50 (-50%)" in text
 
 
 def test_render_handles_no_open_positions() -> None:
-    assert "no open positions" in _render_positions(WHALE, [], ages={}, now=NOW)
+    text, _ = _render_positions(WHALE, [], ages={}, now=NOW)
+    assert "no open positions" in text
+
+
+# --- full address, tap-to-copy header (issue #93) ---------------------------
+#
+# The header shows the whole address (not the short form) with a `code` entity
+# over exactly the address span, so Telegram offers tap-to-copy. Offsets are
+# UTF-16 code units, so an emoji in the nickname must be accounted for.
+
+
+def _entity_span(text: str, entity: object) -> str:
+    """The substring a MessageEntity covers, decoded via UTF-16 code units —
+    exactly how Telegram interprets offset/length."""
+    units = text.encode("utf-16-le")
+    start = entity.offset * 2  # type: ignore[attr-defined]
+    end = (entity.offset + entity.length) * 2  # type: ignore[attr-defined]
+    return units[start:end].decode("utf-16-le")
+
+
+def test_header_shows_full_address_with_a_code_entity_unnamed() -> None:
+    text, entities = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW)
+    assert text.startswith(f"{WHALE} — current positions:")
+    (entity,) = entities
+    assert entity.type == "code"
+    assert _entity_span(text, entity) == WHALE  # covers exactly the address
+
+
+def test_header_shows_full_address_with_a_code_entity_named() -> None:
+    text, entities = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW, name="Avax")
+    assert text.startswith(f"Avax ({WHALE}) — current positions:")
+    (entity,) = entities
+    assert entity.type == "code"
+    assert _entity_span(text, entity) == WHALE
+
+
+def test_header_code_entity_survives_an_emoji_nickname() -> None:
+    # A name with an emoji (a UTF-16 surrogate pair) must not shift the entity
+    # off the address — the offset is measured in UTF-16 code units.
+    text, entities = _render_positions(WHALE, [BTC_LONG], ages={}, now=NOW, name="🐳 Whale")
+    assert text.startswith(f"🐳 Whale ({WHALE}) — current positions:")
+    (entity,) = entities
+    assert _entity_span(text, entity) == WHALE
+
+
+def test_no_positions_header_also_carries_the_copy_entity() -> None:
+    text, entities = _render_positions(WHALE, [], ages={}, now=NOW, name="🐳 Whale")
+    assert text.startswith(f"🐳 Whale ({WHALE}) has no open positions")
+    (entity,) = entities
+    assert _entity_span(text, entity) == WHALE
 
 
 # --- recent-activity line (issue #72) ---------------------------------------
