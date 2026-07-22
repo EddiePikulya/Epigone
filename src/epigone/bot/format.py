@@ -4,6 +4,8 @@ Position Alert renderer."""
 from datetime import datetime
 from decimal import Decimal
 
+from aiogram.types import MessageEntity
+
 from epigone.metrics.library import format_duration
 
 
@@ -19,6 +21,29 @@ def trader_label(label: str | None, address: str) -> str:
     short address always rides along so identity stays verifiable."""
     short = short_address(address)
     return f"{label} ({short})" if label else short
+
+
+def trader_header(label: str | None, address: str) -> tuple[str, MessageEntity]:
+    """The positions/profile header identity with the *full* address (#93), plus
+    a `code` MessageEntity over the address span so Telegram offers tap-to-copy.
+
+    Unlike `trader_label`'s short form (kept for scannable lists and alerts),
+    the header is exactly where a viewer wants the whole address to copy — so it
+    reads `name (0xfull…)` or the bare full address. A `code` entity is used in
+    preference to an HTML parse mode: parse mode would force escaping every piece
+    of dynamic text (a nickname may hold `<` or `&`) across the whole message.
+
+    The entity offset is in UTF-16 code units — Telegram's unit — since a name
+    may carry emoji, so the prefix is measured in UTF-16, not characters. The
+    offset is relative to the start of the returned text; callers render this
+    header at the very start of the message, so it carries straight through to
+    the send/edit call."""
+    prefix = f"{label} (" if label else ""
+    suffix = ")" if label else ""
+    text = f"{prefix}{address}{suffix}"
+    offset = len(prefix.encode("utf-16-le")) // 2
+    length = len(address.encode("utf-16-le")) // 2
+    return text, MessageEntity(type="code", offset=offset, length=length)
 
 
 def signed_usd(amount: Decimal) -> str:

@@ -144,10 +144,10 @@ async def test_rename_persists_and_shows_on_the_positions_header(
     confirmation = session.sent_messages()[-1].text or ""
     assert f"silver guy ({WHALE_SHORT})" in confirmation
 
-    # The positions header now reads name (0xshort…).
+    # The positions header reads name (0xfull…) with the full address (#93).
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
     header = session.sent_messages()[-1].text or ""
-    assert f"silver guy ({WHALE_SHORT})" in header
+    assert header.startswith(f"silver guy ({WHALE})")
 
 
 async def test_tracked_list_shows_the_name(
