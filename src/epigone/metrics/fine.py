@@ -111,10 +111,35 @@ class BatchLead:
 
 
 @dataclass(frozen=True)
+class TripMetrics:
+    """The Metric Library values reducible from a list of completed round-trips
+    alone — every fine metric except the whole-history, fill-level accumulators
+    (maker_share, realized_pnl). Because these derive purely from the trips, the
+    same reducer computes them over ANY slice of the trip list: the whole store
+    for the profile's all-time record, or the round-trips closed inside a
+    window for the track-record toggle (#102). None means "not computable from
+    these trips" — the screener/profile treat None as absent, never as zero."""
+
+    trade_count: int
+    win_rate: Decimal | None
+    avg_win: Decimal | None
+    avg_loss: Decimal | None  # positive magnitude
+    sharpe: Decimal | None
+    max_drawdown: Decimal  # USD depth of the worst realized-PnL fall
+    avg_leverage: Decimal | None
+    avg_hold_seconds: int | None  # mean round-trip duration; None with no completed trades
+    effective_coins: Decimal | None  # inverse-HHI coin spread of round-trips; None with no trips
+
+
+@dataclass(frozen=True)
 class FineMetrics:
     """Fills-derived Metric Library values. None means "not computable from
     this fill history" (no trades, no losses, one active day, …) — the
-    screener treats None as absent, never as zero."""
+    screener treats None as absent, never as zero.
+
+    The trip-derived fields mirror TripMetrics one-for-one; the accumulator
+    fields (maker_share, realized_pnl, the fill counts and window bounds) are
+    the whole-history readings that no trip slice can reconstruct."""
 
     trade_count: int
     win_rate: Decimal | None
@@ -240,15 +265,20 @@ def fold_state(prior: FineState, new_fills: list[Fill]) -> FineState:
     return fold_states(prior, extract_state(new_fills))
 
 
-def metrics_from_state(state: FineState, account_value: Decimal | None) -> FineMetrics:
-    """Reduce an accumulated FineState to Metric Library values. `account_value`
-    (from the coarse pass) anchors the leverage estimate; without it
-    avg_leverage is None. Recomputed in full each refresh, so leverage always
-    reflects today's account value."""
-    trips = list(state.round_trips)
+def reduce_trips(trips: list[RoundTrip], account_value: Decimal | None) -> TripMetrics:
+    """Reduce a list of completed round-trips to the trip-derived Metric Library
+    values — the single definition of win rate, avg win/loss, Sharpe, max
+    drawdown, avg size, avg hold and effective coins. `account_value` (from the
+    coarse pass) anchors the leverage estimate; without it avg_leverage is None.
+
+    The formulas live here and nowhere else: `metrics_from_state` reduces the
+    whole store through this for the persisted fine metrics, and the profile's
+    track-record toggle (#102) reduces a windowed trip slice through the very
+    same function, so a windowed reading can never drift from the engine's
+    definitions."""
     wins = [t.pnl for t in trips if t.pnl > 0]
     losses = [t.pnl for t in trips if t.pnl < 0]
-    return FineMetrics(
+    return TripMetrics(
         trade_count=len(trips),
         win_rate=Decimal(len(wins)) / len(trips) if trips else None,
         avg_win=sum(wins, Decimal(0)) / len(wins) if wins else None,
@@ -256,15 +286,38 @@ def metrics_from_state(state: FineState, account_value: Decimal | None) -> FineM
         sharpe=_sharpe(trips),
         max_drawdown=_max_drawdown(trips),
         avg_leverage=_avg_leverage(trips, account_value),
+        avg_hold_seconds=(
+            sum(t.hold_seconds for t in trips) // len(trips) if trips else None
+        ),
+        effective_coins=_effective_coins(trips),
+    )
+
+
+def metrics_from_state(state: FineState, account_value: Decimal | None) -> FineMetrics:
+    """Reduce an accumulated FineState to Metric Library values. `account_value`
+    (from the coarse pass) anchors the leverage estimate; without it
+    avg_leverage is None. Recomputed in full each refresh, so leverage always
+    reflects today's account value.
+
+    The trip-derived metrics come from the shared `reduce_trips`; only the
+    fill-level accumulators (maker_share, realized_pnl, the fill counts and the
+    fill window) are read off the folded state itself."""
+    trip = reduce_trips(list(state.round_trips), account_value)
+    return FineMetrics(
+        trade_count=trip.trade_count,
+        win_rate=trip.win_rate,
+        avg_win=trip.avg_win,
+        avg_loss=trip.avg_loss,
+        sharpe=trip.sharpe,
+        max_drawdown=trip.max_drawdown,
+        avg_leverage=trip.avg_leverage,
         maker_share=(
             Decimal(state.maker_fill_count) / state.perp_fill_count
             if state.perp_fill_count
             else None
         ),
-        avg_hold_seconds=(
-            sum(t.hold_seconds for t in trips) // len(trips) if trips else None
-        ),
-        effective_coins=_effective_coins(trips),
+        avg_hold_seconds=trip.avg_hold_seconds,
+        effective_coins=trip.effective_coins,
         realized_pnl=state.realized_pnl,
         perp_fill_count=state.perp_fill_count,
         window_start=state.window_start,
