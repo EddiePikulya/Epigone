@@ -34,8 +34,10 @@ from epigone.bot.handlers import (
     SCREENER_PAGE_SIZE,
     SCREENER_PENDING_LABEL,
     follow_toast,
+    previously_marker,
     track_address,
     tracked_set,
+    unfollowed_set,
     upsert_user,
 )
 from epigone.clock import Clock
@@ -682,12 +684,15 @@ async def _render_results(
         f"{METRICS[criteria.sort_key].label}, {direction}",
         "",
     ]
-    tracked = await tracked_set(pool, user_id, [r.address for r in rows])
+    addresses = [r.address for r in rows]
+    tracked = await tracked_set(pool, user_id, addresses)
+    unfollowed = await unfollowed_set(pool, user_id, addresses)
     keyboard: list[list[InlineKeyboardButton]] = []
     for rank, row in enumerate(rows, start=offset + 1):
-        lines.append(f"{rank}. {row.display_name or short_address(row.address)}")
-        lines.append(f"    {_stats_line(row, criteria)}")
         followed = row.address in tracked
+        name = row.display_name or short_address(row.address)
+        lines.append(f"{rank}. {name}{previously_marker(row.address, followed, unfollowed)}")
+        lines.append(f"    {_stats_line(row, criteria)}")
         keyboard.append(
             [
                 InlineKeyboardButton(

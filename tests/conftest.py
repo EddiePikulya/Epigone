@@ -46,7 +46,7 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
     async with pool.acquire() as conn:
         await conn.execute(
             "TRUNCATE users, traders, coarse_metrics, fine_metrics, fine_trades, "
-            "fine_open_episodes, tracks, position_poll_state, position_snapshots, "
+            "fine_open_episodes, tracks, unfollows, position_poll_state, position_snapshots, "
             "position_alerts, first_data_notices, criteria, criteria_preset_dismissals, "
             "rate_budget, rate_limit_events, allowlist"
         )
