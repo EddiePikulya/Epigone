@@ -147,24 +147,43 @@ FOLLOW_FOR_AGE_HINT = "↳ Follow to track how long these positions have been op
 @dataclass(frozen=True)
 class TrackWindow:
     """One span of the track-record toggle (#102): the callback token that
-    carries it, the span it reduces over, the button label, and the header
-    clause that keeps the #101 header honest for the window."""
+    carries it, the span it reduces over, the button label, the header clause
+    that keeps the #101 header honest for the window, and — for the activity
+    line (#104) — the coarse leaderboard window it reads and the label that
+    names that span in the PnL/ROI clause."""
 
     key: str  # callback token; also the "all" sentinel's absence
     span: timedelta
     label: str  # button text
     header: str  # the "(…)" clause after "Track record"
+    coarse_window: str  # coarse_metrics.time_window the activity line reads (#104)
+    pnl_label: str  # the activity line's PnL/ROI span prefix ("week"/"month")
 
 
 # The windows the toggle offers, most-recent first. `all` is not in this list —
 # it is the default (window=None), always shown as its own button whenever any
-# window button is (see _track_window_row).
+# window button is (see _track_window_row). Each carries the coarse leaderboard
+# window the activity line reads for it (#104): 7d → week, 30d → month.
 TRACK_WINDOWS = (
-    TrackWindow("7d", timedelta(days=7), "7d", "trades from the last 7 days"),
-    TrackWindow("30d", timedelta(days=30), "30d", "trades from the last 30 days"),
+    TrackWindow("7d", timedelta(days=7), "7d", "trades from the last 7 days", "week", "week"),
+    TrackWindow("30d", timedelta(days=30), "30d", "trades from the last 30 days", "month", "month"),
 )
 _TRACK_WINDOWS_BY_KEY = {w.key: w for w in TRACK_WINDOWS}
 ALL_WINDOW_KEY = "all"
+
+# The activity line's coarse window and label for the default (All / window=None)
+# view (#104): all-time, matching the default track record's all-time span.
+ALL_ACTIVITY_COARSE_WINDOW = "allTime"
+ALL_ACTIVITY_PNL_LABEL = "all-time"
+
+
+def _activity_coarse_window(window: TrackWindow | None) -> tuple[str, str]:
+    """The coarse leaderboard window and PnL/ROI label the activity line reads for
+    a toggle position (#104): All (window=None) → all-time, 7d → week, 30d →
+    month, each labeled to name the span it covers."""
+    if window is None:
+        return ALL_ACTIVITY_COARSE_WINDOW, ALL_ACTIVITY_PNL_LABEL
+    return window.coarse_window, window.pnl_label
 
 
 def _parse_track_window(token: str) -> TrackWindow | None:
@@ -398,7 +417,7 @@ async def _render_positions_view(
     view = (
         positions_text
         + "\n"
-        + await _activity_block(pool, address, clock.now())
+        + await _activity_block(pool, address, clock.now(), window=window)
         + "\n\n"
         + await _render_track_record(pool, address, clock.now(), window=window)
     )
@@ -796,7 +815,7 @@ async def _render_profile(
             parts.append(previously)
     parts.extend(
         [
-            await _activity_block(pool, address, clock.now()),
+            await _activity_block(pool, address, clock.now(), window=window),
             await _render_track_record(pool, address, clock.now(), window=window),
         ]
     )
@@ -843,77 +862,93 @@ async def _metric_freshness(pool: asyncpg.Pool, clock: Clock, address: str) -> s
     return f"🕒 Metrics updated {_relative_age(clock.now(), latest)}"
 
 
-async def _activity_block(pool: asyncpg.Pool, address: str, now: datetime) -> str:
+async def _activity_block(
+    pool: asyncpg.Pool, address: str, now: datetime, *, window: TrackWindow | None = None
+) -> str:
     """The shared activity block both view-assembly paths render — on_positions
     (a follower's positions view) and _render_profile (the screener profile). The
-    #72 last-trade/month-performance line always, plus the #80 most-played line
+    #72 last-trade/performance line always, plus the #80 most-played line
     right beneath it when the fine store has coins to rank. Assembling it once here
     keeps the two paths from drifting apart (the PR #77 regression: a line added to
-    only one path)."""
-    lines = [await _recent_activity(pool, address, now)]
+    only one path).
+
+    `window` is the track-record toggle (#104): it selects the coarse leaderboard
+    window the performance line reads (All → all-time, 7d → week, 30d → month), so
+    the line re-renders in step with the record beneath it. Most-played and the
+    last-trade recency are window-independent."""
+    lines = [await _recent_activity(pool, address, now, window=window)]
     most_played = await _most_played(pool, address)
     if most_played is not None:
         lines.append(most_played)
     return "\n".join(lines)
 
 
-async def _recent_activity(pool: asyncpg.Pool, address: str, now: datetime) -> str:
+async def _recent_activity(
+    pool: asyncpg.Pool, address: str, now: datetime, *, window: TrackWindow | None = None
+) -> str:
     """The positions view's activity line: when the wallet last traded and how it
     has been doing lately (issue #72).
 
     Last trade is the fine store's newest folded *perp* fill (fine_metrics.window_end,
     perp-only by construction — spot fills never advance it), qualified by how fresh
-    that fills scan is (computed_at). PnL/ROI are the coarse leaderboard month, which
-    exists even for wallets the fine pass hasn't reached, so the line never depends on
-    fine availability."""
+    that fills scan is (computed_at). PnL/ROI are the coarse leaderboard window the
+    toggle selects (#104: All → all-time, 7d → week, 30d → month), which exists even
+    for wallets the fine pass hasn't reached, so the line never depends on fine
+    availability. `account_value` rides the same coarse row (identical across windows
+    — one leaderboard entry seeds them all), so it reads unchanged across toggles."""
+    coarse_window, label = _activity_coarse_window(window)
     row = await pool.fetchrow(
         """
         SELECT fm.window_end AS last_trade_at,
                fm.computed_at AS fills_seen_at,
-               cm.pnl AS month_pnl,
-               cm.roi AS month_roi,
+               cm.pnl AS pnl,
+               cm.roi AS roi,
                cm.account_value AS account_value
         FROM (SELECT $1::text AS address) a
         LEFT JOIN fine_metrics fm ON fm.address = a.address
-        LEFT JOIN coarse_metrics cm ON cm.address = a.address AND cm.time_window = 'month'
+        LEFT JOIN coarse_metrics cm ON cm.address = a.address AND cm.time_window = $2
         """,
         address,
+        coarse_window,
     )
     return _render_recent_activity(
         row["last_trade_at"],
         row["fills_seen_at"],
-        row["month_pnl"],
-        row["month_roi"],
+        row["pnl"],
+        row["roi"],
         row["account_value"],
         now,
+        label,
     )
 
 
 def _render_recent_activity(
     last_trade_at: datetime | None,
     fills_seen_at: datetime | None,
-    month_pnl: Decimal | None,
-    month_roi: Decimal | None,
+    pnl: Decimal | None,
+    roi: Decimal | None,
     account_value: Decimal | None,
     now: datetime,
+    label: str = ALL_ACTIVITY_PNL_LABEL,
 ) -> str:
-    """Render the last-trade + month-performance line from already-fetched values.
+    """Render the last-trade + performance line from already-fetched values.
 
     `last_trade_at` is the newest perp fill we've folded; `fills_seen_at` is when
     that fills knowledge was last refreshed. A wallet with no captured perp fills
-    (`last_trade_at is None`) says so plainly. The month PnL/ROI ride along when the
-    coarse leaderboard has them — ROI is a fraction (0.12 == 12%). `account_value`
-    is the coarse denominator (#85): PnL, ROI and position sizes all read against
-    it, so it trails the line when the coarse row carries it and is omitted when
-    absent (it exists even without fine data)."""
+    (`last_trade_at is None`) says so plainly. The PnL/ROI ride along when the
+    coarse leaderboard has them — ROI is a fraction (0.12 == 12%) — labeled by
+    `label` to name the window they cover (#104: "week"/"month"/"all-time").
+    `account_value` is the coarse denominator (#85): PnL, ROI and position sizes
+    all read against it, so it trails the line when the coarse row carries it and
+    is omitted when absent (it exists even without fine data)."""
     if last_trade_at is None:
         parts = ["No recent trading activity seen"]
     else:
         age = _relative_age(now, last_trade_at)
         stale = _fills_stale(fills_seen_at, now)
         parts = [f"Last trade: {age} (as of last scan)" if stale else f"Last trade: {age}"]
-    if month_pnl is not None and month_roi is not None:
-        parts.append(f"month PnL {signed_usd(month_pnl)} (ROI {signed_pct(month_roi)})")
+    if pnl is not None and roi is not None:
+        parts.append(f"{label} PnL {signed_usd(pnl)} (ROI {signed_pct(roi)})")
     if account_value is not None:
         parts.append(f"account {usd_compact(account_value)}")
     return " · ".join(parts)
