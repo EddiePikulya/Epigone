@@ -12,7 +12,8 @@ MAX_DELIVERY_ATTEMPTS so a single dead chat can't wedge the queue.
 
 That send-with-retry loop lives here once, so a fix to the retry rule can never
 drift between the two queues; each caller supplies only what differs — which
-rows to drain (`fetch`) and how to render one (`build`).
+rows to drain (`fetch`) and how to deliver one (`deliver`: a fresh send, or an
+in-place edit of an earlier message — issue #91).
 """
 
 import logging
@@ -26,7 +27,6 @@ from aiogram.exceptions import (
     TelegramRetryAfter,
     TelegramServerError,
 )
-from aiogram.types import InlineKeyboardMarkup
 
 from epigone.clock import Clock
 
@@ -43,19 +43,20 @@ async def drain_outbox(
     *,
     table: str,
     fetch: Callable[[asyncpg.Pool], Awaitable[Sequence[asyncpg.Record]]],
-    build: Callable[[asyncpg.Record], tuple[str, InlineKeyboardMarkup]],
+    deliver: Callable[[Bot, asyncpg.Record], Awaitable[None]],
 ) -> int:
-    """Drain one outbox pass: send every undelivered row `fetch` returns,
-    stamping delivered_at as each is accepted, and return the delivered count.
-    `build` renders a row to its (text, reply_markup); `table` is the outbox to
-    stamp — a trusted module constant, never user input, so it is safe to inline
-    into the UPDATE."""
+    """Drain one outbox pass: hand every undelivered row `fetch` returns to
+    `deliver`, stamping delivered_at as each is accepted, and return the
+    delivered count. `deliver` performs the row's Telegram action (a fresh
+    send, or an in-place edit of an earlier anchor — issue #91) plus any
+    delivery-time bookkeeping it needs; raising the usual Telegram exceptions
+    routes retry/abort here. `table` is the outbox to stamp — a trusted module
+    constant, never user input, so it is safe to inline into the UPDATE."""
     rows = await fetch(pool)
     delivered = 0
     for row in rows:
-        text, markup = build(row)
         try:
-            await bot.send_message(chat_id=row["user_telegram_id"], text=text, reply_markup=markup)
+            await deliver(bot, row)
         except (TelegramNetworkError, TelegramRetryAfter, TelegramServerError):
             # Telegram itself is struggling, not this chat: touching attempts
             # here would bleed rows away during an outage. Leave every remaining

@@ -37,16 +37,20 @@ async def run_first_data_notice_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock)
 
 async def deliver_first_data_notices(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
     """Send every ready, undelivered notice, oldest first. Returns the count."""
+    async def deliver(bot: Bot, row: asyncpg.Record) -> None:
+        await bot.send_message(
+            chat_id=row["user_telegram_id"],
+            text=render_first_data_notice(row["trader_address"], row["track_name"]),
+            reply_markup=_profile_button(row["trader_address"]),
+        )
+
     return await drain_outbox(
         pool,
         bot,
         clock,
         table="first_data_notices",
         fetch=_fetch_ready_notices,
-        build=lambda row: (
-            render_first_data_notice(row["trader_address"], row["track_name"]),
-            _profile_button(row["trader_address"]),
-        ),
+        deliver=deliver,
     )
 
 
