@@ -160,6 +160,17 @@ async def test_tracked_list_shows_the_name(
 
     listing = session.sent_messages()[-1].text or ""
     assert f"silver guy ({WHALE_SHORT})" in listing
+    # The positions button reads by name too — the list line above carries the
+    # verifiable address, so the button drops it (same rule as alert buttons).
+    markup = session.sent_messages()[-1].reply_markup
+    positions_buttons = [
+        b
+        for row in markup.inline_keyboard
+        for b in row
+        if (b.callback_data or "").startswith("positions:")
+    ]
+    assert any("silver guy" in b.text for b in positions_buttons)
+    assert not any(WHALE_SHORT in b.text for b in positions_buttons)
 
 
 async def test_rename_is_clearable_back_to_the_address(

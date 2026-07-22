@@ -17,6 +17,7 @@ from aiogram.types import (
 
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import (
+    button_label,
     fills_open_age,
     open_age,
     short_address,
@@ -871,7 +872,10 @@ async def _render_tracked_list(
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=f"📊 {short_address(address)}", callback_data=f"positions:{address}"
+                    # Named wallets read by name on the button (#86); the list
+                    # line above carries the verifiable address.
+                    text=f"📊 {button_label(row['name'], address)}",
+                    callback_data=f"positions:{address}",
                 ),
                 _mute_button(address, row["muted"]),
             ]
