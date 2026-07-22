@@ -12,7 +12,7 @@ from typing import cast
 import asyncpg
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNetworkError
-from aiogram.methods import SendMessage, TelegramMethod
+from aiogram.methods import EditMessageText, SendMessage, TelegramMethod
 from aiogram.methods.base import TelegramType
 
 from epigone.bot.alerts import MAX_DELIVERY_ATTEMPTS, deliver_pending
@@ -158,63 +158,252 @@ async def test_a_flip_alert_shows_both_legs(
     assert "entry 110" in message.text
 
 
-async def test_a_scale_in_alert_shows_size_and_the_positions_pnl(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+async def queue_scale(
+    pool: asyncpg.Pool,
+    *,
+    kind: str = "scale_in",
+    address: str = "0xaaa",
+    coin: str = "BTC",
+    side: str = "long",
+    size_usd: str = "25000",
+    prev_size_usd: str = "10000",
+    leverage: str = "5",
 ) -> None:
+    """A scale alert row (add/trim), defaulting to the same BTC-long the open
+    helpers use so it resolves against a queued open anchor (issue #91)."""
     await queue_alert(
         pool,
-        kind="scale_in",
-        side="long",
-        size_usd="25000",
-        prev_size_usd="10000",
-        leverage="5",
-        pct_return="0.32",  # the position's return on margin, not the size growth
+        kind=kind,
+        address=address,
+        coin=coin,
+        side=side,
+        size_usd=size_usd,
+        prev_size_usd=prev_size_usd,
+        leverage=leverage,
     )
 
-    await deliver_pending(pool, bot, clock)
 
-    (message,) = session.sent_messages()
-    assert "added to BTC LONG" in message.text
-    assert "$10,000 → $25,000" in message.text  # size change still shown, in dollars
-    assert "at 5x" in message.text
-    assert "PnL +32%" in message.text  # is the trade winning?
-    assert "+150%" not in message.text  # no longer the size-growth %
-
-
-async def test_a_scale_out_alert_shows_size_and_the_positions_pnl(
+async def test_a_scale_in_edits_the_open_alert_appending_an_up_arrow(
     pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:
+    """The #91 core: an add sends no new message — it edits the open alert,
+    appending ⬆️, and the open's Telegram message id was persisted at delivery."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    assert await deliver_pending(pool, bot, clock) == 1
+    anchor_id = await pool.fetchval(
+        "SELECT telegram_message_id FROM position_alerts WHERE kind = 'open'"
+    )
+    assert anchor_id == 1  # learned from the send result and persisted
+
+    await queue_scale(pool, kind="scale_in")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    assert len(session.sent_messages()) == 1  # no second message
+    (edit,) = session.edited_messages()
+    assert edit.message_id == 1
+    assert edit.chat_id == 42
+    assert "opened BTC LONG" in edit.text  # the open's own text is preserved
+    assert edit.text.endswith("⬆️")
+
+
+async def test_a_scale_out_appends_a_down_arrow(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_scale(pool, kind="scale_out", size_usd="4000")
+    await deliver_pending(pool, bot, clock)
+
+    (edit,) = session.edited_messages()
+    assert edit.text.endswith("⬇️")
+
+
+async def test_scales_accumulate_arrows_on_the_open_in_event_order(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The message accumulates the position's life story: each scale appends its
+    arrow to the changes line, in the order the events happened."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    for kind in ("scale_in", "scale_out", "scale_in"):
+        await queue_scale(pool, kind=kind)
+        await deliver_pending(pool, bot, clock)
+
+    trails = [edit.text.splitlines()[-1] for edit in session.edited_messages()]
+    assert trails == ["⬆️", "⬆️⬇️", "⬆️⬇️⬆️"]
+
+
+async def test_a_scale_edit_preserves_the_tap_through_and_delete_keyboard(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Editing text must not strip the buttons: the tap-through (#47) and the
+    🗑 delete row (#73) ride through the edit intact."""
+    address = "0x1116b5fcc070945062e8879841c29807db373d0d"
+    await queue_alert(pool, address=address, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_scale(pool, address=address)
+    await deliver_pending(pool, bot, clock)
+
+    (edit,) = session.edited_messages()
+    assert edit.reply_markup is not None
+    (button,) = edit.reply_markup.inline_keyboard[0]
+    assert button.callback_data == f"positions:{address}"
+    assert edit.reply_markup.inline_keyboard[-1][0].callback_data == "msgdel"
+
+
+async def test_a_scale_with_no_open_alert_is_silently_dropped(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Followed after the open, so no open alert ever existed: the scale does
+    nothing — no message, no edit — and is stamped delivered, never retried."""
+    await queue_scale(pool, kind="scale_in")
+
+    assert await deliver_pending(pool, bot, clock) == 1
+    assert session.sent_messages() == []
+    assert session.edited_messages() == []
+    assert await pool.fetchval("SELECT delivered_at FROM position_alerts") is not None
+
+
+async def test_a_scale_on_a_deleted_open_message_is_silently_dropped(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """The open message is gone (tapped 🗑, or hand-deleted): Telegram rejects
+    the edit with a bad-request, which is the expected silent outcome — the
+    scale is stamped delivered without burning attempts, not left to retry."""
+    session = EditRejectingSession()
+    bot = make_bot(session)
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    await queue_scale(pool, kind="scale_in")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    scale = await pool.fetchrow("SELECT * FROM position_alerts WHERE kind = 'scale_in'")
+    assert scale is not None
+    assert scale["delivered_at"] is not None
+    assert scale["attempts"] == 0  # a bad-request edit is not a poison send
+    await bot.session.close()
+
+
+async def test_a_scale_after_a_close_with_no_new_open_is_silently_dropped(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The instance closed and re-opened, but the re-open left no alert (floor
+    suppressed, or joined after it): the scale must not bind its arrow to the
+    prior, now-closed instance's message — it is silently dropped instead."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)  # message 1: the closed instance
     await queue_alert(
         pool,
-        kind="scale_out",
+        kind="close",
+        coin="BTC",
+        side=None,
+        size_usd=None,
+        leverage=None,
+        entry_price=None,
+        prev_side="long",
+    )
+    await deliver_pending(pool, bot, clock)  # message 2: the close
+
+    await queue_scale(pool, kind="scale_in")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    assert session.edited_messages() == []  # no arrow on the closed instance
+    assert len(session.sent_messages()) == 2  # only the open and the close
+
+
+async def test_scale_arrows_land_after_a_bot_restart(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """Message ids survive restarts: a fresh bot process, sharing only Postgres,
+    still edits the right message because the id was persisted at delivery."""
+    first = RecordingSession()
+    bot1 = make_bot(first)
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot1, clock)
+    await bot1.session.close()
+
+    second = RecordingSession()  # its own message-id counter starts fresh at 0
+    bot2 = make_bot(second)
+    await queue_scale(pool, kind="scale_in")
+    assert await deliver_pending(pool, bot2, clock) == 1
+
+    (edit,) = second.edited_messages()
+    assert edit.message_id == 1  # the id the first process captured, read from Postgres
+    assert edit.text.endswith("⬆️")
+    await bot2.session.close()
+
+
+async def test_a_scale_queued_before_its_open_is_delivered_still_lands(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Pending-delivery race: both undelivered in one drain. Oldest-first sends
+    the open (capturing its id) before the scale, so the arrow still lands."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await queue_scale(pool, kind="scale_in")
+
+    assert await deliver_pending(pool, bot, clock) == 2
+    (sent,) = session.sent_messages()
+    (edit,) = session.edited_messages()
+    assert edit.message_id == 1
+    assert edit.text.endswith("⬆️")
+
+
+async def test_an_arrow_survives_an_open_that_fails_its_first_send(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """The append-before-send path: the open's first send is rejected, so the
+    scale runs against a not-yet-delivered anchor and records its arrow on the
+    row. When the open finally sends, its text carries that arrow from the start."""
+    flaky = FlakySession(failures=1)  # the open (first send) is rejected once
+    bot = make_bot(flaky)
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await queue_scale(pool, kind="scale_in")
+
+    # Pass 1: open send rejected (attempts++); scale appends its arrow to the row.
+    assert await deliver_pending(pool, bot, clock) == 1
+    assert flaky.edited_messages() == []  # anchor not on Telegram yet, nothing to edit
+
+    # Pass 2: the open retries and now sends with the arrow already in its text.
+    assert await deliver_pending(pool, bot, clock) == 1
+    (sent,) = flaky.sent_messages()
+    assert sent.text.endswith("⬆️")
+    await bot.session.close()
+
+
+async def test_a_flip_becomes_the_anchor_for_later_scales(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """A flip closes one instance and opens a new one, so it is the anchor for
+    subsequent arrows — they land on the flip message, not the original open."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)  # message id 1
+
+    await queue_alert(
+        pool,
+        kind="flip",
+        coin="BTC",
         side="short",
-        size_usd="4000",
-        prev_size_usd="10000",
-        leverage="5",
-        pct_return="-0.08",  # trimming a losing position
+        prev_side="long",
+        size_usd="15000",
+        leverage="3",
+        entry_price="110",
+        realized_pnl="-120",
+        pct_return="-0.06",
+        opened_at=T0 - timedelta(hours=2),
     )
+    await deliver_pending(pool, bot, clock)  # message id 2 — the new anchor
 
+    await queue_scale(pool, kind="scale_in", side="short", leverage="3")
     await deliver_pending(pool, bot, clock)
 
-    (message,) = session.sent_messages()
-    assert "trimmed BTC SHORT" in message.text
-    assert "$10,000 → $4,000" in message.text
-    assert "PnL -8%" in message.text
-
-
-async def test_a_scale_alert_without_pnl_data_just_shows_the_size(
-    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
-) -> None:
-    # pct_return is nullable; a scale alert missing it degrades to size-only.
-    await queue_alert(
-        pool, kind="scale_in", side="long", size_usd="25000", prev_size_usd="10000", leverage="5"
-    )
-
-    await deliver_pending(pool, bot, clock)
-
-    (message,) = session.sent_messages()
-    assert "$10,000 → $25,000 at 5x" in message.text
-    assert "PnL" not in message.text
+    (edit,) = session.edited_messages()
+    assert edit.message_id == 2  # the flip, not the original open
+    assert "flipped BTC LONG → SHORT" in edit.text
+    assert edit.text.endswith("⬆️")
 
 
 async def test_an_xyz_market_alert_names_the_dex_qualified_coin(
@@ -284,6 +473,22 @@ async def test_alerts_deliver_oldest_first(
 
     texts = [m.text for m in session.sent_messages()]
     assert "BTC" in texts[0] and "SOL" in texts[1]
+
+
+class EditRejectingSession(RecordingSession):
+    """Rejects every edit the way Telegram does when the target message is gone
+    (deleted, or too old) — a TelegramBadRequest — while sends succeed."""
+
+    async def make_request(
+        self,
+        bot: Bot,
+        method: TelegramMethod[TelegramType],
+        timeout: int | None = None,
+    ) -> TelegramType:
+        if isinstance(method, EditMessageText):
+            self.requests.append(method)
+            raise TelegramBadRequest(method=method, message="message to edit not found")
+        return cast(TelegramType, await super().make_request(bot, method, timeout))
 
 
 class FlakySession(RecordingSession):
