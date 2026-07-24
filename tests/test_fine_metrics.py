@@ -33,13 +33,19 @@ def compute(fills: list[Fill], account_value: Decimal | None = None) -> FineMetr
     return compute_fine_metrics(fills, account_value=account_value)
 
 
-def _open(coin: str = "HYPE", *, at: datetime, size: str = "1", crossed: bool = True) -> Fill:
-    return fill("Open Long", coin=coin, at=at, start_position="0", size=size, crossed=crossed)
+def _open(
+    coin: str = "HYPE", *, at: datetime, size: str = "1", price: str = "10", crossed: bool = True
+) -> Fill:
+    return fill(
+        "Open Long", coin=coin, at=at, start_position="0", size=size, price=price, crossed=crossed
+    )
 
 
-def _add(coin: str = "HYPE", *, at: datetime, start: str = "1", size: str = "1") -> Fill:
+def _add(
+    coin: str = "HYPE", *, at: datetime, start: str = "1", size: str = "1", price: str = "10"
+) -> Fill:
     # A same-side scale-in: already long, adding more, so it never crosses 0.
-    return fill("Open Long", coin=coin, at=at, start_position=start, size=size)
+    return fill("Open Long", coin=coin, at=at, start_position=start, size=size, price=price)
 
 
 def _close(
@@ -635,9 +641,13 @@ def test_folding_the_fills_since_a_checkpoint_equals_computing_the_union() -> No
         *trip(pnl="25", at=T0 + timedelta(days=3), coin="ETH"),
     ]
     account = Decimal("1000")
-    folded = metrics_from_state(fold_state(extract_state(early), late), account)
+    folded_state = fold_state(extract_state(early), late)
+    folded = metrics_from_state(folded_state, account)
     whole = compute_fine_metrics(early + late, account_value=account)
     assert folded == whole
+    # The equivalence holds for the stored trips themselves too — including
+    # the #116 VWAP fields riding them, not just the reduced metrics.
+    assert folded_state.round_trips == extract_state(early + late).round_trips
 
 
 def test_a_round_trip_accumulates_net_pnl_across_multiple_refreshes() -> None:
@@ -1100,3 +1110,164 @@ def test_reduce_trips_over_nothing_is_all_none() -> None:
     assert empty.avg_hold_seconds is None
     assert empty.effective_coins is None
     assert empty.max_drawdown == Decimal("0")
+
+
+# --- Entry/exit VWAPs (issue #116) --------------------------------------------
+# Each round-trip records the size-weighted average price of its
+# position-increasing fills (entry) and of its decreasing fills' closing
+# portions (exit). The weighted sums ride the open episode across checkpoints
+# exactly like pnl and peak_notional, so the fold must reproduce what one
+# whole-batch pass computes to the digit, and the #63 demotion must drop the
+# sums with the episode.
+
+
+def test_a_round_trips_entry_and_exit_vwaps_are_its_fill_prices() -> None:
+    state = extract_state(
+        [_open(at=T0, price="10"), _close(at=T0 + timedelta(hours=1), price="12")]
+    )
+    (t,) = state.round_trips
+    assert (t.entry_vwap, t.exit_vwap) == (Decimal("10"), Decimal("12"))
+
+
+def test_vwaps_weight_scale_ins_and_trims_by_size() -> None:
+    state = extract_state(
+        [
+            _open(at=T0, size="1", price="10"),
+            _add(at=T0 + timedelta(minutes=5), start="1", size="3", price="20"),
+            _close(at=T0 + timedelta(hours=1), start="4", size="2", price="30", pnl="1"),
+            _close(at=T0 + timedelta(hours=2), start="2", size="2", price="40", pnl="1"),
+        ]
+    )
+    (t,) = state.round_trips
+    assert t.entry_vwap == Decimal("17.5")  # (1·10 + 3·20) / 4
+    assert t.exit_vwap == Decimal("35")  # (2·30 + 2·40) / 4
+
+
+def test_a_flip_splits_its_fill_price_at_the_zero_crossing() -> None:
+    state = extract_state(
+        [
+            _open(at=T0, price="10"),
+            # Long > Short: 1 -> -2. The one closing unit prices the long's
+            # exit; the two far-side units open the short's entry — both at
+            # the flip price, the proration the PnL attribution already uses.
+            fill(
+                "Long > Short",
+                at=T0 + timedelta(hours=2),
+                start_position="1",
+                size="3",
+                price="15",
+                pnl="5",
+            ),
+            fill(
+                "Close Short",
+                at=T0 + timedelta(hours=5),
+                start_position="-2",
+                size="2",
+                price="12",
+                pnl="6",
+            ),
+        ]
+    )
+    long_trip, short_trip = state.round_trips
+    assert (long_trip.entry_vwap, long_trip.exit_vwap) == (Decimal("10"), Decimal("15"))
+    assert (short_trip.entry_vwap, short_trip.exit_vwap) == (Decimal("15"), Decimal("12"))
+
+
+def test_vwap_sums_fold_across_checkpoints_exactly_like_one_batch() -> None:
+    # Opened and trimmed before the checkpoint, scaled in and closed after it:
+    # both sides' weighted sums ride the open episode, so the folded trip's
+    # VWAPs equal the whole-batch computation exactly.
+    early = [
+        _open(at=T0, size="2", price="10"),
+        _close(at=T0 + timedelta(hours=1), start="2", size="1", price="14", pnl="4"),
+    ]
+    late = [
+        _add(at=T0 + timedelta(hours=2), start="1", size="1", price="12"),
+        _close(at=T0 + timedelta(hours=3), start="2", size="2", price="16", pnl="8"),
+    ]
+    folded = fold_state(extract_state(early), late)
+    assert folded.round_trips == extract_state(early + late).round_trips
+    (t,) = folded.round_trips
+    assert t.entry_vwap == Decimal(32) / 3  # (2·10 + 1·12) / 3
+    assert t.exit_vwap == Decimal(46) / 3  # (1·14 + 2·16) / 3
+
+
+def test_a_still_open_episodes_vwap_sums_merge_at_the_fold() -> None:
+    early = [_open(at=T0, size="2", price="10")]
+    late = [_add(at=T0 + timedelta(hours=2), start="2", size="2", price="20")]
+    folded = fold_state(extract_state(early), late)
+    assert folded.open_episodes == extract_state(early + late).open_episodes
+    (episode,) = folded.open_episodes
+    assert episode.vwap is not None
+    assert episode.vwap.entry_vwap == Decimal("15")  # (2·10 + 2·20) / 4
+
+
+def test_vwaps_accumulate_across_multiple_refreshes() -> None:
+    opened = [_open(at=T0, size="2", price="10")]
+    trimmed = [_close(at=T0 + timedelta(hours=1), start="2", size="1", price="12", pnl="2")]
+    closed = [_close(at=T0 + timedelta(hours=2), start="1", size="1", price="14", pnl="4")]
+    state = fold_state(fold_state(extract_state(opened), trimmed), closed)
+    (t,) = state.round_trips
+    assert t.entry_vwap == Decimal("10")
+    assert t.exit_vwap == Decimal("13")  # (1·12 + 1·14) / 2
+
+
+def test_an_episode_stored_before_vwap_recording_completes_a_priceless_trip() -> None:
+    # A pre-#116 fine_open_episodes row loads with vwap None: its opening
+    # fills are gone from the API windows, so the trip it completes keeps NULL
+    # prices even though the closing segment's prices are in hand — a VWAP
+    # over only the fills we happened to see would be confidently wrong.
+    stored = FineState(
+        round_trips=(),
+        maker_fill_count=1,
+        perp_fill_count=1,
+        realized_pnl=Decimal(0),
+        window_start=T0,
+        window_end=T0,
+        last_fill_at=T0,
+        open_episodes=(
+            OpenEpisode("HYPE", T0, Decimal(0), Decimal(0), net_position=Decimal(1), vwap=None),
+        ),
+    )
+    late = [
+        _add(at=T0 + timedelta(hours=1), start="1", size="1", price="20"),
+        _close(at=T0 + timedelta(hours=2), start="2", size="2", price="30", pnl="10"),
+    ]
+    state = fold_state(stored, late)
+    (t,) = state.round_trips
+    assert t.pnl == Decimal("10")
+    assert t.entry_vwap is None and t.exit_vwap is None
+
+
+def test_a_legacy_episode_still_open_after_the_fold_stays_priceless() -> None:
+    stored = FineState(
+        round_trips=(),
+        maker_fill_count=1,
+        perp_fill_count=1,
+        realized_pnl=Decimal(0),
+        window_start=T0,
+        window_end=T0,
+        last_fill_at=T0,
+        open_episodes=(
+            OpenEpisode("HYPE", T0, Decimal(0), Decimal(0), net_position=Decimal(1), vwap=None),
+        ),
+    )
+    late = [_add(at=T0 + timedelta(hours=1), start="1", size="1", price="20")]
+    state = fold_state(stored, late)
+    (episode,) = state.open_episodes
+    assert episode.vwap is None  # unknowable stays unknowable, never partially filled in
+
+
+def test_demotion_drops_the_vwap_sums_with_the_episode() -> None:
+    # #63: an episode whose walk gapped never mints a trip, so its price sums
+    # die with it; the clean re-anchor's trip prices only its own fills.
+    state = extract_state(
+        [
+            _open(at=T0, price="10"),
+            _close(at=T0 + timedelta(hours=1), start="5", size="5", price="99", pnl="7"),
+            _open(at=T0 + timedelta(hours=2), price="20"),
+            _close(at=T0 + timedelta(hours=3), start="1", price="25", pnl="3"),
+        ]
+    )
+    (t,) = state.round_trips
+    assert (t.entry_vwap, t.exit_vwap) == (Decimal("20"), Decimal("25"))
