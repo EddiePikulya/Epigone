@@ -84,7 +84,8 @@ HELP_TEXT = (
     "/start — what Epigone is and how it works\n"
     "/tracked — your tracked traders, their positions, and alert controls\n"
     "/help — this list\n\n"
-    "Paste a wallet address (0x…) to start tracking that trader.\n"
+    "Paste a wallet address (0x…) to open that trader's profile — positions, "
+    "track record, and a Follow button.\n"
     "From /tracked you can mute a trader or set a minimum position size so "
     "small trades stay quiet."
 )
@@ -99,17 +100,18 @@ SCREENER_PENDING_LABEL = "⏳ analyzing"
 
 SCREENER_EMPTY_TEXT = (
     "No traders to rank yet — the universe is still being scanned.\n"
-    "Paste a wallet address (0x…) to start tracking one in the meantime."
+    "Paste a wallet address (0x…) to pull up a trader's profile in the meantime."
 )
 
 INVALID_ADDRESS_TEXT = (
     "That doesn't look like a wallet address.\n\n"
     "Paste a full Hyperliquid address — 0x followed by 40 hex characters — "
-    "and I'll start tracking that trader."
+    "and I'll open that trader's profile."
 )
 
 NOT_TRACKING_TEXT = (
-    "You're not tracking any traders yet.\n\nPaste a wallet address (0x…) to follow your first one."
+    "You're not tracking any traders yet.\n\n"
+    "Paste a wallet address (0x…) to open a trader's profile and follow your first one."
 )
 
 UNKNOWN_COMMAND_TEXT = "I don't know that command. Type /help to see what I can do."
@@ -118,13 +120,10 @@ DATA_DELAYED_TEXT = (
     "Hyperliquid data is delayed right now — your tracked list is safe, try again in a moment."
 )
 
-# Shown when a User at the cap tries to follow one more (#23). Full-message form
-# for the paste path; the shorter toast for the screener/profile button paths,
-# which surface through callback answers.
-TRACK_LIMIT_TEXT = (
-    f"You're tracking {MAX_TRACKED_WALLETS} wallets — that's the limit.\n"
-    "Unfollow one from /tracked before following another."
-)
+# Shown when a User at the cap tries to follow one more (#23). Every Follow now
+# comes through a button (the screener row or the profile's Follow tap, #111), so
+# the cap surfaces through a callback answer's toast — the pasted-address path no
+# longer writes a Track, so its full-message form retired with it.
 TRACK_LIMIT_TOAST = f"Limit reached — {MAX_TRACKED_WALLETS} wallets max. Unfollow one first."
 
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
@@ -272,36 +271,27 @@ async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT, reply_markup=with_delete_button())
 
 
-async def follow_pasted_address(
-    message: Message, pool: asyncpg.Pool, clock: Clock, admin_telegram_id: int | None
+async def open_pasted_profile(
+    message: Message, pool: asyncpg.Pool, gateway: HyperliquidGateway, clock: Clock
 ) -> None:
-    """A pasted valid address Follows the Trader; re-following is idempotent."""
+    """A pasted valid address opens that Trader's profile — the same rich
+    _render_profile view a screener row's profile tap shows, with a Follow/Unfollow
+    toggle — rather than following outright (#111). No track row is written here:
+    following is the deliberate ➕ tap (pfollow: → on_profile_follow). A wallet the
+    User already tracks opens showing Unfollow, a shortcut to its full view instead
+    of an "already tracking" dead-end. The gateway fetch (live positions) can be
+    delayed; a GatewayError answers with the existing delayed-data message rather
+    than crashing, exactly as the screener profile tap."""
     user = message.from_user
     if user is None or message.text is None:
         return
     address = message.text.strip().lower()
-    async with pool.acquire() as conn, conn.transaction():
-        outcome = await track_address(
-            conn,
-            user.id,
-            user.username,
-            address,
-            clock.now(),
-            cap_exempt=user.id == admin_telegram_id,
-        )
-    if outcome is TrackOutcome.FRESHLY_TRACKED:
-        await message.answer(
-            f"Now tracking {short_address(address)}.\n"
-            "Paste more addresses any time — /tracked shows your whole list.",
-            reply_markup=with_delete_button(),
-        )
-    elif outcome is TrackOutcome.ALREADY_TRACKING:
-        await message.answer(
-            f"You're already tracking {short_address(address)}.",
-            reply_markup=with_delete_button(),
-        )
-    else:  # LIMIT_REACHED — the wallet was not added
-        await message.answer(TRACK_LIMIT_TEXT, reply_markup=with_delete_button())
+    try:
+        text, entities, markup = await _render_profile(pool, gateway, clock, user.id, address)
+    except GatewayError:
+        await message.answer(DATA_DELAYED_TEXT, reply_markup=with_delete_button())
+        return
+    await message.answer(text, reply_markup=markup, entities=entities)
 
 
 async def reject_unknown_command(message: Message) -> None:
@@ -1566,7 +1556,7 @@ def build_router() -> Router:
     # The rename flow (#86): consumes a pending typed wallet name before the
     # paste handler, same as the criteria/min-size prompts above.
     names.register(router)
-    router.message.register(follow_pasted_address, _is_wallet_paste)
+    router.message.register(open_pasted_profile, _is_wallet_paste)
     router.message.register(reject_unknown_command, _is_command)
     router.message.register(reject_unrecognized_input)  # anything else: text, stickers, photos…
     router.callback_query.register(on_screener_page, F.data.startswith("screen:"))

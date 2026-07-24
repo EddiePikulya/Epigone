@@ -10,7 +10,7 @@ from aiogram import Bot, Dispatcher
 
 from epigone.ingest.fine import FOLLOW_REFRESH_FRESHNESS, mark_due_on_follow
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, follow_wallet
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
 OTHER = "0x" + "1" * 40
@@ -109,10 +109,10 @@ async def test_mark_due_bumps_exactly_at_the_freshness_boundary(
 # --- the follow paths, end to end through the handlers -----------------------
 
 
-async def test_pasting_an_address_marks_the_wallet_due_now(
+async def test_following_an_address_marks_the_wallet_due_now(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     state = await _scan_state(pool, WHALE)
     assert state is not None
@@ -130,7 +130,7 @@ async def test_following_a_recently_scanned_wallet_does_not_rebump_it(
         pool, WHALE, first_seen=now - timedelta(days=30), refreshed_at=fresh, attempted_at=fresh
     )
 
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     state = await _scan_state(pool, WHALE)
     assert state is not None
@@ -141,8 +141,8 @@ async def test_following_a_recently_scanned_wallet_does_not_rebump_it(
 async def test_following_a_stale_wallet_from_a_button_marks_it_due(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
-    # The profile follow button (pfollow:) is a distinct entry point from paste;
-    # the shared track_address seam means it bumps too.
+    # The profile follow button (pfollow:) is the follow entry point now (#111);
+    # the shared track_address seam means it bumps a stale wallet due.
     now = clock.now()
     stale = now - timedelta(days=2)
     await _seed_scanned_trader(
@@ -161,7 +161,7 @@ async def test_unfollow_leaves_scan_state_untouched(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
     # Follow makes it due; a later scan refreshes it; unfollowing must not re-bump.
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     scanned = clock.now()
     await pool.execute(
         "UPDATE traders SET fine_refreshed_at = $2, fine_attempted_at = $2 WHERE address = $1",
@@ -180,9 +180,9 @@ async def test_unfollow_leaves_scan_state_untouched(
 async def test_refollowing_an_already_tracked_wallet_does_not_rebump(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
-    # First follow bumps it; a scan lands; re-pasting is idempotent (ALREADY_TRACKING)
-    # and must not force another refresh.
-    await feed_text(dp, bot, WHALE, user_id=111)
+    # First follow bumps it; a scan lands; re-tapping Follow is idempotent
+    # (ALREADY_TRACKING) and must not force another refresh.
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     scanned = clock.now()
     await pool.execute(
         "UPDATE traders SET fine_refreshed_at = $2, fine_attempted_at = $2 WHERE address = $1",
@@ -190,7 +190,7 @@ async def test_refollowing_an_already_tracked_wallet_does_not_rebump(
         scanned,
     )
 
-    await feed_text(dp, bot, WHALE, user_id=111)  # re-follow, idempotent
+    await follow_wallet(dp, bot, WHALE, user_id=111)  # re-follow, idempotent
 
     state = await _scan_state(pool, WHALE)
     assert state is not None

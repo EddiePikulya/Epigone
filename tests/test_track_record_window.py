@@ -9,14 +9,14 @@ from datetime import UTC, datetime, timedelta
 import asyncpg
 from aiogram import Bot, Dispatcher
 
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, follow_wallet
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 
 
 async def follow(dp: Dispatcher, bot: Bot, user_id: int = 111) -> None:
-    await feed_text(dp, bot, WHALE, user_id=user_id)
+    await follow_wallet(dp, bot, WHALE, user_id=user_id)
 
 
 async def add_coarse(

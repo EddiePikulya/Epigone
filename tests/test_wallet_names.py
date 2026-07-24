@@ -20,7 +20,7 @@ from epigone.bot.first_data_notice import deliver_first_data_notices
 from epigone.bot.handlers import track_address
 from epigone.bot.names import MAX_NAME_LENGTH, sanitize_name, set_track_name
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
 from tests.test_alert_delivery import queue_alert
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
@@ -28,7 +28,7 @@ WHALE_SHORT = "0xaf0f…e92e"
 
 
 async def _track(dp: Dispatcher, bot: Bot, *, user_id: int = 111, address: str = WHALE) -> None:
-    await feed_text(dp, bot, address, user_id=user_id)
+    await follow_wallet(dp, bot, address, user_id=user_id)
 
 
 async def _name(pool: asyncpg.Pool, user_id: int, address: str = WHALE) -> str | None:
