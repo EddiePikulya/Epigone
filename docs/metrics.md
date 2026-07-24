@@ -87,6 +87,23 @@ saw, so it can exceed the sum of the counted round-trips' PnLs by exactly
 those unattributable partials. It is banked money — a magnitude sum, not a
 per-trade quality signal — so trims cannot game it.
 
+### Entry / exit VWAP (per trade)
+
+Each round-trip records the size-weighted average price of its
+position-increasing fills (entry VWAP) and of its position-decreasing fills
+(exit VWAP) — issue #116. A flip fill splits at the zero crossing exactly as
+its PnL does: the portion that unwound the old position prices that trade's
+exit, the far-side remainder opens the next trade's entry. The weighted sums
+ride the open episode across incremental checkpoints like the PnL and peak
+accumulators, and the #63 continuity guard drops them with a demoted episode.
+Recorded going forward only: trips folded before the feature shipped — and
+trips completing an episode stored before it — keep NULL prices (their fills
+have aged out of the API windows; a VWAP over only the fills we happened to
+see would be confidently wrong, so none is invented). The wallet views'
+**Recent trades** section (last 5 round-trips, newest first, deliberately
+constant across the #102 window toggle) shows the prices as `in → out` where
+present and simply omits the clause where not.
+
 ## Fine metrics
 
 ### Win rate

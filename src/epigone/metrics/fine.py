@@ -25,6 +25,49 @@ TRADING_DAYS_PER_YEAR = 365  # perps trade every day; Sharpe annualizes over all
 
 
 @dataclass(frozen=True)
+class VwapSums:
+    """The size-weighted price sums a trip's entry/exit VWAPs reduce from
+    (issue #116). Entry side: every position-increasing fill at full size.
+    Exit side: every position-decreasing fill at its *closing portion* — a
+    flip fill splits at the zero crossing, its closing portion priced into the
+    old trip's exit and its far-side remainder opening the new trip's entry,
+    the same proration the PnL attribution already uses. Sums rather than the
+    finished averages so they fold across checkpoints exactly like pnl and
+    peak_notional do."""
+
+    entry_cost: Decimal = Decimal(0)  # Σ price · size over position-increasing fills
+    entry_size: Decimal = Decimal(0)
+    exit_cost: Decimal = Decimal(0)  # Σ price · closing-portion over decreasing fills
+    exit_size: Decimal = Decimal(0)
+
+    def with_entry(self, price: Decimal, size: Decimal) -> "VwapSums":
+        return VwapSums(
+            self.entry_cost + price * size, self.entry_size + size,
+            self.exit_cost, self.exit_size,
+        )
+
+    def with_exit(self, price: Decimal, size: Decimal) -> "VwapSums":
+        return VwapSums(
+            self.entry_cost, self.entry_size,
+            self.exit_cost + price * size, self.exit_size + size,
+        )
+
+    def merged(self, other: "VwapSums") -> "VwapSums":
+        return VwapSums(
+            self.entry_cost + other.entry_cost, self.entry_size + other.entry_size,
+            self.exit_cost + other.exit_cost, self.exit_size + other.exit_size,
+        )
+
+    @property
+    def entry_vwap(self) -> Decimal | None:
+        return self.entry_cost / self.entry_size if self.entry_size else None
+
+    @property
+    def exit_vwap(self) -> Decimal | None:
+        return self.exit_cost / self.exit_size if self.exit_size else None
+
+
+@dataclass(frozen=True)
 class RoundTrip:
     """One completed trade: a position's whole life from flat back to flat."""
 
@@ -41,6 +84,11 @@ class RoundTrip:
     # checkpoint (the incremental fetch cuts on millisecond boundaries), so the
     # ordinal is stable across refreshes.
     seq: int = 0
+    # Size-weighted average entry/exit prices (#116). None on trips folded
+    # before VWAP recording shipped — their fills have aged out of the API
+    # windows, so the prices are honestly unknowable, never backfilled.
+    entry_vwap: Decimal | None = None
+    exit_vwap: Decimal | None = None
 
     @property
     def hold_seconds(self) -> int:
@@ -57,13 +105,18 @@ class OpenEpisode:
     batch's continuity guard checks against (#63); 0 (the pre-#63 storage
     default) means "never verified" and can match no real continuation, so
     legacy episodes demote on their next fold instead of trusting a walk that
-    may have been TWAP-blind."""
+    may have been TWAP-blind. `vwap` carries the episode's entry/exit price
+    sums (#116); None marks an episode stored before VWAP recording shipped —
+    its opening fills are gone from the API windows, so any trip it completes
+    keeps NULL prices rather than a VWAP over only the fills we happened to
+    see."""
 
     coin: str
     opened_at: datetime
     pnl: Decimal
     peak_notional: Decimal
     net_position: Decimal = Decimal(0)
+    vwap: VwapSums | None = None  # None: predates recording, prices unknowable
 
 
 @dataclass(frozen=True)
@@ -83,7 +136,8 @@ class Continuation:
     when the segment broke continuity *inside* the batch: the carried episode
     must still be popped (its position walk is dead), but never credited.
     `net_position` is where the walk left the coin when still open at batch
-    end — the merged episode's new anchor."""
+    end — the merged episode's new anchor. `vwap` is the segment's own price
+    sums (#116), merged into the carried episode's exactly like pnl/peak."""
 
     coin: str
     pnl: Decimal
@@ -92,6 +146,7 @@ class Continuation:
     start_position: Decimal = Decimal(0)
     net_position: Decimal = Decimal(0)
     tracked: bool = True
+    vwap: VwapSums = VwapSums()
 
 
 @dataclass(frozen=True)
@@ -429,6 +484,7 @@ def _episodes(
         tracked = True  # False while walking a position whose episode was demoted
         pnl = Decimal(0)
         peak = Decimal(0)
+        vwap = VwapSums()  # the episode's entry/exit price sums (#116)
         walked: Decimal | None = None  # net position after the previous fill
         # Ordinal per completion millisecond (RoundTrip.seq): a same-block
         # close→reopen→close completes two episodes on one timestamp. The
@@ -453,14 +509,21 @@ def _episodes(
                 opened_at = None
                 pnl = Decimal(0)
                 peak = Decimal(0)
+                vwap = VwapSums()
                 tracked = _is_flat(start)  # flat re-anchors clean; mid-position stays demoted
             if not f.closes_position:
                 if _is_flat(start) and opened_at is None and not continuing:
                     opened_at = f.time  # the position leaves 0: an episode opens
+                vwap = vwap.with_entry(f.price, f.size)
                 walked = _post_position(f)
                 continue  # a same-side scale-in never crosses 0
             pnl += f.closed_pnl
             peak = max(peak, abs(start) * f.price)
+            # A flip fill splits at the zero crossing (#116): only the portion
+            # that unwound the old position prices its exit; the far-side
+            # remainder opens the next episode's entry below.
+            closing_portion = min(f.size, abs(start))
+            vwap = vwap.with_exit(f.price, closing_portion)
             end = _post_position(f)  # toward / through 0
             walked = end
             if not _is_flat(end) and (end > 0) == (start > 0):
@@ -470,11 +533,19 @@ def _episodes(
             close_seq[f.time] = seq + 1
             if continuing:
                 continuations.append(
-                    Continuation(coin, pnl, peak, closed_at=f.time, start_position=cont_start)
+                    Continuation(
+                        coin, pnl, peak, closed_at=f.time,
+                        start_position=cont_start, vwap=vwap,
+                    )
                 )
                 continuing = False
             elif tracked and opened_at is not None:
-                trips.append(RoundTrip(coin, pnl, peak, opened_at, f.time, seq))
+                trips.append(
+                    RoundTrip(
+                        coin, pnl, peak, opened_at, f.time, seq,
+                        entry_vwap=vwap.entry_vwap, exit_vwap=vwap.exit_vwap,
+                    )
+                )
             # A flip immediately reopens on the far side; a full close goes
             # flat — either way the walk is at a verified position again, so
             # tracking resumes even after a demoted episode.
@@ -482,16 +553,23 @@ def _episodes(
             tracked = True
             pnl = Decimal(0)
             peak = Decimal(0)
+            vwap = VwapSums()
+            if not _is_flat(end):  # the flip's far side opens at the flip price
+                vwap = vwap.with_entry(f.price, f.size - closing_portion)
         if continuing:  # never closed in this batch: the accumulators ride the fold
             continuations.append(
                 Continuation(
                     coin, pnl, peak, closed_at=None,
                     start_position=cont_start, net_position=walked or Decimal(0),
+                    vwap=vwap,
                 )
             )
         elif tracked and opened_at is not None:
             open_episodes.append(
-                OpenEpisode(coin, opened_at, pnl, peak, net_position=walked or Decimal(0))
+                OpenEpisode(
+                    coin, opened_at, pnl, peak,
+                    net_position=walked or Decimal(0), vwap=vwap,
+                )
             )
     trips.sort(key=lambda t: (t.closed_at, t.coin, t.seq))
     open_episodes.sort(key=lambda e: e.coin)
@@ -549,16 +627,25 @@ def _fold_episodes(
             continue  # missed executions across the checkpoint: demote (#63)
         pnl = episode.pnl + cont.pnl
         peak = max(episode.peak_notional, cont.peak_notional)
+        # A pre-#116 episode (vwap None) stays price-less: its opening fills
+        # predate recording, and a VWAP over only the segment's fills would be
+        # a confidently wrong number, not a partial truth.
+        vwap = None if episode.vwap is None else episode.vwap.merged(cont.vwap)
         if cont.closed_at is None:
             open_eps[cont.coin] = OpenEpisode(
-                cont.coin, episode.opened_at, pnl, peak, net_position=cont.net_position
+                cont.coin, episode.opened_at, pnl, peak,
+                net_position=cont.net_position, vwap=vwap,
             )
         else:
             # seq 0: the continuation's close is by definition the coin's first
             # episode completion in its batch, so it held ordinal 0 there and
             # any same-ms in-batch trades were numbered after it.
             resolved.append(
-                RoundTrip(cont.coin, pnl, peak, episode.opened_at, cont.closed_at, seq=0)
+                RoundTrip(
+                    cont.coin, pnl, peak, episode.opened_at, cont.closed_at, seq=0,
+                    entry_vwap=vwap.entry_vwap if vwap is not None else None,
+                    exit_vwap=vwap.exit_vwap if vwap is not None else None,
+                )
             )
     # A trip dropped at a demoted head marks its whole millisecond as a
     # possibly mis-merged close/reopen group: a reopen the head also minted is
