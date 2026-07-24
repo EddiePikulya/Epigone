@@ -1234,6 +1234,7 @@ async def _render_track_record(
         SELECT t.bot_reason, fm.address IS NOT NULL AS fine_available,
                fm.trade_count, fm.win_rate, fm.avg_win, fm.avg_loss, fm.sharpe,
                fm.max_drawdown, fm.avg_leverage, fm.maker_share, fm.avg_hold_seconds,
+               fm.median_trade, fm.profit_factor, fm.top_trade_share,
                (SELECT min(ft.opened_at) FROM fine_trades ft WHERE ft.address = t.address)
                    AS oldest_trade_at,
                cm.pnl AS month_pnl, cm.roi AS month_roi
@@ -1345,6 +1346,22 @@ def _fine_lines(
     sharpe = f"Sharpe {row['sharpe']:.1f} · " if row["sharpe"] is not None else ""
     if row["win_rate"] is not None:
         lines.append(f"{sharpe}max drawdown ${row['max_drawdown']:,.0f}")
+    # The anti-deception trio (#113): each clause appears only when computable —
+    # median needs a trip, PF a loss, top-trade share a positive total — so a
+    # no-losses wallet drops "PF", a net-loser drops "top trade", and a wallet
+    # with no trips shows the line not at all.
+    median = row["median_trade"]
+    trio = [
+        f"median trade {'-' if median < 0 else ''}${abs(median):,.0f}"
+        if median is not None
+        else None,
+        f"PF {row['profit_factor']:.1f}" if row["profit_factor"] is not None else None,
+        f"top trade {row['top_trade_share']:.0%}"
+        if row["top_trade_share"] is not None
+        else None,
+    ]
+    if any(trio):
+        lines.append(" · ".join(part for part in trio if part is not None))
     style = [
         f"{row['maker_share']:.0%} maker" if row["maker_share"] is not None else None,
         # Estimated sizing vs the account (peak position ÷ account value), NOT the

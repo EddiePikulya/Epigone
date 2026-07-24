@@ -8,7 +8,7 @@ from decimal import Decimal
 import asyncpg
 
 from epigone.gateway import Window
-from epigone.screener import run_screener
+from epigone.screener import Criteria, Filter, Op, run_criteria, run_screener
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
 
@@ -41,17 +41,29 @@ async def add_trader(
     )
 
 
-async def add_fine_metrics(pool: asyncpg.Pool, address: str, win_rate: str = "0.76") -> None:
+async def add_fine_metrics(
+    pool: asyncpg.Pool,
+    address: str,
+    win_rate: str = "0.76",
+    *,
+    median_trade: str = "150",
+    profit_factor: str = "2.4",
+    top_trade_share: str = "0.2",
+) -> None:
     await pool.execute(
         """
         INSERT INTO fine_metrics
             (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
-             avg_leverage, maker_share, realized_pnl, window_start, window_end, computed_at)
-        VALUES ($1, 104, $2, 500, 100, 3.2, 900, 2.5, 0.7, 22000, $3, $3, $3)
+             avg_leverage, maker_share, median_trade, profit_factor, top_trade_share,
+             realized_pnl, window_start, window_end, computed_at)
+        VALUES ($1, 104, $2, 500, 100, 3.2, 900, 2.5, 0.7, $4, $5, $6, 22000, $3, $3, $3)
         """,
         address,
         Decimal(win_rate),
         NOW,
+        Decimal(median_trade),
+        Decimal(profit_factor),
+        Decimal(top_trade_share),
     )
 
 
@@ -114,7 +126,33 @@ async def test_fine_metrics_ride_along_when_available(pool: asyncpg.Pool) -> Non
     assert row.trade_count == 104
     assert row.sharpe == Decimal("3.2")
     assert row.max_drawdown == Decimal("900")
+    assert row.median_trade == Decimal("150")
+    assert row.profit_factor == Decimal("2.4")
+    assert row.top_trade_share == Decimal("0.2")
     assert row.fine_computed_at == NOW
+
+
+async def test_the_anti_deception_trio_filters_and_sorts(pool: asyncpg.Pool) -> None:
+    # A profit-factor floor keeps the edge and drops the coin-flipper, and the
+    # top-trade-share sort ascends — the repeatable edge (low share) leads the
+    # lottery record (#113).
+    await add_trader(pool, "0xedge", month_roi="0.2")
+    await add_fine_metrics(pool, "0xedge", profit_factor="2.0", top_trade_share="0.15")
+    await add_trader(pool, "0xlottery", month_roi="0.9")
+    await add_fine_metrics(pool, "0xlottery", profit_factor="3.0", top_trade_share="0.85")
+    await add_trader(pool, "0xflipper", month_roi="0.1")
+    await add_fine_metrics(pool, "0xflipper", profit_factor="0.6", top_trade_share="0.1")
+
+    criteria = Criteria(
+        filters=(Filter(metric="profit_factor", op=Op.GTE, threshold=Decimal("1.5")),),
+        time_window=Window.MONTH,
+        sort_key="top_trade_share",
+        sort_desc=False,
+    )
+    rows = await run_criteria(pool, criteria, limit=10)
+
+    # 0xflipper filtered out (PF 0.6 < 1.5); the survivors ascend by top-share.
+    assert [r.address for r in rows] == ["0xedge", "0xlottery"]
 
 
 async def test_coarse_only_traders_are_distinguishable(pool: asyncpg.Pool) -> None:

@@ -195,6 +195,44 @@ per-trade quality signal — so trims cannot game it.
   The track record shows it beside Most played, e.g. `Most played: SOL · ETH
   (~2 coins)`.
 
+### Median trade
+- **In plain words:** what the typical trade earns, wins AND losses included —
+  immune to one lucky moonshot. Use as a floor (in dollars) and pair with a
+  Closed-trades floor.
+- **Definition:** the median net PnL across **all** completed round-trips (issue
+  #113), wins and losses together — so it can be negative. Unlike the mean, one
+  outsized winner cannot drag it, so a positive median over many trades is
+  nearly unfakeable: it catches the coin-flipper whose typical trade earns
+  nothing. Reduced from the same round-trips behind the other trade metrics, so
+  it shares the trade definition above (including the pre-window exclusion) and
+  the window toggle. Unavailable (NULL) until at least one round-trip has
+  completed — undefined over zero trades, never 0.
+
+### Profit factor
+- **In plain words:** dollars won per dollar lost. Below 1 loses money no matter
+  the win rate; 1.5–3 is a real edge; huge values usually mean losses barely
+  exist — check the record isn't hiding open losers.
+- **Definition:** gross winning dollars ÷ gross losing dollars over the completed
+  round-trips (issue #113) — the sum of all winning trips' PnL divided by the
+  absolute sum of all losing trips'. It exposes the win-rate illusion a 55%
+  win rate hides: below 1 the wallet loses money regardless of how often it
+  wins. **Unavailable (NULL) when there are no losses** — the denominator is
+  zero, an unbounded "∞" that renders as absent rather than a huge number. An
+  all-losses wallet has zero winning dollars and reads a real **0**, not NULL
+  (the denominator exists). Stored as a plain number.
+
+### Top-trade share
+- **In plain words:** how much of the profit is one single trade. Low = a
+  repeatable edge; high = a lottery ticket that already hit. Use as a ceiling.
+- **Definition:** the best single round-trip's PnL as a fraction of the wallet's
+  **total** round-trip PnL (issue #113) — a lottery-record detector: one
+  moonshot carrying the whole record reads near 1.0, a repeatable edge stays
+  low. **Only meaningful when total PnL > 0**; NULL otherwise (a negative or
+  zero total makes the ratio meaningless, and a net-losing wallet has no profit
+  to concentrate). A single winning trade reads 1.0 (100%) — it is the whole
+  profit. Stored as a **fraction** (PERCENT unit: a 30% ceiling is stored 0.30),
+  and unavailable (NULL) without a positive total.
+
 ### Focus market
 - **In plain words:** keep only wallets specialized in a market — a category
   means most of their trades are in it; a specific ticker means it's among
