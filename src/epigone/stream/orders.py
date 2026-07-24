@@ -21,6 +21,13 @@ Diff semantics (tested in tests/test_order_poller.py):
   orders in one cycle batch into ONE alert row per follower (#115's noise
   rule: active makers place constantly, never one message per order), in
   placement order.
+- **Modify / replace** — Hyperliquid's modify is an atomic cancel/replace
+  that mints a NEW oid (verified live), so without damping a maker nudging a
+  resting ladder's prices would alert every follower every cycle forever. An
+  appearing order that matches an order which disappeared in the SAME cycle —
+  same coin, side, and kind (trigger/position-TP-SL/reduce-only), size within
+  MODIFY_SIZE_TOLERANCE, price free (a price nudge is the modify par
+  excellence) — is carried forward silently as the same plan, not alerted.
 - **Cancel / fill** — a known id disappears: pruned silently. Fills already
   alert as position events; cancels are not news.
 
@@ -71,6 +78,26 @@ ORDERS_WEIGHT = 20
 # is down, not that wallets are odd — stop burning budget and resume next cycle.
 MAX_CONSECUTIVE_FAILURES = 5
 
+# Inter-wallet spacing inside one order pass, for SEND-GATE fairness. The
+# reserve floor protects the position poller's *tokens*, but the #41 send
+# gate is first-come-first-served: one wallet's three weight-20 venue calls
+# close the gate for ~3s (60 / SMOOTHING_WEIGHT_PER_SECOND), and a full pass
+# run back-to-back would keep it near-shut for a minute, stretching every
+# concurrent position poll behind ~1s gate waits. Sleeping 5s between wallets
+# caps the order pass's gate duty cycle at ~3s busy / 8s (~40%), leaving the
+# position pass's weight-2 sends (0.1s windows apiece) ample open gate; the
+# pass stretches to ~8s per wallet — the full 15-wallet cap ≈ 2 minutes,
+# comfortably inside the 300s cadence.
+ORDER_WALLET_SPACING_SECONDS = 5.0
+
+# Replace-detection's size leeway (module docstring): an appearing order
+# counts as a modify of a same-cycle disappearance when coin/side/kind match
+# and its size is within this fraction of the old one. The same 25% bar the
+# position poller uses for scale significance (#10): below it a resize is
+# ladder maintenance; above it the plan itself changed enough to be news, so
+# churn that also resizes >25% still alerts — deliberately.
+MODIFY_SIZE_TOLERANCE = Decimal("0.25")
+
 
 @dataclass(frozen=True)
 class OrderPollResult:
@@ -89,7 +116,11 @@ async def run_order_poll_pass(
     await _prune_untracked(pool)
     rows = await pool.fetch("SELECT DISTINCT trader_address FROM tracks ORDER BY trader_address")
     polled = failed = new_orders = consecutive_failures = 0
-    for row in rows:
+    for i, row in enumerate(rows):
+        if i:
+            # Gate fairness (ORDER_WALLET_SPACING_SECONDS): never run the
+            # heavier order spends back-to-back into the shared send gate.
+            await clock.sleep(ORDER_WALLET_SPACING_SECONDS)
         address: str = row["trader_address"]
         try:
             orders = await _fetch_orders(gateway, budget, address)
@@ -138,7 +169,10 @@ async def _fetch_orders(
 
     fetch_open_orders raises on any venue failure; the wallet then retries
     next pass with its id set untouched, never diffed against a half-empty
-    book into a silent prune and a later ladder-wide re-alert."""
+    book into a silent prune and a later ladder-wide re-alert. All venues are
+    billed up front, so a first-venue failure wastes the two unspent venues'
+    weight — deliberately the conservative direction (the bucket refills in
+    seconds; under-billing is the failure mode that 429s)."""
     for _venue in POSITION_VENUES:
         await budget.spend(ORDERS_WEIGHT)
     return await fetch_open_orders(gateway, address)
@@ -185,37 +219,77 @@ async def _apply_order_poll(
             return 0
 
         known = {
-            r["order_id"]
+            r["order_id"]: r
             for r in await conn.fetch(
-                "SELECT order_id FROM order_snapshots WHERE trader_address = $1", address
+                "SELECT * FROM order_snapshots WHERE trader_address = $1", address
             )
         }
         current_ids = {o.order_id for o in orders}
-        gone = known - current_ids
+        gone = [row for order_id, row in known.items() if order_id not in current_ids]
         if gone:
             # Cancels and fills: silent by design (fills already alert as
-            # position events, a cancel is not news).
+            # position events, a cancel is not news). Replaced orders are gone
+            # too — their reincarnations are filtered out of `news` below.
             await conn.execute(
                 """
                 DELETE FROM order_snapshots
                 WHERE trader_address = $1 AND order_id = ANY($2::bigint[])
                 """,
                 address,
-                list(gone),
+                [row["order_id"] for row in gone],
             )
-        new = sorted(
+        appearing = sorted(
             (o for o in orders if o.order_id not in known),
             key=lambda o: (o.placed_at, o.order_id),
         )
-        await _insert_ids(conn, address, new, now)
+        news = _without_modifies(appearing, gone)
+        await _insert_ids(conn, address, appearing, now)
         await conn.execute(
             "UPDATE order_poll_state SET last_polled_at = $2 WHERE trader_address = $1",
             address,
             now,
         )
-        if new:
-            await _queue_alerts(conn, address, new, now)
-        return len(new)
+        if news:
+            await _queue_alerts(conn, address, news, now)
+        return len(news)
+
+
+def _without_modifies(appearing: list[OpenOrder], gone: list[asyncpg.Record]) -> list[OpenOrder]:
+    """Drop replaces from the appearing orders (module docstring): each
+    appearing order consumes at most one same-cycle disappearance it matches —
+    same coin, side, and kind, size within MODIFY_SIZE_TOLERANCE — greedily in
+    placement order. What survives is genuinely new plan, not maintenance of
+    an already-known one; the matched appearances still enter the snapshot set
+    (the id carries forward), they just never alert."""
+    pool = list(gone)
+    news: list[OpenOrder] = []
+    for order in appearing:
+        match = next((row for row in pool if _is_modify(order, row)), None)
+        if match is None:
+            news.append(order)
+        else:
+            pool.remove(match)
+    return news
+
+
+def _is_modify(order: OpenOrder, gone: asyncpg.Record) -> bool:
+    """Whether an appearing order reads as a replace of this same-cycle
+    disappearance: identical coin/side/kind (price free — a price nudge is the
+    modify par excellence), size within MODIFY_SIZE_TOLERANCE. Position TP/SLs
+    are all size 0, so they match on kind alone — replacing one is still the
+    same 'protect the position' plan."""
+    if (order.coin, order.is_buy, order.is_trigger, order.is_position_tpsl, order.reduce_only) != (
+        gone["coin"],
+        gone["is_buy"],
+        gone["is_trigger"],
+        gone["is_position_tpsl"],
+        gone["reduce_only"],
+    ):
+        return False
+    old: Decimal = gone["size"]
+    if old == 0 or order.size == 0:
+        return old == order.size
+    return abs(order.size - old) / old <= MODIFY_SIZE_TOLERANCE
 
 
 async def _insert_ids(
@@ -223,10 +297,25 @@ async def _insert_ids(
 ) -> None:
     await conn.executemany(
         """
-        INSERT INTO order_snapshots (trader_address, order_id, first_seen_at)
-        VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+        INSERT INTO order_snapshots
+            (trader_address, order_id, coin, is_buy, size,
+             is_trigger, is_position_tpsl, reduce_only, first_seen_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING
         """,
-        [(address, o.order_id, now) for o in orders],
+        [
+            (
+                address,
+                o.order_id,
+                o.coin,
+                o.is_buy,
+                o.size,
+                o.is_trigger,
+                o.is_position_tpsl,
+                o.reduce_only,
+                now,
+            )
+            for o in orders
+        ],
     )
 
 

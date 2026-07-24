@@ -10,10 +10,18 @@
 --     baseline marker. A wallet's first-ever order poll records ids silently
 --     (a ladder that predates observation is not news), and a stream restart
 --     diffs against persisted ids instead of re-alerting the same ladder.
---   order_snapshots  — the known resting-order ids, one row per order. Only
---     the id is bookkeeping: an alert renders from the fetch that discovered
---     the order, and a disappearance (cancel or fill) is deliberately silent
---     (fills already alert as position events), so no order detail persists.
+--   order_snapshots  — the known resting orders, one row per order: the id
+--     plus the attributes replace-detection matches on (coin, side, kind,
+--     size). Hyperliquid's modify is an atomic cancel/replace that mints a
+--     NEW oid (verified live: oid allocation is globally sequential), so an
+--     id-only diff would read every price tweak as a brand-new order and a
+--     ladder-maintaining maker would alert every cycle forever; the poll
+--     instead matches an appearing order against the same cycle's
+--     disappearances and carries a modify forward silently
+--     (epigone.stream.orders). Nothing here is rendered — an alert renders
+--     from the fetch that discovered the order — and a plain disappearance
+--     (cancel or fill) stays deliberately silent (fills already alert as
+--     position events).
 --
 -- order_alerts is the order-side outbox (ADR-0002: stream and bot meet only in
 -- Postgres), one row PER FOLLOWER PER WALLET PER POLL CYCLE — a batch, never
@@ -33,9 +41,15 @@ CREATE TABLE order_poll_state (
 );
 
 CREATE TABLE order_snapshots (
-    trader_address TEXT NOT NULL REFERENCES traders (address),
-    order_id       BIGINT NOT NULL,
-    first_seen_at  TIMESTAMPTZ NOT NULL,
+    trader_address   TEXT NOT NULL REFERENCES traders (address),
+    order_id         BIGINT NOT NULL,
+    coin             TEXT NOT NULL,
+    is_buy           BOOLEAN NOT NULL,
+    size             NUMERIC NOT NULL,
+    is_trigger       BOOLEAN NOT NULL,
+    is_position_tpsl BOOLEAN NOT NULL,
+    reduce_only      BOOLEAN NOT NULL,
+    first_seen_at    TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (trader_address, order_id)
 );
 

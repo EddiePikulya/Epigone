@@ -303,20 +303,33 @@ def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:
 
 def parse_open_orders(payload: Any, dex: str | None = None) -> list[OpenOrder]:
     """Map a frontendOpenOrders payload (shapes recorded live 2026-07-24,
-    issue #115) to OpenOrders. A trigger row's triggerPx is kept only when
-    isTrigger — a plain limit carries a placeholder "0.0" there, which must
-    read as "no trigger", never as a zero price. An unrecognized `side` fails
-    loudly: silently reading it as a sell would flip the alert's meaning."""
+    issue #115) to OpenOrders, PERP ORDERS ONLY. The core response mixes in
+    the wallet's resting SPOT orders (verified live 2026-07-24: a tracked
+    whale's book was 40/97 spot rows, coins `@334`/`@700` — spot-pair
+    indices); Epigone is perp-only (positions, fills-side metrics), so a
+    `@334 BUY $12,000` row would be a meaningless ticker for an asset class
+    the product doesn't cover. Spot is dropped here by the fills convention
+    (Fill.is_perp): spot coins are the `@N`-indexed and `BASE/QUOTE`-named
+    ones; perp coins are bare tickers, builder-DEX perps arrive
+    `dex:`-prefixed and stay.
+
+    A trigger row's triggerPx is kept only when isTrigger — a plain limit
+    carries a placeholder "0.0" there, which must read as "no trigger", never
+    as a zero price. An unrecognized `side` fails loudly: silently reading it
+    as a sell would flip the alert's meaning."""
     try:
         orders: list[OpenOrder] = []
         for raw in payload:
+            coin = str(raw["coin"])
+            if coin.startswith("@") or "/" in coin:
+                continue  # a resting spot order (docstring): out of product scope
             side = str(raw["side"])
             if side not in ("A", "B"):
                 raise ValueError(f"unknown order side {side!r}")
             is_trigger = bool(raw["isTrigger"])
             orders.append(
                 OpenOrder(
-                    coin=_namespaced_coin(str(raw["coin"]), dex),
+                    coin=_namespaced_coin(coin, dex),
                     is_buy=side == "B",
                     limit_price=Decimal(raw["limitPx"]),
                     size=Decimal(raw["sz"]),

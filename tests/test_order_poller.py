@@ -25,7 +25,11 @@ from epigone.budget import WeightBudget
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, OpenOrder, RateLimitedError
 from epigone.gateway.fake import FakeHyperliquidGateway
-from epigone.stream.orders import ORDERS_WEIGHT, run_order_poll_pass
+from epigone.stream.orders import (
+    ORDER_WALLET_SPACING_SECONDS,
+    ORDERS_WEIGHT,
+    run_order_poll_pass,
+)
 from tests.support.clock import FakeClock
 
 WIDE_OPEN_BUDGET = 1_000_000
@@ -296,6 +300,20 @@ async def test_a_whole_position_tpsl_is_never_floor_suppressed(
     assert entry["notional_usd"] is None
 
 
+async def test_the_pass_spaces_wallets_for_send_gate_fairness(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # The reserve floor protects the position poller's tokens; this spacing
+    # protects the shared #41 send gate — heavy order spends never run
+    # back-to-back, so concurrent position polls always find the gate open.
+    for i in range(3):
+        await track(pool, clock, f"0x{i:040x}", 42)
+
+    await run_pass(pool, gateway, clock)
+
+    assert clock.slept == [ORDER_WALLET_SPACING_SECONDS] * 2  # between wallets, not after
+
+
 async def test_budget_is_billed_per_venue_per_wallet(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
@@ -352,6 +370,97 @@ async def test_rate_limiting_is_pacing_not_outage(
     assert result.failed == 6
     events = await pool.fetchval("SELECT count(*) FROM rate_limit_events")
     assert events == 6  # feeds the health monitor's sustained-limiting signal (#54)
+
+
+async def test_a_price_modify_carries_forward_silently_forever(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # Hyperliquid's modify mints a NEW oid (an atomic cancel/replace), so a
+    # maker nudging a resting ladder's prices each cycle would otherwise alert
+    # 288 times a day. Same coin/side/kind/size with a new id and price is the
+    # same plan: silent, cycle after cycle.
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_open_orders("0xaaa", [order(order_id=1001, limit_price="4.5")])
+    await baseline(pool, gateway, clock)
+
+    for cycle, (oid, price) in enumerate([(2001, "4.6"), (3001, "4.7"), (4001, "4.8")], start=1):
+        clock.advance(300)
+        gateway.set_open_orders("0xaaa", [order(order_id=oid, limit_price=price)])
+        result = await run_pass(pool, gateway, clock)
+        assert result.new_orders == 0, f"cycle {cycle} re-alerted a modify"
+    assert await alerts(pool) == []
+    # The identity carried forward: the snapshot set tracks the latest id.
+    ids = await pool.fetch("SELECT order_id FROM order_snapshots")
+    assert [r["order_id"] for r in ids] == [4001]
+
+
+async def test_a_replace_that_resizes_past_the_tolerance_still_alerts(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_open_orders("0xaaa", [order(order_id=1001, size="3000")])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    # +67% is past MODIFY_SIZE_TOLERANCE: the plan itself changed enough to be
+    # news (the same 25% significance bar the position scale alerts use).
+    gateway.set_open_orders("0xaaa", [order(order_id=2001, size="5000")])
+    result = await run_pass(pool, gateway, clock)
+
+    assert result.new_orders == 1
+    (row,) = await alerts(pool)
+    (entry,) = batch(row)
+    assert entry["order_id"] == 2001
+
+
+async def test_a_genuine_new_order_beside_a_modify_alerts_alone(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_open_orders("0xaaa", [order(order_id=1001)])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    gateway.set_open_orders(
+        "0xaaa",
+        [
+            order(order_id=2001, limit_price="4.6"),  # replace of 1001: silent
+            order(coin="HYPE", is_buy=True, order_id=2002, limit_price="60", size="100"),
+        ],
+    )
+    result = await run_pass(pool, gateway, clock)
+
+    assert result.new_orders == 1
+    (row,) = await alerts(pool)
+    (entry,) = batch(row)
+    assert entry["coin"] == "HYPE"
+
+
+async def test_a_replaced_position_tpsl_is_the_same_protection_plan(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    def tpsl(oid: int, trigger: str) -> OpenOrder:
+        return order(
+            coin="GRAM",
+            order_id=oid,
+            size="0",
+            order_type="Stop Market",
+            is_trigger=True,
+            trigger_price=trigger,
+            is_position_tpsl=True,
+            reduce_only=True,
+        )
+
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_open_orders("0xaaa", [tpsl(1001, "1.38")])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    gateway.set_open_orders("0xaaa", [tpsl(2001, "1.45")])  # SL moved up: a modify
+    result = await run_pass(pool, gateway, clock)
+
+    assert result.new_orders == 0
+    assert await alerts(pool) == []
 
 
 async def test_unfollowed_wallets_prune_and_refollow_rebaselines(

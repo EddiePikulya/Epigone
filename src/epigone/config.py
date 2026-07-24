@@ -31,7 +31,10 @@ DEFAULT_FINE_CHUNK_SIZE = 500
 # 900/min shared refill, alongside position polling's ~6/wallet/min. Position
 # polls always win regardless: order spends carry the ingest-style stream
 # reserve (epigone.stream.main), so a mis-tuned interval degrades to slower
-# order alerts, never to starved Position Alerts.
+# order alerts, never to starved Position Alerts. The reserve guards tokens;
+# the #41 send gate (FCFS) is guarded separately — the pass spaces its
+# wallets (stream.orders.ORDER_WALLET_SPACING_SECONDS) so its heavy sends
+# never saturate the gate position polls share.
 # Operator-tunable via ORDER_POLL_INTERVAL_SECONDS; a bad value falls back here.
 DEFAULT_ORDER_POLL_INTERVAL_SECONDS = 300
 

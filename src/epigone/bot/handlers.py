@@ -404,9 +404,7 @@ async def _render_positions_view(
     if track is None:
         return None
     positions = await fetch_open_positions(gateway, address)
-    # Fetched on demand like the positions, and failing the same way: a
-    # GatewayError here rides the caller's existing delayed-data answer (#115).
-    orders_section = _render_open_orders(await fetch_open_orders(gateway, address))
+    orders_section = await _open_orders_section(gateway, address)
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     positions_text, entities = _render_positions(
@@ -798,9 +796,7 @@ async def _render_profile(
     keeping every other button (follow/unfollow, rename, the #93 header
     entity)."""
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
-    # On demand for tracked and untracked wallets alike, degrading exactly like
-    # the positions fetch: a GatewayError rides the caller's delayed-data answer.
-    orders_section = _render_open_orders(await fetch_open_orders(gateway, address))
+    orders_section = await _open_orders_section(gateway, address)
     track = await fetch_track(pool, user_id, address)
     followed = track is not None
     name: str | None = track["name"] if track is not None else None
@@ -1450,6 +1446,27 @@ def _render_positions(
         blocks.append("")
         blocks.append(FOLLOW_FOR_AGE_HINT)
     return "\n".join(blocks), entities
+
+
+# Shown in place of the resting-orders section when only the orders fetch
+# failed (#115 review): a hedge, never silence — silence would read as an
+# empty book, and blanking the whole view over an optional garnish would
+# throw away the healthy positions beside it.
+ORDERS_UNAVAILABLE_LINE = "Resting orders unavailable right now"
+
+
+async def _open_orders_section(gateway: HyperliquidGateway, address: str) -> str | None:
+    """The resting-orders section for a wallet view, fetched on demand (#115).
+
+    Orders are a garnish on the view, not its backbone: the positions fetch
+    keeps its all-venues-must-succeed rule (a partial positions read renders
+    lies), but an orders-only failure degrades to the honest unavailable line
+    while the rest of the view renders. None only for a healthy, empty book —
+    the views then show nothing extra."""
+    try:
+        return _render_open_orders(await fetch_open_orders(gateway, address))
+    except GatewayError:
+        return ORDERS_UNAVAILABLE_LINE
 
 
 def _render_open_orders(orders: list[OpenOrder]) -> str | None:

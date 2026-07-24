@@ -5,18 +5,18 @@ plan before it executes — for tracked and untracked wallets alike.
 Seam test per the house convention: dispatcher + fake transport, fake
 gateway, real Postgres. The line format itself is pinned in
 tests/test_order_alert_delivery.py through the shared renderer; here the
-concern is where the section appears, that empty books add nothing, and that
-a failing orders fetch degrades exactly like a failing positions fetch.
+concern is where the section appears, that empty books add nothing, and the
+degradation split: an orders-only failure hedges in place while a positions
+failure still fails the whole view.
 """
 
 from datetime import UTC, datetime
 from decimal import Decimal
 
-import asyncpg
 from aiogram import Bot, Dispatcher
 
 from epigone.bot.format import MAX_ORDERS_SHOWN
-from epigone.bot.handlers import DATA_DELAYED_TEXT
+from epigone.bot.handlers import DATA_DELAYED_TEXT, ORDERS_UNAVAILABLE_LINE
 from epigone.gateway import GatewayError, OpenOrder, Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
@@ -135,14 +135,30 @@ async def test_a_huge_ladder_is_capped_with_a_count(
     assert "…and 3 more" in profile
 
 
-async def test_a_failing_orders_fetch_degrades_like_a_failing_positions_fetch(
-    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway,
-    pool: asyncpg.Pool,
+async def test_an_orders_only_failure_degrades_to_an_unavailable_line(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
 ) -> None:
+    # Orders are a garnish on the view, not its backbone: an orders-only
+    # fetch failure must not blank the healthy positions beside it — but it
+    # must hedge, never stay silent (silence would read as an empty book).
+    gateway.set_positions(WHALE, [hype_long()])
     gateway.open_orders_errors[WHALE] = GatewayError("info API down")
 
     await feed_text(dp, bot, WHALE, user_id=111)
 
-    # Same message the positions fetch failure answers with: the data is
-    # delayed, nothing crashed, nothing half-rendered.
+    profile = session.sent_messages()[-1].text or ""
+    assert "HYPE" in profile  # positions rendered
+    assert ORDERS_UNAVAILABLE_LINE in profile
+
+
+async def test_a_positions_failure_still_fails_the_whole_view(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
+) -> None:
+    # The all-venues-must-succeed rule is untouched for positions (#21/#31):
+    # a partial positions read renders lies, so the view still answers with
+    # the delayed-data message.
+    gateway.positions_errors[WHALE] = GatewayError("info API down")
+
+    await feed_text(dp, bot, WHALE, user_id=111)
+
     assert (session.sent_messages()[-1].text or "") == DATA_DELAYED_TEXT

@@ -251,8 +251,14 @@ class HyperliquidGateway(Protocol):
         ...
 
     async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
-        """A Trader's resting orders on ONE venue, trigger/TP-SL legs included
-        (issue #115; the info endpoint is `frontendOpenOrders`).
+        """A Trader's resting PERP orders on ONE venue, trigger/TP-SL legs
+        included (issue #115; the info endpoint is `frontendOpenOrders`).
+
+        PERP-ONLY is part of this contract: the core response mixes in the
+        wallet's resting SPOT orders (verified live 2026-07-24 — a tracked
+        whale's book was 40/97 spot rows, `@N` spot-pair indices), which
+        Epigone doesn't cover; implementations drop them by the fills
+        convention (spot coins are `@N`-indexed or `BASE/QUOTE`-named).
 
         PER-DEX, verified live 2026-07-24 against wallets holding xyz orders
         (the #63 never-assume-coverage lesson): with no `dex` the endpoint

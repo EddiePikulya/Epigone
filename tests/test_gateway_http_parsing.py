@@ -263,6 +263,18 @@ def test_parse_open_orders_maps_the_recorded_shapes() -> None:
     assert tp.notional_usd is None
 
 
+def test_parse_open_orders_drops_resting_spot_orders() -> None:
+    # The core response mixes in resting SPOT orders (verified live
+    # 2026-07-24: a tracked whale's book was 40/97 spot rows). Epigone is
+    # perp-only — a `@334 BUY $12,000` alert would name an index, not a
+    # ticker — so the parser drops them by the fills is_perp convention:
+    # `@N`-indexed and `BASE/QUOTE`-named coins are spot.
+    spot_indexed = dict(OPEN_ORDERS_PAYLOAD[0], coin="@700", oid=502000183929)
+    spot_named = dict(OPEN_ORDERS_PAYLOAD[0], coin="PURR/USDC", oid=502000183930)
+    orders = parse_open_orders([spot_indexed, OPEN_ORDERS_PAYLOAD[0], spot_named])
+    assert [o.coin for o in orders] == ["LIT"]
+
+
 def test_an_unseen_trigger_family_labels_itself_rather_than_guessing_sl() -> None:
     # Only Stop/Take-Profit families were observed live (2026-07-24). If
     # Hyperliquid ships a new trigger family, its raw orderType is the label —
