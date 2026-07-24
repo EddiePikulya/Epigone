@@ -196,18 +196,26 @@ class HyperliquidGateway(Protocol):
 # so changing what a fetch hits means changing this number in the same file.
 FILL_ENDPOINTS = 2
 
-# The single HIP-3 builder DEX Epigone covers: xyz hosts ~90% of non-core
-# activity (equity/"stock" perps: xyz:META, xyz:BB, …) at 2x the poll cost,
-# versus 10x for all nine. Its coins come back namespaced (`xyz:META`), so they
-# never collide with core. Hard-coded rather than discovered via perpDexs (a
-# stable HIP-3 deployment; issue #21 left that lookup optional).
+# The HIP-3 builder DEXes Epigone covers for POSITIONS (fills-side metrics are
+# account-wide across all dexs regardless): xyz hosts ~90% of non-core activity
+# (equity/"stock" perps: xyz:META, xyz:BB, …); mkts (Markets by Kinetiq) adds
+# the index perps worth alerting on (mkts:US500, mkts:QQQ). Covering a venue
+# costs one weight-2 clearinghouseState call per tracked wallet per poll — three
+# venues = weight 6/wallet, so the stream reserve's instant-claim floor (120)
+# guarantees 20 wallets, not the 30 its weight-4 sizing note assumed; ample at
+# current tracking levels, revisit the reserve before raising the track cap.
+# Coins come back namespaced (`xyz:META`, `mkts:US500`), never colliding with
+# core. Hard-coded rather than discovered via perpDexs (stable deployments;
+# issue #21 left that lookup optional) — the remaining seven dexs are too thin
+# to justify their poll cost today.
 XYZ_DEX = "xyz"
+MKTS_DEX = "mkts"
 
 # Every venue fetch_open_positions queries per Trader, as `dex` args: the core
-# perps (None) then the xyz builder DEX. The poller bills budget one spend per
-# entry from this same tuple, so its weight accounting can never drift from the
-# calls the helper actually makes (issue #31).
-POSITION_VENUES: tuple[str | None, ...] = (None, XYZ_DEX)
+# perps (None) then the covered builder DEXes. The poller bills budget one
+# spend per entry from this same tuple, so its weight accounting can never
+# drift from the calls the helper actually makes (issue #31).
+POSITION_VENUES: tuple[str | None, ...] = (None, XYZ_DEX, MKTS_DEX)
 
 
 async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> list[Position]:
