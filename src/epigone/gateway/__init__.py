@@ -6,11 +6,12 @@ reads — goes through this interface and nowhere else (ADR-0001; V1 spec
 the real client.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 
 class GatewayError(Exception):
@@ -105,6 +106,97 @@ class Position:
 
 
 @dataclass(frozen=True)
+class OpenOrder:
+    """A resting (unfilled) order on a Trader's book — their plan before it
+    executes (issue #115).
+
+    `size` is what remains to fill, in coin units — except 0, which on a
+    position-wide TP/SL (`is_position_tpsl`) means "the whole position at
+    trigger time", never an empty order. For a trigger order `trigger_price`
+    is the price that arms it and `limit_price` only the slippage bound the
+    fill is capped at (observed live: a stop's limitPx sits ~8% past its
+    triggerPx); for a plain resting limit `trigger_price` is None and
+    `limit_price` is where it rests."""
+
+    coin: str
+    is_buy: bool  # side "B" (bid) is a buy, "A" (ask) a sell
+    limit_price: Decimal
+    size: Decimal
+    order_id: int
+    placed_at: datetime
+    order_type: str  # the API's raw string: "Limit", "Stop Market", "Take Profit Market", …
+    is_trigger: bool
+    trigger_price: Decimal | None
+    is_position_tpsl: bool
+    reduce_only: bool
+
+    @property
+    def notional_usd(self) -> Decimal | None:
+        """The order's dollar size: size × the price it aims to execute near —
+        the trigger price for a trigger order (its limit is just the slippage
+        cap). None for a whole-position TP/SL (size 0): that notional is the
+        position's at trigger time, unknowable from the order, so callers
+        treat None as "never floor-suppressed", exactly like a position event
+        without a notional."""
+        if self.size == 0:
+            return None
+        price = self.trigger_price if self.trigger_price is not None else self.limit_price
+        return self.size * price
+
+    @property
+    def tpsl(self) -> str | None:
+        """The "TP"/"SL" tag a trigger order renders with (issue #115): its
+        orderType family names the intent ("Take Profit …" / "Stop …"). None
+        for a plain resting limit."""
+        if not self.is_trigger:
+            return None
+        return "TP" if self.order_type.startswith("Take Profit") else "SL"
+
+    def to_wire(self) -> dict[str, Any]:
+        """This order as one entry of an order_alerts batch (issue #115) — the
+        JSONB payload the stream queues and the bot renders (ADR-0002: the
+        processes meet only in Postgres). Decimals ride as strings so they
+        round-trip exactly (the criteria.filters precedent); `notional_usd` is
+        stored too — redundant with the prices, but it documents what the
+        min-size floor judged and keeps the row greppable in SQL."""
+        notional = self.notional_usd
+        return {
+            "coin": self.coin,
+            "is_buy": self.is_buy,
+            "limit_price": str(self.limit_price),
+            "size": str(self.size),
+            "order_id": self.order_id,
+            "placed_at": self.placed_at.isoformat(),
+            "order_type": self.order_type,
+            "is_trigger": self.is_trigger,
+            "trigger_price": str(self.trigger_price) if self.trigger_price is not None else None,
+            "is_position_tpsl": self.is_position_tpsl,
+            "reduce_only": self.reduce_only,
+            "notional_usd": str(notional) if notional is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, entry: Mapping[str, Any]) -> "OpenOrder":
+        """The inverse of to_wire, for the delivery side. `notional_usd` is not
+        read back — the property recomputes it from the exactly round-tripped
+        prices, so the stored copy can never drift from the rendered one."""
+        trigger_price = entry["trigger_price"]
+        return cls(
+            coin=entry["coin"],
+            is_buy=entry["is_buy"],
+            limit_price=Decimal(entry["limit_price"]),
+            size=Decimal(entry["size"]),
+            order_id=entry["order_id"],
+            placed_at=datetime.fromisoformat(entry["placed_at"]),
+            order_type=entry["order_type"],
+            is_trigger=entry["is_trigger"],
+            trigger_price=Decimal(trigger_price) if trigger_price is not None else None,
+            is_position_tpsl=entry["is_position_tpsl"],
+            reduce_only=entry["reduce_only"],
+        )
+
+
+@dataclass(frozen=True)
 class Fill:
     """One fill from a Trader's history — the raw material of fine metrics (issue #8).
 
@@ -149,6 +241,27 @@ class HyperliquidGateway(Protocol):
         `dex` selects a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21);
         None reads the core venue. Builder-DEX coins are namespaced `dex:COIN`
         (e.g. `xyz:META`), keeping them distinct from core positions."""
+        ...
+
+    async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
+        """A Trader's resting orders on ONE venue, trigger/TP-SL legs included
+        (issue #115; the info endpoint is `frontendOpenOrders`).
+
+        PER-DEX, verified live 2026-07-24 against wallets holding xyz orders
+        (the #63 never-assume-coverage lesson): with no `dex` the endpoint
+        returns ONLY core-venue orders — a resting xyz ladder comes back []
+        until queried with dex="xyz" — so full coverage means one call per
+        POSITION_VENUES entry, exactly like clearinghouseState. Builder-DEX
+        coins arrive already namespaced (`xyz:BB`); implementations keep them
+        so (prefixing is idempotent, matching positions).
+
+        Response shape (recorded live 2026-07-24, tests/test_gateway_http_parsing):
+        a flat array; `side` is "B" (bid/buy) or "A" (ask/sell). Trigger
+        orders carry isTrigger true, the arming price in triggerPx, and an
+        orderType naming the intent ("Stop Market", "Take Profit Market", …);
+        their limitPx is only the slippage bound. A position-wide TP/SL adds
+        isPositionTpsl true with sz "0.0" — sized to whatever the position is
+        when it triggers. Raises GatewayError on failure."""
         ...
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
@@ -232,3 +345,20 @@ async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> lis
     for dex in POSITION_VENUES:
         positions.extend(await gateway.get_open_positions(address, dex=dex))
     return positions
+
+
+async def fetch_open_orders(gateway: HyperliquidGateway, address: str) -> list[OpenOrder]:
+    """A Trader's resting orders across every venue Epigone covers, merged into
+    one list — frontendOpenOrders is per-dex exactly like clearinghouseState
+    (verified live 2026-07-24, issue #115), so this walks the same
+    POSITION_VENUES the positions fetch does.
+
+    Same all-or-raise rule as fetch_open_positions: a partial fetch would read
+    an unanswered venue's ladder as cancelled — the order poller would drop
+    those known ids and then re-alert the entire ladder when the venue answers
+    again, and a display would show a book the wallet never thinned. Any venue
+    failure therefore raises GatewayError (the #21/#31 rule)."""
+    orders: list[OpenOrder] = []
+    for dex in POSITION_VENUES:
+        orders.extend(await gateway.get_open_orders(address, dex=dex))
+    return orders

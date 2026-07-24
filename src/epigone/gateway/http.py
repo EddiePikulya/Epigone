@@ -32,6 +32,7 @@ from epigone.gateway import (
     GatewayError,
     LeaderboardEntry,
     LeaderboardWindow,
+    OpenOrder,
     Position,
     RateLimitedError,
     Side,
@@ -153,6 +154,16 @@ class HttpHyperliquidGateway:
         except aiohttp.ClientError as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
         return parse_positions(payload, dex)
+
+    async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
+        body: dict[str, str] = {"type": "frontendOpenOrders", "user": address.lower()}
+        if dex is not None:
+            body["dex"] = dex  # per-dex like clearinghouseState (verified live 2026-07-24)
+        try:
+            payload = await self._request_json("POST", INFO_URL, json_body=body)
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"frontendOpenOrders request failed for {address}: {exc}") from exc
+        return parse_open_orders(payload, dex)
 
     async def _request_json(
         self, method: str, url: str, *, json_body: dict[str, Any] | None = None
@@ -288,6 +299,39 @@ def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:
         return positions
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected clearinghouseState payload shape: {exc!r}") from exc
+
+
+def parse_open_orders(payload: Any, dex: str | None = None) -> list[OpenOrder]:
+    """Map a frontendOpenOrders payload (shapes recorded live 2026-07-24,
+    issue #115) to OpenOrders. A trigger row's triggerPx is kept only when
+    isTrigger — a plain limit carries a placeholder "0.0" there, which must
+    read as "no trigger", never as a zero price. An unrecognized `side` fails
+    loudly: silently reading it as a sell would flip the alert's meaning."""
+    try:
+        orders: list[OpenOrder] = []
+        for raw in payload:
+            side = str(raw["side"])
+            if side not in ("A", "B"):
+                raise ValueError(f"unknown order side {side!r}")
+            is_trigger = bool(raw["isTrigger"])
+            orders.append(
+                OpenOrder(
+                    coin=_namespaced_coin(str(raw["coin"]), dex),
+                    is_buy=side == "B",
+                    limit_price=Decimal(raw["limitPx"]),
+                    size=Decimal(raw["sz"]),
+                    order_id=int(raw["oid"]),
+                    placed_at=datetime.fromtimestamp(raw["timestamp"] / 1000, tz=UTC),
+                    order_type=str(raw["orderType"]),
+                    is_trigger=is_trigger,
+                    trigger_price=Decimal(raw["triggerPx"]) if is_trigger else None,
+                    is_position_tpsl=bool(raw["isPositionTpsl"]),
+                    reduce_only=bool(raw["reduceOnly"]),
+                )
+            )
+        return orders
+    except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+        raise GatewayError(f"unexpected frontendOpenOrders payload shape: {exc!r}") from exc
 
 
 def _opt_decimal(value: Any) -> Decimal | None:

@@ -30,7 +30,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from epigone.bot.delete import with_delete_button
-from epigone.bot.format import button_label, held_for, short_address, signed_pct, signed_usd, trader_label
+from epigone.bot.format import (
+    button_label,
+    held_for,
+    signed_pct,
+    signed_usd,
+    trader_label,
+)
 from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
 from epigone.clock import Clock
 
@@ -88,7 +94,7 @@ async def _deliver_anchor(pool: asyncpg.Pool, bot: Bot, row: asyncpg.Record) -> 
     message = await bot.send_message(
         chat_id=row["user_telegram_id"],
         text=render_alert(row, row["scale_arrows"]),
-        reply_markup=_positions_button(row),
+        reply_markup=positions_button(row),
     )
     await pool.execute(
         "UPDATE position_alerts SET telegram_message_id = $2 WHERE id = $1",
@@ -121,7 +127,7 @@ async def _deliver_scale(pool: asyncpg.Pool, bot: Bot, row: asyncpg.Record) -> N
             chat_id=row["user_telegram_id"],
             message_id=anchor["telegram_message_id"],
             text=render_alert(anchor, arrows),
-            reply_markup=_positions_button(anchor),
+            reply_markup=positions_button(anchor),
         )
     except TelegramBadRequest:
         log.debug(
@@ -189,7 +195,7 @@ async def _fetch_pending_alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     return rows
 
 
-def _positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
+def positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
     """Make the alert tap-through to the trader's live positions — the same
     on-demand view /tracked offers (the positions:<address> callback). An alert
     only ever fires for a Trader the recipient follows, which is exactly the

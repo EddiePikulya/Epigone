@@ -1,11 +1,12 @@
 """Shared Telegram text formatting: used by the dialog handlers and the
-Position Alert renderer."""
+Position/Order Alert renderers."""
 
 from datetime import datetime
 from decimal import Decimal
 
 from aiogram.types import MessageEntity
 
+from epigone.gateway import OpenOrder
 from epigone.metrics.library import format_duration
 
 
@@ -53,6 +54,33 @@ def trader_header(label: str | None, address: str) -> tuple[str, MessageEntity]:
     offset = len(prefix.encode("utf-16-le")) // 2
     length = len(address.encode("utf-16-le")) // 2
     return text, MessageEntity(type="code", offset=offset, length=length)
+
+
+def display_coin(coin: str) -> str:
+    """A builder-DEX coin arrives namespaced `dex:COIN` (e.g. xyz:SP500, #21);
+    show the bare ticker rather than leaking the venue prefix. A core coin has
+    no prefix and passes through untouched."""
+    return coin.rsplit(":", 1)[-1]
+
+
+def order_line(order: OpenOrder) -> str:
+    """One resting order, as both the wallet views and Order Alerts render it
+    (issue #115) — shared here so the two can't drift (the #77 lesson).
+
+    A plain limit reads notional-first like a position row (`LIT SELL $13,500
+    @ 4.5`); a trigger order is labeled TP/SL from its orderType and reads
+    against the price that arms it (its limitPx is only a slippage cap); a
+    whole-position TP/SL has no order-level size, so it says what it is
+    instead of inventing one. Builder-DEX coins render as the bare ticker."""
+    coin = display_coin(order.coin)
+    side = "BUY" if order.is_buy else "SELL"
+    if order.is_position_tpsl:
+        return f"{coin} {order.tpsl} @ {order.trigger_price} (whole position)"
+    notional = order.notional_usd
+    amount = f"${notional:,.0f}" if notional is not None else "size unknown"
+    if order.is_trigger:
+        return f"{coin} {side} {order.tpsl} {amount} @ trigger {order.trigger_price}"
+    return f"{coin} {side} {amount} @ {order.limit_price}"
 
 
 def signed_usd(amount: Decimal) -> str:

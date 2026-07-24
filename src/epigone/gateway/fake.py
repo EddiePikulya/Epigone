@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from epigone.gateway import Fill, LeaderboardEntry, Position
+from epigone.gateway import Fill, LeaderboardEntry, OpenOrder, Position
 
 
 class FakeHyperliquidGateway:
@@ -12,6 +12,8 @@ class FakeHyperliquidGateway:
     `positions_calls`
     records each get_open_positions as an (address, dex) pair — dex is None for
     the core venue, "xyz" etc. for a builder DEX (issue #21).
+    `open_orders_calls` records each get_open_orders the same way — orders are
+    per-venue exactly like positions (issue #115).
     """
 
     def __init__(self) -> None:
@@ -20,6 +22,10 @@ class FakeHyperliquidGateway:
         # Fail one venue while another succeeds, keyed by (address, dex).
         self.positions_errors_by_dex: dict[tuple[str, str | None], Exception] = {}
         self.positions_calls: list[tuple[str, str | None]] = []
+        self.open_orders: dict[tuple[str, str | None], list[OpenOrder]] = {}
+        self.open_orders_errors: dict[str, Exception] = {}
+        self.open_orders_errors_by_dex: dict[tuple[str, str | None], Exception] = {}
+        self.open_orders_calls: list[tuple[str, str | None]] = []
         self.leaderboard: list[LeaderboardEntry] = []
         self.leaderboard_error: Exception | None = None
         self.leaderboard_calls = 0
@@ -35,6 +41,14 @@ class FakeHyperliquidGateway:
         if error is not None:
             raise error
         return self.positions.get((key, dex), [])
+
+    async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
+        key = address.lower()
+        self.open_orders_calls.append((key, dex))
+        error = self.open_orders_errors_by_dex.get((key, dex)) or self.open_orders_errors.get(key)
+        if error is not None:
+            raise error
+        return self.open_orders.get((key, dex), [])
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
         self.leaderboard_calls += 1
@@ -64,6 +78,18 @@ class FakeHyperliquidGateway:
         self, address: str, positions: list[Position], dex: str | None = None
     ) -> None:
         self.positions[(address.lower(), dex)] = positions
+
+    def set_open_orders(
+        self, address: str, orders: list[OpenOrder], dex: str | None = None
+    ) -> None:
+        """Provide one venue's resting orders, as the real gateway returns them
+        (issue #115): per-dex — dex=None is the core venue, "xyz" etc. a
+        builder DEX — with builder-DEX coins already namespaced (`xyz:BB`),
+        since frontendOpenOrders serves them namespaced and the parser keeps
+        them so. A test modelling full coverage sets each venue it wants
+        non-empty; unset venues answer [], exactly like the live endpoint for
+        a wallet with no ladder there."""
+        self.open_orders[(address.lower(), dex)] = list(orders)
 
     def set_leaderboard(self, entries: list[LeaderboardEntry]) -> None:
         self.leaderboard = list(entries)

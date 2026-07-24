@@ -21,6 +21,20 @@ DEFAULT_SEED_INTERVAL_MINUTES = 60
 # universe (due count <= chunk) is one full pass, unchanged from before.
 DEFAULT_FINE_CHUNK_SIZE = 500
 
+# Order-poll cadence (issue #115): how often the stream diffs tracked wallets'
+# resting orders. Resting orders live minutes-to-days, so five-minute latency
+# loses nothing — and the cadence is what keeps the heavier endpoint cheap.
+# The math: one poll costs ORDERS_WEIGHT (20 nominal; ~8 measured, see
+# epigone.stream.orders) × 3 covered venues = 60 weight per wallet per cycle,
+# so at 300s each tracked wallet adds 60/5min = 12 nominal weight/min — the
+# full 15-wallet follow cap ≈ 180/min nominal (~72/min real) against the
+# 900/min shared refill, alongside position polling's ~6/wallet/min. Position
+# polls always win regardless: order spends carry the ingest-style stream
+# reserve (epigone.stream.main), so a mis-tuned interval degrades to slower
+# order alerts, never to starved Position Alerts.
+# Operator-tunable via ORDER_POLL_INTERVAL_SECONDS; a bad value falls back here.
+DEFAULT_ORDER_POLL_INTERVAL_SECONDS = 300
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -40,6 +54,9 @@ class Settings:
     # How many due Traders each fine-pass cycle processes before returning to the
     # loop (issue #66). Only the ingest process reads it.
     fine_chunk_size: int
+    # How often the stream diffs tracked wallets' resting orders (issue #115).
+    # Only the stream process reads it.
+    order_poll_interval_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +69,9 @@ class Settings:
                 os.environ.get("SEED_INTERVAL_MINUTES")
             ),
             fine_chunk_size=_parse_fine_chunk_size(os.environ.get("FINE_CHUNK_SIZE")),
+            order_poll_interval_seconds=_parse_order_poll_interval_seconds(
+                os.environ.get("ORDER_POLL_INTERVAL_SECONDS")
+            ),
         )
 
     def require_bot_token(self) -> str:
@@ -94,3 +114,9 @@ def _parse_seed_interval_minutes(raw: str | None) -> int:
 
 def _parse_fine_chunk_size(raw: str | None) -> int:
     return parse_positive_int(raw, default=DEFAULT_FINE_CHUNK_SIZE, name="FINE_CHUNK_SIZE")
+
+
+def _parse_order_poll_interval_seconds(raw: str | None) -> int:
+    return parse_positive_int(
+        raw, default=DEFAULT_ORDER_POLL_INTERVAL_SECONDS, name="ORDER_POLL_INTERVAL_SECONDS"
+    )

@@ -21,8 +21,10 @@ from aiogram.types import (
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import (
     button_label,
+    display_coin,
     fills_open_age,
     open_age,
+    order_line,
     short_address,
     signed_pct,
     signed_usd,
@@ -30,14 +32,17 @@ from epigone.bot.format import (
     trader_label,
     usd_compact,
 )
+from epigone.bot.order_alerts import MAX_ORDERS_SHOWN
 from epigone.clock import Clock
 from epigone.first_data_notice import record_follow_notice_state
 from epigone.gateway import (
     GatewayError,
     HyperliquidGateway,
+    OpenOrder,
     Position,
     Side,
     Window,
+    fetch_open_orders,
     fetch_open_positions,
 )
 from epigone.ingest.fine import mark_due_on_follow
@@ -400,11 +405,16 @@ async def _render_positions_view(
     if track is None:
         return None
     positions = await fetch_open_positions(gateway, address)
+    # Fetched on demand like the positions, and failing the same way: a
+    # GatewayError here rides the caller's existing delayed-data answer (#115).
+    orders_section = _render_open_orders(await fetch_open_orders(gateway, address))
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     positions_text, entities = _render_positions(
         address, positions, ages, clock.now(), fills, name=track["name"]
     )
+    if orders_section is not None:
+        positions_text += f"\n\n{orders_section}"
     view = (
         positions_text
         + "\n"
@@ -789,6 +799,9 @@ async def _render_profile(
     keeping every other button (follow/unfollow, rename, the #93 header
     entity)."""
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
+    # On demand for tracked and untracked wallets alike, degrading exactly like
+    # the positions fetch: a GatewayError rides the caller's delayed-data answer.
+    orders_section = _render_open_orders(await fetch_open_orders(gateway, address))
     track = await fetch_track(pool, user_id, address)
     followed = track is not None
     name: str | None = track["name"] if track is not None else None
@@ -798,6 +811,8 @@ async def _render_profile(
         address, positions, ages, clock.now(), fills, name=name, offer_follow=not followed
     )
     parts = [positions_text]
+    if orders_section is not None:
+        parts.append(orders_section)
     # The "previously followed" note (#99) sits right under the header — but only
     # for a wallet this User dropped and hasn't re-followed; a live Track hides it.
     if not followed:
@@ -980,7 +995,7 @@ def _render_most_played(plays: list[tuple[str, int, bool]]) -> str | None:
     nothing to rank — the line is then omitted rather than shown empty."""
     if not plays:
         return None
-    top = [_display_coin(coin) for coin, _, _ in plays[:MOST_PLAYED_LIMIT]]
+    top = [display_coin(coin) for coin, _, _ in plays[:MOST_PLAYED_LIMIT]]
     line = "Most played: " + " · ".join(top)
     effective = _effective_coins([count for _, count, _ in plays])
     if effective is not None:
@@ -999,13 +1014,6 @@ def _effective_coins(trip_counts: list[int]) -> str | None:
         return None
     effective = total * total / sum(count * count for count in trip_counts)
     return f"{effective:.1f}".rstrip("0").rstrip(".")
-
-
-def _display_coin(coin: str) -> str:
-    """A builder-DEX coin arrives namespaced `dex:COIN` (e.g. xyz:SP500, #21);
-    show the bare ticker rather than leaking the venue prefix. A core coin has no
-    prefix and passes through untouched."""
-    return coin.rsplit(":", 1)[-1]
 
 
 def _relative_age(now: datetime, then: datetime) -> str:
@@ -1443,6 +1451,33 @@ def _render_positions(
         blocks.append("")
         blocks.append(FOLLOW_FOR_AGE_HINT)
     return "\n".join(blocks), entities
+
+
+def _render_open_orders(orders: list[OpenOrder]) -> str | None:
+    """The resting-orders section both wallet views append after the positions
+    block (#115): the trader's plan before it executes, tracked and untracked
+    wallets alike. None — so the views show nothing extra — for a wallet with
+    an empty book.
+
+    Rows sort by coin, then by the price the order acts at (descending), so a
+    ladder reads top-down; the shared order_line labels TP/SL and bares
+    builder-DEX tickers. Capped at the Order Alert batch cap for the same
+    reason (observed live: makers resting 500+ orders — an uncapped section
+    would also gamble with Telegram's message-length limit)."""
+    if not orders:
+        return None
+    ranked = sorted(
+        orders,
+        key=lambda o: (
+            display_coin(o.coin),
+            -(o.trigger_price if o.trigger_price is not None else o.limit_price),
+        ),
+    )
+    lines = [order_line(o) for o in ranked[:MAX_ORDERS_SHOWN]]
+    hidden = len(orders) - MAX_ORDERS_SHOWN
+    if hidden > 0:
+        lines.append(f"…and {hidden} more")
+    return "\n".join(["Resting orders:", *lines])
 
 
 async def _position_ages(
