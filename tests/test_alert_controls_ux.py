@@ -11,14 +11,14 @@ from decimal import Decimal
 import asyncpg
 from aiogram import Bot, Dispatcher
 
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
 WHALE_SHORT = "0xaf0f…e92e"
 
 
 async def _track(pool: asyncpg.Pool, dp: Dispatcher, bot: Bot, user_id: int = 111) -> None:
-    await feed_text(dp, bot, WHALE, user_id=user_id)
+    await follow_wallet(dp, bot, WHALE, user_id=user_id)
 
 
 async def _track_row(pool: asyncpg.Pool, user_id: int = 111) -> asyncpg.Record:

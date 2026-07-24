@@ -1,17 +1,21 @@
-"""Ticket #3 acceptance: paste a wallet to Follow a Trader, view positions, unfollow."""
+"""Ticket #3 + #111: paste a wallet to open its profile, tap Follow to track a
+Trader, view positions, unfollow. Pasting an address now opens the profile view
+(with a Follow/Unfollow toggle) rather than following outright — following is the
+deliberate ➕ tap; arrange steps here follow via that same tap (follow_wallet)."""
 
 from datetime import timedelta
 from decimal import Decimal
 
 import asyncpg
 from aiogram import Bot, Dispatcher
+from aiogram.types import InlineKeyboardMarkup
 
 from epigone.budget import WeightBudget
 from epigone.gateway import GatewayError, Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.stream.poller import run_poll_pass
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
 WHALE_SHORT = "0xaf0f…e92e"
@@ -59,42 +63,68 @@ async def _tracked_addresses(pool: asyncpg.Pool, user_id: int) -> list[str]:
     return [r["trader_address"] for r in rows]
 
 
-async def test_pasting_a_valid_address_follows_the_trader(
+def _callback_data(markup: InlineKeyboardMarkup | None) -> list[str]:
+    if markup is None:
+        return []
+    return [button.callback_data for row in markup.inline_keyboard for button in row]
+
+
+async def test_pasting_an_untracked_address_opens_its_profile_with_follow(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await feed_text(dp, bot, WHALE, user_id=111, username="edik")
 
+    # #111: pasting opens the profile, it does not write a Track — following is now
+    # the deliberate ➕ Follow tap.
+    assert await _tracked_addresses(pool, 111) == []
+    opened = session.sent_messages()[-1]
+    assert WHALE in (opened.text or "")  # full address in the header (#93)
+    data = _callback_data(opened.reply_markup)
+    assert f"pfollow:{WHALE}" in data  # the Follow tap that actually tracks
+    assert f"punfollow:{WHALE}" not in data
+
+
+async def test_pasting_a_tracked_address_opens_its_profile_with_unfollow(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    # A wallet the User already tracks: the same profile, showing Unfollow — a
+    # shortcut to its full view, not an "already tracking" dead-end (#111).
     assert await _tracked_addresses(pool, 111) == [WHALE]
-    text = session.sent_messages()[-1].text or ""
-    assert "tracking" in text.lower()
-    assert WHALE_SHORT in text
+    data = _callback_data(session.sent_messages()[-1].reply_markup)
+    assert f"punfollow:{WHALE}" in data
+    assert f"pfollow:{WHALE}" not in data
 
 
-async def test_mixed_case_address_is_accepted_and_stored_lowercase(
+async def test_mixed_case_paste_opens_the_lowercased_profile(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await feed_text(dp, bot, "0xAF0FDD39E5D92499B0ED9F68693DA99C0EC1E92E", user_id=111)
 
-    assert await _tracked_addresses(pool, 111) == [WHALE]
+    # The follow callback carries the lowercased address, so a later tap tracks it
+    # in canonical form — same normalization the old paste-follow did.
+    assert f"pfollow:{WHALE}" in _callback_data(session.sent_messages()[-1].reply_markup)
 
 
-async def test_refollowing_is_idempotent(
+async def test_tapping_follow_from_a_pasted_profile_tracks_the_trader(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await feed_text(dp, bot, WHALE, user_id=111)
-    await feed_text(dp, bot, WHALE, user_id=111)
+    assert await _tracked_addresses(pool, 111) == []  # paste alone tracks nothing
+
+    await feed_callback(dp, bot, f"pfollow:{WHALE}", user_id=111)
 
     assert await _tracked_addresses(pool, 111) == [WHALE]
-    text = session.sent_messages()[-1].text or ""
-    assert "already" in text.lower()
-    assert WHALE_SHORT in text
 
 
 async def test_two_users_can_follow_the_same_trader(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
-    await feed_text(dp, bot, WHALE, user_id=222)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=222)
 
     assert await _tracked_addresses(pool, 111) == [WHALE]
     assert await _tracked_addresses(pool, 222) == [WHALE]
@@ -119,8 +149,8 @@ async def test_tracked_list_shows_every_trader_with_positions_summary(
     gateway: FakeHyperliquidGateway,
 ) -> None:
     gateway.set_positions(WHALE, [ETH_SHORT_POS, SOL_LONG_POS])
-    await feed_text(dp, bot, WHALE, user_id=111)
-    await feed_text(dp, bot, OTHER, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, OTHER, user_id=111)
 
     await feed_text(dp, bot, "/tracked", user_id=111)
 
@@ -171,7 +201,7 @@ async def test_positions_button_shows_current_positions_on_demand(
     gateway: FakeHyperliquidGateway,
 ) -> None:
     gateway.set_positions(WHALE, [ETH_SHORT_POS, SOL_LONG_POS])
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
@@ -193,7 +223,7 @@ async def test_positions_button_shows_current_positions_on_demand(
 async def test_positions_view_for_a_trader_with_no_open_positions(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
@@ -257,7 +287,7 @@ async def test_positions_view_shows_last_trade_and_recent_pnl_when_no_positions(
 ) -> None:
     # The motivating case: no open positions, but the wallet traded 2h ago and is
     # up all-time — "resting", not "dormant". The default view is all-time (#104).
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     now = clock.now()
     await _seed_last_perp_fill(pool, WHALE, at=now - timedelta(hours=2), computed_at=now)
     await _seed_coarse_all_time(
@@ -281,7 +311,7 @@ async def test_positions_view_shows_last_trade_alongside_open_positions(
     clock: FakeClock,
 ) -> None:
     gateway.set_positions(WHALE, [ETH_SHORT_POS])
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     now = clock.now()
     await _seed_last_perp_fill(pool, WHALE, at=now - timedelta(minutes=30), computed_at=now)
 
@@ -301,7 +331,7 @@ async def test_positions_view_hedges_last_trade_when_fills_knowledge_is_stale(
 ) -> None:
     # The last fine refresh was 3 days ago, so we can't imply a live last-trade
     # time — the wallet may have traded since our last scan.
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     now = clock.now()
     stale = now - timedelta(days=3)
     await _seed_last_perp_fill(pool, WHALE, at=stale, computed_at=stale)
@@ -320,7 +350,7 @@ async def test_positions_view_says_no_trading_activity_when_no_fills_captured(
     clock: FakeClock,
 ) -> None:
     # No fine row at all — say so plainly rather than showing nothing.
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
@@ -378,7 +408,7 @@ async def test_positions_view_shows_most_played_tickers(
     pool: asyncpg.Pool,
     clock: FakeClock,
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     now = clock.now()
     for seq in range(3):
         await _seed_round_trip(pool, WHALE, "SOL", closed_at=now - timedelta(hours=seq), seq=seq)
@@ -401,7 +431,7 @@ async def test_positions_view_most_played_counts_a_currently_open_position(
 ) -> None:
     # A wallet parked in one big BTC short has no completed BTC trips, but the open
     # position makes BTC its coin — it must rank even with zero round-trips.
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     now = clock.now()
     await _seed_round_trip(pool, WHALE, "ETH", closed_at=now - timedelta(hours=1))
     await _seed_open_episode(
@@ -421,7 +451,7 @@ async def test_positions_view_most_played_renders_dex_coins_cleanly(
     pool: asyncpg.Pool,
     clock: FakeClock,
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     now = clock.now()
     for seq in range(2):
         await _seed_round_trip(
@@ -447,7 +477,7 @@ async def test_positions_view_shows_holding_time_from_the_poller_snapshots(
     open at baseline (#4) only knows time-since-tracking, so it reads as an
     at-least age; one the poller saw open reads precisely."""
     gateway.set_positions(WHALE, [ETH_SHORT_POS])
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     # First pass baselines ETH: its opened_at is the baseline moment, not a true
     # open — so its age must be presented honestly.
@@ -482,7 +512,7 @@ async def test_positions_view_merges_core_and_xyz_venues(
 ) -> None:
     gateway.set_positions(WHALE, [ETH_SHORT_POS])
     gateway.set_positions(WHALE, [XYZ_SP500_POS], dex="xyz")
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
@@ -503,7 +533,7 @@ async def test_tracked_list_summary_counts_core_and_xyz(
 ) -> None:
     gateway.set_positions(WHALE, [ETH_SHORT_POS, SOL_LONG_POS])
     gateway.set_positions(WHALE, [XYZ_SP500_POS], dex="xyz")
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_text(dp, bot, "/tracked", user_id=111)
 
@@ -522,7 +552,7 @@ async def test_positions_view_hides_nothing_when_one_venue_fails(
     # wallet that closed all its xyz positions. Degrade instead of half-render.
     gateway.set_positions(WHALE, [ETH_SHORT_POS])
     gateway.positions_errors_by_dex[(WHALE, "xyz")] = GatewayError("xyz venue delayed")
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     sent_before = len(session.sent_messages())
 
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
@@ -540,7 +570,7 @@ async def test_tracked_list_degrades_when_only_the_xyz_venue_fails(
 ) -> None:
     gateway.set_positions(WHALE, [ETH_SHORT_POS])
     gateway.positions_errors_by_dex[(WHALE, "xyz")] = GatewayError("xyz venue delayed")
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_text(dp, bot, "/tracked", user_id=111)
 
@@ -565,8 +595,8 @@ async def test_positions_button_for_an_untracked_trader_is_refused(
 async def test_unfollow_button_removes_the_track_and_refreshes_the_list(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
-    await feed_text(dp, bot, OTHER, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, OTHER, user_id=111)
 
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
 
@@ -580,7 +610,7 @@ async def test_unfollow_button_removes_the_track_and_refreshes_the_list(
 async def test_unfollowing_the_last_trader_shows_the_empty_state(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
 
@@ -592,7 +622,7 @@ async def test_unfollowing_the_last_trader_shows_the_empty_state(
 async def test_stale_unfollow_tap_does_not_claim_success(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
 
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)  # stale button
@@ -605,8 +635,8 @@ async def test_stale_unfollow_tap_does_not_claim_success(
 async def test_unfollow_only_affects_the_tapping_user(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
-    await feed_text(dp, bot, WHALE, user_id=222)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=222)
 
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
 
@@ -621,7 +651,7 @@ async def test_tracked_list_degrades_gracefully_when_hyperliquid_is_delayed(
     pool: asyncpg.Pool,
     gateway: FakeHyperliquidGateway,
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     gateway.positions_errors[WHALE] = GatewayError("info API timed out")
 
     await feed_text(dp, bot, "/tracked", user_id=111)

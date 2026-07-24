@@ -146,6 +146,22 @@ async def feed_callback(
     await _deliver(dp, bot, update)
 
 
+async def follow_wallet(
+    dp: Dispatcher,
+    bot: Bot,
+    address: str,
+    *,
+    user_id: int,
+    username: str | None = None,
+) -> None:
+    """Follow a wallet the way the UI now does — the profile's ➕ Follow tap
+    (pfollow:) — for tests that need a tracked wallet as an arrange step. Pasting
+    an address only opens its profile now (#111); the deliberate Follow tap is what
+    writes the Track (and fires the #82/#83 follow chain), so arrange goes through
+    that same callback rather than a paste."""
+    await feed_callback(dp, bot, f"pfollow:{address}", user_id=user_id, username=username)
+
+
 async def _deliver(dp: Dispatcher, bot: Bot, update: Update) -> None:
     # Re-validate with bot context so nested objects (message.answer etc.) are bound.
     bound = Update.model_validate(update.model_dump(), context={"bot": bot})

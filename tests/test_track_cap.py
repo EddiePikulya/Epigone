@@ -1,13 +1,14 @@
 """Ticket #23 acceptance: a User is capped at 15 tracked wallets. The cap is
 enforced at the one shared seam (`_track_address`), so it holds identically
-across all three follow paths — paste, screener row, and trader profile. Tested
-here at the handler seam, one path per acceptance bullet."""
+across both follow paths — the screener row and the trader profile's Follow tap.
+Pasting no longer follows (#111), so it never touches the cap; it just opens the
+profile. Tested here at the handler seam, one path per acceptance bullet."""
 
 import asyncpg
 from aiogram import Bot, Dispatcher
 
 from epigone.bot.handlers import MAX_TRACKED_WALLETS
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
 from tests.test_screener_ux import _button_texts, _callback_data, add_trader
 
 USER = 111
@@ -27,10 +28,10 @@ async def _tracked(pool: asyncpg.Pool, user_id: int) -> list[str]:
 
 
 async def _fill_to_cap(dp: Dispatcher, bot: Bot, user_id: int = USER) -> list[str]:
-    """Follow exactly MAX_TRACKED_WALLETS distinct wallets by pasting them."""
+    """Follow exactly MAX_TRACKED_WALLETS distinct wallets via the Follow tap."""
     addresses = [_addr(i) for i in range(MAX_TRACKED_WALLETS)]
     for address in addresses:
-        await feed_text(dp, bot, address, user_id=user_id)
+        await follow_wallet(dp, bot, address, user_id=user_id)
     return addresses
 
 
@@ -44,22 +45,37 @@ async def test_following_the_fifteenth_wallet_still_succeeds(
     addresses = await _fill_to_cap(dp, bot)
 
     assert await _tracked(pool, USER) == addresses  # all 15 landed
-    assert "tracking" in (session.sent_messages()[-1].text or "").lower()
+    assert "following" in (session.callback_answers()[-1].text or "").lower()
 
 
-async def test_pasting_a_sixteenth_wallet_is_refused_and_not_added(
+async def test_following_a_sixteenth_wallet_is_refused_and_not_added(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
+    await _fill_to_cap(dp, bot)
+
+    await follow_wallet(dp, bot, _addr(99), user_id=USER)
+
+    tracked = await _tracked(pool, USER)
+    assert len(tracked) == MAX_TRACKED_WALLETS  # the 16th was not added
+    assert _addr(99) not in tracked
+    text = (session.callback_answers()[-1].text or "").lower()
+    assert "limit" in text
+    assert "unfollow" in text  # tells the User how to make room
+
+
+async def test_pasting_at_the_cap_opens_a_profile_and_writes_nothing(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # Pasting never touches the cap now — a sixteenth paste just opens that
+    # trader's profile (with a Follow it can't yet honor), leaving the 15 intact.
     await _fill_to_cap(dp, bot)
 
     await feed_text(dp, bot, _addr(99), user_id=USER)
 
     tracked = await _tracked(pool, USER)
-    assert len(tracked) == MAX_TRACKED_WALLETS  # the 16th was not added
+    assert len(tracked) == MAX_TRACKED_WALLETS  # nothing written by the paste
     assert _addr(99) not in tracked
-    text = (session.sent_messages()[-1].text or "").lower()
-    assert "limit" in text
-    assert "unfollow" in text  # tells the User how to make room
+    assert f"pfollow:{_addr(99)}" in _callback_data(session.sent_messages()[-1].reply_markup)
 
 
 async def test_refollowing_an_already_tracked_wallet_at_the_cap_is_never_blocked(
@@ -67,11 +83,11 @@ async def test_refollowing_an_already_tracked_wallet_at_the_cap_is_never_blocked
 ) -> None:
     addresses = await _fill_to_cap(dp, bot)
 
-    # Re-touch a wallet already tracked while at the cap — idempotent, allowed.
-    await feed_text(dp, bot, addresses[0], user_id=USER)
+    # Re-tap Follow on a wallet already tracked while at the cap — idempotent, allowed.
+    await feed_callback(dp, bot, f"pfollow:{addresses[0]}", user_id=USER)
 
     assert await _tracked(pool, USER) == addresses  # unchanged, still 15
-    assert "already" in (session.sent_messages()[-1].text or "").lower()
+    assert "already following" in (session.callback_answers()[-1].text or "").lower()
 
 
 async def test_unfollowing_frees_a_slot_for_a_new_follow(
@@ -80,7 +96,7 @@ async def test_unfollowing_frees_a_slot_for_a_new_follow(
     addresses = await _fill_to_cap(dp, bot)
 
     await feed_callback(dp, bot, f"unfollow:{addresses[0]}", user_id=USER)
-    await feed_text(dp, bot, _addr(99), user_id=USER)  # the newly-freed slot
+    await follow_wallet(dp, bot, _addr(99), user_id=USER)  # the newly-freed slot
 
     tracked = await _tracked(pool, USER)
     assert len(tracked) == MAX_TRACKED_WALLETS
@@ -125,18 +141,18 @@ async def test_profile_follow_at_the_cap_is_refused_and_not_added(
 async def test_the_admin_follows_past_the_cap(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    """The owner (#33) is cap-exempt: a sixteenth paste lands instead of being
+    """The owner (#33) is cap-exempt: a sixteenth Follow lands instead of being
     refused. Only the admin id — the exemption follows the id, not a flag a
     user could reach."""
     dp["admin_telegram_id"] = USER
     await _fill_to_cap(dp, bot)
 
-    await feed_text(dp, bot, _addr(99), user_id=USER)
+    await follow_wallet(dp, bot, _addr(99), user_id=USER)
 
     tracked = await _tracked(pool, USER)
     assert len(tracked) == MAX_TRACKED_WALLETS + 1
     assert _addr(99) in tracked
-    assert "tracking" in (session.sent_messages()[-1].text or "").lower()
+    assert "following" in (session.callback_answers()[-1].text or "").lower()
 
 
 async def test_a_non_admin_stays_capped_while_an_admin_exists(
@@ -146,7 +162,7 @@ async def test_a_non_admin_stays_capped_while_an_admin_exists(
     dp["admin_telegram_id"] = USER  # someone else is the admin
 
     await _fill_to_cap(dp, bot, user_id=other)
-    await feed_text(dp, bot, _addr(99), user_id=other)
+    await follow_wallet(dp, bot, _addr(99), user_id=other)
 
     tracked = await _tracked(pool, other)
     assert len(tracked) == MAX_TRACKED_WALLETS  # still refused

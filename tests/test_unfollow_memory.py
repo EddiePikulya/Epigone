@@ -19,7 +19,7 @@ from aiogram import Bot, Dispatcher
 from epigone.bot.handlers import track_address, untrack_address
 from epigone.bot.names import set_track_name
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_callback, feed_text
+from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
 WHALE_SHORT = "0xaf0f…e92e"
@@ -172,7 +172,7 @@ async def test_the_log_is_per_user(pool: asyncpg.Pool) -> None:
 async def test_tracked_list_unfollow_button_logs(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)  # follow via paste
+    await follow_wallet(dp, bot, WHALE, user_id=111)  # follow via the Follow tap
 
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
 
@@ -182,7 +182,7 @@ async def test_tracked_list_unfollow_button_logs(
 async def test_profile_unfollow_toggle_logs(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"punfollow:{WHALE}", user_id=111)
 
@@ -192,7 +192,7 @@ async def test_profile_unfollow_toggle_logs(
 async def test_positions_view_unfollow_logs(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
 
     await feed_callback(dp, bot, f"posunfollow:{WHALE}", user_id=111)
 
@@ -206,7 +206,7 @@ async def test_profile_shows_previously_followed_line_after_unfollow(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
     await add_trader(pool, WHALE)
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     await set_track_name(pool, 111, WHALE, "avax")
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
     clock.advance(3 * 86400)  # three days pass
@@ -223,7 +223,7 @@ async def test_profile_line_omits_name_when_none_was_set(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
     await add_trader(pool, WHALE)
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
     clock.advance(3600)
 
@@ -238,9 +238,9 @@ async def test_profile_line_absent_while_currently_tracked(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await add_trader(pool, WHALE)
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
-    await feed_text(dp, bot, WHALE, user_id=111)  # re-follow
+    await follow_wallet(dp, bot, WHALE, user_id=111)  # re-follow
 
     await feed_callback(dp, bot, f"profile:{WHALE}", user_id=111)
 
@@ -267,8 +267,8 @@ async def test_screener_marks_previously_followed_rows(
 ) -> None:
     await add_trader(pool, WHALE, display_name="Dropped")
     await add_trader(pool, "0xkept", display_name="Kept")
-    await feed_text(dp, bot, WHALE, user_id=111)  # follow both
-    await feed_text(dp, bot, "0xkept", user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)  # follow both
+    await follow_wallet(dp, bot, "0xkept", user_id=111)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)  # drop one
 
     await feed_text(dp, bot, "/screener", user_id=111)
@@ -283,9 +283,9 @@ async def test_screener_marker_gone_once_refollowed(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await add_trader(pool, WHALE, display_name="Dropped")
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
-    await feed_text(dp, bot, WHALE, user_id=111)  # re-follow → keeps Following
+    await follow_wallet(dp, bot, WHALE, user_id=111)  # re-follow → keeps Following
 
     await feed_text(dp, bot, "/screener", user_id=111)
 
@@ -305,7 +305,7 @@ async def test_screener_marker_is_per_user(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await add_trader(pool, WHALE, display_name="Dropped")
-    await feed_text(dp, bot, WHALE, user_id=1)
+    await follow_wallet(dp, bot, WHALE, user_id=1)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=1)
 
     await feed_text(dp, bot, "/screener", user_id=2)  # a different User
@@ -318,7 +318,7 @@ async def test_criteria_results_mark_previously_followed_rows(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await add_trader(pool, WHALE, display_name="Dropped")
-    await feed_text(dp, bot, WHALE, user_id=111)
+    await follow_wallet(dp, bot, WHALE, user_id=111)
     await feed_callback(dp, bot, f"unfollow:{WHALE}", user_id=111)
 
     # Run a filterless draft — every scanned trader qualifies.
