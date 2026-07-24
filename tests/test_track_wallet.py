@@ -489,8 +489,9 @@ async def test_positions_view_merges_core_and_xyz_venues(
     text = session.sent_messages()[-1].text or ""
     assert "ETH" in text and "SHORT" in text  # core, unchanged
     assert "xyz:SP500" in text and "LONG" in text  # the builder-DEX position
-    # Both venues fetched, core then xyz — matching the poller's coverage.
-    assert gateway.positions_calls[-2:] == [(WHALE, None), (WHALE, "xyz")]
+    # Every covered venue fetched, core then the builder DEXes — matching the
+    # poller's coverage.
+    assert gateway.positions_calls[-3:] == [(WHALE, None), (WHALE, "xyz"), (WHALE, "mkts")]
 
 
 async def test_tracked_list_summary_counts_core_and_xyz(
