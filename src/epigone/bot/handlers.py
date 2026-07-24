@@ -24,7 +24,7 @@ from epigone.bot.format import (
     display_coin,
     fills_open_age,
     open_age,
-    order_line,
+    order_lines,
     short_address,
     signed_pct,
     signed_usd,
@@ -32,7 +32,6 @@ from epigone.bot.format import (
     trader_label,
     usd_compact,
 )
-from epigone.bot.order_alerts import MAX_ORDERS_SHOWN
 from epigone.clock import Clock
 from epigone.first_data_notice import record_follow_notice_state
 from epigone.gateway import (
@@ -1473,11 +1472,7 @@ def _render_open_orders(orders: list[OpenOrder]) -> str | None:
             -(o.trigger_price if o.trigger_price is not None else o.limit_price),
         ),
     )
-    lines = [order_line(o) for o in ranked[:MAX_ORDERS_SHOWN]]
-    hidden = len(orders) - MAX_ORDERS_SHOWN
-    if hidden > 0:
-        lines.append(f"…and {hidden} more")
-    return "\n".join(["Resting orders:", *lines])
+    return "\n".join(["Resting orders:", *order_lines(ranked)])
 
 
 async def _position_ages(

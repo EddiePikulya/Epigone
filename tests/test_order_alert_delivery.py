@@ -14,7 +14,8 @@ from decimal import Decimal
 import asyncpg
 from aiogram import Bot
 
-from epigone.bot.order_alerts import MAX_ORDERS_SHOWN, deliver_pending_order_alerts
+from epigone.bot.format import MAX_ORDERS_SHOWN
+from epigone.bot.order_alerts import deliver_pending_order_alerts
 from epigone.gateway import OpenOrder
 from tests.support.clock import FakeClock
 from tests.support.telegram import RecordingSession

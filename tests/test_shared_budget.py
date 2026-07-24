@@ -31,6 +31,8 @@ from epigone.budget import (
     SharedWeightBudget,
     record_rate_limit,
 )
+from epigone.stream.orders import ORDERS_WEIGHT
+from epigone.stream.poller import POSITIONS_WEIGHT
 from tests.support.clock import FakeClock
 
 REFILL_PER_SECOND = SHARED_WEIGHT_PER_MINUTE / 60
@@ -298,3 +300,19 @@ async def test_record_rate_limit_never_disturbs_the_budget_row(
     await record_rate_limit(pool, clock.now())
     after = dict(await pool.fetchrow("SELECT * FROM rate_budget"))
     assert before == after
+
+
+async def test_order_polling_spends_behind_the_stream_reserve(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    # Issue #115's no-starvation rule: the order loop spends like ingest —
+    # behind STREAM_RESERVE_WEIGHT (the wiring in epigone.stream.main) — so at
+    # the floor a position poll's claim is instant while an order poll waits
+    # for refill. Order polling can slow itself, never Position Alerts.
+    await _seed_bucket(pool, clock.now(), available=STREAM_RESERVE_WEIGHT)
+    positions = SharedWeightBudget(pool, clock)
+    orders = SharedWeightBudget(pool, clock, reserve=STREAM_RESERVE_WEIGHT)
+    await positions.spend(POSITIONS_WEIGHT)
+    assert clock.slept == []
+    await orders.spend(ORDERS_WEIGHT)
+    assert sum(clock.slept) >= (POSITIONS_WEIGHT + ORDERS_WEIGHT) / REFILL_PER_SECOND

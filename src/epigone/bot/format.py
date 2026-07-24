@@ -63,6 +63,29 @@ def display_coin(coin: str) -> str:
     return coin.rsplit(":", 1)[-1]
 
 
+# How many of a batch's (or a book's) orders a message lists before
+# summarizing the rest. Eight rows read at a glance; beyond that the
+# individual rungs stop carrying information the count doesn't — and an
+# uncapped list from a maker resting 500+ orders (observed live, #115) would
+# gamble with Telegram's message-length limit. Shared by the Order Alert body
+# and the wallet views' resting-orders section.
+MAX_ORDERS_SHOWN = 8
+
+
+def order_lines(orders: list[OpenOrder]) -> list[str]:
+    """One order_line per order, capped at MAX_ORDERS_SHOWN with an
+    "…and N more" tail — the truncation rule shared by the Order Alert body
+    and the views' resting-orders section, extracted so the two can't drift
+    any more than the line format can (#77 lesson). Callers pass the orders
+    already in the order they want read (placement order for alerts, ladder
+    order for views)."""
+    lines = [order_line(o) for o in orders[:MAX_ORDERS_SHOWN]]
+    hidden = len(orders) - MAX_ORDERS_SHOWN
+    if hidden > 0:
+        lines.append(f"…and {hidden} more")
+    return lines
+
+
 def order_line(order: OpenOrder) -> str:
     """One resting order, as both the wallet views and Order Alerts render it
     (issue #115) — shared here so the two can't drift (the #77 lesson).

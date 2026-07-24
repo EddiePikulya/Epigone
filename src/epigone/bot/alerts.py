@@ -37,7 +37,12 @@ from epigone.bot.format import (
     signed_usd,
     trader_label,
 )
-from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
+from epigone.bot.outbox import (
+    DELIVERY_INTERVAL_SECONDS,
+    MAX_DELIVERY_ATTEMPTS,
+    drain_outbox,
+    run_drain_loop,
+)
 from epigone.clock import Clock
 
 log = logging.getLogger(__name__)
@@ -51,15 +56,8 @@ SCALE_ARROWS = {"scale_in": "⬆️", "scale_out": "⬇️"}
 
 
 async def run_delivery_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> None:
-    """Supervised drain loop: one broken iteration (database blip, unexpected
-    error) is logged and retried, never allowed to silently kill the task
-    (ADR-0002's asyncio mitigation) while dialog polling carries on."""
-    while True:
-        try:
-            await deliver_pending(pool, bot, clock)
-        except Exception:
-            log.exception("alert delivery iteration failed; retrying next tick")
-        await clock.sleep(DELIVERY_INTERVAL_SECONDS)
+    """The shared supervised drain loop over Position Alert delivery."""
+    await run_drain_loop(lambda: deliver_pending(pool, bot, clock), clock, label="position alert")
 
 
 async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:

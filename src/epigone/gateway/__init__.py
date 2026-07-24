@@ -146,11 +146,18 @@ class OpenOrder:
     @property
     def tpsl(self) -> str | None:
         """The "TP"/"SL" tag a trigger order renders with (issue #115): its
-        orderType family names the intent ("Take Profit …" / "Stop …"). None
-        for a plain resting limit."""
+        orderType family names the intent ("Take Profit …" / "Stop …" — the
+        two families observed live 2026-07-24). A trigger from a family we
+        have never seen renders its raw orderType rather than a guessed "SL"
+        — self-describing beats silently wrong, and failing the whole parse
+        over a label would be worse. None for a plain resting limit."""
         if not self.is_trigger:
             return None
-        return "TP" if self.order_type.startswith("Take Profit") else "SL"
+        if self.order_type.startswith("Take Profit"):
+            return "TP"
+        if self.order_type.startswith("Stop"):
+            return "SL"
+        return self.order_type
 
     def to_wire(self) -> dict[str, Any]:
         """This order as one entry of an order_alerts batch (issue #115) — the

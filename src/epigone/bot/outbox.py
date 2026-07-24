@@ -36,6 +36,25 @@ DELIVERY_INTERVAL_SECONDS = 2.0
 MAX_DELIVERY_ATTEMPTS = 5
 
 
+async def run_drain_loop(
+    drain: Callable[[], Awaitable[int]],
+    clock: Clock,
+    *,
+    label: str,
+) -> None:
+    """Supervise one outbox's drain forever: one broken iteration (database
+    blip, unexpected error) is logged under `label` and retried next tick,
+    never allowed to silently kill the task (ADR-0002's asyncio mitigation)
+    while dialog polling carries on. All three bot-process outboxes (Position
+    Alerts, Order Alerts, first-data notices) run this same loop."""
+    while True:
+        try:
+            await drain()
+        except Exception:
+            log.exception("%s delivery iteration failed; retrying next tick", label)
+        await clock.sleep(DELIVERY_INTERVAL_SECONDS)
+
+
 async def drain_outbox(
     pool: asyncpg.Pool,
     bot: Bot,

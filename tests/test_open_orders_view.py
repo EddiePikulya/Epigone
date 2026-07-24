@@ -15,8 +15,8 @@ from decimal import Decimal
 import asyncpg
 from aiogram import Bot, Dispatcher
 
+from epigone.bot.format import MAX_ORDERS_SHOWN
 from epigone.bot.handlers import DATA_DELAYED_TEXT
-from epigone.bot.order_alerts import MAX_ORDERS_SHOWN
 from epigone.gateway import GatewayError, OpenOrder, Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet

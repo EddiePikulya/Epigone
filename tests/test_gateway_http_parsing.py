@@ -263,6 +263,19 @@ def test_parse_open_orders_maps_the_recorded_shapes() -> None:
     assert tp.notional_usd is None
 
 
+def test_an_unseen_trigger_family_labels_itself_rather_than_guessing_sl() -> None:
+    # Only Stop/Take-Profit families were observed live (2026-07-24). If
+    # Hyperliquid ships a new trigger family, its raw orderType is the label —
+    # self-describing beats a silently wrong "SL", and failing the whole fetch
+    # over a label would be worse.
+    raw = dict(OPEN_ORDERS_PAYLOAD[1], orderType="Stop Limit")
+    (order,) = parse_open_orders([raw])
+    assert order.tpsl == "SL"  # the Stop family's limit variant
+    raw = dict(OPEN_ORDERS_PAYLOAD[1], orderType="Trailing Stop Market")
+    (order,) = parse_open_orders([raw])
+    assert order.tpsl == "Trailing Stop Market"
+
+
 def test_parse_open_orders_namespaces_builder_dex_coins_idempotently() -> None:
     # The live API already returns xyz coins namespaced (verified 2026-07-24);
     # prefixing must be idempotent, exactly as parse_positions (#21).
