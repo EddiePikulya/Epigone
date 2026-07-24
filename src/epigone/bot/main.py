@@ -9,6 +9,7 @@ from epigone.bot.alerts import run_delivery_loop
 from epigone.bot.first_data_notice import run_first_data_notice_loop
 from epigone.bot.handlers import build_router
 from epigone.bot.menu import set_bot_commands
+from epigone.bot.order_alerts import run_order_delivery_loop
 from epigone.clock import SystemClock
 from epigone.config import Settings
 from epigone.db import create_pool, migrate
@@ -46,12 +47,16 @@ async def main() -> None:
         # The one-time "first fine data landed" notices (issue #83) ride the same
         # Postgres→bot seam as Position Alerts, on their own drain loop.
         first_data = asyncio.create_task(run_first_data_notice_loop(pool, bot, clock))
+        # Order Alerts (issue #115): the stream's order poll queues batches into
+        # order_alerts; same seam, its own drain loop.
+        order_delivery = asyncio.create_task(run_order_delivery_loop(pool, bot, clock))
         logging.getLogger(__name__).info("bot: starting polling and alert delivery")
         try:
             await dp.start_polling(bot)
         finally:
             delivery.cancel()
             first_data.cancel()
+            order_delivery.cancel()
 
 
 if __name__ == "__main__":

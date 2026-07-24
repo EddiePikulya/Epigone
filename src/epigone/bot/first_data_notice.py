@@ -17,22 +17,17 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import button_label, trader_label
-from epigone.bot.outbox import DELIVERY_INTERVAL_SECONDS, MAX_DELIVERY_ATTEMPTS, drain_outbox
+from epigone.bot.outbox import MAX_DELIVERY_ATTEMPTS, drain_outbox, run_drain_loop
 from epigone.clock import Clock
 
 log = logging.getLogger(__name__)
 
 
 async def run_first_data_notice_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> None:
-    """Supervised drain loop, alongside Position Alert delivery in the bot
-    process: one broken iteration is logged and retried next tick, never allowed
-    to kill the task (ADR-0002's asyncio mitigation)."""
-    while True:
-        try:
-            await deliver_first_data_notices(pool, bot, clock)
-        except Exception:
-            log.exception("first-data notice delivery iteration failed; retrying next tick")
-        await clock.sleep(DELIVERY_INTERVAL_SECONDS)
+    """The shared supervised drain loop over first-data notice delivery."""
+    await run_drain_loop(
+        lambda: deliver_first_data_notices(pool, bot, clock), clock, label="first-data notice"
+    )
 
 
 async def deliver_first_data_notices(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:

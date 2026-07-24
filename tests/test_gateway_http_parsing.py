@@ -11,7 +11,12 @@ from decimal import Decimal
 import pytest
 
 from epigone.gateway import GatewayError, Window
-from epigone.gateway.http import parse_fills, parse_leaderboard, parse_positions
+from epigone.gateway.http import (
+    parse_fills,
+    parse_leaderboard,
+    parse_open_orders,
+    parse_positions,
+)
 
 LEADERBOARD_PAYLOAD = {
     "leaderboardRows": [
@@ -158,3 +163,147 @@ def test_parse_fills_rejects_unexpected_shape() -> None:
         parse_fills([{"coin": "HYPE"}])
     with pytest.raises(GatewayError):
         parse_fills({"fills": []})
+
+
+# Recorded verbatim from live frontendOpenOrders responses on 2026-07-24
+# (issue #115): a plain resting limit, a stop-market trigger, and a
+# position-wide TP (isPositionTpsl, sz "0.0" — sized to the position at
+# trigger time).
+OPEN_ORDERS_PAYLOAD = [
+    {
+        "coin": "LIT",
+        "side": "A",
+        "limitPx": "4.5",
+        "sz": "3000.0",
+        "oid": 303953272739,
+        "timestamp": 1769530795995,
+        "triggerCondition": "N/A",
+        "isTrigger": False,
+        "triggerPx": "0.0",
+        "children": [],
+        "isPositionTpsl": False,
+        "reduceOnly": False,
+        "orderType": "Limit",
+        "origSz": "3000.0",
+        "tif": "Alo",
+        "cloid": None,
+    },
+    {
+        "coin": "HYPE",
+        "side": "B",
+        "limitPx": "68.31",
+        "sz": "75.0",
+        "oid": 501580762100,
+        "timestamp": 1784845199675,
+        "triggerCondition": "Price above 63.25",
+        "isTrigger": True,
+        "triggerPx": "63.25",
+        "children": [],
+        "isPositionTpsl": False,
+        "reduceOnly": False,
+        "orderType": "Stop Market",
+        "origSz": "75.0",
+        "tif": None,
+        "cloid": None,
+    },
+    {
+        "coin": "CASHCAT",
+        "side": "A",
+        "limitPx": "0.10212",
+        "sz": "0.0",
+        "oid": 498756412140,
+        "timestamp": 1784477557437,
+        "triggerCondition": "Price above 0.111",
+        "isTrigger": True,
+        "triggerPx": "0.111",
+        "children": [],
+        "isPositionTpsl": True,
+        "reduceOnly": True,
+        "orderType": "Take Profit Market",
+        "origSz": "0.0",
+        "tif": None,
+        "cloid": None,
+    },
+]
+
+
+def test_parse_open_orders_maps_the_recorded_shapes() -> None:
+    orders = parse_open_orders(OPEN_ORDERS_PAYLOAD)
+    assert len(orders) == 3
+
+    limit = orders[0]
+    assert limit.coin == "LIT"
+    assert limit.is_buy is False  # side "A" = ask/sell
+    assert limit.limit_price == Decimal("4.5")
+    assert limit.size == Decimal("3000.0")
+    assert limit.order_id == 303953272739
+    assert limit.placed_at == datetime.fromtimestamp(1769530795.995, tz=UTC)
+    assert limit.order_type == "Limit"
+    assert limit.is_trigger is False
+    assert limit.trigger_price is None  # the API's "0.0" is a placeholder, not a price
+    assert limit.is_position_tpsl is False
+    assert limit.reduce_only is False
+    assert limit.notional_usd == Decimal("13500.0")  # 3000 × 4.5
+    assert limit.tpsl is None
+
+    stop = orders[1]
+    assert stop.is_buy is True  # side "B" = bid/buy
+    assert stop.is_trigger is True
+    assert stop.trigger_price == Decimal("63.25")
+    assert stop.tpsl == "SL"
+    # A trigger's notional reads against the price that arms it — its limitPx
+    # (68.31) is only the slippage cap the fill is bounded by.
+    assert stop.notional_usd == Decimal("75.0") * Decimal("63.25")
+
+    tp = orders[2]
+    assert tp.is_position_tpsl is True
+    assert tp.tpsl == "TP"
+    # sz "0.0" means "the whole position at trigger time": no order-level
+    # notional exists, so None — never a floor-suppressible zero.
+    assert tp.notional_usd is None
+
+
+def test_parse_open_orders_drops_resting_spot_orders() -> None:
+    # The core response mixes in resting SPOT orders (verified live
+    # 2026-07-24: a tracked whale's book was 40/97 spot rows). Epigone is
+    # perp-only — a `@334 BUY $12,000` alert would name an index, not a
+    # ticker — so the parser drops them by the fills is_perp convention:
+    # `@N`-indexed and `BASE/QUOTE`-named coins are spot.
+    spot_indexed = dict(OPEN_ORDERS_PAYLOAD[0], coin="@700", oid=502000183929)
+    spot_named = dict(OPEN_ORDERS_PAYLOAD[0], coin="PURR/USDC", oid=502000183930)
+    orders = parse_open_orders([spot_indexed, OPEN_ORDERS_PAYLOAD[0], spot_named])
+    assert [o.coin for o in orders] == ["LIT"]
+
+
+def test_an_unseen_trigger_family_labels_itself_rather_than_guessing_sl() -> None:
+    # Only Stop/Take-Profit families were observed live (2026-07-24). If
+    # Hyperliquid ships a new trigger family, its raw orderType is the label —
+    # self-describing beats a silently wrong "SL", and failing the whole fetch
+    # over a label would be worse.
+    raw = dict(OPEN_ORDERS_PAYLOAD[1], orderType="Stop Limit")
+    (order,) = parse_open_orders([raw])
+    assert order.tpsl == "SL"  # the Stop family's limit variant
+    raw = dict(OPEN_ORDERS_PAYLOAD[1], orderType="Trailing Stop Market")
+    (order,) = parse_open_orders([raw])
+    assert order.tpsl == "Trailing Stop Market"
+
+
+def test_parse_open_orders_namespaces_builder_dex_coins_idempotently() -> None:
+    # The live API already returns xyz coins namespaced (verified 2026-07-24);
+    # prefixing must be idempotent, exactly as parse_positions (#21).
+    raw = dict(OPEN_ORDERS_PAYLOAD[0], coin="xyz:BB")
+    (already,) = parse_open_orders([raw], dex="xyz")
+    assert already.coin == "xyz:BB"
+    bare = dict(OPEN_ORDERS_PAYLOAD[0], coin="BB")
+    (prefixed,) = parse_open_orders([bare], dex="xyz")
+    assert prefixed.coin == "xyz:BB"
+
+
+def test_parse_open_orders_rejects_unexpected_shape() -> None:
+    with pytest.raises(GatewayError):
+        parse_open_orders([{"coin": "HYPE"}])
+    with pytest.raises(GatewayError):
+        parse_open_orders({"orders": []})
+    with pytest.raises(GatewayError):
+        # An unknown side must fail loudly, never silently parse as a sell.
+        parse_open_orders([dict(OPEN_ORDERS_PAYLOAD[0], side="X")])

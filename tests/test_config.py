@@ -6,6 +6,7 @@ import pytest
 
 from epigone.config import (
     DEFAULT_FINE_CHUNK_SIZE,
+    DEFAULT_ORDER_POLL_INTERVAL_SECONDS,
     DEFAULT_SEED_INTERVAL_MINUTES,
     Settings,
 )
@@ -18,6 +19,7 @@ def _settings(admin_telegram_id: int | None) -> Settings:
         admin_telegram_id=admin_telegram_id,
         seed_interval_minutes=DEFAULT_SEED_INTERVAL_MINUTES,
         fine_chunk_size=DEFAULT_FINE_CHUNK_SIZE,
+        order_poll_interval_seconds=DEFAULT_ORDER_POLL_INTERVAL_SECONDS,
     )
 
 
@@ -91,3 +93,31 @@ def test_fine_chunk_size_falls_back_on_invalid(
     with caplog.at_level(logging.WARNING):
         assert Settings.from_env().fine_chunk_size == DEFAULT_FINE_CHUNK_SIZE
     assert "FINE_CHUNK_SIZE" in caplog.text
+
+
+def test_order_poll_interval_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.delenv("ORDER_POLL_INTERVAL_SECONDS", raising=False)
+    assert Settings.from_env().order_poll_interval_seconds == DEFAULT_ORDER_POLL_INTERVAL_SECONDS
+
+
+def test_order_poll_interval_honours_a_valid_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.setenv("ORDER_POLL_INTERVAL_SECONDS", "600")
+    assert Settings.from_env().order_poll_interval_seconds == 600
+
+
+@pytest.mark.parametrize("bad", ["nonsense", "", "0", "-5"])
+def test_order_poll_interval_falls_back_on_invalid(
+    bad: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A bad interval must degrade to the safe default cadence, never hammer the
+    # heavier orders endpoint or wedge the stream (the #50 convention).
+    monkeypatch.setenv("DATABASE_URL", "postgresql://x")
+    monkeypatch.setenv("ORDER_POLL_INTERVAL_SECONDS", bad)
+    with caplog.at_level(logging.WARNING):
+        assert (
+            Settings.from_env().order_poll_interval_seconds
+            == DEFAULT_ORDER_POLL_INTERVAL_SECONDS
+        )
+    assert "ORDER_POLL_INTERVAL_SECONDS" in caplog.text
