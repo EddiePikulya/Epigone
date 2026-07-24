@@ -195,6 +195,26 @@ per-trade quality signal — so trims cannot game it.
   The track record shows it beside Most played, e.g. `Most played: SOL · ETH
   (~2 coins)`.
 
+### Focus market
+- **In plain words:** keep only wallets specialized in a market — a category
+  means most of their trades are in it; a specific ticker means it's among
+  their top-2 most-traded. Pairs well with Effective coins ≤ 2 and a
+  Closed-trades floor.
+- **Definition:** the one non-numeric filter (issue #108), two modes chosen at
+  build time and stored as a threshold string (`cat:METALS` / `tick:SILVER`).
+  **Category** (Crypto / Stocks / Metals / Energy): more than half of the
+  wallet's completed round-trips are in the category's tickers — a 50/50
+  split does not qualify. The ticker→category map is curated in code
+  (`epigone.focus_market`): core (unprefixed) coins are CRYPTO automatically;
+  an unknown dex-prefixed ticker is uncategorized and counts toward no
+  category until a PR maps it. **Specific ticker:** the ticker is in the
+  wallet's top-2 most-played coins per the shared #80 ranking
+  (`epigone.plays`: round-trips per coin plus a point for an open episode,
+  coin-name tiebreak) — the same ranking behind the profile's Most played
+  line. Matching strips venue prefixes and ignores case (`silver` →
+  `xyz:SILVER`). Wallets with no fine data never qualify in either mode.
+  A filter only — never a sort.
+
 ## Bot exclusion
 
 A **Bot** (CONTEXT.md) is an account whose statistical profile indicates

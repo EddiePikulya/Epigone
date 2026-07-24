@@ -19,7 +19,7 @@ from epigone.criteria_store import (
     update_criteria,
 )
 from epigone.gateway import Window
-from epigone.metrics.library import METRICS, Scope, format_value, parse_threshold
+from epigone.metrics.library import METRICS, Scope, Unit, format_value, parse_threshold
 from epigone.screener import Criteria, Filter, Op, run_criteria, run_screener, strictest_filter
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=UTC)
@@ -349,6 +349,8 @@ def test_every_metric_has_a_one_line_explanation() -> None:
 
 def test_fine_and_coarse_scopes_match_their_tables() -> None:
     for spec in METRICS.values():
+        if spec.unit is Unit.MARKET:
+            continue  # focus market (#108) builds its SQL in epigone.focus_market
         prefix = "cm." if spec.scope is Scope.COARSE else "fm."
         assert spec.sql.startswith(prefix)
 

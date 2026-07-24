@@ -21,6 +21,7 @@ class Unit(Enum):
     COUNT = "count"
     NUMBER = "number"
     DURATION = "duration"  # User types 2d / 12h / 90m, we store seconds
+    MARKET = "market"  # focus market (#108): a category button or a typed ticker, not a number
 
 
 class Scope(Enum):
@@ -205,6 +206,23 @@ _SPECS = [
         ),
         example="2",
     ),
+    # The one non-numeric filter (#108). Its threshold is a cat:/tick: string
+    # (epigone.focus_market), its SQL is built there rather than from `sql`,
+    # and it is a filter only — never a sort.
+    MetricSpec(
+        key="focus_market",
+        label="Focus market",
+        unit=Unit.MARKET,
+        scope=Scope.FINE,
+        sql="",
+        explanation=(
+            "keep only wallets specialized in a market — a category means most "
+            "of their trades are in it; a specific ticker means it's among their "
+            "top-2 most-traded. Pairs well with Effective coins ≤ 2 and a "
+            "Closed-trades floor."
+        ),
+        example="SILVER, BTC or SP500",
+    ),
 ]
 
 METRICS: dict[str, MetricSpec] = {spec.key: spec for spec in _SPECS}
@@ -249,6 +267,8 @@ def format_duration(seconds: int) -> str:
 def parse_threshold(spec: MetricSpec, text: str) -> Decimal | None:
     """A User-typed threshold → the stored value, or None when unparseable.
     Forgiving on the way in: $ , % x and k/m suffixes are all accepted."""
+    if spec.unit is Unit.MARKET:
+        return None  # focus-market thresholds come from buttons/tickers, never numbers
     if spec.unit is Unit.DURATION:
         return parse_duration(text)
     raw = text.strip().lower().replace(",", "").replace("$", "").replace("%", "").replace(" ", "")
