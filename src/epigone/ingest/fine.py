@@ -398,9 +398,11 @@ async def _store_fine_refresh(
             """
             INSERT INTO fine_metrics
                 (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
-                 avg_leverage, maker_share, avg_hold_seconds, effective_coins, realized_pnl,
+                 avg_leverage, maker_share, avg_hold_seconds, effective_coins, median_trade,
+                 profit_factor, top_trade_share, realized_pnl,
                  window_start, window_end, maker_fill_count, perp_fill_count, computed_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                    $18, $19, $20)
             ON CONFLICT (address) DO UPDATE
                 SET trade_count = EXCLUDED.trade_count,
                     win_rate = EXCLUDED.win_rate,
@@ -412,6 +414,9 @@ async def _store_fine_refresh(
                     maker_share = EXCLUDED.maker_share,
                     avg_hold_seconds = EXCLUDED.avg_hold_seconds,
                     effective_coins = EXCLUDED.effective_coins,
+                    median_trade = EXCLUDED.median_trade,
+                    profit_factor = EXCLUDED.profit_factor,
+                    top_trade_share = EXCLUDED.top_trade_share,
                     realized_pnl = EXCLUDED.realized_pnl,
                     window_start = EXCLUDED.window_start,
                     window_end = EXCLUDED.window_end,
@@ -430,6 +435,9 @@ async def _store_fine_refresh(
             metrics.maker_share,
             metrics.avg_hold_seconds,
             metrics.effective_coins,
+            metrics.median_trade,
+            metrics.profit_factor,
+            metrics.top_trade_share,
             metrics.realized_pnl,
             metrics.window_start,
             metrics.window_end,

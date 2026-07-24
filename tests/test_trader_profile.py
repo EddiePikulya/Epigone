@@ -39,9 +39,10 @@ async def add_fine(pool: asyncpg.Pool, address: str = WHALE) -> None:
         """
         INSERT INTO fine_metrics
             (address, trade_count, win_rate, avg_win, avg_loss, sharpe, max_drawdown,
-             avg_leverage, maker_share, avg_hold_seconds, realized_pnl,
-             window_start, window_end, computed_at)
-        VALUES ($1, 161, 0.708, 3951, 841, 12.97, 13893, 2.5, 0.94, 187200, 531967, $2, $2, $2)
+             avg_leverage, maker_share, avg_hold_seconds, median_trade, profit_factor,
+             top_trade_share, realized_pnl, window_start, window_end, computed_at)
+        VALUES ($1, 161, 0.708, 3951, 841, 12.97, 13893, 2.5, 0.94, 187200, 210, 2.4, 0.18,
+                531967, $2, $2, $2)
         """,
         address,
         NOW,
@@ -63,6 +64,9 @@ async def test_profile_shows_fine_metrics_when_available(
     assert "Sharpe 13.0 · max drawdown $13,893" in text
     # Sizing language, not exchange leverage — positions already show "at 25x" (#85).
     assert "94% maker · avg size ~2.5x of account" in text
+    # The anti-deception trio line (#113), trip-derived: median trade, profit
+    # factor, top-trade share (a stored fraction rendered as a percent).
+    assert "median trade $210 · PF 2.4 · top trade 18%" in text
     assert "leverage" not in text.lower()
     assert "⏱ Avg hold: 2d 4h" in text
     # Account value appears on the #72 activity line as the denominator (#85).

@@ -206,6 +206,43 @@ _SPECS = [
         ),
         example="2",
     ),
+    MetricSpec(
+        key="median_trade",
+        label="Median trade",
+        unit=Unit.USD,
+        scope=Scope.FINE,
+        sql="fm.median_trade",
+        explanation=(
+            "what the typical trade earns, wins AND losses included — immune to "
+            "one lucky moonshot. Pair with a Closed-trades floor."
+        ),
+        example="100",
+    ),
+    MetricSpec(
+        key="profit_factor",
+        label="Profit factor",
+        unit=Unit.NUMBER,
+        scope=Scope.FINE,
+        sql="fm.profit_factor",
+        explanation=(
+            "dollars won per dollar lost. Below 1 loses money no matter the win "
+            "rate; 1.5–3 is a real edge; huge values usually mean losses barely "
+            "exist — check the record isn't hiding open losers."
+        ),
+        example="1.5",
+    ),
+    MetricSpec(
+        key="top_trade_share",
+        label="Top-trade share",
+        unit=Unit.PERCENT,
+        scope=Scope.FINE,
+        sql="fm.top_trade_share",
+        explanation=(
+            "how much of the profit is one single trade. Low = repeatable edge; "
+            "high = a lottery ticket that already hit."
+        ),
+        example="30 for 30%",
+    ),
     # The one non-numeric filter (#108). Its threshold is a cat:/tick: string
     # (epigone.focus_market), its SQL is built there rather than from `sql`,
     # and it is a filter only — never a sort.

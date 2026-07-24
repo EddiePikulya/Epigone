@@ -289,6 +289,129 @@ def test_effective_coins_is_none_without_completed_round_trips() -> None:
     assert metrics.effective_coins is None
 
 
+# --- The anti-deception trio (issue #113) -------------------------------------
+
+
+def test_median_trade_is_the_typical_pnl_across_wins_and_losses() -> None:
+    # Five trips: median is the middle value, wins and losses together — one big
+    # winner cannot drag it the way it drags the mean.
+    metrics = compute(
+        [
+            *trip(pnl="-30", at=T0),
+            *trip(pnl="-10", at=T0 + timedelta(hours=1)),
+            *trip(pnl="20", at=T0 + timedelta(hours=2)),
+            *trip(pnl="50", at=T0 + timedelta(hours=3)),
+            *trip(pnl="5000", at=T0 + timedelta(hours=4)),
+        ]
+    )
+    assert metrics.median_trade == Decimal("20")
+
+
+def test_median_trade_is_negative_for_a_coin_flipper() -> None:
+    # A losing typical trade reads negative — the point of a median over ALL
+    # trips (a positive win rate cannot hide it).
+    metrics = compute(
+        [*trip(pnl="-40", at=T0), *trip(pnl="-20", at=T0 + timedelta(hours=1))]
+    )
+    assert metrics.median_trade == Decimal("-30")
+
+
+def test_median_trade_of_a_single_trade_is_that_trade() -> None:
+    metrics = compute(trip(pnl="123"))
+    assert metrics.median_trade == Decimal("123")
+
+
+def test_median_trade_is_none_without_trips() -> None:
+    metrics = compute([_open(at=T0)])
+    assert metrics.trade_count == 0
+    assert metrics.median_trade is None
+
+
+def test_profit_factor_is_gross_wins_over_gross_losses() -> None:
+    # Wins 100 + 50 = 150 gross; losses 40 + 20 = 60 gross → 2.5.
+    metrics = compute(
+        [
+            *trip(pnl="100", at=T0),
+            *trip(pnl="50", at=T0 + timedelta(hours=1)),
+            *trip(pnl="-40", at=T0 + timedelta(hours=2)),
+            *trip(pnl="-20", at=T0 + timedelta(hours=3)),
+        ]
+    )
+    assert metrics.profit_factor == Decimal("150") / Decimal("60")
+
+
+def test_profit_factor_below_one_exposes_a_win_rate_illusion() -> None:
+    # A majority-wins wallet that still loses money: three small wins, one big
+    # loss. Win rate 75%, profit factor < 1 — the number that catches it.
+    metrics = compute(
+        [
+            *trip(pnl="10", at=T0),
+            *trip(pnl="10", at=T0 + timedelta(hours=1)),
+            *trip(pnl="10", at=T0 + timedelta(hours=2)),
+            *trip(pnl="-100", at=T0 + timedelta(hours=3)),
+        ]
+    )
+    assert metrics.win_rate == Decimal("0.75")
+    assert metrics.profit_factor == Decimal("30") / Decimal("100")
+    assert metrics.profit_factor < 1
+
+
+def test_profit_factor_is_none_without_losses() -> None:
+    # No losing dollars means a zero denominator — an unbounded "∞" the screener
+    # renders as absent, never a huge number.
+    metrics = compute([*trip(pnl="100", at=T0), *trip(pnl="50", at=T0 + timedelta(hours=1))])
+    assert metrics.avg_loss is None
+    assert metrics.profit_factor is None
+
+
+def test_profit_factor_is_zero_for_an_all_losses_wallet() -> None:
+    # Losses but no winning dollars: gross_win 0 over real losses → a genuine 0,
+    # not NULL (the denominator exists).
+    metrics = compute([*trip(pnl="-40", at=T0), *trip(pnl="-20", at=T0 + timedelta(hours=1))])
+    assert metrics.profit_factor == Decimal("0")
+
+
+def test_top_trade_share_is_the_best_trip_over_the_total() -> None:
+    # Best trip 90 of a 150 total → 0.6 (60%): most of the profit is one trade.
+    metrics = compute(
+        [
+            *trip(pnl="90", at=T0),
+            *trip(pnl="40", at=T0 + timedelta(hours=1)),
+            *trip(pnl="20", at=T0 + timedelta(hours=2)),
+        ]
+    )
+    assert metrics.top_trade_share == Decimal("90") / Decimal("150")
+
+
+def test_top_trade_share_of_a_single_winning_trade_is_all_of_it() -> None:
+    metrics = compute(trip(pnl="500"))
+    assert metrics.top_trade_share == Decimal("1")
+
+
+def test_top_trade_share_is_none_when_total_pnl_is_negative() -> None:
+    # A net-losing record has no profit to concentrate — the ratio is
+    # meaningless, so NULL (never a share of a negative total).
+    metrics = compute(
+        [
+            *trip(pnl="30", at=T0),
+            *trip(pnl="-40", at=T0 + timedelta(hours=1)),
+            *trip(pnl="-50", at=T0 + timedelta(hours=2)),
+        ]
+    )
+    assert metrics.realized_pnl < 0  # -60 total: no profit to concentrate
+    assert metrics.top_trade_share is None
+
+
+def test_top_trade_share_is_none_for_an_all_losses_wallet() -> None:
+    metrics = compute([*trip(pnl="-40", at=T0), *trip(pnl="-20", at=T0 + timedelta(hours=1))])
+    assert metrics.top_trade_share is None
+
+
+def test_top_trade_share_is_none_without_trips() -> None:
+    metrics = compute([_open(at=T0)])
+    assert metrics.top_trade_share is None
+
+
 def test_max_drawdown_is_the_deepest_fall_of_the_realized_pnl_curve() -> None:
     pnls = ["100", "-50", "-30", "200"]  # peak 100 -> trough 20 before recovering
     in_time_order = [

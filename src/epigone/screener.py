@@ -48,6 +48,9 @@ class ScreenerRow:
     maker_share: Decimal | None
     avg_hold_seconds: int | None
     effective_coins: Decimal | None
+    median_trade: Decimal | None
+    profit_factor: Decimal | None
+    top_trade_share: Decimal | None
     fine_computed_at: datetime | None
 
 
@@ -140,7 +143,7 @@ async def run_criteria(
                fm.address IS NOT NULL AS fine_available,
                fm.win_rate, fm.avg_win, fm.avg_loss, fm.sharpe, fm.max_drawdown,
                fm.trade_count, fm.avg_leverage, fm.maker_share, fm.avg_hold_seconds,
-               fm.effective_coins,
+               fm.effective_coins, fm.median_trade, fm.profit_factor, fm.top_trade_share,
                fm.computed_at AS fine_computed_at
         {_FROM}{conditions}
         ORDER BY {METRICS[criteria.sort_key].sql} {direction} NULLS LAST, t.address

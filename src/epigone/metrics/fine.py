@@ -17,7 +17,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from statistics import stdev
+from statistics import median, stdev
 
 from epigone.gateway import Fill
 
@@ -129,6 +129,9 @@ class TripMetrics:
     avg_leverage: Decimal | None
     avg_hold_seconds: int | None  # mean round-trip duration; None with no completed trades
     effective_coins: Decimal | None  # inverse-HHI coin spread of round-trips; None with no trips
+    median_trade: Decimal | None  # median PnL over ALL trips (can be negative); None with no trips
+    profit_factor: Decimal | None  # gross wins ÷ gross losses; None with no losses (div-by-zero)
+    top_trade_share: Decimal | None  # best trip's share of total PnL; None unless total PnL > 0
 
 
 @dataclass(frozen=True)
@@ -151,6 +154,9 @@ class FineMetrics:
     maker_share: Decimal | None
     avg_hold_seconds: int | None  # mean round-trip duration; None with no completed trades
     effective_coins: Decimal | None  # inverse-HHI coin spread of round-trips; None with no trips
+    median_trade: Decimal | None  # median PnL over ALL trips (can be negative); None with no trips
+    profit_factor: Decimal | None  # gross wins ÷ gross losses; None with no losses (div-by-zero)
+    top_trade_share: Decimal | None  # best trip's share of total PnL; None unless total PnL > 0
     realized_pnl: Decimal
     perp_fill_count: int  # all perp fills seen — activity evidence for Bot vetting (#58)
     window_start: datetime | None  # first and last perp fill the metrics saw
@@ -290,6 +296,9 @@ def reduce_trips(trips: list[RoundTrip], account_value: Decimal | None) -> TripM
             sum(t.hold_seconds for t in trips) // len(trips) if trips else None
         ),
         effective_coins=_effective_coins(trips),
+        median_trade=_median_trade(trips),
+        profit_factor=_profit_factor(trips),
+        top_trade_share=_top_trade_share(trips),
     )
 
 
@@ -318,6 +327,9 @@ def metrics_from_state(state: FineState, account_value: Decimal | None) -> FineM
         ),
         avg_hold_seconds=trip.avg_hold_seconds,
         effective_coins=trip.effective_coins,
+        median_trade=trip.median_trade,
+        profit_factor=trip.profit_factor,
+        top_trade_share=trip.top_trade_share,
         realized_pnl=state.realized_pnl,
         perp_fill_count=state.perp_fill_count,
         window_start=state.window_start,
@@ -583,6 +595,44 @@ def _effective_coins(trips: list[RoundTrip]) -> Decimal | None:
     total = len(trips)
     sum_sq = sum(count * count for count in by_coin.values())
     return Decimal(total * total) / sum_sq
+
+
+def _median_trade(trips: list[RoundTrip]) -> Decimal | None:
+    """The median net PnL across ALL completed round-trips — wins and losses
+    together, so it can be negative (issue #113). Catches the coin-flipper whose
+    typical trade earns nothing: a positive median over many trades is nearly
+    unfakeable, immune to one lucky moonshot the way the mean is not. None with
+    no trips — undefined over zero trades, never 0."""
+    if not trips:
+        return None
+    return median(t.pnl for t in trips)
+
+
+def _profit_factor(trips: list[RoundTrip]) -> Decimal | None:
+    """Gross winning dollars ÷ gross losing dollars (issue #113): the edge a
+    win rate hides — below 1 loses money no matter how often the wallet wins.
+    NULL when there are no losses (the denominator is zero — an unbounded "∞"
+    the screener renders as absent, not a huge number); an all-losses wallet has
+    zero gross winnings and reads a real 0."""
+    gross_win = sum((t.pnl for t in trips if t.pnl > 0), Decimal(0))
+    gross_loss = -sum((t.pnl for t in trips if t.pnl < 0), Decimal(0))
+    if gross_loss == 0:
+        return None
+    return gross_win / gross_loss
+
+
+def _top_trade_share(trips: list[RoundTrip]) -> Decimal | None:
+    """The best single trip's PnL as a fraction of total trip PnL (issue #113):
+    a lottery-record detector — one moonshot carrying the whole record reads
+    near 1.0, a repeatable edge stays low. Only meaningful when total PnL > 0;
+    NULL otherwise (a negative or zero total makes the ratio meaningless, and a
+    net-losing wallet has no "profit" to concentrate). Stored as a fraction."""
+    if not trips:
+        return None
+    total = sum((t.pnl for t in trips), Decimal(0))
+    if total <= 0:
+        return None
+    return max(t.pnl for t in trips) / total
 
 
 def _max_drawdown(trips: list[RoundTrip]) -> Decimal:
