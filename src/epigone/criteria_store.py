@@ -11,6 +11,7 @@ from decimal import Decimal
 
 import asyncpg
 
+from epigone.focus_market import FOCUS_MARKET_KEY
 from epigone.gateway import Window
 from epigone.screener import Criteria, Filter, Op
 
@@ -29,8 +30,16 @@ def _filters_to_json(filters: tuple[Filter, ...]) -> str:
 
 
 def _saved(row: asyncpg.Record) -> SavedCriteria:
+    # The focus-market filter (#108) is the one whose threshold is a
+    # cat:/tick: string, not a number — it rides the same JSONB shape.
     filters = tuple(
-        Filter(metric=f["metric"], op=Op(f["op"]), threshold=Decimal(f["threshold"]))
+        Filter(
+            metric=f["metric"],
+            op=Op(f["op"]),
+            threshold=(
+                f["threshold"] if f["metric"] == FOCUS_MARKET_KEY else Decimal(f["threshold"])
+            ),
+        )
         for f in json.loads(row["filters"])
     )
     return SavedCriteria(

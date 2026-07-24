@@ -43,6 +43,7 @@ from epigone.gateway import (
 from epigone.ingest.fine import mark_due_on_follow
 from epigone.metrics.fine import RoundTrip, reduce_trips
 from epigone.metrics.library import format_duration
+from epigone.plays import RANKED_PLAYS_SQL
 from epigone.screener import ScreenerRow, run_screener
 
 SCREENER_PAGE_SIZE = 5
@@ -963,20 +964,16 @@ MOST_PLAYED_LIMIT = 3
 async def _most_played(pool: asyncpg.Pool, address: str) -> str | None:
     """The wallet's most-played tickers line (#80): its top coins over the fill
     window, ranked by completed round-trips with a currently-open episode counting
-    toward its coin. Perp-only and TWAP-complete by construction (the fine store,
-    #63). None — so the caller omits the line entirely — for a wallet with no fine
-    round-trips or open episodes; never an empty "Most played:"."""
+    toward its coin — the shared ranking (epigone.plays) the focus-market ticker
+    filter (#108) also runs on. Perp-only and TWAP-complete by construction (the
+    fine store, #63). None — so the caller omits the line entirely — for a wallet
+    with no fine round-trips or open episodes; never an empty "Most played:"."""
     rows = await pool.fetch(
-        """
-        SELECT coin,
-               count(*) FILTER (WHERE src = 'trade')::int AS trips,
-               bool_or(src = 'open') AS is_open
-        FROM (
-            SELECT coin, 'trade' AS src FROM fine_trades WHERE address = $1
-            UNION ALL
-            SELECT coin, 'open' AS src FROM fine_open_episodes WHERE address = $1
-        ) plays
-        GROUP BY coin
+        f"""
+        SELECT coin, trips, is_open
+        FROM ({RANKED_PLAYS_SQL}) plays
+        WHERE address = $1
+        ORDER BY play_rank
         """,
         address,
     )
@@ -984,19 +981,16 @@ async def _most_played(pool: asyncpg.Pool, address: str) -> str | None:
 
 
 def _render_most_played(plays: list[tuple[str, int, bool]]) -> str | None:
-    """Rank `(coin, round_trip_count, is_open)` rows and render the top few as
-    "Most played: SOL · BTC · ETH". A coin's weight is its round-trip count plus a
-    point for holding an open position, so a wallet parked in one long-held short
-    still ranks that coin even with few completed trips. Ties break on the coin
-    name for a stable order. Dex-prefixed builder-DEX coins (xyz:SP500) render as
-    the bare ticker (#21). When completed round-trips exist, the effective-coins
-    spread (#95) trails as "(~2 coins)" — the coins and the number tell one
-    story. None when there is nothing to rank — the line is then omitted rather
-    than shown empty."""
+    """Render `(coin, round_trip_count, is_open)` rows — already ordered by the
+    shared #80 ranking (epigone.plays: round-trips plus an open-episode point,
+    coin-name tiebreak) — as "Most played: SOL · BTC · ETH". Dex-prefixed
+    builder-DEX coins (xyz:SP500) render as the bare ticker (#21). When
+    completed round-trips exist, the effective-coins spread (#95) trails as
+    "(~2 coins)" — the coins and the number tell one story. None when there is
+    nothing to rank — the line is then omitted rather than shown empty."""
     if not plays:
         return None
-    ranked = sorted(plays, key=lambda p: (-(p[1] + (1 if p[2] else 0)), p[0]))
-    top = [_display_coin(coin) for coin, _, _ in ranked[:MOST_PLAYED_LIMIT]]
+    top = [_display_coin(coin) for coin, _, _ in plays[:MOST_PLAYED_LIMIT]]
     line = "Most played: " + " · ".join(top)
     effective = _effective_coins([count for _, count, _ in plays])
     if effective is not None:

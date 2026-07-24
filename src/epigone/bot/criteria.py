@@ -16,6 +16,9 @@ navigate, cfadd→cfm:→cfo: adds a filter, cfdel: removes one, cwin→cw: sets
 timeframe, csort→csm:→csd: the sort, crun:{d|id|p<key>}:{offset} runs a draft, a
 saved Criteria, or a starter preset, csave/cedit:/cdel: manage saved ones,
 cdelp:<key> hides a preset for the User (issue #71), cfw: follows a result.
+The focus-market filter (#108) is the one non-numeric filter: cfm:focus_market
+branches to a market picker where cfc:<CATEGORY> completes the filter in one
+tap and cft prompts for a typed ticker instead of the cfo: operator step.
 Callback payloads are client-forgeable, so every id is scoped to the tapping
 User and every metric/operator/window/preset key is looked up, never trusted.
 """
@@ -52,8 +55,17 @@ from epigone.criteria_store import (
     save_criteria,
     update_criteria,
 )
+from epigone.focus_market import (
+    FOCUS_MARKET_KEY,
+    Category,
+    category_threshold,
+    focus_label,
+    normalize_ticker,
+    ticker_seen,
+    ticker_threshold,
+)
 from epigone.gateway import Window
-from epigone.metrics.library import METRICS, format_value, parse_threshold
+from epigone.metrics.library import METRICS, Unit, format_value, parse_threshold
 from epigone.screener import (
     Criteria,
     Filter,
@@ -118,6 +130,14 @@ EMPTY_UNIVERSE_TEXT = (
 DRAFT_EXPIRED_TOAST = "That draft expired — start a fresh one."
 CRITERIA_GONE_TOAST = "That criteria is gone — it may have been deleted."
 
+FOCUS_TICKER_PROMPT_TEXT = (
+    "Focus market — which ticker should the wallet specialize in?\n\n"
+    "Send a ticker — e.g. SILVER, BTC or SP500. Case and venue prefixes don't matter."
+)
+FOCUS_TICKER_UNREADABLE_TEXT = (
+    "I couldn't read that as a ticker. Send e.g. SILVER, BTC or SP500."
+)
+
 
 @dataclass
 class Draft:
@@ -174,6 +194,8 @@ def register(router: Router) -> None:
     router.callback_query.register(on_add_filter, F.data == "cfadd")
     router.callback_query.register(on_filter_metric, F.data.startswith("cfm:"))
     router.callback_query.register(on_filter_op, F.data.startswith("cfo:"))
+    router.callback_query.register(on_filter_category, F.data.startswith("cfc:"))
+    router.callback_query.register(on_filter_ticker, F.data == "cft")
     router.callback_query.register(on_filter_delete, F.data.startswith("cfdel:"))
     router.callback_query.register(on_window_menu, F.data == "cwin")
     router.callback_query.register(on_window_set, F.data.startswith("cw:"))
@@ -247,6 +269,25 @@ async def on_filter_metric(callback: CallbackQuery, pool: asyncpg.Pool, drafts: 
     if drafts.get(callback.from_user.id) is None:
         await _expired(callback, pool)
         return
+    if spec.unit is Unit.MARKET:
+        # The one non-numeric filter (#108): a market is picked, not compared —
+        # no operator step, a category tap completes the filter in one go.
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    text=f"{c.emoji} {c.label}", callback_data=f"cfc:{c.value}"
+                )
+                for c in Category
+            ],
+            [InlineKeyboardButton(text="🔎 Specific ticker…", callback_data="cft")],
+            [InlineKeyboardButton(text="◀ Back", callback_data="cfadd")],
+        ]
+        text = (
+            f"{spec.label} — {spec.explanation}\n\n"
+            "Which market should this wallet specialize in?"
+        )
+        await _show(callback, text, InlineKeyboardMarkup(inline_keyboard=keyboard))
+        return
     keyboard = [
         [
             InlineKeyboardButton(
@@ -269,7 +310,8 @@ async def on_filter_op(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Draf
         op = Op(op_raw)
     except ValueError:
         op = None
-    if spec is None or op is None:
+    # A MARKET spec has no numeric threshold — a forged cfo: must not arm one.
+    if spec is None or op is None or spec.unit is Unit.MARKET:
         await callback.answer("Unknown filter.")
         return
     draft = drafts.get(callback.from_user.id)
@@ -286,6 +328,39 @@ async def on_filter_op(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Draf
     )
     keyboard = [[InlineKeyboardButton(text="◀ Cancel", callback_data="cmenu")]]
     await _show(callback, text, InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+async def on_filter_category(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Drafts) -> None:
+    """A category tap (cfc:METALS) completes the focus-market filter in one
+    step (#108) — the threshold is the category, no typed input needed."""
+    try:
+        category = Category((callback.data or "").removeprefix("cfc:"))
+    except ValueError:
+        await callback.answer("Unknown market.")
+        return
+    draft = drafts.get(callback.from_user.id)
+    if draft is None:
+        await _expired(callback, pool)
+        return
+    added = Filter(metric=FOCUS_MARKET_KEY, op=Op.GTE, threshold=category_threshold(category))
+    draft.filters.append(added)
+    draft.clear_pending()
+    await _show(callback, *_render_builder(draft), toast=f"Added {_describe(added)}")
+
+
+async def on_filter_ticker(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Drafts) -> None:
+    """The Specific-ticker path (#108): arm the ticker prompt. The Op is a
+    placeholder — awaiting_builder_input keys on pending_op, and a focus
+    filter ignores its operator."""
+    draft = drafts.get(callback.from_user.id)
+    if draft is None:
+        await _expired(callback, pool)
+        return
+    draft.awaiting_name = False
+    draft.pending_metric = FOCUS_MARKET_KEY
+    draft.pending_op = Op.GTE
+    keyboard = [[InlineKeyboardButton(text="◀ Cancel", callback_data="cmenu")]]
+    await _show(callback, FOCUS_TICKER_PROMPT_TEXT, InlineKeyboardMarkup(inline_keyboard=keyboard))
 
 
 async def on_filter_delete(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Drafts) -> None:
@@ -345,12 +420,14 @@ async def on_sort_menu(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Draf
     if drafts.get(callback.from_user.id) is None:
         await _expired(callback, pool)
         return
-    await _show(callback, SORT_PICKER_TEXT, _metric_picker("csm:"))
+    await _show(callback, SORT_PICKER_TEXT, _metric_picker("csm:", sortable_only=True))
 
 
 async def on_sort_metric(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Drafts) -> None:
     spec = METRICS.get((callback.data or "").removeprefix("csm:"))
-    if spec is None:
+    # Focus market (#108) is a filter, never a sort — there is no column to
+    # order by, and forged callbacks must not smuggle it in.
+    if spec is None or spec.unit is Unit.MARKET:
         await callback.answer("Unknown metric.")
         return
     if drafts.get(callback.from_user.id) is None:
@@ -370,7 +447,7 @@ async def on_sort_metric(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Dr
 async def on_sort_direction(callback: CallbackQuery, pool: asyncpg.Pool, drafts: Drafts) -> None:
     key, _, direction = (callback.data or "").removeprefix("csd:").partition(":")
     spec = METRICS.get(key)
-    if spec is None or direction not in ("d", "a"):
+    if spec is None or spec.unit is Unit.MARKET or direction not in ("d", "a"):
         await callback.answer("Unknown sort.")
         return
     draft = drafts.get(callback.from_user.id)
@@ -531,10 +608,27 @@ async def on_builder_text(
     if draft.pending_metric is None or draft.pending_op is None:
         return  # unreachable while awaiting_builder_input gates registration
     spec = METRICS[draft.pending_metric]
-    threshold = parse_threshold(spec, message.text)
-    if threshold is None:
-        await message.answer(f"I couldn't read that as a number. Send e.g. {spec.example}.")
-        return
+    if spec.unit is Unit.MARKET:
+        # The ticker path of the focus-market filter (#108): normalize, then
+        # answer an unknown ticker helpfully — the prompt stays armed, so a
+        # corrected ticker still lands.
+        ticker = normalize_ticker(message.text)
+        if ticker is None:
+            await message.answer(FOCUS_TICKER_UNREADABLE_TEXT)
+            return
+        if not await ticker_seen(pool, ticker):
+            await message.answer(
+                f"No analyzed wallet has traded {ticker} yet, so this filter would "
+                "match nobody. Check the spelling or send a different ticker."
+            )
+            return
+        threshold: Decimal | str = ticker_threshold(ticker)
+    else:
+        parsed = parse_threshold(spec, message.text)
+        if parsed is None:
+            await message.answer(f"I couldn't read that as a number. Send e.g. {spec.example}.")
+            return
+        threshold = parsed
     added = Filter(metric=spec.key, op=draft.pending_op, threshold=threshold)
     draft.filters.append(added)
     draft.clear_pending()
@@ -641,10 +735,12 @@ def _render_builder(draft: Draft) -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _metric_picker(prefix: str) -> InlineKeyboardMarkup:
+def _metric_picker(prefix: str, *, sortable_only: bool = False) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     row: list[InlineKeyboardButton] = []
     for spec in METRICS.values():
+        if sortable_only and spec.unit is Unit.MARKET:
+            continue  # focus market (#108) filters but never sorts
         row.append(InlineKeyboardButton(text=spec.label, callback_data=f"{prefix}{spec.key}"))
         if len(row) == 2:
             keyboard.append(row)
@@ -758,7 +854,9 @@ def _stats_line(row: ScreenerRow, criteria: Criteria) -> str:
 
 def _describe(f: Filter) -> str:
     spec = METRICS[f.metric]
-    return f"{spec.label} {f.op.symbol} {format_value(spec, f.threshold)}"
+    if spec.unit is Unit.MARKET:
+        return focus_label(str(f.threshold))  # "Focus market: Metals" — no operator
+    return f"{spec.label} {f.op.symbol} {format_value(spec, Decimal(f.threshold))}"
 
 
 # --- plumbing ---

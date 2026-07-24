@@ -17,6 +17,7 @@ from enum import Enum
 
 import asyncpg
 
+from epigone.focus_market import FOCUS_MARKET_KEY, focus_condition
 from epigone.gateway import Window
 from epigone.metrics.library import METRICS
 
@@ -68,11 +69,13 @@ class Op(Enum):
 @dataclass(frozen=True)
 class Filter:
     """metric → operator → threshold. `metric` is a Metric Library key; a
-    fine-metric filter excludes coarse-only Traders (NULL never clears it)."""
+    fine-metric filter excludes coarse-only Traders (NULL never clears it).
+    The focus-market filter (#108) is the one non-numeric case: its threshold
+    is a cat:/tick: string (epigone.focus_market) and its op is ignored."""
 
     metric: str
     op: Op
-    threshold: Decimal
+    threshold: Decimal | str
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,9 @@ def _conditions(criteria: Criteria) -> tuple[str, list[object]]:
     params: list[object] = [criteria.time_window.value]
     fragments: list[str] = []
     for f in criteria.filters:
+        if f.metric == FOCUS_MARKET_KEY:
+            fragments.append(focus_condition(f.threshold, params))
+            continue
         params.append(f.threshold)
         fragments.append(f" AND {METRICS[f.metric].sql} {f.op.sql} ${len(params)}")
     return "".join(fragments), params

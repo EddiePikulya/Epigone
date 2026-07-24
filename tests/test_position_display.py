@@ -417,14 +417,15 @@ def test_usd_compact_abbreviates_by_magnitude() -> None:
 
 # --- most-played tickers (#80) ----------------------------------------------
 #
-# Ranking is by completed round-trip count per coin over the fill window, with a
-# currently-open episode adding to its coin's weight (a wallet parked in one big
-# short has few trips but that coin is plainly its coin). Top 3, dex-prefixed
-# builder-DEX coins rendered as the bare ticker, and no line at all when the fine
-# store has nothing to rank.
+# Ranking — completed round-trips per coin over the fill window, with a
+# currently-open episode adding to its coin's weight — lives in the shared SQL
+# (epigone.plays), exercised by the DB-backed most-played and focus-market
+# tests. The renderer here trusts that order: top 3, dex-prefixed builder-DEX
+# coins rendered as the bare ticker, and no line at all when the fine store has
+# nothing to rank.
 
 
-def test_most_played_ranks_by_round_trip_count_and_takes_the_top_three() -> None:
+def test_most_played_takes_the_top_three_ranked_plays() -> None:
     line = _render_most_played(
         [
             ("SOL", 9, False),
@@ -437,24 +438,22 @@ def test_most_played_ranks_by_round_trip_count_and_takes_the_top_three() -> None
     assert line == "Most played: SOL · BTC · ETH (~2.8 coins)"
 
 
-def test_most_played_counts_open_exposure_toward_its_coin() -> None:
-    # A wallet sitting in one big BTC short for weeks has few completed BTC trips,
-    # but the open position makes BTC plainly its coin — the open episode counts.
+def test_most_played_effective_coins_ignore_the_open_bonus() -> None:
+    # BTC ranks first through its open episode, but the effective-coins
+    # annotation is trips only (4 trips over 2/1/1 → 16/6 ≈ 2.7).
     line = _render_most_played(
         [
-            ("ETH", 2, False),
             ("BTC", 1, True),
+            ("ETH", 2, False),
             ("SOL", 1, False),
         ]
     )
-    # The open BTC ranks the coin, but the effective-coins annotation is trips
-    # only (4 trips over 2/1/1 → 16/6 ≈ 2.7), blind to the open episode.
     assert line == "Most played: BTC · ETH · SOL (~2.7 coins)"
 
 
 def test_most_played_reads_a_fifty_fifty_pair_as_two_effective_coins() -> None:
-    line = _render_most_played([("SOL", 5, False), ("ETH", 5, False)])
-    assert line == "Most played: ETH · SOL (~2 coins)"  # equal weight ties break on coin name
+    line = _render_most_played([("ETH", 5, False), ("SOL", 5, False)])
+    assert line == "Most played: ETH · SOL (~2 coins)"
 
 
 def test_most_played_includes_a_coin_that_is_only_open() -> None:
