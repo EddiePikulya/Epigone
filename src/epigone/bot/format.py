@@ -1,12 +1,13 @@
 """Shared Telegram text formatting: used by the dialog handlers and the
 Position/Order Alert renderers."""
 
+from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 
 from aiogram.types import MessageEntity
 
-from epigone.gateway import OpenOrder
+from epigone.gateway import OpenOrder, Position, Side
 from epigone.metrics.library import format_duration
 
 
@@ -72,21 +73,30 @@ def display_coin(coin: str) -> str:
 MAX_ORDERS_SHOWN = 8
 
 
-def order_lines(orders: list[OpenOrder]) -> list[str]:
+def order_lines(
+    orders: list[OpenOrder], positions: Mapping[str, Position] | None = None
+) -> list[str]:
     """One order_line per order, capped at MAX_ORDERS_SHOWN with an
     "…and N more" tail — the truncation rule shared by the Order Alert body
     and the views' resting-orders section, extracted so the two can't drift
     any more than the line format can (#77 lesson). Callers pass the orders
     already in the order they want read (placement order for alerts, ladder
-    order for views)."""
-    lines = [order_line(o) for o in orders[:MAX_ORDERS_SHOWN]]
+    order for views).
+
+    `positions` maps a (namespaced) coin to the wallet's current position on
+    it, so each line can annotate what the order would do to that position
+    (#123). Both surfaces pass one — the alert from the wallet's snapshots, the
+    view from the live positions it already fetched; a coin absent from the map
+    genuinely has no position and reads as a new position."""
+    by_coin = positions or {}
+    lines = [order_line(o, by_coin.get(o.coin)) for o in orders[:MAX_ORDERS_SHOWN]]
     hidden = len(orders) - MAX_ORDERS_SHOWN
     if hidden > 0:
         lines.append(f"…and {hidden} more")
     return lines
 
 
-def order_line(order: OpenOrder) -> str:
+def order_line(order: OpenOrder, position: Position | None = None) -> str:
     """One resting order, as both the wallet views and Order Alerts render it
     (issue #115) — shared here so the two can't drift (the #77 lesson).
 
@@ -94,16 +104,53 @@ def order_line(order: OpenOrder) -> str:
     @ 4.5`); a trigger order is labeled TP/SL from its orderType and reads
     against the price that arms it (its limitPx is only a slippage cap); a
     whole-position TP/SL has no order-level size, so it says what it is
-    instead of inventing one. Builder-DEX coins render as the bare ticker."""
+    instead of inventing one. Builder-DEX coins render as the bare ticker.
+
+    `position` is the wallet's current position on this coin (None if it holds
+    none): the line closes with what the order would do to it (#123) — the
+    relationship composes with any #115 TP/SL label, it never replaces it."""
     coin = display_coin(order.coin)
     side = "BUY" if order.is_buy else "SELL"
     if order.is_position_tpsl:
-        return f"{coin} {order.tpsl} @ {order.trigger_price} (whole position)"
+        base = f"{coin} {order.tpsl} @ {order.trigger_price} (whole position)"
+    else:
+        notional = order.notional_usd
+        amount = f"${notional:,.0f}" if notional is not None else "size unknown"
+        if order.is_trigger:
+            base = f"{coin} {side} {order.tpsl} {amount} @ trigger {order.trigger_price}"
+        else:
+            base = f"{coin} {side} {amount} @ {order.limit_price}"
+    return f"{base} → {order_relationship(order, position)}"
+
+
+def order_relationship(order: OpenOrder, position: Position | None) -> str:
+    """What placing `order` would do to the wallet's current position on that
+    coin (issue #123): add to it, reduce/close it, flip it, or open a new one.
+
+    Same-direction orders (a buy under a long, a sell under a short) *add*, and
+    the line carries the position they grow — its size and entry — so the alert
+    is self-contained. Opposing orders *would reduce/close* the position, or
+    *would flip* the side when the order's notional exceeds the position's.
+    Sizes are only as fresh as the last poll cycle (~30s), so a flip is always
+    phrased conditionally, never as fact. No position on the coin is a *new
+    position* — a stop-entry gains exactly this context.
+
+    Notional-vs-notional drives the flip call; a whole-position TP/SL has no
+    order-level notional (its size is 0) and so can only reduce/close what it is
+    armed against, never read as a flip."""
+    if position is None:
+        return "new position"
+    side_label = position.side.value.upper()
+    # A buy grows a long / opposes a short; a sell the mirror — so the order
+    # adds exactly when its buy-ness matches the position being long.
+    if order.is_buy == (position.side is Side.LONG):
+        now = f"{usd_size(position.size_usd)} @ {position.entry_price}"
+        return f"adds to his {side_label} (now {now})"
     notional = order.notional_usd
-    amount = f"${notional:,.0f}" if notional is not None else "size unknown"
-    if order.is_trigger:
-        return f"{coin} {side} {order.tpsl} {amount} @ trigger {order.trigger_price}"
-    return f"{coin} {side} {amount} @ {order.limit_price}"
+    if notional is not None and notional > position.size_usd:
+        flipped = Side.SHORT if position.side is Side.LONG else Side.LONG
+        return f"would flip him {flipped.value.upper()}"
+    return f"would reduce/close his {side_label}"
 
 
 def signed_usd(amount: Decimal) -> str:
@@ -126,6 +173,29 @@ def usd_compact(amount: Decimal) -> str:
     if value >= 1_000:
         return f"${value / 1_000:.0f}k"
     return f"${value:,.0f}"
+
+
+def usd_size(amount: Decimal) -> str:
+    """A compact dollar size that keeps one k/M decimal — $127.6k, $6.9k, $1.1M
+    — for the order-relationship position context (#123). Unlike usd_compact
+    (whose whole-number k-rounding, $127.6k → $128k, only wants a sense of
+    scale), this sits beside a position the reader is about to act on, so the
+    tenths matter. A trailing .0 drops ($6.0k → $6k) and sub-thousand sizes read
+    in full ($940)."""
+    value = abs(amount)
+    if value >= 1_000_000:
+        return f"${_trim_tenths(value / 1_000_000)}M"
+    if value >= 1_000:
+        return f"${_trim_tenths(value / 1_000)}k"
+    return f"${value:,.0f}"
+
+
+def _trim_tenths(value: Decimal) -> str:
+    """`value` to one decimal place with a trailing .0 stripped (6.9 → "6.9",
+    6.0 → "6"). The :.1f guarantees exactly one fractional digit, so at most one
+    trailing zero is ever removed — the integer part's zeros are safe behind the
+    decimal point."""
+    return f"{value:.1f}".rstrip("0").rstrip(".")
 
 
 def compact_price(price: Decimal) -> str:

@@ -25,7 +25,7 @@ from epigone.bot.alerts import positions_button
 from epigone.bot.format import order_lines, trader_label
 from epigone.bot.outbox import MAX_DELIVERY_ATTEMPTS, drain_outbox, run_drain_loop
 from epigone.clock import Clock
-from epigone.gateway import OpenOrder
+from epigone.gateway import OpenOrder, Position, Side
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ async def deliver_pending_order_alerts(pool: asyncpg.Pool, bot: Bot, clock: Cloc
     async def deliver(bot: Bot, row: asyncpg.Record) -> None:
         await bot.send_message(
             chat_id=row["user_telegram_id"],
-            text=render_order_alert(row),
+            text=await render_order_alert(pool, row),
             reply_markup=positions_button(row),
         )
 
@@ -77,14 +77,47 @@ async def _fetch_pending(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     return rows
 
 
-def render_order_alert(row: asyncpg.Record) -> str:
+async def render_order_alert(pool: asyncpg.Pool, row: asyncpg.Record) -> str:
     """The message text for one batch row: a header naming the wallet and the
     batch size, then the shared capped order lines (format.order_lines) in the
-    placement order the poll stored."""
+    placement order the poll stored.
+
+    Each line is annotated with what the order would do to the wallet's current
+    position on that coin (#123) — read from the poller's snapshots at delivery
+    time, the same read-time DB pattern as #121's coin-match, no new polling or
+    state. A wallet with no snapshot on a coin reads as a new position."""
     label = trader_label(row["track_name"] or row["display_name"], row["trader_address"])
     orders = [OpenOrder.from_wire(entry) for entry in json.loads(row["orders"])]
+    positions = await _position_snapshots(pool, row["trader_address"])
     if len(orders) == 1:
         head = f"📋 {label} placed a new order:"
     else:
         head = f"📋 {label} placed {len(orders)} new orders:"
-    return "\n".join([head, *order_lines(orders)])
+    return "\n".join([head, *order_lines(orders, positions)])
+
+
+async def _position_snapshots(pool: asyncpg.Pool, address: str) -> dict[str, Position]:
+    """coin → the wallet's current open position, from the poller's snapshots
+    (#123). The order annotation compares each order against these; a coin the
+    wallet holds nothing on is simply absent, and the renderer reads that as a
+    new position. Only the fields the annotation needs — side, notional, entry
+    — are hydrated; a snapshot Position omits margin/leverage-derived extras."""
+    rows = await pool.fetch(
+        """
+        SELECT coin, side, size_usd, leverage, entry_price, unrealized_pnl
+        FROM position_snapshots
+        WHERE trader_address = $1
+        """,
+        address,
+    )
+    return {
+        r["coin"]: Position(
+            coin=r["coin"],
+            side=Side(r["side"]),
+            size_usd=r["size_usd"],
+            leverage=r["leverage"],
+            entry_price=r["entry_price"],
+            unrealized_pnl=r["unrealized_pnl"],
+        )
+        for r in rows
+    }

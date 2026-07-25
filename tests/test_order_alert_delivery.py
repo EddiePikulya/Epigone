@@ -51,6 +51,33 @@ def order(
     )
 
 
+async def snapshot(
+    pool: asyncpg.Pool,
+    coin: str,
+    side: str,
+    size_usd: str,
+    *,
+    entry_price: str = "6.7134",
+    address: str = "0xaaa",
+) -> None:
+    """A position_snapshots row as the poller would have written it — the source
+    the order annotation (#123) reads at delivery time."""
+    await pool.execute(
+        """
+        INSERT INTO position_snapshots
+            (trader_address, coin, side, size_usd, leverage, entry_price,
+             unrealized_pnl, opened_at, updated_at)
+        VALUES ($1, $2, $3, $4, 5, $5, 0, $6, $6)
+        """,
+        address,
+        coin,
+        side,
+        Decimal(size_usd),
+        Decimal(entry_price),
+        T0,
+    )
+
+
 async def queue_batch(
     pool: asyncpg.Pool,
     orders: list[OpenOrder],
@@ -193,3 +220,84 @@ async def test_the_recipients_own_nickname_wins_over_the_leaderboard_label(
     (message,) = session.sent_messages()
     assert "silver guy" in message.text
     assert "Ansem" not in message.text
+
+
+async def test_each_relationship_annotates_the_order_against_the_snapshot(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # One batch, one coin per relationship (#123). Each order's notional is
+    # $13,500 (3000 @ 4.5); the snapshot notional decides reduce/close vs flip.
+    await queue_batch(
+        pool,
+        [
+            order(coin="AAA", order_id=1),  # SELL, snapshot SHORT → adds
+            order(coin="BBB", is_buy=True, order_id=2),  # BUY, snapshot LONG → adds
+            order(coin="CCC", is_buy=True, order_id=3),  # BUY $13.5k vs SHORT $20k → reduce
+            order(coin="DDD", order_id=4),  # SELL $13.5k vs LONG $20k → reduce
+            order(coin="EEE", is_buy=True, order_id=5),  # BUY $13.5k vs SHORT $5k → flip LONG
+            order(coin="FFF", order_id=6),  # SELL $13.5k vs LONG $5k → flip SHORT
+            order(coin="GGG", order_id=7),  # no snapshot → new position
+        ],
+    )
+    await snapshot(pool, "AAA", "short", "6900", entry_price="6.7134")
+    await snapshot(pool, "BBB", "long", "20000", entry_price="41.2")
+    await snapshot(pool, "CCC", "short", "20000")
+    await snapshot(pool, "DDD", "long", "20000")
+    await snapshot(pool, "EEE", "short", "5000")
+    await snapshot(pool, "FFF", "long", "5000")
+
+    await deliver_pending_order_alerts(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    text = message.text
+    # $6.9k keeps the k-tenth (usd_size); $20k drops a trailing .0.
+    assert "AAA SELL $13,500 @ 4.5 → adds to his SHORT (now $6.9k @ 6.7134)" in text
+    assert "BBB BUY $13,500 @ 4.5 → adds to his LONG (now $20k @ 41.2)" in text
+    assert "CCC BUY $13,500 @ 4.5 → would reduce/close his SHORT" in text
+    assert "DDD SELL $13,500 @ 4.5 → would reduce/close his LONG" in text
+    assert "EEE BUY $13,500 @ 4.5 → would flip him LONG" in text
+    assert "FFF SELL $13,500 @ 4.5 → would flip him SHORT" in text
+    assert "GGG SELL $13,500 @ 4.5 → new position" in text
+
+
+async def test_a_whole_position_tpsl_composes_its_label_with_the_relationship(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    # The #115 TP/SL label survives; the #123 relationship composes with it,
+    # never replaces it. A whole-position TP on a SHORT is a reduce-only BUY
+    # with no order notional, so it can only read as reduce/close, never a flip.
+    await queue_batch(
+        pool,
+        [
+            order(
+                coin="GRAM",
+                is_buy=True,
+                order_id=1,
+                size="0",
+                order_type="Take Profit Market",
+                is_trigger=True,
+                trigger_price="1.38",
+                is_position_tpsl=True,
+                reduce_only=True,
+            ),
+            # A stop-ENTRY on a coin the wallet holds nothing on gains context.
+            order(
+                coin="HYPE",
+                is_buy=True,
+                order_id=2,
+                size="75",
+                limit_price="68.31",
+                order_type="Stop Market",
+                is_trigger=True,
+                trigger_price="63.25",
+            ),
+        ],
+    )
+    await snapshot(pool, "GRAM", "short", "9000", entry_price="1.42")
+
+    await deliver_pending_order_alerts(pool, bot, clock)
+
+    (message,) = session.sent_messages()
+    text = message.text
+    assert "GRAM TP @ 1.38 (whole position) → would reduce/close his SHORT" in text
+    assert "HYPE BUY SL $4,744 @ trigger 63.25 → new position" in text

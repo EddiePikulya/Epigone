@@ -497,7 +497,7 @@ async def _render_positions_view(
     if track is None:
         return None
     positions = await fetch_open_positions(gateway, address)
-    orders_section = await _open_orders_section(gateway, address)
+    orders_section = await _open_orders_section(gateway, address, positions)
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     positions_text, entities = _render_positions(
@@ -892,7 +892,7 @@ async def _render_profile(
     keeping every other button (follow/unfollow, rename, the #93 header
     entity)."""
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
-    orders_section = await _open_orders_section(gateway, address)
+    orders_section = await _open_orders_section(gateway, address, positions)
     track = await fetch_track(pool, user_id, address)
     followed = track is not None
     name: str | None = track["name"] if track is not None else None
@@ -1616,33 +1616,43 @@ def _render_positions(
 ORDERS_UNAVAILABLE_LINE = "Resting orders unavailable right now"
 
 
-async def _open_orders_section(gateway: HyperliquidGateway, address: str) -> str | None:
+async def _open_orders_section(
+    gateway: HyperliquidGateway, address: str, positions: list[Position]
+) -> str | None:
     """The resting-orders section for a wallet view, fetched on demand (#115).
 
     Orders are a garnish on the view, not its backbone: the positions fetch
     keeps its all-venues-must-succeed rule (a partial positions read renders
     lies), but an orders-only failure degrades to the honest unavailable line
     while the rest of the view renders. None only for a healthy, empty book —
-    the views then show nothing extra."""
+    the views then show nothing extra.
+
+    `positions` are the live positions the view already fetched — passed in so
+    each order can be annotated with what it would do to the wallet's position
+    on that coin (#123). The live list is the annotation source on both
+    surfaces of the view: an untracked wallet has no poller snapshot, so
+    reusing what is already in hand makes the annotation work there too."""
     try:
-        return _render_open_orders(await fetch_open_orders(gateway, address))
+        return _render_open_orders(await fetch_open_orders(gateway, address), positions)
     except GatewayError:
         return ORDERS_UNAVAILABLE_LINE
 
 
-def _render_open_orders(orders: list[OpenOrder]) -> str | None:
+def _render_open_orders(orders: list[OpenOrder], positions: list[Position]) -> str | None:
     """The resting-orders section both wallet views append after the positions
     block (#115): the trader's plan before it executes, tracked and untracked
     wallets alike. None — so the views show nothing extra — for a wallet with
     an empty book.
 
     Rows sort by coin, then by the price the order acts at (descending), so a
-    ladder reads top-down; the shared order_line labels TP/SL and bares
-    builder-DEX tickers. Capped at the Order Alert batch cap for the same
-    reason (observed live: makers resting 500+ orders — an uncapped section
-    would also gamble with Telegram's message-length limit)."""
+    ladder reads top-down; the shared order_line labels TP/SL, bares
+    builder-DEX tickers, and annotates each with its relationship to the live
+    position on that coin (#123). Capped at the Order Alert batch cap for the
+    same reason (observed live: makers resting 500+ orders — an uncapped
+    section would also gamble with Telegram's message-length limit)."""
     if not orders:
         return None
+    by_coin = {p.coin: p for p in positions}
     ranked = sorted(
         orders,
         key=lambda o: (
@@ -1650,7 +1660,7 @@ def _render_open_orders(orders: list[OpenOrder]) -> str | None:
             -(o.trigger_price if o.trigger_price is not None else o.limit_price),
         ),
     )
-    return "\n".join(["Resting orders:", *order_lines(ranked)])
+    return "\n".join(["Resting orders:", *order_lines(ranked, by_coin)])
 
 
 async def _position_ages(
