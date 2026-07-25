@@ -1171,6 +1171,9 @@ def test_a_flip_splits_its_fill_price_at_the_zero_crossing() -> None:
     long_trip, short_trip = state.round_trips
     assert (long_trip.entry_vwap, long_trip.exit_vwap) == (Decimal("10"), Decimal("15"))
     assert (short_trip.entry_vwap, short_trip.exit_vwap) == (Decimal("15"), Decimal("12"))
+    # The flip's two trips carry opposite sides, each the sign of its own
+    # episode's position — not an inference from the (both positive) PnLs (#119).
+    assert (long_trip.side, short_trip.side) == ("LONG", "SHORT")
 
 
 def test_vwap_sums_fold_across_checkpoints_exactly_like_one_batch() -> None:
@@ -1271,3 +1274,58 @@ def test_demotion_drops_the_vwap_sums_with_the_episode() -> None:
     )
     (t,) = state.round_trips
     assert (t.entry_vwap, t.exit_vwap) == (Decimal("20"), Decimal("25"))
+
+
+# --- LONG / SHORT side (issue #119) -------------------------------------------
+# Each round-trip is stamped LONG or SHORT at mint from the sign of its
+# episode's net position — an episode is single-direction by construction, so
+# the side is never inferred from pnl/price direction. A cross-checkpoint trip
+# takes its side from the stored episode's persisted net_position, so the fold
+# reproduces the whole-batch stamp exactly.
+
+
+def test_a_long_round_trip_is_stamped_long() -> None:
+    state = extract_state([_open(at=T0), _close(at=T0 + timedelta(hours=1), pnl="5")])
+    (t,) = state.round_trips
+    assert t.side == "LONG"
+
+
+def test_a_short_round_trip_is_stamped_short() -> None:
+    # A losing short is stamped SHORT from its position sign — the negative PnL
+    # plays no part (a pnl×price inference would misread it, #119).
+    state = extract_state(
+        [
+            fill("Open Short", at=T0, start_position="0", size="1", price="10"),
+            fill(
+                "Close Short",
+                at=T0 + timedelta(hours=1),
+                start_position="-1",
+                size="1",
+                price="12",
+                pnl="-2",
+            ),
+        ]
+    )
+    (t,) = state.round_trips
+    assert t.side == "SHORT"
+
+
+def test_side_folds_across_a_checkpoint_from_the_stored_episode() -> None:
+    # A short opened before the checkpoint and closed after it: the folded trip
+    # takes SHORT from the carried episode's net_position, matching the
+    # whole-batch stamp to the letter (the same fold rigor as pnl/peak/VWAP).
+    early = [fill("Open Short", at=T0, start_position="0", size="2", price="10")]
+    late = [
+        fill(
+            "Close Short",
+            at=T0 + timedelta(hours=1),
+            start_position="-2",
+            size="2",
+            price="8",
+            pnl="4",
+        )
+    ]
+    folded = fold_state(extract_state(early), late)
+    assert folded.round_trips == extract_state(early + late).round_trips
+    (t,) = folded.round_trips
+    assert t.side == "SHORT"

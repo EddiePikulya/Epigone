@@ -301,7 +301,7 @@ async def _load_fine_state(
         address,
     )
     trade_rows = await pool.fetch(
-        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq, entry_vwap, exit_vwap "
+        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq, entry_vwap, exit_vwap, side "
         "FROM fine_trades WHERE address = $1 ORDER BY closed_at, coin, seq",
         address,
     )
@@ -315,6 +315,7 @@ async def _load_fine_state(
             seq=r["seq"],
             entry_vwap=r["entry_vwap"],
             exit_vwap=r["exit_vwap"],
+            side=r["side"],
         )
         for r in trade_rows
     )
@@ -407,19 +408,20 @@ async def _store_fine_refresh(
                 """
                 INSERT INTO fine_trades
                     (address, coin, pnl, peak_notional, opened_at, closed_at, seq,
-                     entry_vwap, exit_vwap)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                     entry_vwap, exit_vwap, side)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (address, coin, closed_at, seq) DO UPDATE
                     SET pnl = EXCLUDED.pnl,
                         peak_notional = EXCLUDED.peak_notional,
                         opened_at = EXCLUDED.opened_at,
                         entry_vwap = EXCLUDED.entry_vwap,
-                        exit_vwap = EXCLUDED.exit_vwap
+                        exit_vwap = EXCLUDED.exit_vwap,
+                        side = EXCLUDED.side
                 """,
                 [
                     (
                         address, t.coin, t.pnl, t.peak_notional, t.opened_at, t.closed_at,
-                        t.seq, t.entry_vwap, t.exit_vwap,
+                        t.seq, t.entry_vwap, t.exit_vwap, t.side,
                     )
                     for t in new_trips
                 ],

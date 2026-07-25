@@ -1,9 +1,13 @@
-"""Issue #116: the wallet views' Recent trades section — the last 5 completed
-round-trips, newest first, with dates/PnL/peak size and, where recorded,
-entry/exit VWAPs. Rendered on both view-assembly paths (the follower's
-positions view and the screener/paste profile), after the track record;
-wallets with no stored trips omit the section entirely. Deliberately constant
-across the #102 window toggle (see _recent_trades_section)."""
+"""Issues #116/#119: the wallet views' Recent trades section — the last 5
+completed round-trips, newest first. Each line reads
+`LONG SOL +$1,240 (+3.2%) · in 77.51 → out 79.02 · 07-22 14:10 → 07-23 09:55 (19h 45m)`:
+a LONG/SHORT side prefix (#119), ticker, net PnL and its ROE% (pnl ÷ peak,
+#119), entry/exit VWAPs where recorded (#116), and open → close datetimes with
+hold duration. Rendered on both view-assembly paths (the follower's positions
+view and the screener/paste profile), after the track record; wallets with no
+stored trips omit the section entirely. Deliberately constant across the #102
+window toggle (see _recent_trades_section). Pre-#116 trips render with no
+`in → out` clause and pre-#119 trips with no side prefix — graceful degradation."""
 
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -39,12 +43,14 @@ async def add_trip(
     seq: int = 0,
     entry_vwap: str | None = None,
     exit_vwap: str | None = None,
+    side: str | None = None,
 ) -> None:
     await pool.execute(
         """
         INSERT INTO fine_trades
-            (address, coin, pnl, peak_notional, opened_at, closed_at, seq, entry_vwap, exit_vwap)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            (address, coin, pnl, peak_notional, opened_at, closed_at, seq,
+             entry_vwap, exit_vwap, side)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         """,
         WHALE,
         coin,
@@ -55,15 +61,17 @@ async def add_trip(
         seq,
         Decimal(entry_vwap) if entry_vwap is not None else None,
         Decimal(exit_vwap) if exit_vwap is not None else None,
+        side,
     )
 
 
-async def test_the_positions_view_renders_a_priced_trade_line(
+async def test_the_positions_view_renders_a_full_trade_line(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await follow_wallet(dp, bot, WHALE, user_id=111)
     await add_trip(
         pool,
+        side="LONG",
         opened=datetime(2026, 7, 22, 14, 10, tzinfo=UTC),
         closed=datetime(2026, 7, 23, 9, 55, tzinfo=UTC),
         entry_vwap="77.51",
@@ -74,13 +82,35 @@ async def test_the_positions_view_renders_a_priced_trade_line(
 
     text = session.sent_messages()[-1].text or ""
     assert "Recent trades:" in text
+    # side · ticker · PnL · ROE (1240/39000 = 3.2%) · in→out VWAPs · dates (hold).
     assert (
-        "SOL +$1,240 · $39k peak · 07-22 14:10 → 07-23 09:55 (19h 45m)"
-        " · in 77.51 → out 79.02" in text
+        "LONG SOL +$1,240 (+3.2%) · in 77.51 → out 79.02"
+        " · 07-22 14:10 → 07-23 09:55 (19h 45m)" in text
     )
     # The section reads as recency under the record, so it sits after the
     # track-record block ("No metrics yet …" is that block's unscanned fallback).
     assert text.index("Recent trades:") > text.index("No metrics yet")
+
+
+async def test_a_short_trip_shows_the_short_prefix_and_signed_roe(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # A losing short: SHORT prefix from the stored side, negative ROE from the
+    # negative PnL over the same peak exposure (-380/12000 = -3.2%, #119).
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    await add_trip(
+        pool,
+        side="SHORT",
+        pnl="-380",
+        peak="12000",
+        opened=datetime(2026, 7, 20, 6, 0, tzinfo=UTC),
+        closed=datetime(2026, 7, 20, 18, 30, tzinfo=UTC),
+    )
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    text = session.sent_messages()[-1].text or ""
+    assert "SHORT SOL -$380 (-3.2%) · 07-20 06:00 → 07-20 18:30 (12h 30m)" in text
 
 
 async def test_the_section_lists_the_last_five_trips_newest_first(
@@ -115,6 +145,7 @@ async def test_the_profile_path_shows_the_section_too(
     await add_trader(pool)
     await add_trip(
         pool,
+        side="LONG",
         opened=datetime(2026, 7, 22, 14, 10, tzinfo=UTC),
         closed=datetime(2026, 7, 23, 9, 55, tzinfo=UTC),
     )
@@ -123,7 +154,7 @@ async def test_the_profile_path_shows_the_section_too(
 
     text = session.sent_messages()[-1].text or ""
     assert "Recent trades:" in text
-    assert "SOL +$1,240 · $39k peak" in text
+    assert "LONG SOL +$1,240 (+3.2%)" in text
 
 
 async def test_a_wallet_with_no_trips_omits_the_section(
@@ -145,6 +176,7 @@ async def test_a_pre_vwap_trip_renders_without_the_price_clause(
     await follow_wallet(dp, bot, WHALE, user_id=111)
     await add_trip(
         pool,
+        side="LONG",
         pnl="-380",
         peak="12000",
         opened=datetime(2026, 7, 20, 6, 0, tzinfo=UTC),
@@ -154,9 +186,29 @@ async def test_a_pre_vwap_trip_renders_without_the_price_clause(
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
     text = session.sent_messages()[-1].text or ""
-    assert "SOL -$380 · $12k peak · 07-20 06:00 → 07-20 18:30 (12h 30m)" in text
+    assert "LONG SOL -$380 (-3.2%) · 07-20 06:00 → 07-20 18:30 (12h 30m)" in text
     assert "in " not in text.split("Recent trades:")[1]
     assert "out" not in text.split("Recent trades:")[1]
+
+
+async def test_a_pre_side_trip_renders_without_the_prefix(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    # Trips folded before #119 shipped carry NULL side — the LONG/SHORT prefix
+    # is simply omitted, everything else (PnL, ROE, dates) intact, the same
+    # graceful degradation as the pre-#116 price-less trips.
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    await add_trip(
+        pool,
+        opened=datetime(2026, 7, 22, 14, 10, tzinfo=UTC),
+        closed=datetime(2026, 7, 23, 9, 55, tzinfo=UTC),
+    )
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    section = (session.sent_messages()[-1].text or "").split("Recent trades:")[1]
+    assert "SOL +$1,240 (+3.2%)" in section
+    assert "LONG" not in section and "SHORT" not in section
 
 
 async def test_builder_dex_trips_render_as_the_bare_ticker(
@@ -166,6 +218,7 @@ async def test_builder_dex_trips_render_as_the_bare_ticker(
     await add_trip(
         pool,
         coin="xyz:SP500",
+        side="LONG",
         opened=datetime(2026, 7, 22, 14, 10, tzinfo=UTC),
         closed=datetime(2026, 7, 23, 9, 55, tzinfo=UTC),
     )
@@ -173,5 +226,5 @@ async def test_builder_dex_trips_render_as_the_bare_ticker(
     await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
 
     text = session.sent_messages()[-1].text or ""
-    assert "SP500 +$1,240" in text
+    assert "LONG SP500 +$1,240" in text
     assert "xyz:" not in text.split("Recent trades:")[1]

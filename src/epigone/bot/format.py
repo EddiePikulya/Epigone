@@ -111,9 +111,9 @@ def signed_usd(amount: Decimal) -> str:
     return f"{sign}${abs(amount):,.0f}"
 
 
-def signed_pct(ratio: Decimal) -> str:
+def signed_pct(ratio: Decimal, *, decimals: int = 0) -> str:
     sign = "-" if ratio < 0 else "+"
-    return f"{sign}{abs(ratio):.0%}"
+    return f"{sign}{abs(ratio):.{decimals}%}"
 
 
 def usd_compact(amount: Decimal) -> str:
