@@ -63,6 +63,17 @@ def hype_long() -> Position:
     )
 
 
+def pos(coin: str, side: Side, size_usd: str, entry_price: str = "6.7134") -> Position:
+    return Position(
+        coin=coin,
+        side=side,
+        size_usd=Decimal(size_usd),
+        leverage=Decimal("5"),
+        entry_price=Decimal(entry_price),
+        unrealized_pnl=Decimal("0"),
+    )
+
+
 async def test_an_untracked_profile_lists_resting_orders_with_tpsl_labeled(
     dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
 ) -> None:
@@ -92,6 +103,78 @@ async def test_an_untracked_profile_lists_resting_orders_with_tpsl_labeled(
     assert "LIT SELL $13,500 @ 4.5" in profile
     assert "HYPE BUY SL $4,744 @ trigger 63.25" in profile  # trigger labeled
     assert "BB BUY $1,550 @ 15.5" in profile  # builder-DEX order, bare ticker
+
+
+async def test_each_relationship_annotates_orders_against_the_live_positions(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
+) -> None:
+    # The view has no snapshots for an untracked wallet, so it annotates from
+    # the live positions it already fetched for the same view (#123). Each
+    # order's notional is $13,500 (3000 @ 4.5); the position notional decides
+    # reduce/close vs flip.
+    gateway.set_positions(
+        WHALE,
+        [
+            pos("AAA", Side.SHORT, "6900"),
+            pos("BBB", Side.LONG, "20000", entry_price="41.2"),
+            pos("CCC", Side.SHORT, "20000"),
+            pos("DDD", Side.LONG, "20000"),
+            pos("EEE", Side.SHORT, "5000"),
+            pos("FFF", Side.LONG, "5000"),
+        ],
+    )
+    gateway.set_open_orders(
+        WHALE,
+        [
+            order(coin="AAA", order_id=1),  # SELL, SHORT → adds
+            order(coin="BBB", is_buy=True, order_id=2),  # BUY, LONG → adds
+            order(coin="CCC", is_buy=True, order_id=3),  # BUY $13.5k vs SHORT $20k → reduce
+            order(coin="DDD", order_id=4),  # SELL $13.5k vs LONG $20k → reduce
+            order(coin="EEE", is_buy=True, order_id=5),  # BUY $13.5k vs SHORT $5k → flip LONG
+            order(coin="FFF", order_id=6),  # SELL $13.5k vs LONG $5k → flip SHORT
+            order(coin="GGG", order_id=7),  # no position → new position
+        ],
+    )
+
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    profile = session.sent_messages()[-1].text or ""
+    # $6.9k keeps the k-tenth (usd_size); $20k drops a trailing .0.
+    assert "AAA SELL $13,500 @ 4.5 → adds to his SHORT (now $6.9k @ 6.7134)" in profile
+    assert "BBB BUY $13,500 @ 4.5 → adds to his LONG (now $20k @ 41.2)" in profile
+    assert "CCC BUY $13,500 @ 4.5 → would reduce/close his SHORT" in profile
+    assert "DDD SELL $13,500 @ 4.5 → would reduce/close his LONG" in profile
+    assert "EEE BUY $13,500 @ 4.5 → would flip him LONG" in profile
+    assert "FFF SELL $13,500 @ 4.5 → would flip him SHORT" in profile
+    assert "GGG SELL $13,500 @ 4.5 → new position" in profile
+
+
+async def test_a_trigger_order_composes_its_tpsl_label_with_the_relationship(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
+) -> None:
+    # The #115 TP/SL label composes with the #123 relationship. A whole-position
+    # TP on a LONG is a reduce-only sell with no order notional → reduce/close,
+    # never a flip.
+    gateway.set_positions(WHALE, [pos("HYPE", Side.LONG, "240000", entry_price="48.20")])
+    gateway.set_open_orders(
+        WHALE,
+        [
+            order(
+                coin="HYPE",
+                order_id=1,
+                size="0",
+                order_type="Take Profit Market",
+                is_trigger=True,
+                trigger_price="72.0",
+                is_position_tpsl=True,
+            ),
+        ],
+    )
+
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    profile = session.sent_messages()[-1].text or ""
+    assert "HYPE TP @ 72.0 (whole position) → would reduce/close his LONG" in profile
 
 
 async def test_a_wallet_with_no_resting_orders_shows_nothing_extra(
