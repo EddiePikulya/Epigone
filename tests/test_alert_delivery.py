@@ -632,3 +632,125 @@ async def test_a_position_change_travels_from_poll_to_telegram(
     (message,) = session.sent_messages()
     assert message.chat_id == 42
     assert "opened ETH LONG" in message.text
+
+
+# --- My-wallet copy alerts (#121): a scale by a tracked wallet on a coin the
+# follower's own linked wallet is holding fires a full standalone message, on
+# top of the #91 arrow edit. ---
+
+
+async def hold(
+    pool: asyncpg.Pool,
+    *,
+    user_id: int = 42,
+    coin: str = "BTC",
+    own_address: str = "0xme",
+    side: str = "long",
+) -> None:
+    """The follower links their own wallet and it holds an open position on `coin`
+    — the snapshot the poller would have recorded. Seeds the traders FK, the
+    users.linked_wallet column, and one position_snapshots row."""
+    await pool.execute(
+        """
+        INSERT INTO traders (address, first_seen_at, last_seen_at)
+        VALUES ($1, $2, $2) ON CONFLICT (address) DO NOTHING
+        """,
+        own_address,
+        T0,
+    )
+    await pool.execute(
+        "INSERT INTO users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+    )
+    await pool.execute(
+        "UPDATE users SET linked_wallet = $2 WHERE telegram_id = $1", user_id, own_address
+    )
+    await pool.execute(
+        """
+        INSERT INTO position_snapshots
+            (trader_address, coin, side, size_usd, leverage, entry_price,
+             unrealized_pnl, opened_at, updated_at)
+        VALUES ($1, $2, $3, 5000, 3, 100, 0, $4, $4)
+        """,
+        own_address,
+        coin,
+        side,
+        T0,
+    )
+
+
+async def test_a_scale_on_a_held_coin_sends_a_full_copy_alert_plus_the_arrow(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The #121 core: when the follower's own wallet is in the same coin, the
+    scale is urgent — they get a full standalone message with the #57-style detail
+    (prev → new size), and the #91 arrow edit still lands on the anchor."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)  # anchor delivered, message id captured
+    await hold(pool, user_id=42, coin="BTC")
+
+    await queue_scale(pool, kind="scale_out", size_usd="4000", prev_size_usd="10000")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    (edit,) = session.edited_messages()
+    assert edit.text.endswith("⬇️")  # the arrow edit still happens
+
+    # The open send, then the extra copy alert send.
+    copy = session.sent_messages()[-1]
+    assert copy.chat_id == 42
+    assert "BTC" in copy.text
+    assert "trimmed" in copy.text
+    assert "$10,000" in copy.text and "$4,000" in copy.text  # prev → new size
+    assert copy.reply_markup is not None  # tap-through + 🗑 buttons per convention
+
+
+async def test_a_scale_on_an_unheld_coin_only_edits_the_arrow(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The follower's wallet holds ETH, not the scaled BTC — arrow edit only, no
+    extra message. Coin match, not merely 'has a linked wallet'."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+    await hold(pool, user_id=42, coin="ETH")  # holds a different coin
+
+    await queue_scale(pool, kind="scale_in")
+    await deliver_pending(pool, bot, clock)
+
+    assert len(session.sent_messages()) == 1  # just the open; no copy alert
+    (edit,) = session.edited_messages()
+    assert edit.text.endswith("⬆️")
+
+
+async def test_no_linked_wallet_means_no_copy_alert(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Zero behavior change for a follower who never linked a wallet."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_scale(pool, kind="scale_in")
+    await deliver_pending(pool, bot, clock)
+
+    assert len(session.sent_messages()) == 1  # open only, exactly as before #121
+    assert len(session.edited_messages()) == 1
+
+
+async def test_only_followers_holding_the_coin_get_the_copy_alert(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Two followers of the same wallet: only the one whose own wallet holds the
+    scaled coin gets the extra message; both still get the arrow edit."""
+    for uid in (42, 43):
+        await queue_alert(pool, user_id=uid, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+    await hold(pool, user_id=42, coin="BTC", own_address="0xme42")  # only 42 holds it
+
+    for uid in (42, 43):
+        await queue_alert(
+            pool, user_id=uid, kind="scale_in", coin="BTC", side="long",
+            size_usd="25000", prev_size_usd="10000",
+        )
+    await deliver_pending(pool, bot, clock)
+
+    copies = [m for m in session.sent_messages() if "You're in" in (m.text or "")]
+    assert len(copies) == 1 and copies[0].chat_id == 42
+    assert len(session.edited_messages()) == 2  # both anchors edited

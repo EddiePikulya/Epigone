@@ -18,11 +18,21 @@ If the anchor message is gone — the recipient tapped the 🗑 (#73), deleted i
 hand, or never had one (they followed after the open) — the scale is silently
 dropped: a failed edit is the expected outcome there, not an error.
 
+My-wallet copy alerts (issue #121): the one case where a scale is urgent is when
+the follower copied that position. If their own linked wallet (the /mywallet
+command) is currently holding the scaled coin, delivering a scale ALSO sends them
+a full standalone message with the #57-style detail (prev → new size) — on top of
+the arrow edit, which still happens regardless. The match is a coin check against
+their linked wallet's snapshots at delivery time (_holds_coin); no linked wallet,
+or a scale on a coin they aren't holding, means the arrow edit is all they get.
+
 This module supplies only what is alert-specific: which rows to drain and how to
-deliver one (a fresh send for open/close/flip, an anchor edit for a scale).
+deliver one (a fresh send for open/close/flip, an anchor edit for a scale plus an
+optional copy alert for a holder).
 """
 
 import logging
+from decimal import Decimal
 
 import asyncpg
 from aiogram import Bot
@@ -47,11 +57,19 @@ from epigone.clock import Clock
 
 log = logging.getLogger(__name__)
 
-__all__ = ["DELIVERY_INTERVAL_SECONDS", "MAX_DELIVERY_ATTEMPTS", "deliver_pending", "render_alert"]
+__all__ = [
+    "DELIVERY_INTERVAL_SECONDS",
+    "MAX_DELIVERY_ATTEMPTS",
+    "deliver_pending",
+    "render_alert",
+    "render_own_scale",
+]
 
 # The arrow a scale appends to its anchor's changes line: up for an add, down
 # for a trim. Concatenated in event order (e.g. '⬆️⬇️⬆️'), they are the whole of
-# a scale's representation — the pre-#91 size/PnL detail is dropped by design.
+# a scale's representation on the anchor — the pre-#91 size/PnL detail is dropped
+# there by design, but restored in the standalone copy alert (#121) for a
+# follower who is holding the coin (render_own_scale).
 SCALE_ARROWS = {"scale_in": "⬆️", "scale_out": "⬇️"}
 
 
@@ -109,6 +127,20 @@ async def _deliver_scale(pool: asyncpg.Pool, bot: Bot, row: asyncpg.Record) -> N
     Silently a no-op when the anchor never existed (the recipient followed after
     the open) or its message is gone (🗑 #73, hand-deleted): a TelegramBadRequest
     on the edit is the expected outcome there, not an error to burn attempts on."""
+    # My-wallet copy alert (#121): if this follower's own linked wallet is holding
+    # the scaled coin, the scale is urgent — send them a full standalone message
+    # in addition to the arrow. Sent BEFORE the anchor edit so the persistent
+    # arrow trail is only mutated after this external send lands; a duplicate on a
+    # retry is the outbox's documented at-least-once residue. Mute/min-size need
+    # no check here — a suppressed scale never became a row to deliver (they are
+    # filtered at queue time in the poller), so any scale that reaches delivery
+    # already cleared this follower's controls.
+    if await _holds_coin(pool, row["user_telegram_id"], row["coin"]):
+        await bot.send_message(
+            chat_id=row["user_telegram_id"],
+            text=render_own_scale(row),
+            reply_markup=positions_button(row),
+        )
     anchor = await _find_anchor(pool, row)
     if anchor is None:
         return
@@ -170,6 +202,33 @@ async def _find_anchor(pool: asyncpg.Pool, row: asyncpg.Record) -> asyncpg.Recor
     if latest is None or latest["kind"] == "close":
         return None
     return latest
+
+
+async def _holds_coin(pool: asyncpg.Pool, user_telegram_id: int, coin: str) -> bool:
+    """The My-wallet copy-alert match predicate (#121): is this follower's own
+    linked wallet currently holding an open position on `coin`?
+
+    Decision note — coin match, not side match. A copier who is in SOL wants to
+    know their leader is scaling SOL whether they are aligned or hedged, so the
+    predicate matches on coin alone. Side-matching (compare the snapshot's side to
+    the scale's) is the obvious refinement if copies are known to always mirror
+    the leader's direction; it is kept a coin match until that holds. The check
+    reads position_snapshots live and joins through users.linked_wallet, so
+    unlinking (linked_wallet → NULL) stops matches immediately, even before the
+    poller prunes the now-orphan snapshot."""
+    return (
+        await pool.fetchval(
+            """
+            SELECT 1 FROM users u
+            JOIN position_snapshots ps
+                ON ps.trader_address = u.linked_wallet AND ps.coin = $2
+            WHERE u.telegram_id = $1
+            """,
+            user_telegram_id,
+            coin,
+        )
+        is not None
+    )
 
 
 async def _fetch_pending_alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
@@ -244,12 +303,37 @@ def render_alert(row: asyncpg.Record, scale_arrows: str | None = None) -> str:
     return text
 
 
+def render_own_scale(row: asyncpg.Record) -> str:
+    """The standalone My-wallet copy alert (#121): the full message a follower
+    gets when a wallet they track scales a coin their own linked wallet is holding
+    — the urgent case #91 collapsed into a bare arrow. It restores the pre-#91
+    #57 scale detail (the size it grew/shrank from → to, plus live PnL) under a
+    'you're in it' banner, so the follower can act on their own copied position."""
+    label = trader_label(row["track_name"] or row["display_name"], row["trader_address"])
+    coin: str = row["coin"]
+    verb = "added to" if row["kind"] == "scale_in" else "trimmed"
+    return f"⚠️ You're in {coin} — {label} {verb} {coin} {_side(row['side'])} — {_scale_leg(row)}"
+
+
 def _side(side: str) -> str:
     return side.upper()
 
 
 def _new_leg(row: asyncpg.Record) -> str:
     return f"${row['size_usd']:,.0f} at {row['leverage']}x, entry {row['entry_price']}"
+
+
+def _scale_leg(row: asyncpg.Record) -> str:
+    """A scale's detail (issue #57, restored for #121's copy alert): the size it
+    grew from → to at what leverage, plus the position's live return on margin
+    (#35) so the follower sees whether the trade is actually winning, not just how
+    much it moved. PnL is omitted only when it isn't available."""
+    prev: Decimal = row["prev_size_usd"]
+    new: Decimal = row["size_usd"]
+    leg = f"${prev:,.0f} → ${new:,.0f} at {row['leverage']}x"
+    if row["pct_return"] is not None:
+        leg += f", PnL {signed_pct(row['pct_return'])}"
+    return leg
 
 
 def _closed_leg(row: asyncpg.Record) -> str:
