@@ -688,3 +688,110 @@ async def test_an_mkts_open_emits_an_alert_naming_the_market(
     assert len(rows) == 1
     assert rows[0]["kind"] == "open"
     assert rows[0]["coin"] == "mkts:US500"
+
+
+# --- My-wallet copy alerts (#121): linked wallets join the poll set as a
+# holdings reference, never generating tracking alerts of their own. ---
+
+
+async def link(pool: asyncpg.Pool, clock: Clock, user_id: int, address: str) -> None:
+    """A User declaring `address` as their own wallet (the /mywallet link): seeds
+    the traders row the command seeds so the snapshot FK holds, then sets the
+    linked_wallet column."""
+    await pool.execute(
+        """
+        INSERT INTO traders (address, first_seen_at, last_seen_at)
+        VALUES ($1, $2, $2) ON CONFLICT (address) DO NOTHING
+        """,
+        address,
+        clock.now(),
+    )
+    await pool.execute(
+        "INSERT INTO users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+    )
+    await pool.execute(
+        "UPDATE users SET linked_wallet = $2 WHERE telegram_id = $1", user_id, address
+    )
+
+
+async def snapshot_coins(pool: asyncpg.Pool, address: str) -> set[str]:
+    return {
+        r["coin"]
+        for r in await pool.fetch(
+            "SELECT coin FROM position_snapshots WHERE trader_address = $1", address
+        )
+    }
+
+
+async def test_a_linked_wallet_is_polled_for_snapshots_but_never_alerts(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A wallet linked (own-wallet) but tracked by nobody is snapshotted so it can
+    serve as a holdings reference, yet a scale on it queues no alert — there is no
+    follower to fan out to."""
+    await link(pool, clock, 42, "0xown")
+    gateway.set_positions("0xown", [position(coin="SOL", size_usd="10000")])
+    await baseline(pool, gateway, clock)
+
+    assert await snapshot_coins(pool, "0xown") == {"SOL"}  # polled for holdings
+
+    clock.advance(30)
+    gateway.set_positions("0xown", [position(coin="SOL", size_usd="20000")])  # +100%
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.polled == 1  # it is in the poll set
+    assert await alerts(pool) == []  # but nobody tracks it, so no tracking alert
+    assert await snapshot_coins(pool, "0xown") == {"SOL"}  # snapshot kept fresh
+
+
+async def test_a_wallet_both_linked_and_tracked_still_alerts_its_followers(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """One user links a wallet another user tracks: it is polled once, and the
+    tracking follower still gets alerts — linking never suppresses tracking."""
+    await link(pool, clock, 42, "0xaaa")  # user 42 links it as their own
+    await track(pool, clock, "0xaaa", 99)  # user 99 tracks it
+    gateway.set_positions("0xaaa", [position(coin="BTC", size_usd="10000")])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="BTC", size_usd="20000")])
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    rows = await alerts(pool)
+    assert len(rows) == 1  # exactly one — the wallet is polled once despite two roles
+    assert rows[0]["user_telegram_id"] == 99 and rows[0]["kind"] == "scale_in"
+
+
+async def test_unlinking_prunes_the_orphan_snapshot(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Clearing the linked wallet drops it from the poll set; the next pass prunes
+    its now-orphan snapshot, exactly as losing a last follower does."""
+    await link(pool, clock, 42, "0xown")
+    gateway.set_positions("0xown", [position(coin="SOL")])
+    await baseline(pool, gateway, clock)
+    assert await snapshot_coins(pool, "0xown") == {"SOL"}
+
+    await pool.execute("UPDATE users SET linked_wallet = NULL WHERE telegram_id = 42")
+    clock.advance(30)
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert await snapshot_coins(pool, "0xown") == set()  # pruned
+
+
+async def test_unlinking_keeps_the_snapshot_when_still_tracked(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A wallet both linked and tracked survives an unlink — its tracker still
+    needs the snapshot — so the prune only fires when no role is left."""
+    await link(pool, clock, 42, "0xaaa")
+    await track(pool, clock, "0xaaa", 99)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    await baseline(pool, gateway, clock)
+
+    await pool.execute("UPDATE users SET linked_wallet = NULL WHERE telegram_id = 42")
+    clock.advance(30)
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert await snapshot_coins(pool, "0xaaa") == {"BTC"}  # tracker keeps it alive

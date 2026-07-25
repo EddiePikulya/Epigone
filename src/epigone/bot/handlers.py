@@ -9,7 +9,7 @@ from typing import Any
 import asyncpg
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -89,11 +89,36 @@ HELP_TEXT = (
     "/screener — the best traders right now, ranked by 30-day ROI\n"
     "/start — what Epigone is and how it works\n"
     "/tracked — your tracked traders, their positions, and alert controls\n"
+    "/mywallet — link your own wallet so you get a full alert when a trader you "
+    "track scales a coin you're holding\n"
     "/help — this list\n\n"
     "Paste a wallet address (0x…) to open that trader's profile — positions, "
     "track record, and a Follow button.\n"
     "From /tracked you can mute a trader or set a minimum position size so "
     "small trades stay quiet."
+)
+
+# /mywallet copy alerts (#121). Linking your own wallet has one effect: when a
+# trader you track scales a coin your wallet is currently holding, you get a full
+# standalone alert (not just the #91 arrow). One wallet per User; re-set replaces.
+MYWALLET_SET_TEXT = (
+    "✅ Linked your wallet {short}.\n\n"
+    "You'll now get a full alert whenever a trader you track adds to or trims a "
+    "coin you're holding — on top of the usual arrow. Use /mywallet clear to unlink."
+)
+MYWALLET_CLEARED_TEXT = "Unlinked your wallet — copy alerts off."
+MYWALLET_NONE_TEXT = (
+    "You don't have a wallet linked. Send /mywallet 0x… to link one and get a full "
+    "alert when a trader you track scales a coin you're holding."
+)
+MYWALLET_STATUS_TEXT = (
+    "Your linked wallet: {short}.\n"
+    "Send /mywallet 0x… to change it, or /mywallet clear to unlink."
+)
+MYWALLET_INVALID_TEXT = (
+    "That doesn't look like a wallet address.\n\n"
+    "Send /mywallet followed by your full Hyperliquid address — 0x and 40 hex "
+    "characters — or /mywallet clear to unlink."
 )
 
 SCREENER_HEADER = "🏆 Top traders — best 30-day ROI, bots excluded"
@@ -275,6 +300,72 @@ async def cmd_start(message: Message, pool: asyncpg.Pool) -> None:
 
 async def cmd_help(message: Message) -> None:
     await message.answer(HELP_TEXT, reply_markup=with_delete_button())
+
+
+async def cmd_mywallet(
+    message: Message, command: CommandObject, pool: asyncpg.Pool, clock: Clock
+) -> None:
+    """Link, replace, or clear the User's own wallet (#121).
+
+    A linked wallet joins the stream poll set (epigone.stream.poller) purely as a
+    holdings reference — its positions are snapshotted but it never generates
+    tracking alerts. Its only effect is the copy-alert match at delivery time: a
+    scale by a tracked wallet on a coin the linked wallet is holding fires a full
+    standalone alert. One wallet per User (re-set replaces); validation mirrors
+    the pasted-address path (`_ADDRESS_RE`), and the address is stored lowercased
+    like every other. Unlinking just nulls the column — the poller's untracked
+    sweep prunes the now-orphan snapshots next pass, exactly as an unfollow does,
+    while the delivery-time match reads linked_wallet live so it stops at once."""
+    user = message.from_user
+    if user is None:
+        return
+    arg = (command.args or "").strip()
+    if not arg:
+        linked: str | None = await pool.fetchval(
+            "SELECT linked_wallet FROM users WHERE telegram_id = $1", user.id
+        )
+        text = (
+            MYWALLET_STATUS_TEXT.format(short=short_address(linked))
+            if linked is not None
+            else MYWALLET_NONE_TEXT
+        )
+        await message.answer(text, reply_markup=with_delete_button())
+        return
+    if arg.lower() == "clear":
+        await upsert_user(pool, user.id, user.username)
+        cleared = await pool.fetchval(
+            "UPDATE users SET linked_wallet = NULL "
+            "WHERE telegram_id = $1 AND linked_wallet IS NOT NULL RETURNING telegram_id",
+            user.id,
+        )
+        await message.answer(
+            MYWALLET_CLEARED_TEXT if cleared is not None else MYWALLET_NONE_TEXT,
+            reply_markup=with_delete_button(),
+        )
+        return
+    if _ADDRESS_RE.fullmatch(arg) is None:
+        await message.answer(MYWALLET_INVALID_TEXT, reply_markup=with_delete_button())
+        return
+    address = arg.lower()
+    await upsert_user(pool, user.id, user.username)
+    # The poller snapshots the linked wallet into position_snapshots, which keys
+    # into traders (FK) — so seed the traders row the same way a Follow does, or
+    # the first poll of a never-seen wallet would violate the constraint.
+    await pool.execute(
+        """
+        INSERT INTO traders (address, first_seen_at, last_seen_at)
+        VALUES ($1, $2, $2) ON CONFLICT (address) DO NOTHING
+        """,
+        address,
+        clock.now(),
+    )
+    await pool.execute(
+        "UPDATE users SET linked_wallet = $2 WHERE telegram_id = $1", user.id, address
+    )
+    await message.answer(
+        MYWALLET_SET_TEXT.format(short=short_address(address)),
+        reply_markup=with_delete_button(),
+    )
 
 
 async def open_pasted_profile(
@@ -1682,6 +1773,7 @@ def build_router() -> Router:
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_screener, Command("screener"))
     router.message.register(cmd_tracked, Command("tracked"))
+    router.message.register(cmd_mywallet, Command("mywallet"))
     # Before the paste/reject handlers: each consumes its own typed input
     # (criteria thresholds/names, a min-size amount) while a prompt is pending;
     # commands still cut through.

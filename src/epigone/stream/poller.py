@@ -1,13 +1,16 @@
 """The tracked-wallet poll pass: position diffing for Position Alerts (issue #4).
 
-Each pass polls every distinct tracked Trader (deduped across Users) via
-clearinghouseState, diffs against the persisted snapshots, and queues alerts.
-Every Trader is polled on two venues per pass — the core perps and the xyz
-HIP-3 builder DEX (issue #21) — because most non-core activity (equity/"stock"
-perps like `xyz:META`) lives on xyz. The two position lists merge before
-diffing; xyz coins are namespaced (`xyz:META`) so the (trader, coin) snapshot
-key tracks the venues independently, with no schema change and no false
-OPEN/CLOSE from mixing them.
+Each pass polls every distinct wallet in the poll set (deduped across Users) via
+clearinghouseState, diffs against the persisted snapshots, and queues alerts. The
+poll set is tracked Traders UNION Users' own linked wallets (issue #121): a linked
+wallet is snapshotted as its owner's holdings reference but never queues tracking
+alerts (only `tracks` followers are fanned out to). Every wallet is polled on each
+POSITION_VENUE per pass — the core perps, the xyz HIP-3 builder DEX (issue #21),
+and the mkts index DEX — because most non-core activity (equity/"stock" perps like
+`xyz:META`) lives off core. The venues' position lists merge before diffing; their
+coins are namespaced (`xyz:META`, `mkts:US500`) so the (trader, coin) snapshot key
+tracks the venues independently, with no schema change and no false OPEN/CLOSE from
+mixing them.
 
 Diff semantics (tested in tests/test_position_poller.py):
 
@@ -66,10 +69,12 @@ from epigone.gateway import (
 log = logging.getLogger(__name__)
 
 # The stream spends against the shared 900/min budget (epigone.budget, issue
-# #28) with priority over ingest. Each tracked wallet costs two
-# clearinghouseState calls per poll — core plus the xyz builder DEX (issue #21)
-# — so weight 4 per wallet per 30s poll, giving ~110 distinct tracked wallets
-# before pacing stretches the interval even with ingest fully idle.
+# #28) with priority over ingest. Each wallet in the poll set costs one
+# clearinghouseState call per POSITION_VENUE — core, the xyz builder DEX (#21),
+# and the mkts index DEX — so weight 6 per wallet per 30s poll. The poll set is
+# tracked wallets UNION Users' own linked wallets (#121), so a linked wallet adds
+# the same weight-6 as a tracked one; being one-per-User and only the followers'
+# own, they add a handful of wallets, not a multiplier, to that distinct count.
 POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this once per DEX
 
 # A same-side size change alerts as SCALE-IN/SCALE-OUT (issue #10) only once it
@@ -112,10 +117,29 @@ class _Event:
 async def run_poll_pass(
     pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: Budget, clock: Clock
 ) -> PollResult:
-    """Two clearinghouseState calls per distinct tracked Trader — core and the
-    xyz builder DEX (issue #21) — merged before diffing, paced by the budget."""
+    """One clearinghouseState call per POSITION_VENUE for each distinct wallet in
+    the poll set — tracked Traders plus Users' own linked wallets (issue #121) —
+    merged before diffing, paced by the budget. A purely-linked wallet is
+    snapshotted but queues no alerts: _queue_alerts fans out only to `tracks`."""
     await _prune_untracked(pool)
-    rows = await pool.fetch("SELECT DISTINCT trader_address FROM tracks ORDER BY trader_address")
+    rows = await pool.fetch(
+        # The poll set is tracked wallets UNION Users' own linked wallets (#121).
+        # A linked wallet is polled purely so its positions are snapshotted as the
+        # User's holdings reference — the diff still runs, but _queue_alerts fans
+        # out only to `tracks` followers, so a wallet nobody tracks produces zero
+        # alerts. UNION dedups the both-roles case, so it costs one poll either way.
+        #
+        # Budget delta: each distinct wallet in the set costs POSITIONS_WEIGHT per
+        # POSITION_VENUE — 3 venues × weight 2 = 6/pass — whether it is tracked,
+        # linked, or both. Linked wallets are one-per-User and only the followers'
+        # own, so in practice they add a handful of wallets, not a multiplier.
+        """
+        SELECT trader_address FROM tracks
+        UNION
+        SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL
+        ORDER BY 1
+        """
+    )
     polled = failed = events = consecutive_failures = 0
     for row in rows:
         address: str = row["trader_address"]
@@ -171,20 +195,27 @@ async def _fetch_positions(
 
 
 async def _prune_untracked(pool: asyncpg.Pool) -> None:
-    """Drop poll bookkeeping for Traders nobody follows (the re-follow rule in
-    the module docstring). Queued alerts are untouched — they were real when
-    detected and still owe delivery."""
+    """Drop poll bookkeeping for wallets in no one's poll set — neither tracked
+    nor linked (#121). The re-follow rule in the module docstring, widened to the
+    union: a wallet only linked as a User's own drops the instant that link is
+    cleared, exactly as a Trader drops when their last follower leaves, while a
+    wallet still tracked (or still linked) by anyone keeps its snapshot. Queued
+    alerts are untouched — they were real when detected and still owe delivery."""
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(
             """
             DELETE FROM position_snapshots
             WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
+              AND trader_address NOT IN
+                  (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
             """
         )
         await conn.execute(
             """
             DELETE FROM position_poll_state
             WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
+              AND trader_address NOT IN
+                  (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
             """
         )
 
