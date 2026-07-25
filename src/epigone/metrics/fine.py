@@ -89,6 +89,12 @@ class RoundTrip:
     # windows, so the prices are honestly unknowable, never backfilled.
     entry_vwap: Decimal | None = None
     exit_vwap: Decimal | None = None
+    # "LONG" / "SHORT": the sign of the episode's net position (#119). An
+    # episode is single-direction by construction, so the side is stamped at
+    # trip mint — never inferred from pnl/price direction, which a near-zero-PnL
+    # trade would make lie. None on trips folded before this shipped: they
+    # render with no LONG/SHORT prefix, the same graceful degradation as prices.
+    side: str | None = None
 
     @property
     def hold_seconds(self) -> int:
@@ -429,6 +435,15 @@ def _is_flat(position: Decimal) -> bool:
     return abs(position) <= POSITION_DUST
 
 
+def _side_of(position: Decimal) -> str:
+    """The direction label of a non-flat position (#119): SHORT below zero,
+    LONG at or above. Called at trip mint on a position known non-flat — a
+    closing fill's startPosition, or a still-open episode's persisted
+    net_position — so the sign is the episode's whole direction, not an
+    inference from PnL or price movement."""
+    return "SHORT" if position < 0 else "LONG"
+
+
 def _post_position(f: Fill) -> Decimal:
     """The signed position after a perp fill. A closing fill moves toward (or
     through) 0 by its size; an opening fill moves away on its named side —
@@ -544,6 +559,10 @@ def _episodes(
                     RoundTrip(
                         coin, pnl, peak, opened_at, f.time, seq,
                         entry_vwap=vwap.entry_vwap, exit_vwap=vwap.exit_vwap,
+                        # `start` is the position just before this close — the
+                        # episode's own direction, so a flip's two trips (start
+                        # each side of 0) carry opposite sides (#119).
+                        side=_side_of(start),
                     )
                 )
             # A flip immediately reopens on the far side; a full close goes
@@ -645,6 +664,10 @@ def _fold_episodes(
                     cont.coin, pnl, peak, episode.opened_at, cont.closed_at, seq=0,
                     entry_vwap=vwap.entry_vwap if vwap is not None else None,
                     exit_vwap=vwap.exit_vwap if vwap is not None else None,
+                    # The episode's persisted net_position is its direction; the
+                    # continuity guard above already proved it non-zero and
+                    # matching the delta's fills, so its sign is the side (#119).
+                    side=_side_of(episode.net_position),
                 )
             )
     # A trip dropped at a demoted head marks its whole millisecond as a

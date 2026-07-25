@@ -819,11 +819,14 @@ async def test_vwap_sums_persist_across_refreshes_and_price_the_trade(pool: asyn
     await run_fine_pass(pool, gateway, budget, clock)
 
     trade = await pool.fetchrow(
-        "SELECT entry_vwap, exit_vwap FROM fine_trades WHERE address = '0xaaa'"
+        "SELECT entry_vwap, exit_vwap, side FROM fine_trades WHERE address = '0xaaa'"
     )
     assert trade is not None
     assert trade["entry_vwap"] == Decimal("10")
     assert trade["exit_vwap"] == Decimal("13")  # (1·12 + 1·14) / 2
+    # The side rides the cross-checkpoint fold too, stamped LONG from the
+    # carried episode's positive net_position (#119).
+    assert trade["side"] == "LONG"
 
 
 async def test_a_pre_vwap_episode_row_completes_a_priceless_trade(pool: asyncpg.Pool) -> None:

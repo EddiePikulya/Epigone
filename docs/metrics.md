@@ -104,6 +104,29 @@ see would be confidently wrong, so none is invented). The wallet views'
 constant across the #102 window toggle) shows the prices as `in → out` where
 present and simply omits the clause where not.
 
+### Direction and ROE (per trade)
+
+Each round-trip also carries its **direction** — `LONG` or `SHORT` — and an
+**ROE%** on the Recent trades line (issue #119), e.g.
+`LONG BTC +$3,764 (+12.5%) · in 60,500 → out 61,500 · …`.
+
+The direction is the sign of the episode's net position, stamped at trip mint,
+never inferred from the PnL or the price move: an episode is single-direction
+by construction (a flip splits at the zero crossing into two trips carrying
+opposite sides), and a near-zero-PnL trade would make a PnL×price inference
+lie. Recorded going forward only — trips folded before this shipped keep NULL
+side and render with no prefix, the same graceful degradation as the pre-#116
+price-less trips.
+
+ROE% is `pnl ÷ peak_notional`, signed — **return on exposure, not return on
+margin.** It measures the trade's PnL against the largest position value it
+carried (the same peak notional behind the avg-leverage estimate), because
+fills carry no margin data: the exchange's leverage setting is not
+reconstructable from the fill stream, so a true return-on-margin is
+unavailable. Both columns already exist on every stored trip, so ROE renders
+for the whole history immediately, historical trips included. It shares the
+avg-size caveat: peak notional is the position's size signal, not its margin.
+
 ## Fine metrics
 
 ### Win rate
