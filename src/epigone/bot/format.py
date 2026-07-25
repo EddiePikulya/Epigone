@@ -128,6 +128,19 @@ def usd_compact(amount: Decimal) -> str:
     return f"${value:,.0f}"
 
 
+def compact_price(price: Decimal) -> str:
+    """A computed price (an entry/exit VWAP, #116) rounded back onto the
+    exchange's own 5-significant-digit grid — Hyperliquid quantizes perp
+    prices to 5 sig figs, so a size-weighted average's longer tail is
+    precision the market never had, and it would dwarf the line it sits on.
+    Trailing zeros drop (79.020 → 79.02) so prices read like the exchange
+    prints them."""
+    if price == 0:
+        return "0"
+    quantized = price.quantize(Decimal(1).scaleb(price.adjusted() - 4))
+    return format(quantized.normalize(), "f")
+
+
 def held_for(opened_at: datetime, closed_at: datetime) -> str:
     """Compact holding time between two instants: 45s / 12m / 3h 20m / 2d 5h."""
     return format_duration(int((closed_at - opened_at).total_seconds()))

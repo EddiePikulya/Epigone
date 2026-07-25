@@ -785,3 +785,75 @@ async def test_same_ms_trades_both_persist(pool: asyncpg.Pool) -> None:
     assert metrics is not None
     assert metrics["trade_count"] == 2
     assert metrics["win_rate"] == Decimal("0.5")
+
+
+async def test_vwap_sums_persist_across_refreshes_and_price_the_trade(pool: asyncpg.Pool) -> None:
+    # #116: opened in one refresh (entry sums stored on the open episode),
+    # trimmed in the next (exit sums accumulate), closed in a third — the
+    # stored trade carries entry/exit VWAPs spanning all three batches, the
+    # same fold rigor as the PnL/peak accumulators (#58).
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    budget = WeightBudget(WIDE_OPEN_BUDGET, clock)
+    opened = fill("Open Long", at=T0, start_position="0", size="2", price="10")
+    gateway.set_fills("0xaaa", [opened])
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    episode = await pool.fetchrow(
+        "SELECT entry_cost, entry_size, exit_cost, exit_size "
+        "FROM fine_open_episodes WHERE address = '0xaaa'"
+    )
+    assert episode is not None
+    assert (episode["entry_cost"], episode["entry_size"]) == (Decimal("20"), Decimal("2"))
+    assert (episode["exit_cost"], episode["exit_size"]) == (Decimal(0), Decimal(0))
+
+    trim = fill(pnl="2", at=T0 + timedelta(hours=1), start_position="2", price="12")
+    gateway.set_fills("0xaaa", [opened, trim])
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    closed = fill(pnl="4", at=T0 + timedelta(hours=2), start_position="1", price="14")
+    gateway.set_fills("0xaaa", [opened, trim, closed])
+    clock.advance(2 * 24 * 3600)
+    await run_fine_pass(pool, gateway, budget, clock)
+
+    trade = await pool.fetchrow(
+        "SELECT entry_vwap, exit_vwap FROM fine_trades WHERE address = '0xaaa'"
+    )
+    assert trade is not None
+    assert trade["entry_vwap"] == Decimal("10")
+    assert trade["exit_vwap"] == Decimal("13")  # (1·12 + 1·14) / 2
+
+
+async def test_a_pre_vwap_episode_row_completes_a_priceless_trade(pool: asyncpg.Pool) -> None:
+    # A fine_open_episodes row stored before #116 carries NULL sums (the
+    # migration adds the columns without a default). The trade it completes
+    # keeps NULL prices — its opening fills are gone from the API windows, so
+    # a VWAP over only the closing segment would be confidently wrong.
+    gateway = FakeHyperliquidGateway()
+    clock = FakeClock()
+    await add_trader(pool, clock, "0xaaa")
+    await pool.execute(
+        "UPDATE traders SET fine_checkpoint_at = $1 WHERE address = '0xaaa'", T0
+    )
+    await pool.execute(
+        """
+        INSERT INTO fine_open_episodes (address, coin, opened_at, pnl, peak_notional, net_position)
+        VALUES ('0xaaa', 'HYPE', $1, 0, 0, 2)
+        """,
+        T0,
+    )
+    gateway.set_fills(
+        "0xaaa",
+        [fill(pnl="8", at=T0 + timedelta(hours=1), start_position="2", size="2", price="30")],
+    )
+
+    await run_fine_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    trade = await pool.fetchrow(
+        "SELECT pnl, entry_vwap, exit_vwap FROM fine_trades WHERE address = '0xaaa'"
+    )
+    assert trade is not None
+    assert trade["pnl"] == Decimal("8")  # the round-trip itself completes fine
+    assert trade["entry_vwap"] is None and trade["exit_vwap"] is None

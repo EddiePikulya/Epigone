@@ -21,8 +21,10 @@ from aiogram.types import (
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import (
     button_label,
+    compact_price,
     display_coin,
     fills_open_age,
+    held_for,
     open_age,
     order_lines,
     short_address,
@@ -419,6 +421,9 @@ async def _render_positions_view(
         + "\n\n"
         + await _render_track_record(pool, address, clock.now(), window=window)
     )
+    recent_trades = await _recent_trades_section(pool, address)
+    if recent_trades is not None:
+        view += f"\n\n{recent_trades}"
     keyboard: list[list[InlineKeyboardButton]] = []
     toggle = await _track_window_row(
         pool, address, clock.now(), prefix=POSITIONS_WINDOW_PREFIX, active=window
@@ -820,6 +825,9 @@ async def _render_profile(
             await _render_track_record(pool, address, clock.now(), window=window),
         ]
     )
+    recent_trades = await _recent_trades_section(pool, address)
+    if recent_trades is not None:
+        parts.append(recent_trades)
     freshness = await _metric_freshness(pool, clock, address)
     if freshness is not None:
         parts.append(freshness)
@@ -1329,6 +1337,57 @@ def _trades_span_label(oldest_trade_at: datetime | None, now: datetime) -> str:
     if days < 60:
         return f"trades from the last {days} day{'s' if days > 1 else ''}"
     return f"trades from the last ~{round(days / 30)} months"
+
+
+# How many round-trips the Recent trades section lists (#116). Five reads at a
+# glance and, with each trade a full line, stays well clear of Telegram's
+# message-length limit under everything else the wallet views carry.
+RECENT_TRADES_LIMIT = 5
+
+
+async def _recent_trades_section(pool: asyncpg.Pool, address: str) -> str | None:
+    """The wallet views' Recent trades section (#116): the last
+    RECENT_TRADES_LIMIT completed round-trips, newest first — ticker, net PnL,
+    peak size, open → close datetimes with hold duration, and entry/exit VWAPs
+    where recorded. None (the caller omits the section) for a wallet with no
+    stored trips.
+
+    Deliberately constant across the #102 window toggle: the toggle re-scopes
+    the *aggregate* track record, while this list is a concrete recency sample
+    that is already newest-first — any toggle window either contains these same
+    five trips or merely truncates the list, so re-windowing would add churn
+    without information. Trips folded before VWAP recording shipped (#116) have
+    NULL prices and render without the `in → out` clause: their fills have aged
+    out of the API windows, so the prices are honestly unknowable."""
+    rows = await pool.fetch(
+        "SELECT coin, pnl, peak_notional, opened_at, closed_at, entry_vwap, exit_vwap "
+        "FROM fine_trades WHERE address = $1 "
+        "ORDER BY closed_at DESC, coin DESC, seq DESC LIMIT $2",
+        address,
+        RECENT_TRADES_LIMIT,
+    )
+    if not rows:
+        return None
+    return "\n".join(["Recent trades:", *(_recent_trade_line(r) for r in rows)])
+
+
+def _recent_trade_line(row: Mapping[str, Any]) -> str:
+    """One completed round-trip, e.g.
+    `SOL +$1,240 · $39k peak · 07-22 14:10 → 07-23 09:55 (19h 45m) · in 77.51 → out 79.02`.
+    Times are UTC, the exchange's clock. Leverage is deliberately absent —
+    fills carry no margin data (the avg-size caveat), so peak notional stands
+    in as the size signal. Builder-DEX coins render as the bare ticker (#21)."""
+    line = (
+        f"{display_coin(row['coin'])} {signed_usd(row['pnl'])}"
+        f" · {usd_compact(row['peak_notional'])} peak"
+        f" · {row['opened_at']:%m-%d %H:%M} → {row['closed_at']:%m-%d %H:%M}"
+        f" ({held_for(row['opened_at'], row['closed_at'])})"
+    )
+    # Both VWAPs land together (one fold recorded them) or not at all (the trip
+    # predates recording) — no half-priced renderings.
+    if row["entry_vwap"] is not None and row["exit_vwap"] is not None:
+        line += f" · in {compact_price(row['entry_vwap'])} → out {compact_price(row['exit_vwap'])}"
+    return line
 
 
 def _fine_lines(

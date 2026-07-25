@@ -38,6 +38,7 @@ from epigone.metrics.fine import (
     FineState,
     OpenEpisode,
     RoundTrip,
+    VwapSums,
     extract_state,
     fold_states,
     metrics_from_state,
@@ -300,7 +301,7 @@ async def _load_fine_state(
         address,
     )
     trade_rows = await pool.fetch(
-        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq "
+        "SELECT coin, pnl, peak_notional, opened_at, closed_at, seq, entry_vwap, exit_vwap "
         "FROM fine_trades WHERE address = $1 ORDER BY closed_at, coin, seq",
         address,
     )
@@ -312,6 +313,8 @@ async def _load_fine_state(
             opened_at=r["opened_at"],
             closed_at=r["closed_at"],
             seq=r["seq"],
+            entry_vwap=r["entry_vwap"],
+            exit_vwap=r["exit_vwap"],
         )
         for r in trade_rows
     )
@@ -321,7 +324,8 @@ async def _load_fine_state(
     # plus the walked net position the next batch's continuity guard verifies
     # against (issue #63).
     episode_rows = await pool.fetch(
-        "SELECT coin, opened_at, pnl, peak_notional, net_position "
+        "SELECT coin, opened_at, pnl, peak_notional, net_position, "
+        "entry_cost, entry_size, exit_cost, exit_size "
         "FROM fine_open_episodes WHERE address = $1",
         address,
     )
@@ -340,6 +344,19 @@ async def _load_fine_state(
                 pnl=r["pnl"],
                 peak_notional=r["peak_notional"],
                 net_position=r["net_position"],
+                # NULL sums (all four together) mark a pre-#116 row: the
+                # episode's prices are unknowable, kept None so a completing
+                # trip stays honestly price-less.
+                vwap=(
+                    VwapSums(
+                        entry_cost=r["entry_cost"],
+                        entry_size=r["entry_size"],
+                        exit_cost=r["exit_cost"],
+                        exit_size=r["exit_size"],
+                    )
+                    if r["entry_size"] is not None
+                    else None
+                ),
             )
             for r in episode_rows
         ),
@@ -371,10 +388,17 @@ async def _store_fine_refresh(
         if state.open_episodes:
             await conn.executemany(
                 "INSERT INTO fine_open_episodes "
-                "(address, coin, opened_at, pnl, peak_notional, net_position) "
-                "VALUES ($1, $2, $3, $4, $5, $6)",
+                "(address, coin, opened_at, pnl, peak_notional, net_position, "
+                " entry_cost, entry_size, exit_cost, exit_size) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                 [
-                    (address, e.coin, e.opened_at, e.pnl, e.peak_notional, e.net_position)
+                    (
+                        address, e.coin, e.opened_at, e.pnl, e.peak_notional, e.net_position,
+                        e.vwap.entry_cost if e.vwap is not None else None,
+                        e.vwap.entry_size if e.vwap is not None else None,
+                        e.vwap.exit_cost if e.vwap is not None else None,
+                        e.vwap.exit_size if e.vwap is not None else None,
+                    )
                     for e in state.open_episodes
                 ],
             )
@@ -382,15 +406,21 @@ async def _store_fine_refresh(
             await conn.executemany(
                 """
                 INSERT INTO fine_trades
-                    (address, coin, pnl, peak_notional, opened_at, closed_at, seq)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    (address, coin, pnl, peak_notional, opened_at, closed_at, seq,
+                     entry_vwap, exit_vwap)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 ON CONFLICT (address, coin, closed_at, seq) DO UPDATE
                     SET pnl = EXCLUDED.pnl,
                         peak_notional = EXCLUDED.peak_notional,
-                        opened_at = EXCLUDED.opened_at
+                        opened_at = EXCLUDED.opened_at,
+                        entry_vwap = EXCLUDED.entry_vwap,
+                        exit_vwap = EXCLUDED.exit_vwap
                 """,
                 [
-                    (address, t.coin, t.pnl, t.peak_notional, t.opened_at, t.closed_at, t.seq)
+                    (
+                        address, t.coin, t.pnl, t.peak_notional, t.opened_at, t.closed_at,
+                        t.seq, t.entry_vwap, t.exit_vwap,
+                    )
                     for t in new_trips
                 ],
             )
