@@ -463,6 +463,135 @@ async def test_a_replaced_position_tpsl_is_the_same_protection_plan(
     assert await alerts(pool) == []
 
 
+# --- Anchor enrichment (#125): a position-attached TP/SL set change on an
+# anchored coin queues a `tpsl` position-alert row carrying the refreshed line,
+# off the same diff and with no new API spend. ---
+
+
+def tpsl_order(oid: int, coin: str, trigger: str, family: str = "Take Profit Market") -> OpenOrder:
+    """A whole-position TP/SL trigger (sz 0, reduce-only) resting against a coin."""
+    return order(
+        coin=coin,
+        order_id=oid,
+        size="0",
+        order_type=family,
+        is_trigger=True,
+        trigger_price=trigger,
+        is_position_tpsl=True,
+        reduce_only=True,
+    )
+
+
+async def seed_anchor(
+    pool: asyncpg.Pool, address: str, coin: str, user_id: int, *, message_id: int = 1
+) -> None:
+    """A delivered open anchor (#91) for (user, trader, coin): the live message
+    enrichment targets. Its telegram_message_id stands in for a real send."""
+    await pool.execute(
+        """
+        INSERT INTO position_alerts
+            (user_telegram_id, trader_address, kind, coin, side, size_usd, leverage,
+             entry_price, created_at, delivered_at, telegram_message_id)
+        VALUES ($1, $2, 'open', $3, 'long', 10000, 5, 100, $4, $4, $5)
+        """,
+        user_id,
+        address,
+        coin,
+        PLACED_AT,
+        message_id,
+    )
+
+
+async def tpsl_rows(pool: asyncpg.Pool) -> list[asyncpg.Record]:
+    return await pool.fetch("SELECT * FROM position_alerts WHERE kind = 'tpsl' ORDER BY id")
+
+
+async def test_appearing_position_tpsl_queues_an_anchor_enrichment(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    await seed_anchor(pool, "0xaaa", "GRAM", 42)
+    gateway.set_open_orders("0xaaa", [])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    gateway.set_open_orders(
+        "0xaaa",
+        [tpsl_order(1001, "GRAM", "1.50"), tpsl_order(1002, "GRAM", "1.20", "Stop Market")],
+    )
+    await run_pass(pool, gateway, clock)
+
+    (row,) = await tpsl_rows(pool)
+    assert row["coin"] == "GRAM"
+    assert row["user_telegram_id"] == 42
+    assert row["tpsl_line"] == "TP 1.50 · SL 1.20"
+
+
+async def test_an_unchanged_tpsl_set_queues_no_enrichment(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    await seed_anchor(pool, "0xaaa", "GRAM", 42)
+    gateway.set_open_orders("0xaaa", [tpsl_order(1001, "GRAM", "1.50")])
+    await baseline(pool, gateway, clock)  # the set is already resting at baseline
+
+    clock.advance(300)
+    await run_pass(pool, gateway, clock)  # same set, same ids
+
+    assert await tpsl_rows(pool) == []  # no change → no edit churn
+
+
+async def test_tpsl_without_a_live_anchor_queues_no_enrichment(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)  # tracked, but no open anchor for GRAM
+    gateway.set_open_orders("0xaaa", [])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    gateway.set_open_orders("0xaaa", [tpsl_order(1001, "GRAM", "1.50")])
+    await run_pass(pool, gateway, clock)
+
+    assert await tpsl_rows(pool) == []  # nothing to enrich
+    assert len(await alerts(pool)) == 1  # but the #115 order alert still fired
+
+
+async def test_a_moved_tpsl_refreshes_the_anchor_though_its_alert_is_damped(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    await seed_anchor(pool, "0xaaa", "GRAM", 42)
+    gateway.set_open_orders("0xaaa", [tpsl_order(1001, "GRAM", "1.50")])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    # A move is a cancel/replace to a new oid (verified live): the order alert is
+    # damped as a modify, but the id set changed, so the anchor line must refresh.
+    gateway.set_open_orders("0xaaa", [tpsl_order(2001, "GRAM", "1.65")])
+    await run_pass(pool, gateway, clock)
+
+    assert await alerts(pool) == []  # modify-damped, no order alert
+    (row,) = await tpsl_rows(pool)
+    assert row["tpsl_line"] == "TP 1.65"
+
+
+async def test_a_cancelled_tpsl_queues_a_drop(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    await seed_anchor(pool, "0xaaa", "GRAM", 42)
+    gateway.set_open_orders("0xaaa", [tpsl_order(1001, "GRAM", "1.50")])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(300)
+    gateway.set_open_orders("0xaaa", [])  # the whole set cancelled
+    await run_pass(pool, gateway, clock)
+
+    (row,) = await tpsl_rows(pool)
+    assert row["coin"] == "GRAM"
+    assert row["tpsl_line"] is None  # NULL line → the bot drops the anchor line
+
+
 async def test_unfollowed_wallets_prune_and_refollow_rebaselines(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:

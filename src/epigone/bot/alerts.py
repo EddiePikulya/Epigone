@@ -72,6 +72,12 @@ __all__ = [
 # follower who is holding the coin (render_own_scale).
 SCALE_ARROWS = {"scale_in": "⬆️", "scale_out": "⬇️"}
 
+# Sentinel for render_alert's tpsl_line: distinguishes "use the anchor's own
+# persisted line" (the default, for a fresh send or a scale re-render) from an
+# explicit line an enrichment edit passes — including an explicit None, which
+# renders no line (the TP/SL set emptied, #125).
+_ANCHOR_TPSL = object()
+
 
 async def run_delivery_loop(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> None:
     """The shared supervised drain loop over Position Alert delivery."""
@@ -87,7 +93,9 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
     so a scale queued in the same pass as its open still lands correctly."""
 
     async def deliver(bot: Bot, row: asyncpg.Record) -> None:
-        if row["kind"] in SCALE_ARROWS:
+        if row["kind"] == "tpsl":
+            await _deliver_tpsl(pool, bot, row)
+        elif row["kind"] in SCALE_ARROWS:
             await _deliver_scale(pool, bot, row)
         else:
             await _deliver_anchor(pool, bot, row)
@@ -162,6 +170,49 @@ async def _deliver_scale(pool: asyncpg.Pool, bot: Bot, row: asyncpg.Record) -> N
     except TelegramBadRequest:
         log.debug(
             "scale alert %d: anchor message %s gone, edit skipped",
+            row["id"],
+            anchor["telegram_message_id"],
+        )
+
+
+async def _deliver_tpsl(pool: asyncpg.Pool, bot: Bot, row: asyncpg.Record) -> None:
+    """Enrich a position's open/flip anchor with its current take-profit/stop-loss
+    line (issue #125). The order poller queues one of these per follower when it
+    observes the position-attached TP/SL set for a coin *change*; here the anchor
+    is edited to append or refresh the `TP … · SL …` line beneath it — composing
+    with the scale arrows (#91) and any annotations already there, since
+    render_alert rebuilds the whole message from the anchor's persisted state.
+
+    The desired line rides on the enrichment row (NULL means the set emptied —
+    drop the line); it is persisted onto the anchor row before the edit so a
+    later scale re-render carries it, and so an anchor not yet on Telegram shows
+    it when finally sent. Silent no-ops: no live anchor (followed after the open,
+    or the instance closed) is the scale silent-drop rule; a line that already
+    matches skips the edit so an unchanged set never churns; a missing message
+    (🗑 #73, hand-deleted) fails the edit with the expected TelegramBadRequest."""
+    anchor = await _find_anchor(pool, row)
+    if anchor is None:
+        return
+    new_line = row["tpsl_line"]
+    if anchor["tpsl_line"] == new_line:
+        return
+    await pool.execute(
+        "UPDATE position_alerts SET tpsl_line = $2 WHERE id = $1", anchor["id"], new_line
+    )
+    if anchor["telegram_message_id"] is None:
+        # Not on Telegram yet (its send failed or is still pending): the line is
+        # now persisted, so the anchor renders it when it is finally delivered.
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=row["user_telegram_id"],
+            message_id=anchor["telegram_message_id"],
+            text=render_alert(anchor, anchor["scale_arrows"], tpsl_line=new_line),
+            reply_markup=positions_button(anchor),
+        )
+    except TelegramBadRequest:
+        log.debug(
+            "tpsl alert %d: anchor message %s gone, edit skipped",
             row["id"],
             anchor["telegram_message_id"],
         )
@@ -279,12 +330,21 @@ def positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:
     )
 
 
-def render_alert(row: asyncpg.Record, scale_arrows: str | None = None) -> str:
+def render_alert(
+    row: asyncpg.Record, scale_arrows: str | None = None, tpsl_line: object = _ANCHOR_TPSL
+) -> str:
     """The message text for an open/close/flip alert. `scale_arrows` is the
     anchor's accumulated arrow trail (issue #91): when present it renders as a
     changes line beneath the alert, so an edited open reads as the position's
     life story (e.g. a line ending '⬆️⬇️⬆️'). Only opens and flips ever carry
-    arrows; a close is terminal and never edited."""
+    arrows; a close is terminal and never edited.
+
+    Beneath the arrows comes the position-attached TP/SL line (issue #125): the
+    anchor's own persisted `tpsl_line` by default, so a fresh send and a scale
+    re-render both carry it. An enrichment edit passes `tpsl_line` explicitly to
+    render the freshly observed set — including an explicit None to drop the
+    line when the set has emptied. Ordering is base → arrows → TP/SL, so the
+    three surfaces compose without clobbering (the ticket's composition rule)."""
     # The recipient's own name for the wallet wins over the leaderboard label (#86).
     label = trader_label(row["track_name"] or row["display_name"], row["trader_address"])
     coin: str = row["coin"]
@@ -300,6 +360,9 @@ def render_alert(row: asyncpg.Record, scale_arrows: str | None = None) -> str:
         )
     if scale_arrows:
         text += f"\n{scale_arrows}"
+    line = row["tpsl_line"] if tpsl_line is _ANCHOR_TPSL else tpsl_line
+    if line:
+        text += f"\n{line}"
     return text
 
 

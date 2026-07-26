@@ -25,8 +25,10 @@ from epigone.bot.format import (
     display_coin,
     fills_open_age,
     held_for,
+    is_position_tpsl_order,
     open_age,
     order_lines,
+    position_tpsl_line,
     short_address,
     signed_pct,
     signed_usd,
@@ -497,12 +499,19 @@ async def _render_positions_view(
     if track is None:
         return None
     positions = await fetch_open_positions(gateway, address)
-    orders_section = await _open_orders_section(gateway, address, positions)
+    orders = await _fetch_view_orders(gateway, address)
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     positions_text, entities = _render_positions(
-        address, positions, ages, clock.now(), fills, name=track["name"]
+        address,
+        positions,
+        ages,
+        clock.now(),
+        fills,
+        _position_tpsl(orders or [], positions),
+        name=track["name"],
     )
+    orders_section = _orders_section(orders, positions)
     if orders_section is not None:
         positions_text += f"\n\n{orders_section}"
     view = (
@@ -892,15 +901,23 @@ async def _render_profile(
     keeping every other button (follow/unfollow, rename, the #93 header
     entity)."""
     positions = await fetch_open_positions(gateway, address)  # may raise GatewayError
-    orders_section = await _open_orders_section(gateway, address, positions)
+    orders = await _fetch_view_orders(gateway, address)
     track = await fetch_track(pool, user_id, address)
     followed = track is not None
     name: str | None = track["name"] if track is not None else None
     ages = await _position_ages(pool, address)
     fills = await _fills_open_episodes(pool, address)
     positions_text, entities = _render_positions(
-        address, positions, ages, clock.now(), fills, name=name, offer_follow=not followed
+        address,
+        positions,
+        ages,
+        clock.now(),
+        fills,
+        _position_tpsl(orders or [], positions),
+        name=name,
+        offer_follow=not followed,
     )
+    orders_section = _orders_section(orders, positions)
     parts = [positions_text]
     if orders_section is not None:
         parts.append(orders_section)
@@ -1547,6 +1564,7 @@ def _render_positions(
     ages: dict[str, tuple[datetime, bool]],
     now: datetime,
     fills: dict[str, tuple[datetime, Decimal, datetime | None]] | None = None,
+    tpsl: Mapping[str, list[OpenOrder]] | None = None,
     *,
     name: str | None = None,
     offer_follow: bool = False,
@@ -1574,12 +1592,18 @@ def _render_positions(
     `offer_follow` (an untracked profile) appends a single nudge to follow when
     at least one position was left ageless — the honest way to explain the gap:
     the open time is knowable only by observing the wallet, which following
-    starts. Suppressed for a follower, who already gets the poller's own age."""
+    starts. Suppressed for a follower, who already gets the poller's own age.
+
+    `tpsl` maps a coin to the position-attached take-profit/stop-loss orders
+    resting against it (#125), pulled from the same order fetch the view makes;
+    a position with any gains a `↳ TP … · SL …` sub-line. These triggers move
+    here off the generic orders section so they read where they act."""
     header, addr_entity = trader_header(name, address)
     entities = [addr_entity]
     if not positions:
         return f"{header} has no open positions right now.", entities
     fills = fills or {}
+    tpsl = tpsl or {}
     blocks = [f"{header} — current positions:", ""]
     any_ageless = False
     for p in positions:
@@ -1598,11 +1622,15 @@ def _render_positions(
                 detail.append(fills_age)
             else:
                 any_ageless = True
-        blocks.append(
+        block = (
             f"{p.coin} {p.side.value.upper()} — "
             f"${p.size_usd:,.0f} notional · ${p.margin:,.0f} margin at {p.leverage}x\n"
             f"    " + " · ".join(detail)
         )
+        tpsl_line = position_tpsl_line(tpsl.get(p.coin, []))
+        if tpsl_line is not None:
+            block += f"\n    ↳ {tpsl_line}"
+        blocks.append(block)
     if offer_follow and any_ageless:
         blocks.append("")
         blocks.append(FOLLOW_FOR_AGE_HINT)
@@ -1616,33 +1644,61 @@ def _render_positions(
 ORDERS_UNAVAILABLE_LINE = "Resting orders unavailable right now"
 
 
-async def _open_orders_section(
-    gateway: HyperliquidGateway, address: str, positions: list[Position]
-) -> str | None:
-    """The resting-orders section for a wallet view, fetched on demand (#115).
+async def _fetch_view_orders(
+    gateway: HyperliquidGateway, address: str
+) -> list[OpenOrder] | None:
+    """The resting orders a wallet view surfaces (#115), fetched on demand — the
+    single fetch that feeds both the position lines' TP/SL sub-lines (#125) and
+    the generic orders section below them.
 
     Orders are a garnish on the view, not its backbone: the positions fetch
     keeps its all-venues-must-succeed rule (a partial positions read renders
-    lies), but an orders-only failure degrades to the honest unavailable line
-    while the rest of the view renders. None only for a healthy, empty book —
-    the views then show nothing extra.
-
-    `positions` are the live positions the view already fetched — passed in so
-    each order can be annotated with what it would do to the wallet's position
-    on that coin (#123). The live list is the annotation source on both
-    surfaces of the view: an untracked wallet has no poller snapshot, so
-    reusing what is already in hand makes the annotation work there too."""
+    lies), but an orders-only failure returns None so the caller degrades the
+    section to the honest unavailable line while the rest of the view renders.
+    None (the fetch failed) is distinct from an empty list (a healthy wallet
+    with no resting orders): the former hedges, the latter shows nothing."""
     try:
-        return _render_open_orders(await fetch_open_orders(gateway, address), positions)
+        return await fetch_open_orders(gateway, address)
     except GatewayError:
+        return None
+
+
+def _position_tpsl(
+    orders: list[OpenOrder], positions: list[Position]
+) -> dict[str, list[OpenOrder]]:
+    """coin → the position-attached TP/SL orders resting against the wallet's
+    live position on it (#125). Only a coin the wallet actually holds collects
+    a line; a protective trigger on a coin with no position (rare) has nothing
+    to attach to and stays in the generic orders section instead."""
+    held = {p.coin for p in positions}
+    by_coin: dict[str, list[OpenOrder]] = {}
+    for order in orders:
+        if is_position_tpsl_order(order) and order.coin in held:
+            by_coin.setdefault(order.coin, []).append(order)
+    return by_coin
+
+
+def _orders_section(orders: list[OpenOrder] | None, positions: list[Position]) -> str | None:
+    """The generic resting-orders section text: the unavailable hedge when the
+    fetch failed (orders is None), else the entry triggers and plain limits, or
+    None for a healthy book with nothing left to show.
+
+    Position-attached TP/SL on held coins are dropped here — they render on
+    their own position lines (#125), so listing them again would duplicate. A
+    trigger on a coin the wallet does not hold has no position line and stays."""
+    if orders is None:
         return ORDERS_UNAVAILABLE_LINE
+    held = {p.coin for p in positions}
+    rest = [o for o in orders if not (is_position_tpsl_order(o) and o.coin in held)]
+    return _render_open_orders(rest, positions)
 
 
 def _render_open_orders(orders: list[OpenOrder], positions: list[Position]) -> str | None:
     """The resting-orders section both wallet views append after the positions
     block (#115): the trader's plan before it executes, tracked and untracked
     wallets alike. None — so the views show nothing extra — for a wallet with
-    an empty book.
+    an empty book (or one whose only orders were position-attached TP/SL, now
+    lifted onto the position lines, #125).
 
     Rows sort by coin, then by the price the order acts at (descending), so a
     ladder reads top-down; the shared order_line labels TP/SL, bares
