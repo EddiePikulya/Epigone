@@ -96,6 +96,60 @@ def order_lines(
     return lines
 
 
+def is_position_tpsl_trigger(is_trigger: bool, is_position_tpsl: bool, reduce_only: bool) -> bool:
+    """Whether a resting order is a take-profit/stop-loss *attached to a
+    position* rather than a fresh plan (issue #125): a whole-position TP/SL
+    (`is_position_tpsl`, size 0) or a reduce-only sized trigger — both protect
+    an existing position. A non-reduce trigger is a stop-*entry* (it opens or
+    adds), and a plain limit is neither, so both stay in the generic orders
+    section; only these move onto the position line they guard.
+
+    Keyed off the three raw flags so the one rule serves both a live OpenOrder
+    (is_position_tpsl_order) and a persisted order_snapshots Record (the poller's
+    anchor-enrichment diff) without the predicate drifting between them."""
+    return is_trigger and (is_position_tpsl or reduce_only)
+
+
+def is_position_tpsl_order(order: OpenOrder) -> bool:
+    """is_position_tpsl_trigger over a live OpenOrder."""
+    return is_position_tpsl_trigger(
+        order.is_trigger, order.is_position_tpsl, order.reduce_only
+    )
+
+
+def position_tpsl_line(orders: list[OpenOrder]) -> str | None:
+    """The `TP 6.50 · SL 7.10` line a position surfaces for its attached
+    triggers (issue #125), shared by the wallet views' position rows and the
+    open-alert anchor enrichment so the two can't drift. None when there are no
+    resting triggers to show.
+
+    Each trigger reads as its TP/SL tag and the price that arms it; a
+    partial-size one (a reduce-only trigger that closes part of the position)
+    also carries its notional so it is distinguishable from a whole-position
+    exit (`TP 6.50 ($13,500)`). Take-profits sort ahead of stops, then by
+    trigger price, so a position's ladder reads the same way every time."""
+    if not orders:
+        return None
+    ranked = sorted(
+        orders,
+        key=lambda o: (o.tpsl != "TP", o.trigger_price if o.trigger_price is not None else 0),
+    )
+    return " · ".join(_position_tpsl_part(o) for o in ranked)
+
+
+def _position_tpsl_part(order: OpenOrder) -> str:
+    """One trigger in a position's TP/SL line: its tag and trigger price, plus
+    the notional for a partial (sized) exit so it is not mistaken for a
+    whole-position one. A whole-position TP/SL has no order-level notional and
+    reads bare — its size is the position's at trigger time."""
+    part = f"{order.tpsl} {order.trigger_price}"
+    if not order.is_position_tpsl:
+        notional = order.notional_usd
+        if notional is not None:
+            part += f" (${notional:,.0f})"
+    return part
+
+
 def order_line(order: OpenOrder, position: Position | None = None) -> str:
     """One resting order, as both the wallet views and Order Alerts render it
     (issue #115) — shared here so the two can't drift (the #77 lesson).

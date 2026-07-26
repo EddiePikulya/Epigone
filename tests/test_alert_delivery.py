@@ -183,6 +183,184 @@ async def queue_scale(
     )
 
 
+# --- Anchor TP/SL enrichment (#125): a `tpsl` row edits the coin's open/flip
+# anchor to append or refresh its `TP … · SL …` line, composing with the #91
+# arrows and surviving as persisted state for later re-renders. ---
+
+
+async def queue_tpsl(
+    pool: asyncpg.Pool,
+    *,
+    user_id: int = 42,
+    address: str = "0xaaa",
+    coin: str = "BTC",
+    tpsl_line: str | None,
+    created_at: datetime = T0,
+) -> None:
+    """A `tpsl` enrichment row as the order poller would have queued it (#125):
+    the freshly rendered line for a coin (NULL to drop it), no position legs."""
+    await pool.execute(
+        "INSERT INTO users (telegram_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+    )
+    await pool.execute(
+        """
+        INSERT INTO traders (address, display_name, first_seen_at, last_seen_at)
+        VALUES ($1, 'Ansem', $2, $2) ON CONFLICT (address) DO NOTHING
+        """,
+        address,
+        created_at,
+    )
+    await pool.execute(
+        """
+        INSERT INTO position_alerts
+            (user_telegram_id, trader_address, kind, coin, tpsl_line, created_at)
+        VALUES ($1, $2, 'tpsl', $3, $4, $5)
+        """,
+        user_id,
+        address,
+        coin,
+        tpsl_line,
+        created_at,
+    )
+
+
+async def test_a_tpsl_enrichment_appends_the_line_to_the_open_anchor(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The #125 core: the anchor is edited in place — no new message — to carry
+    the position's TP/SL line, and the line is persisted for later re-renders."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_tpsl(pool, coin="BTC", tpsl_line="TP 6.50 · SL 7.10")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    assert len(session.sent_messages()) == 1  # no second message
+    (edit,) = session.edited_messages()
+    assert edit.message_id == 1
+    assert "opened BTC LONG" in edit.text  # base text preserved
+    assert edit.text.endswith("TP 6.50 · SL 7.10")
+    stored = await pool.fetchval("SELECT tpsl_line FROM position_alerts WHERE kind = 'open'")
+    assert stored == "TP 6.50 · SL 7.10"  # persisted on the anchor
+
+
+async def test_a_tpsl_with_no_anchor_is_silently_dropped(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Followed after the open, so no anchor exists: the enrichment does nothing
+    and is stamped delivered, exactly the scale silent-drop rule."""
+    await queue_tpsl(pool, coin="BTC", tpsl_line="TP 6.50")
+
+    assert await deliver_pending(pool, bot, clock) == 1
+    assert session.sent_messages() == []
+    assert session.edited_messages() == []
+    delivered = await pool.fetchval("SELECT delivered_at FROM position_alerts WHERE kind = 'tpsl'")
+    assert delivered is not None
+
+
+async def test_an_unchanged_tpsl_line_does_not_edit_again(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Belt-and-suspenders idempotence: a second enrichment carrying the line the
+    anchor already shows makes no edit, so a re-delivery never churns."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_tpsl(pool, coin="BTC", tpsl_line="TP 6.50")
+    await deliver_pending(pool, bot, clock)
+    assert len(session.edited_messages()) == 1
+
+    await queue_tpsl(pool, coin="BTC", tpsl_line="TP 6.50")  # same line again
+    assert await deliver_pending(pool, bot, clock) == 1  # stamped delivered
+    assert len(session.edited_messages()) == 1  # but no new edit
+
+
+async def test_a_moved_tpsl_updates_then_a_cancel_drops_the_line(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The line tracks the set over cycles: a move rewrites it, a cancel (NULL
+    line) removes it and clears the persisted state."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    for line in ("TP 6.50", "TP 7.00"):
+        await queue_tpsl(pool, coin="BTC", tpsl_line=line)
+        await deliver_pending(pool, bot, clock)
+    await queue_tpsl(pool, coin="BTC", tpsl_line=None)  # cancelled → drop
+    await deliver_pending(pool, bot, clock)
+
+    trails = [edit.text.splitlines()[-1] for edit in session.edited_messages()]
+    assert trails[:2] == ["TP 6.50", "TP 7.00"]  # placed, then moved
+    last = session.edited_messages()[-1]
+    assert "TP" not in last.text  # the cancel drops the line, back to the base alert
+    assert last.text.splitlines()[-1].endswith("opened BTC LONG — $10,000 at 5x, entry 100")
+    stored = await pool.fetchval("SELECT tpsl_line FROM position_alerts WHERE kind = 'open'")
+    assert stored is None
+
+
+async def test_enrichment_preserves_arrows_and_the_keyboard(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Composition with #91: an anchor that already has a scale arrow keeps it —
+    base → arrows → TP/SL — and the tap-through + 🗑 keyboard rides through."""
+    address = "0x1116b5fcc070945062e8879841c29807db373d0d"
+    await queue_alert(pool, address=address, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+    await queue_scale(pool, address=address, kind="scale_in")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_tpsl(pool, address=address, coin="BTC", tpsl_line="TP 6.50 · SL 7.10")
+    await deliver_pending(pool, bot, clock)
+
+    edit = session.edited_messages()[-1]
+    lines = edit.text.splitlines()
+    assert "opened BTC LONG" in lines[0]
+    assert lines[-2] == "⬆️"  # the scale arrow survives, above the TP/SL line
+    assert lines[-1] == "TP 6.50 · SL 7.10"
+    (button,) = edit.reply_markup.inline_keyboard[0]
+    assert button.callback_data == f"positions:{address}"
+    assert edit.reply_markup.inline_keyboard[-1][0].callback_data == "msgdel"
+
+
+async def test_a_scale_after_enrichment_keeps_the_tpsl_line(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """Composition the other way: a scale that re-renders the anchor must not
+    clobber a TP/SL line an earlier enrichment persisted on it."""
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+    await queue_tpsl(pool, coin="BTC", tpsl_line="TP 6.50")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_scale(pool, kind="scale_in")
+    await deliver_pending(pool, bot, clock)
+
+    edit = session.edited_messages()[-1]
+    lines = edit.text.splitlines()
+    assert lines[-2] == "⬆️"  # the fresh arrow
+    assert lines[-1] == "TP 6.50"  # the persisted TP/SL line, still there
+
+
+async def test_a_tpsl_on_a_deleted_anchor_is_silently_dropped(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """The anchor message is gone (🗑, hand-deleted): the edit's TelegramBadRequest
+    is the expected silent outcome — stamped delivered without burning attempts."""
+    session = EditRejectingSession()
+    bot = make_bot(session)
+    await queue_alert(pool, kind="open", coin="BTC", side="long")
+    await deliver_pending(pool, bot, clock)
+
+    await queue_tpsl(pool, coin="BTC", tpsl_line="TP 6.50")
+    assert await deliver_pending(pool, bot, clock) == 1
+
+    row = await pool.fetchrow("SELECT * FROM position_alerts WHERE kind = 'tpsl'")
+    assert row is not None
+    assert row["delivered_at"] is not None
+    assert row["attempts"] == 0
+    await bot.session.close()
+
+
 async def test_a_scale_in_edits_the_open_alert_appending_an_up_arrow(
     pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
 ) -> None:

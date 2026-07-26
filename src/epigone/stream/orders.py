@@ -41,16 +41,33 @@ formats what the poll saw.
 
 Snapshot updates and alert-row inserts share one transaction per Trader, so a
 new order is alerted exactly once across stream restarts (the position
-poller's transactional pattern)."""
+poller's transactional pattern).
+
+Anchor enrichment (issue #125): the same pass, off the same diff, refreshes the
+open-alert anchor's position-attached TP/SL line. A coin whose position-TP/SL
+id set changed (a trigger placed, cancelled, or moved to a new oid) queues one
+`tpsl` position-alert row per follower with a live anchor, carrying the
+freshly rendered `TP … · SL …` line (NULL to drop it); the bot edits the anchor
+in place. Keyed off the raw id sets rather than the alert-worthy `news`, so a
+modify's silent oid swap still refreshes the line, and an unchanged set queues
+nothing — no edit churn. Zero new API spend: it reads only the orders this pass
+already fetched and the snapshots it already holds."""
 
 import json
 import logging
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
 import asyncpg
 
+from epigone.bot.format import (
+    is_position_tpsl_order,
+    is_position_tpsl_trigger,
+    position_tpsl_line,
+)
 from epigone.budget import Budget, record_rate_limit
 from epigone.clock import Clock
 from epigone.gateway import (
@@ -251,6 +268,11 @@ async def _apply_order_poll(
         )
         if news:
             await _queue_alerts(conn, address, news, now)
+        # Anchor enrichment (#125) runs off the same diff, independent of `news`:
+        # a TP/SL move mints a new oid the modify-damping folds out of `news`,
+        # yet the anchor's line must still refresh — so it keys off the raw
+        # per-coin trigger-id sets (known → orders), not the alert-worthy subset.
+        await _enrich_tpsl_anchors(conn, address, known, orders, now)
         return len(news)
 
 
@@ -360,6 +382,103 @@ async def _queue_alerts(
         VALUES ($1, $2, $3::jsonb, $4)
         """,
         rows,
+    )
+
+
+async def _enrich_tpsl_anchors(
+    conn: asyncpg.Connection,
+    address: str,
+    known: dict[int, asyncpg.Record],
+    orders: list[OpenOrder],
+    now: datetime,
+) -> None:
+    """Refresh the open-alert anchor's TP/SL line for any coin whose
+    position-attached trigger set changed this cycle (issue #125).
+
+    Change is judged by the set of position-TP/SL order ids per coin, previous
+    (the snapshots before this diff) versus current — the one signal that
+    catches every case with no extra API spend: a trigger placed grows the set,
+    a cancel shrinks it, and a move mints a new oid (Hyperliquid's modify is a
+    cancel/replace, verified live) so the id swaps even on a bare price nudge.
+    Unchanged sets queue nothing, so an idle position never churns its anchor.
+
+    A changed coin queues one enrichment row per follower with a live anchor for
+    it; the row carries the freshly rendered line (NULL when the set emptied —
+    drop it), and the bot edits the anchor in place (epigone.bot.alerts). No
+    anchor for a coin means no rows — untracked/unanchored positions are views
+    only. All within the poll's transaction, so the refresh commits with the
+    snapshot changes that imply it."""
+    previous = _tpsl_ids_by_coin_from_snapshots(known.values())
+    current = _tpsl_ids_by_coin_from_orders(orders)
+    current_orders: dict[str, list[OpenOrder]] = defaultdict(list)
+    for order in orders:
+        if is_position_tpsl_order(order):
+            current_orders[order.coin].append(order)
+    for coin in previous.keys() | current.keys():
+        if previous.get(coin, frozenset()) == current.get(coin, frozenset()):
+            continue
+        line = position_tpsl_line(current_orders.get(coin, []))
+        await _queue_tpsl_enrichment(conn, address, coin, line, now)
+
+
+def _tpsl_ids_by_coin_from_orders(orders: list[OpenOrder]) -> dict[str, frozenset[int]]:
+    by_coin: dict[str, set[int]] = defaultdict(set)
+    for order in orders:
+        if is_position_tpsl_order(order):
+            by_coin[order.coin].add(order.order_id)
+    return {coin: frozenset(ids) for coin, ids in by_coin.items()}
+
+
+def _tpsl_ids_by_coin_from_snapshots(
+    snapshots: Iterable[asyncpg.Record],
+) -> dict[str, frozenset[int]]:
+    """The same per-coin position-TP/SL id partition as the OpenOrder form, over
+    persisted order_snapshots rows (which carry the kind flags but not price) —
+    enough to diff the set, since only ids are compared. Shares the one
+    predicate (is_position_tpsl_trigger) with the OpenOrder side so they can't
+    drift on what counts as a position-attached trigger."""
+    by_coin: dict[str, set[int]] = defaultdict(set)
+    for snap in snapshots:
+        if is_position_tpsl_trigger(
+            snap["is_trigger"], snap["is_position_tpsl"], snap["reduce_only"]
+        ):
+            by_coin[snap["coin"]].add(snap["order_id"])
+    return {coin: frozenset(ids) for coin, ids in by_coin.items()}
+
+
+async def _queue_tpsl_enrichment(
+    conn: asyncpg.Connection, address: str, coin: str, line: str | None, now: datetime
+) -> None:
+    """Queue a `tpsl` enrichment row per follower who has a live open/flip anchor
+    for this (trader, coin) — the latest instance boundary is an open or flip,
+    not a close. A follower who joined after the open, or whose position closed,
+    has no anchor and gets no row (the bot would silent-drop it anyway, but
+    filtering here keeps the queue clean). `line` is the rendered TP/SL text,
+    NULL to drop it; the bot resolves the anchor and edits it in place."""
+    followers = await conn.fetch(
+        """
+        SELECT user_telegram_id
+        FROM (
+            SELECT DISTINCT ON (user_telegram_id) user_telegram_id, kind
+            FROM position_alerts
+            WHERE trader_address = $1 AND coin = $2
+                AND kind IN ('open', 'flip', 'close')
+            ORDER BY user_telegram_id, id DESC
+        ) latest
+        WHERE kind <> 'close'
+        """,
+        address,
+        coin,
+    )
+    if not followers:
+        return
+    await conn.executemany(
+        """
+        INSERT INTO position_alerts
+            (user_telegram_id, trader_address, kind, coin, tpsl_line, created_at)
+        VALUES ($1, $2, 'tpsl', $3, $4, $5)
+        """,
+        [(f["user_telegram_id"], address, coin, line, now) for f in followers],
     )
 
 

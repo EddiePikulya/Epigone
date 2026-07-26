@@ -36,6 +36,7 @@ def order(
     is_trigger: bool = False,
     trigger_price: str | None = None,
     is_position_tpsl: bool = False,
+    reduce_only: bool | None = None,
 ) -> OpenOrder:
     return OpenOrder(
         coin=coin,
@@ -48,7 +49,9 @@ def order(
         is_trigger=is_trigger,
         trigger_price=Decimal(trigger_price) if trigger_price is not None else None,
         is_position_tpsl=is_position_tpsl,
-        reduce_only=is_position_tpsl,
+        # A whole-position TP/SL is reduce-only by nature; a sized partial exit
+        # opts in explicitly. Non-tpsl triggers default to entry (not reduce).
+        reduce_only=is_position_tpsl if reduce_only is None else reduce_only,
     )
 
 
@@ -149,12 +152,13 @@ async def test_each_relationship_annotates_orders_against_the_live_positions(
     assert "GGG SELL $13,500 @ 4.5 → new position" in profile
 
 
-async def test_a_trigger_order_composes_its_tpsl_label_with_the_relationship(
+async def test_position_attached_tpsl_moves_onto_the_position_line(
     dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
 ) -> None:
-    # The #115 TP/SL label composes with the #123 relationship. A whole-position
-    # TP on a LONG is a reduce-only sell with no order notional → reduce/close,
-    # never a flip.
+    # #125: a whole-position TP/SL resting against a held coin no longer lists
+    # in the generic orders section — it rides the position line as a `↳ TP …`
+    # sub-line, matched by coin from the same fetch. With nothing else resting,
+    # the orders section disappears entirely.
     gateway.set_positions(WHALE, [pos("HYPE", Side.LONG, "240000", entry_price="48.20")])
     gateway.set_open_orders(
         WHALE,
@@ -168,13 +172,84 @@ async def test_a_trigger_order_composes_its_tpsl_label_with_the_relationship(
                 trigger_price="72.0",
                 is_position_tpsl=True,
             ),
+            order(
+                coin="HYPE",
+                is_buy=True,
+                order_id=2,
+                size="0",
+                order_type="Stop Market",
+                is_trigger=True,
+                trigger_price="42.0",
+                is_position_tpsl=True,
+            ),
         ],
     )
 
     await feed_text(dp, bot, WHALE, user_id=111)
 
     profile = session.sent_messages()[-1].text or ""
-    assert "HYPE TP @ 72.0 (whole position) → would reduce/close his LONG" in profile
+    assert "↳ TP 72.0 · SL 42.0" in profile  # on the HYPE position line
+    assert "Resting orders" not in profile  # nothing left for the generic section
+    assert "whole position" not in profile  # the #115 orders-section phrasing is gone
+
+
+async def test_a_partial_tpsl_is_labeled_with_its_size_on_the_position_line(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
+) -> None:
+    # A reduce-only sized trigger (a partial exit) attaches to the position too,
+    # but carries its notional so it reads apart from a whole-position exit.
+    gateway.set_positions(WHALE, [pos("SOL", Side.LONG, "20000", entry_price="150")])
+    gateway.set_open_orders(
+        WHALE,
+        [
+            order(
+                coin="SOL",
+                order_id=1,
+                size="50",
+                limit_price="200",
+                order_type="Take Profit Market",
+                is_trigger=True,
+                trigger_price="200",
+                reduce_only=True,
+            ),
+        ],
+    )
+
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    profile = session.sent_messages()[-1].text or ""
+    assert "↳ TP 200 ($10,000)" in profile  # 50 @ 200 = $10k, labeled partial
+    assert "Resting orders" not in profile
+
+
+async def test_an_entry_trigger_stays_in_the_orders_section(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
+) -> None:
+    # A non-reduce trigger opens or adds — it is a plan, not a guard — so it
+    # stays in the generic orders section and never touches a position line.
+    gateway.set_positions(WHALE, [pos("HYPE", Side.LONG, "240000", entry_price="48.20")])
+    gateway.set_open_orders(
+        WHALE,
+        [
+            order(
+                coin="HYPE",
+                is_buy=True,
+                order_id=1,
+                size="75",
+                limit_price="68.31",
+                order_type="Stop Market",
+                is_trigger=True,
+                trigger_price="63.25",
+            ),
+        ],
+    )
+
+    await feed_text(dp, bot, WHALE, user_id=111)
+
+    profile = session.sent_messages()[-1].text or ""
+    assert "Resting orders:" in profile
+    assert "HYPE BUY SL $4,744 @ trigger 63.25" in profile
+    assert "↳ TP" not in profile and "↳ SL" not in profile  # nothing on the position line
 
 
 async def test_a_wallet_with_no_resting_orders_shows_nothing_extra(
@@ -200,6 +275,35 @@ async def test_the_followers_positions_view_lists_resting_orders_too(
     view = session.sent_messages()[-1].text or ""
     assert "Resting orders:" in view
     assert "LIT SELL $13,500 @ 4.5" in view
+
+
+async def test_the_followers_positions_view_shows_tpsl_on_the_position_line_too(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, gateway: FakeHyperliquidGateway
+) -> None:
+    # The second view path (a follower's positions view) lifts position-attached
+    # TP/SL onto the position line exactly like the untracked profile does.
+    await follow_wallet(dp, bot, WHALE, user_id=111)
+    gateway.set_positions(WHALE, [pos("HYPE", Side.LONG, "240000", entry_price="48.20")])
+    gateway.set_open_orders(
+        WHALE,
+        [
+            order(
+                coin="HYPE",
+                order_id=1,
+                size="0",
+                order_type="Take Profit Market",
+                is_trigger=True,
+                trigger_price="72.0",
+                is_position_tpsl=True,
+            ),
+        ],
+    )
+
+    await feed_callback(dp, bot, f"positions:{WHALE}", user_id=111)
+
+    view = session.sent_messages()[-1].text or ""
+    assert "↳ TP 72.0" in view
+    assert "Resting orders" not in view
 
 
 async def test_a_huge_ladder_is_capped_with_a_count(
