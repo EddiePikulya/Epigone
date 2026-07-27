@@ -22,6 +22,7 @@ import asyncpg
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from epigone.bot.delete import with_delete_button
 from epigone.bot.format import short_address
 from epigone.gateway import GatewayError, HyperliquidGateway
 
@@ -39,6 +40,21 @@ CANCEL_KB = InlineKeyboardMarkup(
 # The prompts tell the User to "send 0" to clear a floor; these are the natural
 # ways to say the same thing, so a plain-worded reply isn't read as a number.
 _CLEARING_WORDS = {"0", "off", "none", "clear"}
+
+# Interactive min-size flow prompts (#73): self-replacing, so deliberately
+# button-free. Named so the #130 delete-button guard can key its exemption off
+# the real strings rather than re-typing them (tests/support/telegram.py).
+GLOBAL_MIN_PROMPT_TEXT = (
+    "⚙️ Global minimum position size.\n\n"
+    "Send a dollar amount — e.g. 5000 — to silence alerts for positions "
+    "smaller than that across every tracked trader (unless a trader has "
+    "its own floor). Send 0 to turn it off."
+)
+MIN_SIZE_UNREADABLE_TEXT = (
+    "I couldn't read that as a dollar amount. Send a number like 5000, "
+    "or 0 to turn the floor off."
+)
+MIN_CANCEL_TEXT = "Cancelled — nothing changed."
 
 
 def register(router: Router) -> None:
@@ -112,20 +128,15 @@ async def on_track_min_prompt(
 async def on_global_min_prompt(callback: CallbackQuery, min_size_pending: MinSizePending) -> None:
     min_size_pending[callback.from_user.id] = GLOBAL
     if isinstance(callback.message, Message):
-        await callback.message.answer(
-            "⚙️ Global minimum position size.\n\n"
-            "Send a dollar amount — e.g. 5000 — to silence alerts for positions "
-            "smaller than that across every tracked trader (unless a trader has "
-            "its own floor). Send 0 to turn it off.",
-            reply_markup=CANCEL_KB,
-        )
+        await callback.message.answer(GLOBAL_MIN_PROMPT_TEXT, reply_markup=CANCEL_KB)
     await callback.answer()
 
 
 async def on_min_cancel(callback: CallbackQuery, min_size_pending: MinSizePending) -> None:
     min_size_pending.pop(callback.from_user.id, None)
     if isinstance(callback.message, Message):
-        await callback.message.edit_text("Cancelled — nothing changed.")
+        # The flow is over — a terminal confirmation carries the 🗑 row (#73/#130).
+        await callback.message.edit_text(MIN_CANCEL_TEXT, reply_markup=with_delete_button())
     await callback.answer()
 
 
@@ -144,10 +155,7 @@ async def on_min_size_text(
         return  # unreachable while awaiting_min_size gates registration
     ok, value = parse_min_size(message.text)
     if not ok:
-        await message.answer(
-            "I couldn't read that as a dollar amount. Send a number like 5000, "
-            "or 0 to turn the floor off."
-        )
+        await message.answer(MIN_SIZE_UNREADABLE_TEXT)
         return
     min_size_pending.pop(user.id, None)
     if target == GLOBAL:
@@ -232,6 +240,10 @@ async def _send_list(
     try:
         text, markup = await _render_tracked_list(pool, gateway, user_id)
     except GatewayError:
-        await message.answer(f"{confirmation}\n\n{DATA_DELAYED_TEXT}")
+        # The floor was set; only the list refresh is stale. Still a terminal
+        # message, so it carries the 🗑 row like the happy path (#73/#130).
+        await message.answer(
+            f"{confirmation}\n\n{DATA_DELAYED_TEXT}", reply_markup=with_delete_button()
+        )
         return
     await message.answer(f"{confirmation}\n\n{text}", reply_markup=markup)

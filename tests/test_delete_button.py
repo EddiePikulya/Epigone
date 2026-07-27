@@ -12,17 +12,25 @@ from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import asyncpg
+import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.methods import DeleteMessage, TelegramMethod
+from aiogram.methods import DeleteMessage, EditMessageText, SendMessage, TelegramMethod
 from aiogram.methods.base import TelegramType
 from aiogram.types import InlineKeyboardMarkup
 
+from epigone.bot import criteria
 from epigone.bot.alerts import deliver_pending
-from epigone.bot.delete import DELETE_CALLBACK, DELETE_TOO_OLD_TOAST
+from epigone.bot.delete import DELETE_CALLBACK, DELETE_TOO_OLD_TOAST, with_delete_button
 from epigone.monitor.main import run_monitor_cycle
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_callback, feed_text, make_bot
+from tests.support.telegram import (
+    RecordingSession,
+    assert_delete_buttons,
+    feed_callback,
+    feed_text,
+    make_bot,
+)
 from tests.test_alert_delivery import queue_alert
 from tests.test_monitor_loop import ADMIN_ID, _add_trader, _config, _monitor
 from tests.test_screener_ux import add_trader
@@ -264,3 +272,46 @@ async def test_criteria_results_carry_a_delete_button(
 
     results = session.edited_messages()[-1]  # cnew drew the builder, crun the results
     assert _has_delete_row(results.reply_markup)
+
+
+# --- the structural guard itself (issue #130) ---
+#
+# assert_delete_buttons is wired into the `session` fixture, so every test above
+# already runs it. These exercise the guard directly on a hand-built session so
+# its two verdicts — flag a bare message, spare an exempt one — are pinned.
+
+
+def test_guard_flags_a_send_missing_the_delete_row() -> None:
+    session = RecordingSession()
+    session.requests.append(SendMessage(chat_id=1, text="🔴 whale closed BTC"))
+
+    with pytest.raises(AssertionError, match="missing the 🗑 delete row"):
+        assert_delete_buttons(session)
+
+
+def test_guard_flags_an_edit_missing_the_delete_row() -> None:
+    # The #130 repro shape: an in-place edit that rebuilt markup as None.
+    session = RecordingSession()
+    session.requests.append(
+        EditMessageText(chat_id=1, message_id=2, text="refreshed view", reply_markup=None)
+    )
+
+    with pytest.raises(AssertionError, match="missing the 🗑 delete row"):
+        assert_delete_buttons(session)
+
+
+def test_guard_passes_a_send_that_carries_the_delete_row() -> None:
+    session = RecordingSession()
+    session.requests.append(
+        SendMessage(chat_id=1, text="🔴 whale closed BTC", reply_markup=with_delete_button())
+    )
+
+    assert_delete_buttons(session)  # no raise
+
+
+def test_guard_exempts_the_interactive_flow_prompts() -> None:
+    # A criteria-builder prompt is deliberately button-free; the guard spares it.
+    session = RecordingSession()
+    session.requests.append(SendMessage(chat_id=1, text=criteria.NAME_PROMPT_TEXT))
+
+    assert_delete_buttons(session)  # no raise

@@ -1,6 +1,6 @@
 import asyncio
 import os
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 
 import asyncpg
 import pytest
@@ -11,7 +11,7 @@ from epigone.db import migrate
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.clock import FakeClock
 from tests.support.db import reset_database
-from tests.support.telegram import RecordingSession, make_bot
+from tests.support.telegram import RecordingSession, assert_delete_buttons, make_bot
 
 DEFAULT_TEST_DATABASE_URL = "postgresql://epigone:epigone@localhost:5432/epigone_test"
 
@@ -56,8 +56,14 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
 
 
 @pytest.fixture
-def session() -> RecordingSession:
-    return RecordingSession()
+def session() -> Generator[RecordingSession, None, None]:
+    """The recording fake transport, plus the #73/#130 structural guard: after
+    the test runs, every send/edit it captured is checked for the 🗑 delete row
+    (except the exempt interactive-flow prompts). So every test that drives the
+    bot through this session doubles as a delete-button regression test."""
+    recording = RecordingSession()
+    yield recording
+    assert_delete_buttons(recording)
 
 
 @pytest.fixture

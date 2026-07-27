@@ -27,6 +27,7 @@ import asyncpg
 from aiogram import F, Router
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from epigone.bot.delete import with_delete_button
 from epigone.bot.format import short_address, trader_label
 
 # rename_pending[user_id] is the address the User is typing a name for; absence
@@ -44,6 +45,9 @@ NAME_TOO_LONG_TEXT = (
     f"That name is too long — {MAX_NAME_LENGTH} characters max. Send a shorter one."
 )
 NAME_EMPTY_TEXT = "That name is empty. Send some text, or tap Clear name to remove it."
+# The rename flow's in-place cancel (#73): self-replacing, so button-free. Named
+# for the #130 delete-button guard's exemption list (tests/support/telegram.py).
+RENAME_CANCEL_TEXT = "Cancelled — the name is unchanged."
 
 _WHITESPACE_RUN = re.compile(r"\s+")
 
@@ -123,10 +127,13 @@ async def on_name_clear(
     rename_pending.pop(callback.from_user.id, None)
     cleared = await set_track_name(pool, callback.from_user.id, address, None)
     if isinstance(callback.message, Message):
+        # Terminal confirmation (the prompt is spent), so it carries the 🗑 row
+        # like every other non-prompt message (#73/#130).
         await callback.message.edit_text(
             f"🏷 Name cleared — back to {short_address(address)}."
             if cleared
-            else f"You're no longer tracking {short_address(address)}."
+            else f"You're no longer tracking {short_address(address)}.",
+            reply_markup=with_delete_button(),
         )
     await callback.answer("Name cleared" if cleared else "You're not tracking this trader.")
 
@@ -134,7 +141,8 @@ async def on_name_clear(
 async def on_rename_cancel(callback: CallbackQuery, rename_pending: RenamePending) -> None:
     rename_pending.pop(callback.from_user.id, None)
     if isinstance(callback.message, Message):
-        await callback.message.edit_text("Cancelled — the name is unchanged.")
+        # The flow is over — a terminal confirmation carries the 🗑 row (#73/#130).
+        await callback.message.edit_text(RENAME_CANCEL_TEXT, reply_markup=with_delete_button())
     await callback.answer()
 
 
@@ -159,11 +167,16 @@ async def on_rename_text(
         return
     rename_pending.pop(user.id, None)
     saved = await set_track_name(pool, user.id, address, name)
+    # Both outcomes are terminal, so they carry the 🗑 row (#73/#130).
     if not saved:  # unfollowed between arming the prompt and sending the name
-        await message.answer(f"You're no longer tracking {short_address(address)}.")
+        await message.answer(
+            f"You're no longer tracking {short_address(address)}.",
+            reply_markup=with_delete_button(),
+        )
         return
     await message.answer(
-        f"✏️ Saved — you'll see this trader as {trader_label(name, address)} from now on."
+        f"✏️ Saved — you'll see this trader as {trader_label(name, address)} from now on.",
+        reply_markup=with_delete_button(),
     )
 
 

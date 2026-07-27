@@ -22,6 +22,7 @@ from aiogram.types import User as TgUser
 from aiogram.types.update import UpdateTypeLookupError
 
 from epigone import allowlist
+from epigone.bot.delete import with_delete_button
 
 REFUSAL_TEXT = "Epigone is invite-only — ask the owner for access"
 ADMIN_ONLY_TEXT = "That's an owner-only command."
@@ -116,15 +117,15 @@ async def cmd_allow(
     admin_telegram_id: int | None,
 ) -> None:
     if not _is_admin(message.from_user, admin_telegram_id):
-        await message.answer(ADMIN_ONLY_TEXT)
+        await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
         return
     target = _parse_target(command.args)
     if target is None:
-        await message.answer(ALLOW_USAGE_TEXT)
+        await message.answer(ALLOW_USAGE_TEXT, reply_markup=with_delete_button())
         return
     assert message.from_user is not None  # _is_admin guarantees it
     await allowlist.grant(pool, target, granted_by=message.from_user.id)
-    await message.answer(f"✅ {target} can now use Epigone.")
+    await message.answer(f"✅ {target} can now use Epigone.", reply_markup=with_delete_button())
 
 
 async def cmd_revoke(
@@ -134,22 +135,26 @@ async def cmd_revoke(
     admin_telegram_id: int | None,
 ) -> None:
     if not _is_admin(message.from_user, admin_telegram_id):
-        await message.answer(ADMIN_ONLY_TEXT)
+        await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
         return
     target = _parse_target(command.args)
     if target is None:
-        await message.answer(REVOKE_USAGE_TEXT)
+        await message.answer(REVOKE_USAGE_TEXT, reply_markup=with_delete_button())
         return
     if target == admin_telegram_id:
         # The owner is always allowed from config; revoking them would be a
         # no-op that reads as a lockout. Refuse it outright.
-        await message.answer(CANT_REVOKE_ADMIN_TEXT)
+        await message.answer(CANT_REVOKE_ADMIN_TEXT, reply_markup=with_delete_button())
         return
     removed = await allowlist.revoke(pool, target)
     if removed:
-        await message.answer(f"🚫 {target} can no longer use Epigone.")
+        await message.answer(
+            f"🚫 {target} can no longer use Epigone.", reply_markup=with_delete_button()
+        )
     else:
-        await message.answer(f"{target} wasn't on the allowlist.")
+        await message.answer(
+            f"{target} wasn't on the allowlist.", reply_markup=with_delete_button()
+        )
 
 
 async def cmd_allowed(
@@ -158,7 +163,7 @@ async def cmd_allowed(
     admin_telegram_id: int | None,
 ) -> None:
     if not _is_admin(message.from_user, admin_telegram_id):
-        await message.answer(ADMIN_ONLY_TEXT)
+        await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
         return
     ids = await allowlist.list_allowed(pool)
     lines = [f"Owner: {admin_telegram_id}"]
@@ -167,7 +172,7 @@ async def cmd_allowed(
         lines.extend(f"  • {telegram_id}" for telegram_id in ids)
     else:
         lines.append("No one else is on the allowlist yet.")
-    await message.answer("\n".join(lines))
+    await message.answer("\n".join(lines), reply_markup=with_delete_button())
 
 
 def register(router: Router) -> None:
