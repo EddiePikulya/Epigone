@@ -34,6 +34,7 @@ from hyperliquid.utils.signing import sign_l1_action
 
 from epigone.budget import Budget
 from epigone.clock import Clock
+from epigone.gateway.backoff import RATE_LIMIT_MAX_TRIES, backoff_delay, parse_retry_after
 from epigone.gateway.execution import (
     ActionRejectedError,
     BuilderFee,
@@ -67,13 +68,6 @@ TESTNET_EXCHANGE_URL = "https://api.hyperliquid-testnet.xyz/exchange"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
-# Same bounded 429 retry shape as the read gateway (issue #28): ~30s worst
-# case. Safe for writes because every retry re-posts the identical signed
-# payload (single-use nonce ⇒ at-most-once execution).
-RATE_LIMIT_MAX_TRIES = 6
-RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
-RATE_LIMIT_BACKOFF_CAP_SECONDS = 30.0
-
 
 class HttpExecutionGateway:
     """One instance = one signer = one traded master account = one nonce lane
@@ -81,9 +75,11 @@ class HttpExecutionGateway:
 
     `master_address` is the account whose orders this lane trades. It never
     rides the wire in Phase A (the exchange resolves the acting master from
-    the agent signature itself); it exists to make the ADR-0005 invariant
-    structural: construction REFUSES a signer whose address equals the
-    master's, so the key that owns the funds can never sign here."""
+    the agent signature itself); it exists for the gateway-side layer of the
+    ADR-0005 invariant: construction REFUSES a signer whose address equals
+    the master's, so this-account's-own-master-key can never sign here.
+    Defense in depth, not the whole defense — see the layered statement in
+    epigone.gateway.execution's module docstring."""
 
     def __init__(
         self,
@@ -196,9 +192,9 @@ class HttpExecutionGateway:
                     if response.status != 429:
                         response.raise_for_status()
                         return await response.json()
-                    delay = _parse_retry_after(response.headers.get("Retry-After"))
+                    delay = parse_retry_after(response.headers.get("Retry-After"))
                     if delay is None:
-                        delay = self._backoff_delay(attempt)
+                        delay = backoff_delay(attempt, self._rng)
             except TimeoutError as exc:
                 # Ambiguous by nature: the action may have executed and the
                 # response died in flight. No retry — the caller reconciles
@@ -220,13 +216,6 @@ class HttpExecutionGateway:
         raise ExecutionRateLimitedError(
             f"still 429 from {self._exchange_url} after {RATE_LIMIT_MAX_TRIES} tries"
         )
-
-    def _backoff_delay(self, attempt: int) -> float:
-        """Exponential window with equal jitter: 50-100% of base * 2^attempt
-        (the read gateway's shape, issue #28)."""
-        window = min(RATE_LIMIT_BACKOFF_CAP_SECONDS, RATE_LIMIT_BACKOFF_BASE_SECONDS * 2.0**attempt)
-        return window * (0.5 + 0.5 * self._rng())
-
 
 def _order_wire(order: OrderSpec) -> dict[str, Any]:
     """One order as the exchange's wire dict — the SDK's OrderWire key order
@@ -327,15 +316,3 @@ def parse_cancel_statuses(data: Any, *, expected: int) -> list[CancelResult]:
     if len(results) != expected:
         raise ExecutionError(f"expected {expected} cancel statuses, got {len(results)}: {data!r}")
     return results
-
-
-def _parse_retry_after(value: str | None) -> float | None:
-    """Retry-After as delta-seconds; the HTTP-date form (or garbage) falls
-    back to our own backoff (the read gateway's convention)."""
-    if value is None:
-        return None
-    try:
-        seconds = float(value)
-    except ValueError:
-        return None
-    return max(0.0, seconds)

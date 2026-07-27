@@ -38,6 +38,7 @@ from epigone.gateway import (
     Side,
     Window,
 )
+from epigone.gateway.backoff import RATE_LIMIT_MAX_TRIES, backoff_delay, parse_retry_after
 
 log = logging.getLogger(__name__)
 
@@ -58,12 +59,6 @@ REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 # milliseconds, so two seconds is generous (#63 review).
 COVERAGE_HORIZON_MARGIN = timedelta(seconds=2)
 
-# Bounded 429 retries: 6 tries = up to 5 sleeps (1+2+4+8+16s at full jitter),
-# ~30s worst case — long enough to ride out a blip, short enough that a pass
-# under sustained limiting still moves on and resumes next cycle.
-RATE_LIMIT_MAX_TRIES = 6
-RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
-RATE_LIMIT_BACKOFF_CAP_SECONDS = 30.0
 
 
 class HttpHyperliquidGateway:
@@ -177,31 +172,13 @@ class HttpHyperliquidGateway:
                 if response.status != 429:
                     response.raise_for_status()
                     return await response.json()
-                delay = _parse_retry_after(response.headers.get("Retry-After"))
+                delay = parse_retry_after(response.headers.get("Retry-After"))
                 if delay is None:
-                    delay = self._backoff_delay(attempt)
+                    delay = backoff_delay(attempt, self._rng)
             if attempt + 1 < RATE_LIMIT_MAX_TRIES:
                 log.warning("429 from %s: backing off %.1fs (try %d)", url, delay, attempt + 1)
                 await self._clock.sleep(delay)
         raise RateLimitedError(f"still 429 from {url} after {RATE_LIMIT_MAX_TRIES} tries")
-
-    def _backoff_delay(self, attempt: int) -> float:
-        """Exponential window with equal jitter: 50–100% of base * 2^attempt."""
-        window = min(RATE_LIMIT_BACKOFF_CAP_SECONDS, RATE_LIMIT_BACKOFF_BASE_SECONDS * 2.0**attempt)
-        return window * (0.5 + 0.5 * self._rng())
-
-
-def _parse_retry_after(value: str | None) -> float | None:
-    """Retry-After as delta-seconds; the HTTP-date form (or garbage) falls back
-    to our own backoff rather than trusting a parse of the server's clock."""
-    if value is None:
-        return None
-    try:
-        seconds = float(value)
-    except ValueError:
-        return None
-    return max(0.0, seconds)
-
 
 def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
     known = {window.value: window for window in Window}

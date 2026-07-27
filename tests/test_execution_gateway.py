@@ -135,6 +135,7 @@ def test_trigger_rejects_a_non_positive_price() -> None:
         ),
         ("Invalid TP/SL price. asset=4", RejectReason.BAD_TRIGGER_PRICE),
         ("Order would exceed the open interest cap.", RejectReason.OPEN_INTEREST_CAP),
+        ("Too many requests from this address.", RejectReason.RATE_LIMITED),
         ("something the exchange never said before", RejectReason.UNKNOWN),
     ],
 )

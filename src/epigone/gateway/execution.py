@@ -5,20 +5,26 @@ leverage, scheduleCancel — go through this interface and nowhere else
 (ADR-0005; the ADR-0001 shape extended to writes, issue #133). Tests inject
 FakeExecutionGateway; production wires HttpExecutionGateway.
 
-Agent-key-only, by construction (the ADR-0005 invariant):
+Agent-key-only (the ADR-0005 invariant), enforced in layers — and stated
+precisely, because the layers guarantee different things:
 
-- The surface below contains ONLY L1 trading actions. Every fund-moving or
+- IMPOSSIBLE BY CONSTRUCTION: moving funds or granting authority. The
+  surface below contains ONLY L1 trading actions; every fund-moving or
   authority-granting action (`withdraw3`, `usdSend`, `approveAgent`,
   `approveBuilderFee`, …) is a user-signed action — a different signature
-  scheme this module cannot express, so no code path through Epigone's
+  scheme this module cannot express — so no code path through Epigone's
   execution seam can move funds out or mint signing authority even if handed
   a master key by mistake.
-- Implementations take the signer and the master account it trades as
-  separate values and MUST refuse a signer whose address equals the master's
-  (HttpExecutionGateway raises MasterKeySignerError at construction): the key
-  that owns the traded account never signs here. Any other key is only
-  useful once the master has approved it as an agent on Hyperliquid — the
-  chain enforces that, we don't have to.
+- STRUCTURALLY CHECKED: signing with the traded account's own key.
+  Implementations take the signer and the master account as separate values
+  and MUST refuse a signer whose address equals the master's
+  (HttpExecutionGateway raises MasterKeySignerError at construction). This
+  check cannot recognize an arbitrary master key presented with a mismatched
+  master_address — keeping master keys off Epigone entirely is the
+  keystore's invariant (issue #134, ADR-0005), of which this check is the
+  gateway-side defense in depth. Any non-master key is only useful once the
+  master has approved it as an agent on Hyperliquid — the chain enforces
+  that, we don't have to.
 
 The Signer seam: the gateway accepts any eth_account LocalAccount-compatible
 signer (what hyperliquid-python-sdk's signing helpers take). Loading,
@@ -132,6 +138,10 @@ class RejectReason(Enum):
     NO_IMMEDIATE_MATCH = "no_immediate_match"  # Ioc/market found no liquidity
     OPEN_INTEREST_CAP = "open_interest_cap"
     MISSING_ORDER = "missing_order"  # cancel/modify of an unknown oid
+    # A throttle the exchange voices as reject PROSE (e.g. the address-based
+    # budget's trickle) rather than as HTTP 429 — the 429 path surfaces as
+    # ExecutionRateLimitedError after in-place retry instead (research §5).
+    RATE_LIMITED = "rate_limited"
     UNKNOWN = "unknown"
 
 
@@ -162,6 +172,8 @@ _REJECT_PATTERNS: tuple[tuple[str, RejectReason], ...] = (
     ("open interest", RejectReason.OPEN_INTEREST_CAP),
     ("never placed", RejectReason.MISSING_ORDER),
     ("already canceled", RejectReason.MISSING_ORDER),
+    ("too many", RejectReason.RATE_LIMITED),
+    ("rate limit", RejectReason.RATE_LIMITED),
 )
 
 
@@ -406,11 +418,21 @@ class ExecutionGateway(Protocol):
       re-issuing. Sustained 429 raises ExecutionRateLimitedError (never
       ambiguous: a 429'd action was rejected before processing).
 
-    There is no protocol-level "cancel everything now": immediate cancel-all
-    is enumerate-open-orders (read gateway) + cancel_orders, and the
-    dead-man's variant is schedule_cancel (research §2). scheduleCancel
-    cancels ORDERS only — position unwind on executor death is A3's policy,
-    not a protocol feature.
+    Two deliberate deltas from issue #133's action list, recorded here per
+    the honest-deviation convention:
+    - "cancel-all": Hyperliquid has no cancel-all L1 action. Immediate
+      cancel-all is a composition — enumerate open orders (read gateway,
+      which owns the coin-name↔asset mapping) + cancel_orders — and belongs
+      to A3's /kill, not this seam; the dead-man's variant is
+      schedule_cancel (research §2). scheduleCancel cancels ORDERS only —
+      position unwind on executor death is likewise A3's policy.
+    - "address-based budget accounting": the address ledger (1 request per
+      1 USDC traded + 10k buffer, research §5) is the exchange's own
+      per-master account; modeling it client-side needs traded-volume data
+      this seam doesn't see. A1 ships the IP-side execution lane
+      (SharedWeightBudget, exchange_action_weight); address-limit throttles
+      surface as ExecutionRateLimitedError / RejectReason.RATE_LIMITED, and
+      a client-side ledger is B4's multi-account concern (open Q7).
     """
 
     async def place_orders(
