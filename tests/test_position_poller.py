@@ -14,6 +14,7 @@ epigone.stream.poller):
 Alert-control suppression (mute, min-size) lives in tests/test_alert_controls.py.
 """
 
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
@@ -22,6 +23,7 @@ from epigone.budget import WeightBudget
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, Position, RateLimitedError, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
+from epigone.ingest.fine import MARK_DUE_FRESHNESS
 from epigone.stream.poller import POSITIONS_WEIGHT, run_poll_pass
 from tests.support.clock import FakeClock
 
@@ -795,3 +797,158 @@ async def test_unlinking_keeps_the_snapshot_when_still_tracked(
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
     assert await snapshot_coins(pool, "0xaaa") == {"BTC"}  # tracker keeps it alive
+
+
+# --- issue #129: a close/flip bumps the wallet due-now for a fine refresh -----
+#
+# The poller shares mark_due_now with the Follow path (#82): a close or flip
+# alert clears fine_refreshed_at + fine_attempted_at so the tracked-first fine
+# pass (#65/#66) refreshes the round-trip within minutes and Recent trades
+# matches the alert. Opens/scales don't. The freshness guard (mark_due_now's
+# unit behaviour is covered in tests/test_follow_refresh.py) means a wallet
+# refreshed within the window is left alone, so fan-in repeats are no-ops.
+
+
+async def _seed_fine_scanned(pool: asyncpg.Pool, address: str, at: datetime) -> None:
+    """Stamp a prior fine refresh on an already-tracked wallet, so a later bump
+    is observable as the columns going NULL (vs. the NULL a fresh Track starts
+    with)."""
+    await pool.execute(
+        "UPDATE traders SET fine_refreshed_at = $2, fine_attempted_at = $2 WHERE address = $1",
+        address,
+        at,
+    )
+
+
+async def _fine_scan_state(pool: asyncpg.Pool, address: str) -> asyncpg.Record | None:
+    return await pool.fetchrow(
+        "SELECT fine_refreshed_at, fine_attempted_at FROM traders WHERE address = $1", address
+    )
+
+
+async def test_a_close_marks_a_stale_tracked_wallet_due_now(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    await baseline(pool, gateway, clock)
+    await _seed_fine_scanned(pool, "0xaaa", clock.now() - timedelta(hours=6))
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [])  # BTC closes
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1
+    state = await _fine_scan_state(pool, "0xaaa")
+    assert state is not None
+    assert state["fine_refreshed_at"] is None  # due now
+    assert state["fine_attempted_at"] is None  # sorts first in the fine queue
+
+
+async def test_a_flip_marks_a_stale_tracked_wallet_due_now(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC", side=Side.LONG)])
+    await baseline(pool, gateway, clock)
+    await _seed_fine_scanned(pool, "0xaaa", clock.now() - timedelta(hours=6))
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="BTC", side=Side.SHORT)])  # flip
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1
+    state = await _fine_scan_state(pool, "0xaaa")
+    assert state is not None
+    assert state["fine_refreshed_at"] is None
+    assert state["fine_attempted_at"] is None
+
+
+async def test_an_open_does_not_mark_the_wallet_due_now(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """An open mints nothing for fine_trades (the live position already shows it),
+    so it must not force a fine refresh — the seeded scan state is untouched."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    await baseline(pool, gateway, clock)
+    scanned = clock.now() - timedelta(hours=6)
+    await _seed_fine_scanned(pool, "0xaaa", scanned)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="BTC"), position(coin="SOL")])  # SOL opens
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1  # the open alerted...
+    state = await _fine_scan_state(pool, "0xaaa")
+    assert state is not None
+    assert state["fine_refreshed_at"] == scanned  # ...but the fine scan stays put
+    assert state["fine_attempted_at"] == scanned
+
+
+async def test_a_scale_does_not_mark_the_wallet_due_now(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A scale-in resizes an open position — no round-trip minted — so like an
+    open it leaves the fine scan state alone."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC", size_usd="10000")])
+    await baseline(pool, gateway, clock)
+    scanned = clock.now() - timedelta(hours=6)
+    await _seed_fine_scanned(pool, "0xaaa", scanned)
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="BTC", size_usd="15000")])  # +50% scale-in
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 1  # the scale alerted...
+    state = await _fine_scan_state(pool, "0xaaa")
+    assert state is not None
+    assert state["fine_refreshed_at"] == scanned  # ...but the fine scan stays put
+    assert state["fine_attempted_at"] == scanned
+
+
+async def test_multiple_closes_in_one_pass_leave_the_wallet_due(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Fan-in dedup: three coins closing in one pass bump the wallet once (the
+    freshness guard makes any repeat a no-op) — the wallet just ends up due."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions(
+        "0xaaa",
+        [position(coin="BTC"), position(coin="ETH"), position(coin="SOL")],
+    )
+    await baseline(pool, gateway, clock)
+    await _seed_fine_scanned(pool, "0xaaa", clock.now() - timedelta(hours=6))
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [])  # all three close at once
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 3
+    state = await _fine_scan_state(pool, "0xaaa")
+    assert state is not None
+    assert state["fine_refreshed_at"] is None
+    assert state["fine_attempted_at"] is None
+
+
+async def test_a_close_on_a_freshly_refreshed_wallet_is_not_rebumped(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The shared freshness guard: a wallet fine-refreshed inside the window is
+    left on the cadence even when it closes — no back-to-back refresh churn."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    await baseline(pool, gateway, clock)
+
+    clock.advance(30)
+    # Refreshed just now, well inside MARK_DUE_FRESHNESS.
+    fresh = clock.now() - (MARK_DUE_FRESHNESS - timedelta(minutes=1))
+    await _seed_fine_scanned(pool, "0xaaa", fresh)
+    gateway.set_positions("0xaaa", [])  # BTC closes
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    state = await _fine_scan_state(pool, "0xaaa")
+    assert state is not None
+    assert state["fine_refreshed_at"] == fresh  # left untouched
+    assert state["fine_attempted_at"] == fresh

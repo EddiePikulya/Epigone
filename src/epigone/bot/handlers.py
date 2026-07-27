@@ -48,7 +48,7 @@ from epigone.gateway import (
     fetch_open_orders,
     fetch_open_positions,
 )
-from epigone.ingest.fine import mark_due_on_follow
+from epigone.ingest.fine import mark_due_now
 from epigone.metrics.fine import RoundTrip, reduce_trips
 from epigone.metrics.library import format_duration
 from epigone.plays import RANKED_PLAYS_SQL
@@ -1204,7 +1204,7 @@ async def track_address(
     # A fresh Follow makes the wallet due now, so its fine data refreshes within
     # minutes instead of on the daily cadence (issue #82) — a recently-scanned
     # wallet is left alone. Postgres-only; the ingest picks it up (ADR-0002).
-    await mark_due_on_follow(conn, address, now)
+    await mark_due_now(conn, address, now)
     # Settle this pair's one-time "first data landed" notice (issue #83): pending
     # if the wallet is not yet scanned (notify when its first data lands),
     # suppressed if the data is already there. Only on a genuinely new Track — a
