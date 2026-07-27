@@ -170,6 +170,34 @@ async def test_tampered_ciphertext_refuses_to_decrypt(
         await keystore.signer(OPERATOR)
 
 
+async def test_truncated_blob_is_a_keystore_error(
+    keystore: AgentKeystore, pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """A blob shorter than a valid GCM nonce raises ValueError inside
+    `cryptography`, not InvalidTag — it must still surface as the domain
+    error, never a raw crypto traceback."""
+    await keystore.generate_agent_key(
+        user_id=OPERATOR, master_address=MASTER, agent_name=None, expires_at=_expiry(clock)
+    )
+    await pool.execute(
+        "UPDATE agent_keys SET key_ciphertext = substring(key_ciphertext from 1 for 4)"
+    )
+    with pytest.raises(KeystoreError, match="decrypt"):
+        await keystore.signer(OPERATOR)
+
+
+async def test_unknown_user_is_a_clear_error(
+    keystore: AgentKeystore, clock: FakeClock
+) -> None:
+    with pytest.raises(KeystoreError, match="no user account"):
+        await keystore.generate_agent_key(
+            user_id=999_999,
+            master_address=MASTER,
+            agent_name=None,
+            expires_at=_expiry(clock),
+        )
+
+
 async def test_ciphertext_is_bound_to_its_row(
     keystore: AgentKeystore, pool: asyncpg.Pool, clock: FakeClock
 ) -> None:

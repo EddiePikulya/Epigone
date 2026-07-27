@@ -118,11 +118,14 @@ def _seal(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
 
 
 def _unseal(key: bytes, blob: bytes, aad: bytes) -> bytes:
+    # ValueError covers malformed blobs (e.g. truncated below a valid nonce);
+    # every decrypt failure mode must surface as the domain error, and the
+    # message must carry no key-derived material.
     try:
         return AESGCM(key).decrypt(blob[:_NONCE_LEN], blob[_NONCE_LEN:], aad)
-    except InvalidTag:
+    except (InvalidTag, ValueError):
         raise KeystoreError(
-            "failed to decrypt agent key: ciphertext failed authentication"
+            "failed to decrypt agent key: sealed blob failed authentication or is malformed"
         ) from None
 
 
@@ -217,6 +220,11 @@ class AgentKeystore:
             raise KeystoreError(
                 f"agent address {agent_address} was already stored once — never reuse an "
                 f"agent address after deregistration (nonce-replay hazard, ADR-0005)"
+            ) from None
+        except asyncpg.ForeignKeyViolationError:
+            raise KeystoreError(
+                f"no user account {user_id} — the user must exist (any /start against "
+                f"the bot creates the row) before a key can be bound to them"
             ) from None
         return record
 

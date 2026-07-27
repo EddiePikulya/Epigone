@@ -33,6 +33,8 @@ trade but can never withdraw, transfer, or grant authority (research §3).
 2. `DATABASE_URL` pointing at the Epigone database, and a `users` row for the
    account id you'll bind the key to (the operator's Telegram id in Phase A —
    any /start against the bot creates it).
+3. When the executor process ships (A4), mount the KEK file **read-only** into
+   that container in docker-compose — never bake it into an image or commit it.
 
 ## The two ceremony shapes, and which one we use
 
