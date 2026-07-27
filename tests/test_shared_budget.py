@@ -23,6 +23,7 @@ import pytest
 
 from epigone.budget import (
     BURST_WEIGHT,
+    EXECUTION_RESERVE_WEIGHT,
     PER_IP_WEIGHT_PER_MINUTE,
     RATE_EVENT_RETENTION,
     SHARED_WEIGHT_PER_MINUTE,
@@ -31,6 +32,7 @@ from epigone.budget import (
     SharedWeightBudget,
     record_rate_limit,
 )
+from epigone.ingest.fine import FILLS_WEIGHT
 from epigone.stream.orders import ORDERS_WEIGHT
 from epigone.stream.poller import POSITIONS_WEIGHT
 from tests.support.clock import FakeClock
@@ -316,3 +318,31 @@ async def test_order_polling_spends_behind_the_stream_reserve(
     assert clock.slept == []
     await orders.spend(ORDERS_WEIGHT)
     assert sum(clock.slept) >= (POSITIONS_WEIGHT + ORDERS_WEIGHT) / REFILL_PER_SECOND
+
+
+async def test_the_execution_lane_outranks_the_pollers(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    # Issue #133: every poller leaves EXECUTION_RESERVE_WEIGHT in the bucket
+    # (the wiring in stream/ingest main), so at the execution floor a signed
+    # action's claim is instant while even the position poller — previously
+    # the top spender — waits for refill.
+    await _seed_bucket(pool, clock.now(), available=EXECUTION_RESERVE_WEIGHT)
+    execution = SharedWeightBudget(pool, clock)
+    positions = SharedWeightBudget(pool, clock, reserve=EXECUTION_RESERVE_WEIGHT)
+    await execution.spend(2)  # a batch of up to 79 orders costs ≤ 2
+    assert clock.slept == []
+    await positions.spend(POSITIONS_WEIGHT)
+    assert sum(clock.slept) >= (2 + POSITIONS_WEIGHT) / REFILL_PER_SECOND
+
+
+async def test_ingests_largest_spend_still_fits_under_the_stacked_reserves(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    # The capacity check in budget.py's EXECUTION_RESERVE_WEIGHT note: with
+    # both floors stacked, ingest's heaviest single spend (a fills fetch)
+    # must remain grantable — otherwise spend() raises ValueError forever.
+    ingest = SharedWeightBudget(
+        pool, clock, reserve=EXECUTION_RESERVE_WEIGHT + STREAM_RESERVE_WEIGHT
+    )
+    await ingest.spend(FILLS_WEIGHT)

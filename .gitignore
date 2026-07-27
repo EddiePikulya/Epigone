@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 .env
+
+# Throwaway TESTNET key material (issue #133 harness) — never committed.
+.testnet-keys.json

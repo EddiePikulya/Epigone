@@ -58,6 +58,18 @@ BURST_WEIGHT = 240
 # low bucket blocks ingest entirely, so refill accrues to the stream first.
 STREAM_RESERVE_WEIGHT = 120
 
+# The execution lane's floor (issue #133, research open-Q 7): every OTHER
+# spender leaves this much in the bucket, so a signed order never queues
+# behind backfill or polling. Exchange actions are cheap against the IP
+# budget — 1 + floor(batch/40) weight each (research §5) — so 30 covers a
+# ~25-action burst instantly; the address-based budget (1 req/1 USDC traded)
+# is the exchange's own per-master ledger, not modeled here. Priority order
+# is now: execution (reserve 0) > position polls (EXECUTION_RESERVE_WEIGHT)
+# > order polls = ingest (EXECUTION_RESERVE_WEIGHT + STREAM_RESERVE_WEIGHT).
+# Capacity check: ingest's floor becomes 150, its largest single spend
+# (FILLS_WEIGHT 40) still fits under BURST_WEIGHT − 150 = 90.
+EXECUTION_RESERVE_WEIGHT = 30
+
 # The send gate's pace (issue #41): a grant of weight w reserves the next
 # w / SMOOTHING_WEIGHT_PER_SECOND seconds, so instantaneous spend never exceeds
 # this rate. 20/s is the per-IP cap spread uniformly (1200/60) — never send

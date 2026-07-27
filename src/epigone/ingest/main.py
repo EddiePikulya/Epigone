@@ -19,7 +19,12 @@ from datetime import datetime, timedelta
 import aiohttp
 import asyncpg
 
-from epigone.budget import STREAM_RESERVE_WEIGHT, Budget, SharedWeightBudget
+from epigone.budget import (
+    EXECUTION_RESERVE_WEIGHT,
+    STREAM_RESERVE_WEIGHT,
+    Budget,
+    SharedWeightBudget,
+)
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
 from epigone.db import create_pool, migrate
@@ -39,8 +44,11 @@ async def run(
     pool = await create_pool(pool_url)
     await migrate(pool)
     # Ingest is the background spender: it draws the shared budget (issue #28)
-    # only above the stream's reserve, so Position Alerts always poll first.
-    budget = SharedWeightBudget(pool, clock, reserve=STREAM_RESERVE_WEIGHT)
+    # only above the stream's AND the execution lane's reserves (issue #133),
+    # so signed orders and Position Alerts always go first.
+    budget = SharedWeightBudget(
+        pool, clock, reserve=EXECUTION_RESERVE_WEIGHT + STREAM_RESERVE_WEIGHT
+    )
     async with aiohttp.ClientSession() as session:
         gateway = HttpHyperliquidGateway(session, clock)
         await ingest_loop(pool, gateway, budget, clock, seed_interval, chunk_size=chunk_size)

@@ -7,6 +7,7 @@ dependencies = [
     "aiogram>=3.15",
     "aiohttp>=3.9",
     "asyncpg>=0.30",
+    "hyperliquid-python-sdk>=0.24.0",
 ]
 
 [dependency-groups]
@@ -36,6 +37,10 @@ packages = ["epigone"]
 
 [[tool.mypy.overrides]]
 module = "asyncpg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "hyperliquid.*"
 ignore_missing_imports = true
 
 [tool.ruff]
