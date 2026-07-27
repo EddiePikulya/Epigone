@@ -49,7 +49,7 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
             "fine_open_episodes, tracks, unfollows, position_poll_state, position_snapshots, "
             "position_alerts, order_poll_state, order_snapshots, order_alerts, "
             "first_data_notices, criteria, criteria_preset_dismissals, "
-            "rate_budget, rate_limit_events, allowlist"
+            "rate_budget, rate_limit_events, allowlist, agent_keys"
         )
     yield pool
     await pool.close()

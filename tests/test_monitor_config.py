@@ -7,6 +7,7 @@ from datetime import timedelta
 import pytest
 
 from epigone.monitor.config import (
+    DEFAULT_AGENT_KEY_WARN_DAYS,
     DEFAULT_DISK_PERCENT,
     DEFAULT_HEARTBEAT_HOUR,
     DEFAULT_INTERVAL_MINUTES,
@@ -30,6 +31,7 @@ HEALTHCHECK_VARS = [
     "HEALTHCHECK_STARVATION_MIN_DUE",
     "HEALTHCHECK_DISK_PERCENT",
     "HEALTHCHECK_DISK_PATH",
+    "HEALTHCHECK_AGENT_KEY_WARN_DAYS",
 ]
 
 
@@ -50,6 +52,7 @@ def test_defaults_when_unset() -> None:
         minutes=DEFAULT_STARVATION_WINDOW_MINUTES
     )
     assert config.thresholds.starvation_min_due == DEFAULT_STARVATION_MIN_DUE
+    assert config.thresholds.agent_key_warn == timedelta(days=DEFAULT_AGENT_KEY_WARN_DAYS)
 
 
 def test_coarse_staleness_defaults_to_twice_the_seed_interval() -> None:
@@ -66,6 +69,7 @@ def test_valid_overrides_are_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEALTHCHECK_RATE_MAX_EVENTS", "10")
     monkeypatch.setenv("HEALTHCHECK_STARVATION_WINDOW_MINUTES", "60")
     monkeypatch.setenv("HEALTHCHECK_STARVATION_MIN_DUE", "100")
+    monkeypatch.setenv("HEALTHCHECK_AGENT_KEY_WARN_DAYS", "30")
     config = MonitorConfig.from_env(seed_interval_minutes=60)
     assert config.interval == timedelta(minutes=5)
     assert config.heartbeat_hour == 0  # midnight is valid
@@ -75,6 +79,7 @@ def test_valid_overrides_are_honoured(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.thresholds.rate_max_events == 10
     assert config.thresholds.starvation_window == timedelta(minutes=60)
     assert config.thresholds.starvation_min_due == 100
+    assert config.thresholds.agent_key_warn == timedelta(days=30)
 
 
 @pytest.mark.parametrize("bad", ["nonsense", "", "0", "-5"])

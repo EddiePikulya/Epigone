@@ -46,6 +46,7 @@ def _config() -> MonitorConfig:
             disk_percent=85,
             starvation_window=timedelta(minutes=45),
             starvation_min_due=50,
+            agent_key_warn=timedelta(days=14),
         ),
         disk_path="/",
     )
