@@ -10,16 +10,22 @@ the SDK's own recover helper.
 
 429s back off and retry like the read gateway (issue #28) — but here the
 retry re-posts the SAME signed payload: nonces are single-use per signer, so
-a replay can never execute twice, making the retry safe by construction. A
-persistent streak escapes as ExecutionRateLimitedError. Timeouts and other
-transport failures raise ExecutionError WITHOUT retry — a lost response is
-ambiguous (the action may have executed) and only the caller, via the read
-gateway, can reconcile that.
+a replay can never execute TWICE (chain-enforced). Whether a 429'd attempt
+was ever processed at all is UNVERIFIED (funded-testnet probe pending), so
+an invalid-nonce reject on a retried submission — the exact signature a
+processed-then-retried action would leave — surfaces as
+AmbiguousExecutionError, never as a clean rejection. A persistent 429
+streak escapes as ExecutionRateLimitedError; timeouts raise
+AmbiguousExecutionError WITHOUT retry — in every ambiguous case only the
+caller, via the read gateway, can reconcile.
 
-Base URL is constructor-injected and testnet-first: Phase A1 points at
-TESTNET_EXCHANGE_URL; the signature's phantom-agent `source` field ("a"
-mainnet / "b" testnet) derives from the URL exactly as the SDK derives it,
-so a testnet gateway cannot produce a mainnet-valid signature.
+Base URL is constructor-injected and testnet-only by construction: Phase
+A1–A4 points at TESTNET_EXCHANGE_URL, and a MAINNET URL is refused at
+construction (MainnetNotEnabledError) unless the A5 safety layer passes its
+explicit allow_mainnet capability. The signature's phantom-agent `source`
+field ("a" mainnet / "b" testnet) derives from the URL exactly as the SDK
+derives it, so a testnet gateway cannot produce a mainnet-valid signature
+either.
 """
 
 import logging
@@ -37,6 +43,7 @@ from epigone.clock import Clock
 from epigone.gateway.backoff import RATE_LIMIT_MAX_TRIES, backoff_delay, parse_retry_after
 from epigone.gateway.execution import (
     ActionRejectedError,
+    AmbiguousExecutionError,
     BuilderFee,
     CancelOk,
     CancelRejected,
@@ -46,6 +53,7 @@ from epigone.gateway.execution import (
     ExecutionError,
     ExecutionRateLimitedError,
     Grouping,
+    MainnetNotEnabledError,
     MasterKeySignerError,
     ModifySpec,
     NonceSource,
@@ -54,6 +62,7 @@ from epigone.gateway.execution import (
     OrderResting,
     OrderResult,
     OrderSpec,
+    RejectReason,
     Signer,
     classify_reject,
     decimal_to_wire,
@@ -90,8 +99,19 @@ class HttpExecutionGateway:
         signer: Signer,
         master_address: str,
         exchange_url: str = TESTNET_EXCHANGE_URL,
+        allow_mainnet: bool = False,
         rng: Callable[[], float] = random.random,
     ) -> None:
+        # The A5 gate (PR #140 review): mainnet is unreachable BY
+        # CONSTRUCTION until the safety layer exists. Nothing in the
+        # codebase passes allow_mainnet=True; A5 (risk policy v0 — caps,
+        # allowlist, kill switch) is the slice that gets to wire it.
+        if exchange_url == MAINNET_EXCHANGE_URL and not allow_mainnet:
+            raise MainnetNotEnabledError(
+                "mainnet execution is gated behind the A5 safety layer "
+                "(ADR-0005): pass allow_mainnet=True only from A5's wiring, "
+                "never before the risk policy exists"
+            )
         if signer.address.lower() == master_address.lower():
             raise MasterKeySignerError(
                 f"signer {signer.address} IS the master account: the master key "
@@ -169,7 +189,12 @@ class HttpExecutionGateway:
     async def _submit(self, action: dict[str, Any], *, batch_len: int) -> Any:
         """Spend the execution lane's weight, sign once, post (with same-
         payload 429 retry), and unwrap the response envelope to its `data`.
-        Raises ActionRejectedError on {"status": "err"}."""
+        Raises ActionRejectedError on {"status": "err"} — EXCEPT an
+        invalid-nonce reject on a RETRIED submission, which is ambiguous
+        (PR #140 review): 429-means-not-processed is unverified, so if the
+        429'd attempt WAS processed, the same-nonce retry answers "Invalid
+        nonce" for an action that is live. That case must never read as a
+        clean rejection."""
         await self._budget.spend(exchange_action_weight(batch_len))
         nonce = self._nonces.next()
         signature = sign_l1_action(self._signer, action, None, nonce, None, self._is_mainnet)
@@ -180,10 +205,23 @@ class HttpExecutionGateway:
             "vaultAddress": None,
             "expiresAfter": None,
         }
-        body = await self._post(payload)
-        return _unwrap(body)
+        body, retried = await self._post(payload)
+        try:
+            return _unwrap(body)
+        except ActionRejectedError as exc:
+            if retried and exc.reason is RejectReason.INVALID_NONCE:
+                raise AmbiguousExecutionError(
+                    "invalid-nonce reject after a 429 retry: the 429'd attempt "
+                    "may have executed under this nonce — reconcile via the "
+                    f"read gateway before re-issuing (exchange said: {exc.message!r})"
+                ) from exc
+            raise
 
-    async def _post(self, payload: dict[str, Any]) -> Any:
+    async def _post(self, payload: dict[str, Any]) -> tuple[Any, bool]:
+        """POST the signed payload, retrying 429s with the IDENTICAL body
+        (single-use nonces make the replay at-most-once). Returns (json body,
+        whether any retry happened) — the retry flag is what lets _submit
+        treat a subsequent invalid-nonce reject as ambiguous."""
         for attempt in range(RATE_LIMIT_MAX_TRIES):
             try:
                 async with self._session.post(
@@ -191,17 +229,16 @@ class HttpExecutionGateway:
                 ) as response:
                     if response.status != 429:
                         response.raise_for_status()
-                        return await response.json()
+                        return await response.json(), attempt > 0
                     delay = parse_retry_after(response.headers.get("Retry-After"))
                     if delay is None:
                         delay = backoff_delay(attempt, self._rng)
             except TimeoutError as exc:
-                # Ambiguous by nature: the action may have executed and the
-                # response died in flight. No retry — the caller reconciles
-                # through the read gateway (module docstring).
-                raise ExecutionError(
-                    f"exchange request timed out (AMBIGUOUS — the action may have "
-                    f"executed; reconcile before re-issuing): {exc!r}"
+                # The response died in flight; the action may have executed.
+                # No retry — the caller reconciles (module docstring).
+                raise AmbiguousExecutionError(
+                    f"exchange request timed out — the action may have executed; "
+                    f"reconcile before re-issuing: {exc!r}"
                 ) from exc
             except aiohttp.ClientError as exc:
                 raise ExecutionError(f"exchange request failed: {exc}") from exc
@@ -214,7 +251,9 @@ class HttpExecutionGateway:
                 )
                 await self._clock.sleep(delay)
         raise ExecutionRateLimitedError(
-            f"still 429 from {self._exchange_url} after {RATE_LIMIT_MAX_TRIES} tries"
+            f"still 429 from {self._exchange_url} after {RATE_LIMIT_MAX_TRIES} tries "
+            "(whether any 429'd attempt was processed is unverified — reconcile "
+            "before re-issuing non-idempotent work)"
         )
 
 def _order_wire(order: OrderSpec) -> dict[str, Any]:

@@ -37,8 +37,10 @@ be unused, and sit inside (T − 2 days, T + 1 day). NonceSource implements the
 docs' own advice — an atomic per-signer ms-timestamp counter — and each
 HttpExecutionGateway instance owns one, so the rule is: ONE gateway instance
 per signer per process (matching "one API wallet per trading process").
-A nonce is single-use on-chain, which is what makes the HTTP impl's 429
-retry safe: re-posting the same signed payload can never execute twice.
+A nonce is single-use on-chain, which bounds the HTTP impl's 429 retry:
+re-posting the same signed payload can never execute TWICE (chain-enforced).
+Whether it executed ONCE before the 429 is the part the chain cannot tell us
+— see AmbiguousExecutionError and ExecutionRateLimitedError.
 
 == TESTNET FINDINGS (recorded 2026-07-27, api.hyperliquid-testnet.xyz) ==
 
@@ -72,6 +74,10 @@ harness detects funding and completes all three probes on re-run:
    funded re-run; the zero-volume submission path is already wired.
 3. Gray-zone L1 actions from an agent signer (open Q3): pending funded
    re-run; master-vs-agent control methodology is already wired.
+4. 429 semantics (raised by PR #140 review): whether a 429'd /exchange
+   submission is ALWAYS rejected before processing — assumed nowhere,
+   treated as ambiguous (AmbiguousExecutionError) until a funded run can
+   drive the live limiter and observe.
 """
 
 import re
@@ -100,23 +106,41 @@ class Signer(Protocol):
 
 
 class ExecutionError(Exception):
-    """An exchange write failed in transport (network, HTTP, malformed payload).
+    """An exchange write failed in transport (network, HTTP, malformed payload)."""
 
-    A TIMEOUT here is ambiguous: the action may or may not have executed.
-    Callers must reconcile through the read gateway (open orders / fills)
-    before re-issuing anything that is not idempotent — never blind-retry."""
+
+class AmbiguousExecutionError(ExecutionError):
+    """The action MAY have executed and the gateway cannot know (issue #133
+    review). Raised for a timeout (the response died in flight) and for an
+    invalid-nonce reject that follows a 429 retry (if — UNVERIFIED, see
+    ExecutionRateLimitedError — a 429'd attempt can ever have been processed,
+    the same-nonce retry would answer "Invalid nonce" for an order that is
+    LIVE). Callers MUST reconcile through the read gateway (open orders /
+    fills) before re-issuing anything that is not idempotent — treating this
+    as a clean rejection is the silent-live-order hazard in money code."""
 
 
 class ExecutionRateLimitedError(ExecutionError):
     """The exchange kept answering 429 after backoff-and-retry (the issue #28
-    convention). Pacing, not an outage — and never ambiguous: a 429'd action
-    was rejected before processing, so nothing executed."""
+    convention). Pacing, not an outage. Whether a 429'd action is ALWAYS
+    rejected before processing is UNVERIFIED against the live limiter —
+    confirm on funded testnet (#133 probe, pending); until then assume a
+    sustained-429 submission is ambiguous and reconcile via the read gateway
+    before re-issuing non-idempotent work."""
 
 
 class MasterKeySignerError(ValueError):
     """The signer's address equals the master account it would trade — a
     master key on the execution path, which ADR-0005 forbids Epigone's
     servers to ever hold. Raised at construction so the path cannot exist."""
+
+
+class MainnetNotEnabledError(ValueError):
+    """The gateway was pointed at the MAINNET exchange without the explicit
+    A5 capability. Phase A1–A4 is testnet-only BY CONSTRUCTION: nothing in
+    the codebase passes allow_mainnet=True until A5 (risk policy v0 — caps,
+    allowlist, kill switch) wires it around the executor, so a mainnet order
+    is unreachable before the safety layer exists. Raised at construction."""
 
 
 class RejectReason(Enum):
@@ -172,7 +196,10 @@ _REJECT_PATTERNS: tuple[tuple[str, RejectReason], ...] = (
     ("open interest", RejectReason.OPEN_INTEREST_CAP),
     ("never placed", RejectReason.MISSING_ORDER),
     ("already canceled", RejectReason.MISSING_ORDER),
-    ("too many", RejectReason.RATE_LIMITED),
+    # "too many REQUESTS" specifically — a bare "too many" would misread a
+    # "Too many open orders" cap (research §5's 1,000-order limit) as a
+    # throttle; an order-count cap has no arm yet and classifies UNKNOWN.
+    ("too many requests", RejectReason.RATE_LIMITED),
     ("rate limit", RejectReason.RATE_LIMITED),
 )
 
@@ -384,7 +411,17 @@ class NonceSource:
     """Per-signer nonces: an atomic ms-timestamp counter (the docs' own
     concurrency advice, research §2). Monotonic even when calls land in the
     same millisecond or the clock steps backwards; asyncio's single thread
-    makes next() atomic (no await inside)."""
+    makes next() atomic (no await inside).
+
+    IN-MEMORY, single-process by contract (one gateway instance per signer
+    per process — module docstring): a >1-action/ms burst runs the counter
+    ahead of the wall clock, so a crash-restart inside that window can
+    re-issue an already-used nonce. The exchange rejects the reuse
+    ("Invalid nonce" → RejectReason.INVALID_NONCE) and the counter jumps
+    past the clock on the next call, so the failure is a typed, transient,
+    self-correcting reject — never a double-execution (nonces are
+    single-use on-chain). Persisting the last-issued nonce is B4's
+    multi-account concern; not worth a Postgres seam for one operator lane."""
 
     def __init__(self, clock: Clock) -> None:
         self._clock = clock
@@ -413,10 +450,13 @@ class ExecutionGateway(Protocol):
       instance, one signer, one process lane.
     - A whole-action pre-validation failure raises ActionRejectedError
       (nothing executed); per-item verdicts come back as typed results.
-    - Transport failures raise ExecutionError; timeouts are AMBIGUOUS (the
-      action may have executed) — reconcile via the read gateway before
-      re-issuing. Sustained 429 raises ExecutionRateLimitedError (never
-      ambiguous: a 429'd action was rejected before processing).
+    - Transport failures raise ExecutionError. AMBIGUOUS outcomes — a
+      timeout, or an invalid-nonce reject after a 429 retry — raise
+      AmbiguousExecutionError instead: the action MAY have executed, and the
+      caller must reconcile via the read gateway before re-issuing.
+      Sustained 429 raises ExecutionRateLimitedError; whether a 429'd
+      action was ever processed is UNVERIFIED (funded-testnet probe
+      pending), so treat that as ambiguous too.
 
     Two deliberate deltas from issue #133's action list, recorded here per
     the honest-deviation convention:

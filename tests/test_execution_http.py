@@ -25,6 +25,7 @@ from hyperliquid.utils.signing import recover_agent_or_user_from_l1_action
 import epigone.gateway.execution_http as execution_http
 from epigone.gateway.execution import (
     ActionRejectedError,
+    AmbiguousExecutionError,
     BuilderFee,
     CancelOk,
     CancelRejected,
@@ -33,6 +34,7 @@ from epigone.gateway.execution import (
     ExecutionError,
     ExecutionRateLimitedError,
     Grouping,
+    MainnetNotEnabledError,
     MasterKeySignerError,
     ModifySpec,
     OrderFilled,
@@ -43,7 +45,11 @@ from epigone.gateway.execution import (
     TpSl,
     Trigger,
 )
-from epigone.gateway.execution_http import RATE_LIMIT_MAX_TRIES, HttpExecutionGateway
+from epigone.gateway.execution_http import (
+    MAINNET_EXCHANGE_URL,
+    RATE_LIMIT_MAX_TRIES,
+    HttpExecutionGateway,
+)
 from tests.support.clock import FakeClock
 
 # Ephemeral test-only key material: a fixed private key for the agent signer
@@ -165,6 +171,30 @@ def test_a_signer_that_is_the_master_is_refused_at_construction() -> None:
             signer=AGENT,
             master_address=AGENT.address.upper().replace("0X", "0x"),
         )
+
+
+def test_a_mainnet_url_is_refused_until_a5_passes_the_capability() -> None:
+    # The A5 gate (PR #140 review): "testnet-only pre-A5" is construction,
+    # not convention — nothing in the codebase passes allow_mainnet=True.
+    with pytest.raises(MainnetNotEnabledError):
+        HttpExecutionGateway(
+            None,  # type: ignore[arg-type]  # refused before any use
+            FakeClock(),
+            RecordingBudget(),
+            signer=AGENT,
+            master_address=MASTER,
+            exchange_url=MAINNET_EXCHANGE_URL,
+        )
+    # The capability itself works — A5 is the only intended caller.
+    HttpExecutionGateway(
+        None,  # type: ignore[arg-type]  # construction only
+        FakeClock(),
+        RecordingBudget(),
+        signer=AGENT,
+        master_address=MASTER,
+        exchange_url=MAINNET_EXCHANGE_URL,
+        allow_mainnet=True,
+    )
 
 
 # --- wire shapes and signatures ----------------------------------------------
@@ -393,19 +423,53 @@ async def test_a_429_streak_escapes_as_rate_limited(replaying: Any) -> None:
     assert len(h.received) == RATE_LIMIT_MAX_TRIES
 
 
-async def test_a_timeout_raises_an_ambiguity_marked_error_without_retry(
+async def test_a_timeout_raises_the_typed_ambiguous_error_without_retry(
     replaying: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # A timeout is the one transport failure where the action may have
-    # executed — it must surface as ambiguous and must NOT be replayed
-    # blindly by the gateway.
-    monkeypatch.setattr(
-        execution_http, "REQUEST_TIMEOUT", aiohttp.ClientTimeout(total=0.05)
-    )
+    # A timeout means the action may have executed — it must surface as the
+    # typed ambiguous error and must NOT be replayed blindly by the gateway.
+    monkeypatch.setattr(execution_http, "REQUEST_TIMEOUT", aiohttp.ClientTimeout(total=0.05))
     h = await replaying(OK_DEFAULT, handler_sleep=0.5)
-    with pytest.raises(ExecutionError, match="AMBIGUOUS"):
+    with pytest.raises(AmbiguousExecutionError):
         await h.gateway.schedule_cancel(None)
     assert len(h.received) == 1
+
+
+async def test_an_invalid_nonce_after_a_429_retry_is_ambiguous_not_rejected(
+    replaying: Any,
+) -> None:
+    # The silent-live-order hazard (PR #140 review): if the 429'd attempt
+    # WAS processed (429-means-not-processed is unverified), the same-nonce
+    # retry answers "Invalid nonce" while the order is live. That sequence
+    # must surface as reconcile-required, never as a clean rejection.
+    h = await replaying(429, {"status": "err", "response": "Invalid nonce"})
+    with pytest.raises(AmbiguousExecutionError):
+        await h.gateway.schedule_cancel(None)
+    assert len(h.received) == 2
+
+
+async def test_an_invalid_nonce_without_any_retry_stays_a_clean_rejection(
+    replaying: Any,
+) -> None:
+    # No 429 happened, so nothing earlier could have executed under this
+    # nonce: the reject is unambiguous and keeps its classified reason.
+    h = await replaying({"status": "err", "response": "Invalid nonce"})
+    with pytest.raises(ActionRejectedError) as excinfo:
+        await h.gateway.schedule_cancel(None)
+    assert not isinstance(excinfo.value, AmbiguousExecutionError)
+    assert excinfo.value.reason is RejectReason.INVALID_NONCE
+
+
+async def test_a_non_nonce_rejection_after_a_429_retry_stays_a_clean_rejection(
+    replaying: Any,
+) -> None:
+    # Ambiguity is specific to the invalid-nonce signature a processed-then-
+    # retried action would leave; an ordinary reject after a 429 is still a
+    # reject (the margin check failing twice says nothing executed).
+    h = await replaying(429, {"status": "err", "response": "Insufficient margin to place order."})
+    with pytest.raises(ActionRejectedError) as excinfo:
+        await h.gateway.schedule_cancel(None)
+    assert excinfo.value.reason is RejectReason.INSUFFICIENT_MARGIN
 
 
 async def test_a_connection_failure_raises_execution_error(replaying: Any) -> None:
