@@ -59,7 +59,7 @@ API wallets, error responses, rate limits) and the official
 
 | Scheme | Action types | Who may sign |
 | --- | --- | --- |
-| **L1 actions** — action hash = keccak(msgpack(action) ‖ nonce ‖ vault flag), wrapped as EIP-712 over a phantom `Agent(string source, bytes32 connectionId)` struct | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `twapOrder`, `twapCancel`, `vaultTransfer`, `noop`, `reserveRequestWeight` (+ `setReferrer`, `createSubAccount`, `subAccountTransfer` — see gray zone below) | master **or an approved agent key** |
+| **L1 actions** — action hash = keccak(msgpack(action) ‖ nonce ‖ vault flag), wrapped as EIP-712 over a phantom `Agent(string source, bytes32 connectionId)` struct | `order`, `cancel`, `cancelByCloid`, `modify`, `batchModify`, `updateLeverage`, `updateIsolatedMargin`, `scheduleCancel`, `twapOrder`, `twapCancel`, `noop`, `reserveRequestWeight` (+ `vaultTransfer`, `setReferrer`, `createSubAccount`, `subAccountTransfer` — see gray zone below) | master **or an approved agent key** |
 | **User-signed actions** — human-readable EIP-712 (domain `HyperliquidSignTransaction`) | `usdSend`, `spotSend`, `withdraw3`, `usdClassTransfer`, `sendAsset`, `approveAgent`, `approveBuilderFee`, `convertToMultiSigUser`, `tokenDelegate`, … | **master wallet only** |
 
 Everything that moves funds out or changes who may sign is user-signed —
@@ -69,12 +69,18 @@ main wallet, not an agent/API wallet"* **[V]** — and structurally, a
 user-signed payload recovers the signer as the acting account, so an agent's
 signature resolves to the wrong (empty) account **[I, structurally certain]**.
 
-Gray zone: `subAccountTransfer` / `createSubAccount` / `setReferrer` are
-L1-signed in the SDK, and the docs don't state whether the chain accepts them
-from an agent signer. Treat them as master-only in threat modeling until a
-testnet probe says otherwise. One deliberate exception exists:
-`agentSendAsset`, the single agent-signable transfer, restricted to
-*self-directed* moves ("Destination must match the source address"). **[V]**
+Gray zone: `vaultTransfer` / `subAccountTransfer` / `createSubAccount` /
+`setReferrer` are L1-signed in the SDK, and the docs don't state whether the
+chain accepts them from an agent signer — treat them as agent-signable in
+threat modeling until a testnet probe says otherwise (open question 3). Note
+none of them is an *external* exit: `vaultTransfer` and `subAccountTransfer`
+move equity between the master's own perps account and its vaults/subaccounts
+(no destination address parameter to divert funds to), so even in the worst
+case they widen the pool exposed to bad trading rather than open a
+withdrawal path. The one *documented* agent-signable transfer is
+`agentSendAsset`, restricted to *self-directed* moves ("Destination must
+match the source address"). **[V for the actions' shapes / I for chain
+acceptance]**
 
 ### Nonces
 
@@ -136,7 +142,8 @@ What the spike set out to verify, verified:
 - **CANNOT:** withdraw, transfer (`withdraw3`, `usdSend`, `spotSend`,
   `usdClassTransfer`, `sendAsset`), approve another agent, approve a builder
   fee, or convert the account to multi-sig — all user-signed, master-only.
-  **[V]**
+  **[V]** (For the gray-zone L1 actions — internal vault/subaccount moves —
+  see §2; assume agent-signable until probed.)
 - **Approval:** master signs `approveAgent` (user-signed) with agent address,
   optional name, optional `valid_until` — **max 180 days**. Docs state 1
   unnamed + 3 named (+2/subaccount); live probes contradict the formula (§1).
@@ -233,7 +240,7 @@ approval rides the same one-time master-wallet signing ceremony as
 
 The question: who holds the **master** key (funds + approval authority)? The
 agent key is settled — Epigone generates and holds it server-side, encrypted;
-it is the bounded, revocable credential. Four candidate answers for the
+it is the bounded, revocable credential. Five candidate answers for the
 master, weighed honestly:
 
 ### 6.1 Turnkey — TEE infrastructure (what Bullpen builds on)
@@ -264,11 +271,13 @@ master, weighed honestly:
   productized path is a Telegram **Mini App** (`telegram-cloud-storage-stamper`
   + demo repo) storing the user's session key in Telegram Cloud Storage;
   reachable only from Mini App JS, not from a server-side bot. **[V]**
-- **Pricing:** free tier 1,000 wallets / 25 sigs/mo; $0.10/sig
+- **Pricing/latency:** free tier 1,000 wallets / 25 sigs/mo; $0.10/sig
   pay-as-you-go; Pro $99/mo at $0.05/sig; Enterprise to $0.0015 with SLAs.
-  Rate cap: hard 10 RPS per sub-org. With the agent architecture we sign via
-  Turnkey only at onboarding (approveAgent + approveBuilderFee) and for
-  withdrawals — cost and RPS are negligible. **[V]**
+  Rate cap: hard 10 RPS per sub-org; marketing claims 50–100ms signing
+  latency (not independently benchmarked **[S]**). With the agent
+  architecture we sign via Turnkey only at onboarding (approveAgent +
+  approveBuilderFee) and for withdrawals — cost, latency, and RPS are all
+  negligible off the hot path. **[V]**
 - **Ecosystem proof:** Turnkey's Hyperliquid blog lists Dexari, Hyperbot,
   pvp.trade, Kinetiq, Hyperbeat, Liminal, SuperX, Slash.trade; Bullpen's own
   FAQ confirms "non-custodial Turnkey wallet … export your private key at any
@@ -308,7 +317,19 @@ master, weighed honestly:
   poor fit for a server-automated bot. Cheapest tiers ($69/mo growth) don't
   compensate. **[V/I]**
 
-### 6.4 Self-managed encrypted keys — the DIY bar
+### 6.4 Bring-your-own-wallet — the zero-provider answer
+
+The user's existing wallet (MetaMask/Rabby/hardware) *is* the master: they
+sign `approveAgent` + `approveBuilderFee` once on a minimal Epigone signing
+page and we never see the key at all. Strongest custody story of the five,
+zero vendor dependency, zero marginal cost — and the operator's own Phase A
+setup is exactly this with the ceremony done by hand on app.hyperliquid.xyz.
+Its limit is reach, not safety: it presumes an existing wallet and existing
+funds, which excludes the non-crypto-native user #127 centers. Funnel detail
+in §7(a); it survives as a permanent tier (Phase B), not the end state.
+**[I from V facts]**
+
+### 6.5 Self-managed encrypted keys — the DIY bar
 
 A competent small-operator design (KMS envelope encryption, per-user DEKs,
 decrypt only in-process) defends against DB dumps, stolen backups, and casual
@@ -336,7 +357,7 @@ Funding facts **[V unless noted]**:
   Privy bundles Meld/MoonPay/Coinbase + bank rails in its funding modal
   **[V]**; a direct in-app HL fiat onramp (Swapped.com) is in testing **[S]**.
 
-The three funnels, friction-marked (★ = observed drop-off point):
+The three funnels, friction-marked (★ = likely drop-off point **[I]**):
 
 | | (a) Bring-your-own-wallet | (b) Embedded wallet + agent | (c) Custodial server key |
 | --- | --- | --- | --- |
@@ -379,6 +400,19 @@ Threat-model table for the recommended architecture (ADR-0005):
 | Key provider (Turnkey/Privy) | master keys at risk *if* TEE+policy model fails — the residual trust ask | provider attestation/audits; policy pinning approveAgent to our agent address; withdrawal-destination allowlist; user key export |
 | User device (Telegram account) | attacker can command trading via our bot as the user | Epigone caps; withdrawal destinations pinned to user's own addresses; provider re-auth for sensitive ops |
 | Operator (us) turning malicious | same as server compromise — trading, not theft | the honest pitch: verifiable non-custody (`userRole`/`extraAgents` are publicly checkable), user-revocable outside our system |
+
+What "feels safe" requires in UX terms, mapped to primitives: (1)
+**revocation the user can do outside our system** — the Hyperliquid API page
+(§3), which Epigone should deep-link rather than wrap; (2) **visible
+non-withdrawal guarantees** — a "verify our permissions" surface that shows
+the live `extraAgents` entry (name, expiry) and explains that withdrawals are
+master-signed only, checkable by anyone against public endpoints; (3)
+**position/PnL transparency** — free reuse: Epigone's read pipeline already
+renders positions, PnL, and recent trades for arbitrary addresses (the
+tracking product), so the user's own account gets the same views plus an
+execution audit trail ("what Epigone did and why", the A3 table). None of
+this needs new data sources — it is product surface over primitives verified
+above. **[I from V facts]**
 
 ## 9. Regulatory flags (noted, not resolved — not legal advice)
 
@@ -423,25 +457,25 @@ after the regulatory gate; C adds normies only after B proves the engine.
 | A1 | **ExecutionGateway** (write-side twin of the read gateway): order/cancel/modify/TP-SL/leverage/scheduleCancel via the SDK's signing, typed action results, error taxonomy, address-budget accounting; fake for tests; **testnet harness** | — | L | The execution seam, testnet-proven (incl. probing the open questions: agent caps, scheduleCancel gate) |
 | A2 | **Agent-key custody v0**: operator approves a named agent from their own wallet (HL UI); encrypted keystore (KMS/age envelope) for the agent key; rotation runbook for the 180-day expiry | — | S | Master key never touches the server, from day one |
 | A3 | **Safety layer v0**: scheduleCancel heartbeat, `/kill` command (cancel-all + halt), append-only execution audit table, position-unwind-on-halt policy | A1 | M | Dead-man's switch + audit trail before the first real order |
-| A4 | **Operator copy executor**: consume the existing stream alerts for followed Traders → sized copy orders (fixed sizing config), open/scale/close mirroring, TP/SL attachment | A1–A3 | L | The actual product loop, single-user |
+| A4 | **Operator copy executor**: consume the existing Position Alerts for tracked Traders → sized copy orders (fixed sizing config), open/scale/close mirroring, TP/SL attachment | A1–A3 | L | The actual product loop, single-user |
 | A5 | **Risk policy v0**: per-coin allowlist (liquidity floor), max position notional, max leverage, max daily loss halt — enforced in the executor, because (verified) no protocol or provider layer can | A4 | M | The only place per-order limits can exist, built as a first-class module |
 
 **Phase B — external crypto-native users (BYOW), behind the regulatory gate:**
 
-| # | Slice | Depends | Size |
-| --- | --- | --- | --- |
-| B1 | Regulatory gate: counsel review of §9, geofencing (US + sanctioned), ToS | A | — |
-| B2 | Per-user agent onboarding: signing page for `approveAgent` + `approveBuilderFee` (user's own wallet), per-user agent isolation, `userRole`-based verification UX | A | M |
-| B3 | Builder-code revenue plumbing: builder field on copied orders, accrual tracking, claim runbook | B2 | S |
-| B4 | Multi-account executor: per-user nonce/signer separation, per-user risk policies, per-user kill/revocation status monitoring (detect user-side revocation gracefully) | B2 | L |
+| # | Slice | Depends | Size | Delivers |
+| --- | --- | --- | --- | --- |
+| B1 | Regulatory gate: counsel review of §9, geofencing (US + sanctioned), ToS | A | — | Legal go/no-go before any external account |
+| B2 | Per-user agent onboarding: signing page for `approveAgent` + `approveBuilderFee` (user's own wallet), per-user agent isolation, `userRole`-based verification UX | A | M | Crypto-native users, custody-free |
+| B3 | Builder-code revenue plumbing: builder field on copied orders, accrual tracking, claim runbook | B2 | S | Revenue on copied flow |
+| B4 | Multi-account executor: per-user nonce/signer separation, per-user risk policies, per-user kill/revocation status monitoring (detect user-side revocation gracefully) | B2 | L | Execution engine at N users |
 
 **Phase C — normie onboarding (embedded wallets):**
 
-| # | Slice | Depends | Size |
-| --- | --- | --- | --- |
-| C1 | Provider selection spike: hands-on Turnkey vs Privy eval (the thing this spike could not do without signups) — policy pinning of approveAgent, Mini App auth flow, export UX | B | M |
-| C2 | Telegram Mini App onboarding: one-tap wallet creation, bundled onramp, consent ceremony (agent + builder fee), key-export offer | C1 | L |
-| C3 | Withdrawal-destination allowlist + user transparency surfaces (positions/PnL views, "verify our permissions yourself" deep links) | C2 | M |
+| # | Slice | Depends | Size | Delivers |
+| --- | --- | --- | --- | --- |
+| C1 | Provider selection spike: hands-on Turnkey vs Privy eval (the thing this spike could not do without signups) — policy pinning of approveAgent, Mini App auth flow, export UX | B | M | Vendor decision on evidence |
+| C2 | Telegram Mini App onboarding: one-tap wallet creation, bundled onramp, consent ceremony (agent + builder fee), key-export offer | C1 | L | Normie funnel end-to-end |
+| C3 | Withdrawal-destination allowlist + user transparency surfaces (positions/PnL views, "verify our permissions yourself" deep links) | C2 | M | The feels-safe UX layer (§8) |
 
 ## 11. Open questions
 
@@ -450,9 +484,11 @@ after the regulatory gate; C adds normies only after B proves the engine.
 2. **scheduleCancel eligibility:** does the $1M cumulative-volume gate from
    secondary sources exist? (Testnet probe, A1.) Also: policy for flattening
    *positions* (not just orders) on executor death.
-3. **Gray-zone L1 actions:** are `subAccountTransfer`/`createSubAccount`
-   accepted from agent signers? Changes the subaccount-per-strategy design
-   space and the threat model. (Testnet probe, A1.)
+3. **Gray-zone L1 actions:** are `vaultTransfer`/`subAccountTransfer`/
+   `createSubAccount` accepted from agent signers? None opens an external
+   exit (§2), but the answer changes the subaccount-per-strategy design
+   space and how much equity a leaked agent key can expose to bad trading.
+   (Testnet probe, A1.)
 4. **Turnkey vs Privy:** decided hands-on in C1 — key criteria: policy
    pinning of `approveAgent` to our agent address (Turnkey verified-in-docs;
    Privy policy engine is Enterprise-gated), Mini App auth DX, funding modal,

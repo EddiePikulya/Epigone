@@ -39,8 +39,11 @@ The spike's decisive findings (all sourced in the research doc):
    "L1 action" an approved **agent key** may sign; every fund-moving or
    authority-granting action (`withdraw3`, `usdSend`, `approveAgent`,
    `approveBuilderFee`, …) is "user-signed" — **master key only**. Verified
-   in docs and structurally. Live probes show top accounts running 26–103
-   named agents each: this is the exchange's intended automation primitive.
+   in docs for the load-bearing cases (builder-fee approval verbatim),
+   structurally certain for the rest; a handful of gray-zone internal
+   vault/subaccount actions are flagged for testnet probing, none an
+   external exit. Live probes show top accounts running 26–103 named agents
+   each: this is the exchange's intended automation primitive.
 2. **No layer above Epigone can constrain individual orders.** Orders are
    signed over an opaque action hash, so neither Hyperliquid approvals nor
    any provider policy engine (verified for Turnkey, which otherwise parses
@@ -124,10 +127,11 @@ polish.
 
 - **Provider signs every order (no server-held agent key).** Strictly
   dominated: order content is an opaque hash, so per-order signing buys zero
-  policy leverage while adding 50–100ms + per-signature cost + a 10 RPS
-  per-user provider cap on the hot path, and putting an infrastructure vendor
-  in the execution critical path violates the dependency rule's spirit.
-  Rejected on evidence, not taste.
+  policy leverage while adding vendor signing latency (Turnkey markets
+  50–100ms), per-signature cost, and provider rate caps (Turnkey: hard
+  10 RPS per sub-org) to the hot path — and putting an infrastructure
+  vendor in the execution critical path violates the dependency rule's
+  spirit. Rejected on evidence, not taste.
 - **Self-managed encrypted master keys (full custody).** Lowest onboarding
   friction (no Mini App tap), and it is what most incumbent Telegram bots do.
   Rejected: it is the architecture of every major incident in the record, it
