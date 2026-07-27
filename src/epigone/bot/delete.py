@@ -12,9 +12,13 @@ The health monitor shares the bot token but only sends (ADR-0002); its DMs' own
 delete taps arrive here, at the bot process's polling loop, so this one handler
 covers both senders.
 
-Interactive flow prompts (the criteria builder, the min-size prompts) are
-deliberately left without the button — they replace themselves as the flow
-advances, and deleting a mid-flow prompt would only confuse the draft state.
+Armed interactive-flow prompts — the criteria builder, the min-size prompt, and
+the rename prompt — are deliberately left without the button: they replace
+themselves as the flow advances, and deleting a mid-flow prompt would only
+confuse the draft state. Only the still-armed prompt is exempt; once the flow
+ends, its terminal confirmation carries the row like any other message. The
+#130 structural guard (tests/support/telegram.py) pins this — its exemption
+list is the single record of what may ship button-free.
 """
 
 from aiogram import F, Router

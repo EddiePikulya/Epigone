@@ -551,7 +551,10 @@ async def on_positions_unfollow(callback: CallbackQuery, pool: asyncpg.Pool, clo
             # appended after the header, so the existing offsets still hold.
             await callback.message.edit_text(
                 f"{body}\n\n✖️ Unfollowed — you'll no longer get alerts for this trader.",
-                reply_markup=None,
+                # The view's own buttons are gone (there's nothing left to act on),
+                # but the message stays deletable — an in-place edit must never drop
+                # the 🗑 row (#73/#130).
+                reply_markup=with_delete_button(),
                 entities=callback.message.entities,
             )
         except TelegramBadRequest:

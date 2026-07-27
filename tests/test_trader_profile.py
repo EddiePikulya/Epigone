@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 import asyncpg
 from aiogram import Bot, Dispatcher
 
+from epigone.bot.delete import DELETE_CALLBACK
 from tests.support.telegram import RecordingSession, feed_callback, follow_wallet
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
@@ -136,11 +137,15 @@ async def test_unfollow_from_the_positions_view_drops_the_track_in_place(
 
     await feed_callback(dp, bot, f"posunfollow:{WHALE}", user_id=111)
 
-    # the Track is gone, confirmed in place (button removed) and via the toast
+    # the Track is gone, confirmed in place and via the toast. The view's own
+    # buttons are gone (nothing left to act on) but the 🗑 delete row stays — an
+    # in-place edit must never drop it (#73/#130).
     assert await pool.fetchval("SELECT count(*) FROM tracks WHERE trader_address = $1", WHALE) == 0
     edited = session.edited_messages()[-1]
     assert "Unfollowed" in (edited.text or "")
-    assert edited.reply_markup is None
+    assert edited.reply_markup is not None
+    rows = [[b.callback_data or "" for b in row] for row in edited.reply_markup.inline_keyboard]
+    assert rows == [[DELETE_CALLBACK]]
     assert "Unfollowed" in (session.callback_answers()[-1].text or "")
 
 
