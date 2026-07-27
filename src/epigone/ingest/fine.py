@@ -175,24 +175,36 @@ async def _stamp_attempt(pool: asyncpg.Pool, address: str, now: datetime) -> Non
     await pool.execute("UPDATE traders SET fine_attempted_at = $2 WHERE address = $1", address, now)
 
 
-# A Follow marks its wallet due-now for an immediate fine refresh (issue #82) —
-# unless the fine data was refreshed this recently. The floor is anti-spam (a
-# follow→unfollow→follow loop can't force pointless refresh spend) and a
-# guard against redundant work (a wallet another User already tracks is on the
-# active cadence, freshly scanned, so already current).
-FOLLOW_REFRESH_FRESHNESS = timedelta(minutes=15)
+# Two events mark a tracked wallet due-now for an immediate fine refresh: a
+# Follow (issue #82) and a close/flip alert from the stream poller (issue #129).
+# Both clear fine_refreshed_at (making it due per DUE_ELIGIBILITY) and
+# fine_attempted_at (sorting it first per `_due_traders`' ORDER BY), so the
+# chunked, tracked-first pass (#65/#66) refreshes it within minutes.
+#
+# The freshness guard skips a wallet refreshed this recently — anti-spam (a
+# follow→unfollow→follow loop can't force pointless refresh spend), fan-in dedup
+# (a wallet closing several coins in one poll pass is bumped once, the rest
+# no-op), and a guard against redundant work (a wallet another User already
+# tracks is on the active cadence, freshly scanned, so already current).
+MARK_DUE_FRESHNESS = timedelta(minutes=15)
 
 
-async def mark_due_on_follow(
+async def mark_due_now(
     executor: asyncpg.Pool | asyncpg.Connection, address: str, now: datetime
 ) -> bool:
-    """Bump `address` to the front of the fine-refresh queue on a Follow, unless
-    its fine data is still fresh. Clears fine_refreshed_at (making it due per
+    """Bump `address` to the front of the fine-refresh queue, unless its fine
+    data is still fresh. Clears fine_refreshed_at (making it due per
     DUE_ELIGIBILITY) and fine_attempted_at (sorting it first per `_due_traders`'
     ORDER BY), so the chunked, tracked-first pass (#65/#66) refreshes it within
     minutes — no restart, no Hyperliquid call here (ADR-0002: processes meet in
-    Postgres). Skips a wallet refreshed within FOLLOW_REFRESH_FRESHNESS; returns
-    whether it bumped."""
+    Postgres). Skips a wallet refreshed within MARK_DUE_FRESHNESS; returns
+    whether it bumped.
+
+    Shared by the Follow handler (#82) and the poller's close/flip path (#129).
+    Budget: a tracked wallet closes a handful of times/day, so the close/flip
+    trigger adds only tens of extra fine refreshes/day, each an incremental pull
+    at ~20-120 weight (FILLS_WEIGHT base plus the per-fill surcharge) — well
+    within the fine pass's share of the 900/min budget (epigone.budget)."""
     status = await executor.execute(
         """
         UPDATE traders
@@ -201,7 +213,7 @@ async def mark_due_on_follow(
           AND (fine_refreshed_at IS NULL OR fine_refreshed_at <= $2)
         """,
         address,
-        now - FOLLOW_REFRESH_FRESHNESS,
+        now - MARK_DUE_FRESHNESS,
     )
     return bool(status != "UPDATE 0")
 

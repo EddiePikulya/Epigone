@@ -65,6 +65,7 @@ from epigone.gateway import (
     RateLimitedError,
     fetch_open_positions,
 )
+from epigone.ingest.fine import mark_due_now
 
 log = logging.getLogger(__name__)
 
@@ -282,6 +283,19 @@ async def _apply_poll(
         )
         if events:
             await _queue_alerts(conn, address, events, now)
+            # A close or flip mints a round-trip; bump the wallet due-now so the
+            # fine pass folds it in within minutes and Recent trades / track
+            # record match the alert by the time the user taps through (issue
+            # #129). Opens/scales don't — nothing lands in fine_trades that
+            # matters at alert-read time (the open shows via live positions).
+            # One bump per pass regardless of how many coins closed; the
+            # freshness guard makes any repeat a harmless no-op. Postgres-only
+            # (ADR-0002): mark_due_now only rewrites the `traders` row, and the
+            # fine pass ignores a wallet that is neither tracked nor coarse-
+            # profitable (DUE_ELIGIBILITY), so a purely-linked wallet's close is
+            # a no-op there — no wasted refresh for a wallet no one follows.
+            if any(event.kind in ("close", "flip") for event in events):
+                await mark_due_now(conn, address, now)
         return len(events)
 
 

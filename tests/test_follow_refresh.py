@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import asyncpg
 from aiogram import Bot, Dispatcher
 
-from epigone.ingest.fine import FOLLOW_REFRESH_FRESHNESS, mark_due_on_follow
+from epigone.ingest.fine import MARK_DUE_FRESHNESS, mark_due_now
 from tests.support.clock import FakeClock
 from tests.support.telegram import RecordingSession, feed_callback, follow_wallet
 
@@ -62,7 +62,7 @@ async def test_mark_due_clears_both_columns_for_a_stale_wallet(
         attempted_at=now - timedelta(hours=6),
     )
 
-    bumped = await mark_due_on_follow(pool, WHALE, now)
+    bumped = await mark_due_now(pool, WHALE, now)
 
     assert bumped is True
     state = await _scan_state(pool, WHALE)
@@ -80,7 +80,7 @@ async def test_mark_due_skips_a_recently_refreshed_wallet(
         pool, WHALE, first_seen=now - timedelta(days=30), refreshed_at=fresh, attempted_at=fresh
     )
 
-    bumped = await mark_due_on_follow(pool, WHALE, now)
+    bumped = await mark_due_now(pool, WHALE, now)
 
     assert bumped is False
     state = await _scan_state(pool, WHALE)
@@ -94,12 +94,12 @@ async def test_mark_due_bumps_exactly_at_the_freshness_boundary(
 ) -> None:
     # At exactly the window edge the data is no longer "fresh" — bump it.
     now = clock.now()
-    edge = now - FOLLOW_REFRESH_FRESHNESS
+    edge = now - MARK_DUE_FRESHNESS
     await _seed_scanned_trader(
         pool, WHALE, first_seen=now - timedelta(days=30), refreshed_at=edge, attempted_at=edge
     )
 
-    bumped = await mark_due_on_follow(pool, WHALE, now)
+    bumped = await mark_due_now(pool, WHALE, now)
 
     assert bumped is True
     state = await _scan_state(pool, WHALE)
