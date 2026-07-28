@@ -42,7 +42,8 @@ re-posting the same signed payload can never execute TWICE (chain-enforced).
 Whether it executed ONCE before the 429 is the part the chain cannot tell us
 — see AmbiguousExecutionError and ExecutionRateLimitedError.
 
-== TESTNET FINDINGS (recorded 2026-07-27, api.hyperliquid-testnet.xyz) ==
+== TESTNET FINDINGS (2026-07-27 unfunded; 2026-07-28 funded run — the open
+   questions below are ANSWERED, api.hyperliquid-testnet.xyz) ==
 
 Probed by scripts/testnet_probe.py (throwaway keys, testnet only — the #63
 empirical-contract convention). What the run established:
@@ -64,20 +65,51 @@ empirical-contract convention). What the run established:
   before performing actions. User: 0x…". Agent approval — and therefore
   every downstream probe — requires a deposited account.
 
-Open questions 1–3 (research §11) themselves are BLOCKED on that funding
-wall: the testnet faucet is an on-chain claimDrip() on Arbitrum Sepolia
-(gas + mainnet-history wallet), a one-time manual operator step. The
-harness detects funding and completes all three probes on re-run:
+Open questions 1–3 (research §11) — ANSWERED on funded testnet 2026-07-28
+(throwaway master funded with 95 mock USDC, zero volume; agent approved):
 
-1. Agent-count cap (open Q1): pending funded re-run of the harness.
-2. scheduleCancel volume gate (open Q2 — feeds A3's contingency): pending
-   funded re-run; the zero-volume submission path is already wired.
-3. Gray-zone L1 actions from an agent signer (open Q3): pending funded
-   re-run; master-vs-agent control methodology is already wired.
-4. 429 semantics (raised by PR #140 review): whether a 429'd /exchange
-   submission is ALWAYS rejected before processing — assumed nowhere,
-   treated as ambiguous (AmbiguousExecutionError) until a funded run can
-   drive the live limiter and observe.
+1. AGENT-COUNT CAP IS VOLUME-SCALED, NOT THE DOCUMENTED 1+3 (open Q1):
+   a zero-volume account approved exactly 3 named agents, then refused with
+   "Too many extra agents for cumulative volume traded. Current limit is 3".
+   This explains the 26–103 agents seen on live mainnet whales — slots are
+   earned by trading volume. Consequence for multi-user (Phase B): the quota
+   that matters is the USER's, since each user's master approves our agent on
+   their own account; Epigone's own account quota only bounds ITS agents.
+   Also observed: re-approving an EXISTING agent NAME with a new address
+   atomically swaps that slot's address — the clean rotation primitive (A2's
+   runbook), and a removal leaves the account briefly in "User has pending
+   agent removal" during which further approvals are refused.
+2. scheduleCancel HAS A $1M CUMULATIVE-VOLUME GATE (open Q2 — this DECIDES
+   A3's design): a funded zero-volume account is refused with "Cannot set
+   scheduled cancel time until enough volume traded. Required: $1000000.
+   Traded: $0." Both the set (+70s) and clear (None) forms are gated.
+   THEREFORE A3 MUST SHIP THE WATCHDOG FALLBACK as the primary dead-man's
+   switch — an operator account will not qualify at first, and the protocol
+   primitive only becomes available after $1M of traded volume.
+3. GRAY-ZONE L1 ACTIONS ARE NOT AGENT-REACHABLE HERE (open Q3): with the
+   agent approved and the master funded, all three actions refuse the AGENT
+   signer with "User or API Wallet 0x… does not exist" while the MASTER
+   control run gets action-specific errors instead (createSubAccount: "Cannot
+   create sub-accounts until enough volume traded. Required: $100000";
+   subAccountTransfer: "Invalid sub-account transfer from … to …";
+   vaultTransfer: "Vault not registered: …"). The agent-vs-master divergence
+   is exactly the signer-specific refusal the probe was designed to detect:
+   these actions resolve the SIGNER as an account, so an agent key cannot
+   drive them. Consistent with ADR-0005's blast-radius claim; note the
+   master's own errors are volume/registration gates, not permission grants,
+   so re-probe on a high-volume account before relying on the negative.
+4. 429 semantics (raised by PR #140 review): still UNVERIFIED — the funded
+   run never drove the live limiter into sustained 429s. Whether a 429'd
+   /exchange submission is ALWAYS rejected before processing remains assumed
+   nowhere and treated as ambiguous (AmbiguousExecutionError) until observed.
+5. ADDRESS-BASED REQUEST BUDGET CONFIRMED (research §5's secondary-source
+   formula, verified on a live mainnet account 2026-07-28): `userRateLimit`
+   answered {"cumVlm": "58293.48", "nRequestsCap": 68293} — exactly
+   10_000 + floor(cumVlm), confirming the documented "1 request per 1 USDC
+   traded, plus a 10k buffer" allowance. The executor can therefore compute a
+   per-account request budget from cumVlm without guessing; a fresh copy
+   account starts with only the 10k buffer, which bounds how chatty a
+   low-volume account's executor lane may be.
 """
 
 import re
