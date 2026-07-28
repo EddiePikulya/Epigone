@@ -34,12 +34,16 @@ cancel_waiter before any per-op timeout arms — so round 5 removed the
 dependency instead of bounding another leg:
 
 - once an incident is DECLARED — a DB-blind window or a real stall trip —
-  the cycle performs ZERO Postgres work before the cancel pass reaches the
-  wire: no heartbeat, no reads, no halt row, the rate budget drops to its
-  in-process bucket (FallbackBudget.incident_mode) without attempting the
-  shared row, and even the audit wrapper defers its attempt row to after
-  the call (AuditedExecutionGateway.wire_first). Postgres-free by
-  construction, not by exception handling: nothing left to hang;
+  the cycle does no Postgres state work before the cancel pass reaches the
+  wire: no heartbeat, no reads, no halt row, and the rate budget drops to
+  its in-process bucket (FallbackBudget.incident_mode) without attempting
+  the shared row. For a DB-BLIND incident the audit wrapper also defers
+  its attempt row to after the call (AuditedExecutionGateway.wire_first) —
+  fully Postgres-free to the wire, by construction. A real-stall trip,
+  whose liveness reads answered that same cycle, deliberately KEEPS its
+  bounded, best-effort write-ahead attempt row (round 6): against a
+  healthy database the evidence is worth one plain bounded INSERT, and
+  losing it to a crash-after-cancel would be a hole nothing else covers;
 - everything durable — halt row, audit events, sweep verification — runs
   AFTER the cancel attempt, best-effort, under a hard real-time ceiling
   (DB_BLOCK_CEILING_SECONDS; safe because Pool.release is shielded, so a
@@ -271,19 +275,31 @@ class Watchdog:
         row to after the call (wire_first)."""
         self._blind = incident
         self._blind_passes = 0
-        self._set_incident_posture(True)
+        self._set_incident_posture(incident)
 
     def _clear_incident(self) -> None:
         self._blind = None
         self._blind_passes = 0
-        self._set_incident_posture(False)
+        # The failure streak dies with the incident (round 6 item 1): the
+        # reconcile's successful writes ARE the interruption, so a later
+        # blip must open a FRESH streak — carrying the old onset would
+        # re-trip instantly with a false "without interruption" span in the
+        # durable record.
+        self._db_failing_since = None
+        self._set_incident_posture(None)
 
-    def _set_incident_posture(self, on: bool) -> None:
+    def _set_incident_posture(self, incident: _BlindIncident | None) -> None:
         # In-process test budgets (WeightBudget) lack the flag — and are
         # already Postgres-free, so there is nothing to switch off.
         if isinstance(self._budget, FallbackBudget):
-            self._budget.incident_mode = on
-        self._exec.wire_first = on
+            self._budget.incident_mode = incident is not None
+        # Wire-first audit only while the database is actually UNREADABLE
+        # (round 6 item 3): a real-stall trip's liveness reads answered this
+        # very cycle, so its write-ahead attempt row would land and keeps
+        # its evidential value — deferring it would open a carve-out (a
+        # crash between cancel and deferred write, against a HEALTHY
+        # database) that nothing else covers.
+        self._exec.wire_first = incident is not None and incident.db_blind
 
     def _handle_unreadable(self, now: datetime) -> None:
         """A liveness read failed. Open (or age) the CONTINUOUS failure
@@ -408,8 +424,13 @@ class Watchdog:
             headline = "trip"
             reason = self._blind.reason
         else:
+            # The trip parenthetical says "unconfirmed", not "unwritable"
+            # (round 6 item 4): a reconcile ceiling can fire BETWEEN the
+            # halt row's commit and clearing the incident, in which case the
+            # next cycle joins its own, successfully written row — the label
+            # must be true for both that case and a genuinely failing write.
             headline = "DB-blind sweep reconciled" if self._blind.db_blind else (
-                "unrecorded trip reconciled (halt row was unwritable)"
+                "unrecorded trip reconciled (halt row write had not been confirmed)"
             )
             reason = (
                 f"{headline}: {self._blind.reason}; resting orders were being "

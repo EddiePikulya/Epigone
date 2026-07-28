@@ -27,6 +27,7 @@ execution path can forget the trail: wrap any ExecutionGateway and every
 call is paired with its rows.
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -37,6 +38,7 @@ from typing import Any, TypeVar
 import asyncpg
 
 from epigone.clock import Clock
+from epigone.safety.db import SAFETY_DB_TIMEOUT_SECONDS
 from epigone.gateway.execution import (
     ActionRejectedError,
     AmbiguousExecutionError,
@@ -72,6 +74,12 @@ ERROR = "error"  # nothing reached the exchange
 EVENT = "event"  # a safety-state change, not a wire action
 
 T = TypeVar("T")
+
+# The wire-first posture's deferred attempt/outcome pair runs under this
+# hard real-time ceiling (round 6 item 2): the same bound the incident
+# cycle's other durable blocks obey (4× the safety pool's touch timeout),
+# so no post-cancel bookkeeping can stretch a cycle past its stated budget.
+DEFERRED_AUDIT_CEILING_SECONDS = 4 * SAFETY_DB_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -211,17 +219,19 @@ class AuditedExecutionGateway:
       protecting. Best-effort is about DB failures only; action failures
       still raise exactly as always.
 
-    Plus one INCIDENT posture on top of best-effort (PR #143 round 5):
-    `wire_first=True` (a plain attribute the watchdog flips while an
-    incident is declared) moves the attempt row AFTER the wire call, so a
-    declared incident performs ZERO Postgres work before the cancel — the
-    attempt-then-outcome pair still lands (best-effort) once the call
-    returns or fails. The trade is explicit: while wire_first is on, a
-    process crash between signing and returning leaves NO attempt row —
-    accepted, because the mode only runs during incidents, when the
-    database is presumed unreachable and the write-ahead row would have
-    failed anyway. Meaningful only with best_effort_audit; the executor's
-    order path never sets it."""
+    Plus one INCIDENT posture on top of best-effort (PR #143 rounds 5–6):
+    `wire_first=True` (a plain attribute the watchdog flips while a
+    DB-BLIND incident is declared) moves the attempt row AFTER the wire
+    call, so the blind cancel performs ZERO Postgres work before the wire —
+    the attempt-then-outcome pair still lands (best-effort, under its own
+    hard ceiling) once the call returns or fails. The trade is explicit:
+    while wire_first is on, a process crash between signing and returning
+    leaves NO attempt row — accepted for exactly the DB-blind window,
+    where the database is UNREADABLE and the write-ahead row would have
+    failed anyway. It is NOT set for a real-stall trip (round 6): there
+    the liveness reads answered that same cycle, the write-ahead row would
+    land, and its evidence is kept. Meaningful only with
+    best_effort_audit; the executor's order path never sets it."""
 
     def __init__(
         self,
@@ -317,25 +327,28 @@ class AuditedExecutionGateway:
         call: Callable[[], Awaitable[T]],
         result_json: Callable[[T], Any],
     ) -> T:
-        # wire_first (incident posture, class docstring): the attempt row is
+        # wire_first (DB-blind posture, class docstring): the attempt row is
         # deferred to after the call, so nothing touches Postgres pre-wire.
-        attempt = None if self.wire_first else await self._record_attempt(action, request)
+        wire_first = self.wire_first
+        attempt = None if wire_first else await self._record_attempt(action, request)
         try:
             result = await call()
         except ActionRejectedError as exc:
-            if attempt is None and self.wire_first:
-                attempt = await self._record_attempt(action, request)
-            await self._record_outcome(
+            await self._finish_audit(
                 attempt,
+                wire_first,
+                action,
+                request,
                 outcome=REJECTED,
                 detail={"reason": exc.reason.value, "message": exc.message},
             )
             raise
         except AmbiguousExecutionError as exc:
-            if attempt is None and self.wire_first:
-                attempt = await self._record_attempt(action, request)
-            await self._record_outcome(
+            await self._finish_audit(
                 attempt,
+                wire_first,
+                action,
+                request,
                 outcome=AMBIGUOUS,
                 detail={"type": type(exc).__name__, "message": str(exc)},
             )
@@ -343,18 +356,56 @@ class AuditedExecutionGateway:
         except Exception as exc:
             # ExecutionError (nothing sent) and anything unforeseen alike:
             # the trail must never lose a failure, whatever its shape.
-            if attempt is None and self.wire_first:
-                attempt = await self._record_attempt(action, request)
-            await self._record_outcome(
+            await self._finish_audit(
                 attempt,
+                wire_first,
+                action,
+                request,
                 outcome=ERROR,
                 detail={"type": type(exc).__name__, "message": str(exc)},
             )
             raise
-        if attempt is None and self.wire_first:
-            attempt = await self._record_attempt(action, request)
-        await self._record_outcome(attempt, outcome=OK, detail=result_json(result))
+        await self._finish_audit(
+            attempt, wire_first, action, request, outcome=OK, detail=result_json(result)
+        )
         return result
+
+    async def _finish_audit(
+        self,
+        attempt: AuditedAttempt | None,
+        wire_first: bool,
+        action: str,
+        request: Any,
+        *,
+        outcome: str,
+        detail: Any,
+    ) -> None:
+        """Close the trail for one call. Write-ahead mode records the
+        outcome against the pre-wire attempt; the wire-first posture writes
+        the DEFERRED attempt/outcome pair here, under its own hard real-time
+        ceiling (round 6 item 2): the pair is pool-bounded plain INSERTs,
+        but nothing on an incident cycle may stretch past the same ceiling
+        the reconcile obeys — and in this posture audit loss is always
+        best-effort-tolerated, the ceiling included."""
+        if not wire_first:
+            await self._record_outcome(attempt, outcome=outcome, detail=detail)
+            return
+
+        async def deferred_pair() -> None:
+            deferred = await self._record_attempt(action, request)
+            await self._record_outcome(deferred, outcome=outcome, detail=detail)
+
+        try:
+            await asyncio.wait_for(deferred_pair(), DEFERRED_AUDIT_CEILING_SECONDS)
+        except Exception:
+            if not self._best_effort_audit:
+                raise
+            log.exception(
+                "deferred wire-first audit pair for %s failed or hit its ceiling — "
+                "the action already ran; reconcile the trail from the exchange if "
+                "it matters",
+                action,
+            )
 
     async def _record_attempt(self, action: str, request: Any) -> AuditedAttempt | None:
         """The write-ahead attempt row — or, in best-effort mode, None when

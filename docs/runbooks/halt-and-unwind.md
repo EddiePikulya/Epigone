@@ -103,22 +103,27 @@ than what the code guarantees, and the whole section covers an
 **already-running watchdog only**; see the cold-start boundary below):
 
 - **What a Postgres outage does NOT stop:** cancelling — because once an
-  incident is declared, the cancel path does not use Postgres AT ALL
-  (round 5): no heartbeat, no reads, no halt row, the rate budget runs on
-  its in-process bucket without attempting the shared row, and the audit
-  wrapper defers its attempt row to after the wire (wire-first audit) for
-  the incident's duration. Durable bookkeeping — halt row, events, sweep
-  stamps, the deferred audit pair — happens AFTER each cancel attempt
-  under a hard ~20s ceiling, and a failing reconcile just leaves the
-  incident open: the next cycle cancels again, every cycle, until writes
-  recover. Getting TO the declaration is bounded too: normal-operation DB
-  touches ride the safety pool's connect/per-query/lock-wait/release
-  budgets (~2× the 5s bound per fully hung touch), every state block of
-  the cycle sits under the same hard ceiling, and the shared rate bucket
-  ceilings each of its own database attempts — together covering even the
-  transaction-exit leg asyncpg cannot time (an untimed cancel-wait before
-  ROLLBACK, the round-5 finding that ended the bound-one-more-leg
-  approach).
+  incident is declared, the cancel path does no Postgres state work before
+  the wire (round 5): no heartbeat, no reads, no halt row, and the rate
+  budget runs on its in-process bucket without attempting the shared row.
+  A DB-BLIND incident also defers the audit attempt row to after the wire
+  (wire-first audit) — fully Postgres-free to the wire; a real-stall trip,
+  whose reads answered that same cycle, keeps its bounded best-effort
+  write-ahead attempt row on purpose (round 6). Durable bookkeeping
+  happens AFTER each cancel attempt as separately ceilinged blocks — the
+  deferred audit pair and the reconcile each under their own hard ~20s
+  ceiling, each exiting at ceiling plus the ~5s release budget — so a
+  worst-case incident cycle's post-cancel database time is roughly TWO
+  ceilings (~50s all-in), bounded, never open-ended; a failing reconcile
+  just leaves the incident open and the next cycle cancels again, every
+  cycle, until writes recover. Getting TO the declaration is bounded too:
+  normal-operation DB touches ride the safety pool's
+  connect/per-query/lock-wait/release budgets (~2× the 5s bound per fully
+  hung touch), every state block of the cycle sits under the same hard
+  ceiling, and the shared rate bucket ceilings each of its own database
+  attempts — together covering even the transaction-exit leg asyncpg
+  cannot time (an untimed cancel-wait before ROLLBACK, the round-5 finding
+  that ended the bound-one-more-leg approach).
 - **What a Postgres outage DOES change:** the watchdog cannot *read*
   executor liveness or halt state, so it cannot distinguish stall from
   health. Its answer is the **blind trip**: unreadable *continuously* —
@@ -126,9 +131,10 @@ than what the code guarantees, and the whole section covers an
   single dropped connection never trips it — past
   `WATCHDOG_DB_BLIND_SECONDS` (default 180 = 3× the stall threshold), it
   attempts a cancel pass every cycle until the database answers — and
-  incident cycles touch Postgres only AFTER the cancel, under a hard
-  ceiling, so "every cycle" stretches by at most the post-cancel reconcile
-  ceiling (~20s), never by TCP retransmission timescales. Worst-case time
+  incident cycles touch Postgres only AFTER the cancel, in separately
+  ceilinged blocks, so "every cycle" stretches by at most the sum of the
+  post-cancel ceilings (deferred audit pair + reconcile, ~50s all-in with
+  their release budgets), never by TCP retransmission timescales. Worst-case time
   from outage onset to the first blind cancel LANDING: up to one poll
   interval before the streak opens, plus the streak threshold, plus up to
   one more poll interval and one waiting cycle's ceilinged DB blocks (the

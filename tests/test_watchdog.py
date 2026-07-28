@@ -534,6 +534,7 @@ async def test_blind_trip_cancels_at_the_real_budget_seam(
 
 async def test_blind_sweep_reconciles_into_a_distinct_halt_on_recovery(
     watchdog: Watchdog,
+    audited: AuditedExecutionGateway,
     pool: asyncpg.Pool,
     clock: FakeClock,
     read_gateway: FakeHyperliquidGateway,
@@ -560,6 +561,7 @@ async def test_blind_sweep_reconciles_into_a_distinct_halt_on_recovery(
     monkeypatch.undo()
     read_gateway.set_open_orders(MASTER, [])
     await watchdog.run_cycle()
+    assert audited.wire_first is False  # posture cleared with the incident
     halt = await active_halt(pool)
     assert halt is not None
     assert halt.source == WATCHDOG_SOURCE
@@ -847,9 +849,11 @@ async def test_a_trip_reaches_the_wire_before_any_halt_state_is_written(
     audited: AuditedExecutionGateway,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 5's ordering rule, pinned: a real stall trip cancels BEFORE the
-    halt row is attempted, and the cancel pass itself runs with the rate
-    budget in incident mode — the shared Postgres bucket untouched."""
+    """Round 5's ordering rule (as amended by round 6), pinned: a real stall
+    trip cancels BEFORE the halt row is attempted, the cancel pass runs with
+    the rate budget in incident mode — the shared Postgres bucket untouched —
+    but the trip KEEPS its write-ahead audit attempt (wire_first is a
+    DB-blind-only posture): the attempt row precedes the cancel."""
     from epigone.safety import watchdog as watchdog_module
     from tests.test_safety_budget import _RecordingDeadPrimary
 
@@ -878,9 +882,8 @@ async def test_a_trip_reaches_the_wire_before_any_halt_state_is_written(
         return await real_request_halt(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(watchdog_module, "request_halt", order_asserting_request_halt)
-    # And the audit wrapper itself must not write pre-wire during the
-    # incident (wire_first): every attempt row lands with the cancel already
-    # on the fake gateway's tape.
+    # The trip's audit stays WRITE-AHEAD (round 6 item 3): record where each
+    # attempt row lands relative to the cancel on the fake gateway's tape.
     real_record_attempt = audit.record_attempt
     attempt_orderings: list[int] = []
 
@@ -899,6 +902,59 @@ async def test_a_trip_reaches_the_wire_before_any_halt_state_is_written(
 
     assert observed["cancels_at_halt_write"] == 1  # the wire came FIRST
     assert observed["shared_calls_at_halt_write"] == 0  # and touched no shared bucket
-    assert attempt_orderings and all(c >= 1 for c in attempt_orderings)  # audit after wire
+    # Write-ahead evidence kept on a live DB: the cancel's attempt row was
+    # recorded BEFORE the cancel reached the fake gateway.
+    assert attempt_orderings and attempt_orderings[0] == 0
     halt = await active_halt(pool)
     assert halt is not None and "stale" in halt.reason
+
+
+async def test_a_post_reconcile_blip_does_not_retrip(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 item 1 — the streak dies with the incident: after a DB-blind
+    window reconciles, a SINGLE later read failure must open a FRESH streak
+    (the reconcile's successful writes were the interruption), never re-trip
+    instantly off the old onset with a false 'without interruption' span."""
+    from epigone.safety import watchdog as watchdog_module
+
+    async def db_down(_pool: asyncpg.Pool) -> None:
+        raise ConnectionError("postgres unreachable")
+
+    # A full blind incident, reconciled: outage, trip, recovery.
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 95)])
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    await watchdog.run_cycle()  # streak opens
+    clock.advance(DB_BLIND.total_seconds() + 1)
+    await watchdog.run_cycle()  # blind trip (cancel #1)
+    monkeypatch.undo()
+    read_gateway.set_open_orders(MASTER, [])
+    clock.advance(10)
+    await watchdog.run_cycle()  # reconciles + sweeps
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None
+    await resume(pool, clock, audit, halt_id=halt.id, resumed_by=ADMIN)
+    cancels_after_incident = len(_cancels(exec_gateway))
+
+    # Much later, ONE dropped connection. Before the fix, blind_for was
+    # computed from the ORIGINAL outage onset and re-tripped immediately.
+    clock.advance(3600)
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 96)])
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    await watchdog.run_cycle()
+    assert len(_cancels(exec_gateway)) == cancels_after_incident  # no false sweep
+    assert await pool.fetchval(
+        "SELECT count(*) FROM execution_halts WHERE resumed_at IS NULL"
+    ) == 0
+
+    # The blip heals: still nothing. Only a fresh unbroken streak may trip.
+    monkeypatch.undo()
+    clock.advance(10)
+    await watchdog.run_cycle()
+    assert len(_cancels(exec_gateway)) == cancels_after_incident
