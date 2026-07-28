@@ -43,10 +43,13 @@ Whether it executed ONCE before the 429 is the part the chain cannot tell us
 — see AmbiguousExecutionError and ExecutionRateLimitedError.
 
 == TESTNET FINDINGS (2026-07-27 unfunded; 2026-07-28 funded run — the open
-   questions below are ANSWERED, api.hyperliquid-testnet.xyz) ==
+   questions below are ANSWERED; same day, volume-farmed run (issue #142) —
+   the $100k gate crossed, finding 3 CORRECTED, sub-account semantics in
+   findings 6-8, api.hyperliquid-testnet.xyz) ==
 
-Probed by scripts/testnet_probe.py (throwaway keys, testnet only — the #63
-empirical-contract convention). What the run established:
+Probed by scripts/testnet_probe.py, scripts/testnet_farm_volume.py and
+scripts/testnet_subaccount_probe.py (throwaway keys, testnet only — the #63
+empirical-contract convention). What the runs established:
 
 - SIGNING CONTRACT VERIFIED END-TO-END: signed `order` and `scheduleCancel`
   actions submitted by HttpExecutionGateway recover SERVER-side to exactly
@@ -86,18 +89,28 @@ Open questions 1–3 (research §11) — ANSWERED on funded testnet 2026-07-28
    THEREFORE A3 MUST SHIP THE WATCHDOG FALLBACK as the primary dead-man's
    switch — an operator account will not qualify at first, and the protocol
    primitive only becomes available after $1M of traded volume.
-3. GRAY-ZONE L1 ACTIONS ARE NOT AGENT-REACHABLE HERE (open Q3): with the
-   agent approved and the master funded, all three actions refuse the AGENT
-   signer with "User or API Wallet 0x… does not exist" while the MASTER
-   control run gets action-specific errors instead (createSubAccount: "Cannot
-   create sub-accounts until enough volume traded. Required: $100000";
-   subAccountTransfer: "Invalid sub-account transfer from … to …";
-   vaultTransfer: "Vault not registered: …"). The agent-vs-master divergence
-   is exactly the signer-specific refusal the probe was designed to detect:
-   these actions resolve the SIGNER as an account, so an agent key cannot
-   drive them. Consistent with ADR-0005's blast-radius claim; note the
-   master's own errors are volume/registration gates, not permission grants,
-   so re-probe on a high-volume account before relying on the negative.
+3. GRAY-ZONE L1 ACTIONS ARE AGENT-REACHABLE — the zero-volume negative was
+   WRONG (open Q3, CORRECTED by the #142 run the same day). The earlier
+   refusals ("User or API Wallet 0x… does not exist") were an artifact:
+   that run's agent key was never actually approved — the Q1 cap probe had
+   filled all 3 slots with SDK-generated-and-discarded keys, so the
+   keys-file agent signing Q3 held no approval. Re-probed at $101k cumVlm
+   with the agent GENUINELY approved (verified via extraAgents):
+   - createSubAccount signed by the AGENT succeeds ({"status": "ok",
+     "data": "0x38107077…"} — the agent minted a real sub-account);
+   - subAccountTransfer signed by the AGENT succeeds AND really moves
+     funds (the sub's accountValue readback confirms the deposit landed);
+   - vaultTransfer signed by the agent now gets the ACTION-level error
+     ("Vault not registered: 0x…"), identical to the master control — the
+     signer is accepted; only vault registration is missing.
+   THEREFORE an approved agent key drives the ENTIRE L1 surface, including
+   intra-account fund plumbing: the L1-vs-user-signed signature-scheme
+   split is the ONLY privilege boundary — there is no agent-vs-master
+   distinction inside L1. What stays agent-unreachable is exactly the
+   user-signed set (approveAgent, withdraw3, usdSend, …), so ADR-0005's
+   no-external-exit claim stands; its implicit "agents can't touch
+   sub/vault plumbing" reading falls (see finding 6 for what that does to
+   sub-account isolation).
 4. 429 semantics (raised by PR #140 review): still UNVERIFIED — the funded
    run never drove the live limiter into sustained 429s. Whether a 429'd
    /exchange submission is ALWAYS rejected before processing remains assumed
@@ -110,6 +123,70 @@ Open questions 1–3 (research §11) — ANSWERED on funded testnet 2026-07-28
    per-account request budget from cumVlm without guessing; a fresh copy
    account starts with only the 10k buffer, which bounds how chatty a
    low-volume account's executor lane may be.
+6. SUB-ACCOUNT SEMANTICS (issue #142's four questions, probed at $101k
+   cumVlm by scripts/testnet_subaccount_probe.py after farming through the
+   gate with scripts/testnet_farm_volume.py):
+   - createSubAccount past the $100k gate: SUCCEEDS — {"status": "ok",
+     "response": {"type": "createSubAccount", "data": "0xb583637e…"}}.
+   - AGENTS ARE MASTER-SCOPED ONLY: approveAgent submitted with
+     vaultAddress=<sub> is refused with "Vault may not perform this
+     action." and extraAgents(<sub>) stays [] while the master's list is
+     unchanged. userRole(<sub>) answers {"role": "subAccount", "data":
+     {"master": "0x…"}} — a sub-account has no key of its own, so no
+     user-signed action (agent approval included) can ever originate from
+     it. There is no such thing as "an agent on the sub-account".
+   - AN APPROVED AGENT TRADES THE SUB: an order carrying
+     vaultAddress=<sub> signed by the master-approved agent is accepted
+     and fills ({"filled": {"totalSz": "0.0003", "avgPx": "63486.0"}}),
+     and so does the reduce-only close — the SDK's vault mechanism covers
+     sub-accounts, and ONE master-level agent grant covers the master and
+     every sub.
+   - subAccountTransfer MOVES FUNDS BOTH WAYS and is NOT master-only: usd
+     is micro-USD (usd=50_000_000 arrived as accountValue "50.0"), the
+     withdraw leg drained the sub back to "0.0", and the APPROVED AGENT's
+     deposit was accepted and really landed (finding 3).
+7. AGENT-CAP GROWTH CONFIRMED: at $101k cumVlm a 4th named agent approved
+   cleanly where the zero-volume cap was exactly 3 (finding 1) — slots
+   scale with traded volume, curve unprobed.
+8. scheduleCancel GATE COUNTER IS LIVE: at $101,605.98 both the set and
+   clear forms still refuse, now naming the counter — "Cannot set
+   scheduled cancel time until enough volume traded. Required: $1000000.
+   Traded: $101605.98."
+9. scheduleCancel WORKS PAST THE GATE, THROUGH THE PRODUCTION PATH: after
+   farming the throwaway master to $1,001,002 cumVlm, set(+70s) and
+   clear(None) were both ACCEPTED when submitted by HttpExecutionGateway
+   with the AGENT signer — exactly the A3 dead-man's-switch path — with a
+   master-signed SDK control matching ({"status": "ok"}). A3's protocol
+   primitive is now testnet-proven end-to-end; finding 2's conclusion
+   stands unchanged for fresh accounts (the watchdog fallback ships first,
+   the primitive unlocks per account at $1M traded).
+   Farming economics, measured (scripts/testnet_farm_volume.py): $1M of
+   taker volume on testnet BTC cost $643.79 of mock equity, a steady
+   6.3-6.5 bp per $ of cumVlm — 4.5 bp of that is the taker fee (cumVlm
+   counts both legs, each leg pays 4.5 bp), the remaining ~2 bp is
+   spread+impact on a book only ~$1.5-5k deep in the top 3 levels. Also
+   observed
+   mid-run: a testnet network upgrade put the exchange in a post-only
+   phase ("Only post-only orders allowed immediately after network
+   upgrade") during which every IOC is refused — transient, lifted within
+   minutes, worth knowing before reading executor errors as bugs.
+
+A4 IMPLICATION (the question #142 existed to answer): sub-accounts are NOT
+a key-compromise boundary. A compromised master-approved agent key reaches
+the master AND every sub — it trades subs via vaultAddress, shuffles funds
+via subAccountTransfer, and can mint new subs (findings 3 and 6) — so
+ring-fencing copy capital in a sub-account contains nothing once the key
+leaks. The only key-compromise boundary Hyperliquid offers is the master
+account itself: a DEDICATED WALLET whose master approves a copy-only agent
+key. Sub-accounts DO still bound Epigone SOFTWARE faults: margin is
+per-(sub)account and Epigone's execution surface is orders-only by
+construction (no subAccountTransfer exists in this seam), so a mis-sized
+copy order pointed at a sub can lose at most the sub's equity — useful
+margin/PnL segregation inside one trust domain, nothing more. Phase B
+corollary: a user approving our agent on their main account implicitly
+grants trade+shuffle reach over ALL their sub-accounts; onboarding should
+steer copy capital into a dedicated wallet, never a sub of the user's main
+account.
 """
 
 import re
