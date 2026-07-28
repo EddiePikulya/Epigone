@@ -29,6 +29,12 @@ class FakeHyperliquidGateway:
         self.leaderboard: list[LeaderboardEntry] = []
         self.leaderboard_error: Exception | None = None
         self.leaderboard_calls = 0
+        # Asset-id mapping sources (issue #135): per-venue universes (coin
+        # names in asset-index order, builder-DEX names namespaced like the
+        # real meta parser keeps them) and the builder-dex listing whose order
+        # fixes the offsets.
+        self.perp_universes: dict[str | None, list[str]] = {}
+        self.perp_dex_listing: list[str] = []
         self.fills: dict[str, list[Fill]] = {}
         self.fills_errors: dict[str, Exception] = {}
         self.fills_calls: list[str] = []
@@ -49,6 +55,12 @@ class FakeHyperliquidGateway:
         if error is not None:
             raise error
         return self.open_orders.get((key, dex), [])
+
+    async def get_perp_universe(self, dex: str | None = None) -> list[str]:
+        return list(self.perp_universes.get(dex, []))
+
+    async def get_perp_dexs(self) -> list[str]:
+        return list(self.perp_dex_listing)
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
         self.leaderboard_calls += 1

@@ -297,6 +297,23 @@ class HyperliquidGateway(Protocol):
         Raises GatewayError on failure."""
         ...
 
+    async def get_perp_universe(self, dex: str | None = None) -> list[str]:
+        """ONE venue's perp coins in ASSET-INDEX ORDER (the info `meta`
+        endpoint's universe array): a coin's list position is the integer
+        asset id `/exchange` actions name it by — for a builder DEX, plus
+        that dex's offset (see fetch_asset_ids, which owns the composition).
+        Builder-DEX names come back namespaced (`xyz:META`), matching
+        positions and orders. Raises GatewayError on failure."""
+        ...
+
+    async def get_perp_dexs(self) -> list[str]:
+        """Builder-deployed perp dex names in LISTING ORDER (the `perpDexs`
+        endpoint), core excluded: a dex's position here fixes its asset-id
+        offset (110000 + position × 10000 — the SDK's own mapping,
+        hyperliquid.info). Raises GatewayError on failure — including on a
+        listing whose shape would make the offsets a guess."""
+        ...
+
     async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
         """A Trader's fills at or after `start` — the same regular ∪ TWAP-slice
         union as get_fills (userFillsByTime plus userTwapSliceFillsByTime) —
@@ -358,6 +375,42 @@ async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> lis
     for dex in POSITION_VENUES:
         positions.extend(await gateway.get_open_positions(address, dex=dex))
     return positions
+
+
+# The builder-DEX asset-id arithmetic (verified against the SDK's own
+# mapping, hyperliquid.info): builder dexs start at 110000, striding 10000
+# per dex in perpDexs listing order; a coin's id is the offset plus its
+# universe index. Core perps are just their universe index.
+BUILDER_DEX_ASSET_BASE = 110_000
+BUILDER_DEX_ASSET_STRIDE = 10_000
+
+
+async def fetch_asset_ids(gateway: HyperliquidGateway) -> dict[str, int]:
+    """Coin name → the integer asset id `/exchange` actions take, across every
+    venue Epigone covers (POSITION_VENUES) — the mapping a cancel-by-oid needs
+    to name an OpenOrder's asset (issue #135; the read gateway owns the
+    coin↔asset mapping, per the execution seam's contract).
+
+    Keys match exactly what positions/orders carry: bare tickers for core,
+    namespaced `dex:COIN` for builder DEXes. All-or-raise like the other
+    fetch helpers: a partial map would turn an unmapped coin into an
+    uncancelable order at exactly the moment a sweep needs it — and a covered
+    dex missing from the perpDexs listing raises rather than guessing an
+    offset, because a wrong asset id cancels (or leaves alive) the wrong
+    order."""
+    ids: dict[str, int] = {}
+    for index, coin in enumerate(await gateway.get_perp_universe(None)):
+        ids[coin] = index
+    covered = [dex for dex in POSITION_VENUES if dex is not None]
+    if covered:
+        listing = await gateway.get_perp_dexs()
+        for dex in covered:
+            if dex not in listing:
+                raise GatewayError(f"perp dex {dex!r} missing from perpDexs listing {listing!r}")
+            offset = BUILDER_DEX_ASSET_BASE + listing.index(dex) * BUILDER_DEX_ASSET_STRIDE
+            for index, coin in enumerate(await gateway.get_perp_universe(dex)):
+                ids[coin] = offset + index
+    return ids
 
 
 async def fetch_open_orders(gateway: HyperliquidGateway, address: str) -> list[OpenOrder]:

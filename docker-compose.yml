@@ -80,5 +80,31 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # The A3 safety layer's PRIMARY dead-man's switch (issue #135): cancel-alls
+  # and halts when the executor's heartbeat goes stale, sweeps /kill halts,
+  # and maintains the scheduleCancel upgrade path (volume-gated, PR #141).
+  # Behind the `execution` profile: it fail-fasts without a watchdog-lane
+  # agent key (`python -m epigone.keystore generate --lane watchdog …`, then
+  # the approval ceremony), so it only joins `docker compose up` once the
+  # operator opts in with --profile execution after the ceremony. Testnet by
+  # construction until A5 (WATCHDOG_EXCHANGE_URL defaults to testnet, and
+  # mainnet is refused in code regardless).
+  watchdog:
+    build: .
+    profiles: ["execution"]
+    command: ["/app/.venv/bin/python", "-m", "epigone.safety.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+      ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID}
+      KEYSTORE_KEK_FILE: /run/secrets/keystore-kek
+    volumes:
+      # The KEK file (outside git, outside the DB — keystore invariant),
+      # mounted read-only where KEYSTORE_KEK_FILE points.
+      - ${KEYSTORE_KEK_FILE:-./.keystore-kek}:/run/secrets/keystore-kek:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:

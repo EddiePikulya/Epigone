@@ -17,6 +17,9 @@ from epigone.monitor.alerting import Monitor
 from epigone.monitor.checks import CheckThresholds
 from epigone.monitor.config import MonitorConfig
 from epigone.monitor.main import run_monitor_cycle
+from epigone.safety import heartbeat
+from epigone.safety.audit import ExecutionAudit
+from epigone.safety.halt import WATCHDOG_SOURCE, request_halt
 from tests.support.clock import FakeClock
 from tests.support.telegram import RecordingSession
 
@@ -47,6 +50,7 @@ def _config() -> MonitorConfig:
             starvation_window=timedelta(minutes=45),
             starvation_min_due=50,
             agent_key_warn=timedelta(days=14),
+            watchdog_stale=timedelta(seconds=300),
         ),
         disk_path="/",
     )
@@ -306,3 +310,28 @@ async def test_an_unreachable_database_dms_the_admin_a_critical_alert(
     (sent,) = session.sent_messages()
     assert sent.chat_id == ADMIN_ID
     assert "🚨" in sent.text and "unreachable" in sent.text
+
+
+async def test_a_live_halt_and_a_stale_watchdog_page_the_admin(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The #135 alert path end-to-end: the watchdog trips (halt row + its own
+    old heartbeat), and one cycle later the admin holds a 🚨 DM for each — the
+    monitor is how a watchdog action reaches a human."""
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(minutes=2),
+        computed_at=clock.now() - timedelta(minutes=5),
+    )
+    await heartbeat.beat(pool, heartbeat.WATCHDOG_PROCESS, clock.now() - timedelta(minutes=11))
+    await request_halt(
+        pool, clock, ExecutionAudit(pool, clock),
+        source=WATCHDOG_SOURCE, reason="executor heartbeat stale: 95s > 60s",
+    )
+
+    messages = await _cycle(pool, bot, _monitor(), clock)
+
+    assert len(messages) == 2
+    watchdog_alert = next(m for m in messages if "Watchdog" in m)
+    halt_alert = next(m for m in messages if "HALTED" in m)
+    assert "🚨" in watchdog_alert and "dead-man" in watchdog_alert
+    assert "🚨" in halt_alert and "95s > 60s" in halt_alert and "sweep PENDING" in halt_alert

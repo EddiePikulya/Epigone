@@ -211,7 +211,7 @@ def is_delete_button_exempt(text: str) -> bool:
     handful of distinctive prefixes/markers for prompts whose text is assembled
     inline. Keep this the single source of truth — a new exemption belongs here,
     next to the others, and nowhere else."""
-    from epigone.bot import access, controls, criteria, names
+    from epigone.bot import access, controls, criteria, names, operator
 
     # Fully-static messages, keyed off the real constant so a wording change in
     # the bot moves the exemption with it (no stale literal to drift).
@@ -236,6 +236,10 @@ def is_delete_button_exempt(text: str) -> bool:
         # reprompt. The terminal cancel is not exempt (it carries the row).
         controls.GLOBAL_MIN_PROMPT_TEXT,
         controls.MIN_SIZE_UNREADABLE_TEXT,
+        # Resume-confirm prompt (bot/operator.py, #135) — mid-flow, carries its
+        # own confirm/cancel keyboard. The terminal resumed/cancelled/killed
+        # replies are NOT exempt: they carry the row like any other.
+        operator.RESUME_PROMPT_TEXT,
     }
     if text in exact:
         return True

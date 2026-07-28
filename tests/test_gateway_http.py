@@ -19,7 +19,6 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-import epigone.gateway.http as gateway_http
 from epigone.gateway import GatewayError, RateLimitedError, Side
 from epigone.gateway.http import (
     COVERAGE_HORIZON_MARGIN,
@@ -68,13 +67,20 @@ async def replaying_gateway(
     app.router.add_post("/info", info)
     server = TestServer(app)
     await server.start_server()
-    original_url = gateway_http.INFO_URL
-    gateway_http.INFO_URL = str(server.make_url("/info"))
     session = aiohttp.ClientSession()
     try:
-        yield HttpHyperliquidGateway(session, clock or FakeClock(), rng=rng), received
+        # The constructor's injection seam (issue #135) replaces the old
+        # module-global monkeypatch: point this instance at the replay server.
+        yield (
+            HttpHyperliquidGateway(
+                session,
+                clock or FakeClock(),
+                info_url=str(server.make_url("/info")),
+                rng=rng,
+            ),
+            received,
+        )
     finally:
-        gateway_http.INFO_URL = original_url
         await session.close()
         await server.close()
 

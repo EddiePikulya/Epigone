@@ -1,0 +1,385 @@
+"""The append-only execution audit trail (issue #135, ADR-0005).
+
+Two row shapes in one table (`execution_audit`, migration 0024):
+
+- ATTEMPT/OUTCOME pairs for signed exchange actions. The attempt row is
+  written BEFORE anything touches the wire — write-ahead discipline: if the
+  audit insert fails, the action is never sent, and a crash between signing
+  and the response still leaves the attempt on record (an attempt row with
+  no outcome row is exactly the "reconcile me" signal an operator needs).
+  The outcome row links back via `attempt_of` and classifies what happened
+  in the ExecutionError hierarchy's own vocabulary: `ok`, `rejected`
+  (ActionRejectedError — nothing executed), `ambiguous`
+  (AmbiguousExecutionError — the action MAY have executed; the caller
+  reconciles, and this row records that obligation), `error` (nothing
+  reached the exchange).
+- EVENT rows for safety-state changes: halt, resume, sweep completion,
+  dead-man's-switch eligibility/activation. Same table so one query tells
+  the whole story of an incident in order.
+
+`risk_decision` states what authorized the action — in A3 that is the
+safety layer's own authorizations ("operator command /kill", "executor
+heartbeat stale 65s > 60s"); A5's risk policy will write its verdicts here.
+
+Append-only is enforced by the DB trigger, not convention; this module only
+ever INSERTs. AuditedExecutionGateway is the structural guarantee that no
+execution path can forget the trail: wrap any ExecutionGateway and every
+call is paired with its rows.
+"""
+
+import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, TypeVar
+
+import asyncpg
+
+from epigone.clock import Clock
+from epigone.gateway.execution import (
+    ActionRejectedError,
+    AmbiguousExecutionError,
+    BuilderFee,
+    CancelOk,
+    CancelResult,
+    CancelSpec,
+    CloidCancelSpec,
+    ExecutionGateway,
+    Grouping,
+    ModifySpec,
+    OrderFilled,
+    OrderResting,
+    OrderResult,
+    OrderSpec,
+)
+
+# Who acted. The operator acts through bot commands (/kill, /resume); the
+# watchdog and (future, A4+) executor are processes with their own signers.
+OPERATOR_ACTOR = "operator"
+WATCHDOG_ACTOR = "watchdog"
+EXECUTOR_ACTOR = "executor"
+
+# Outcome vocabulary — the ExecutionError hierarchy's split, plus the two
+# non-wire shapes.
+SUBMITTED = "submitted"  # attempt rows: written before the wire
+OK = "ok"
+REJECTED = "rejected"  # whole-action pre-validation reject; nothing executed
+AMBIGUOUS = "ambiguous"  # MAY have executed; reconcile before re-issuing
+ERROR = "error"  # nothing reached the exchange
+EVENT = "event"  # a safety-state change, not a wire action
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class AuditedAttempt:
+    """The handle record_attempt returns, carrying what the outcome row must
+    repeat so each row reads standalone in the trail."""
+
+    id: int
+    actor: str
+    action: str
+    master_address: str | None
+    signer_address: str | None
+    risk_decision: str
+
+
+class ExecutionAudit:
+    """INSERT-only writer over execution_audit. Timestamps come from the
+    injected clock; JSON payloads serialize Decimals and datetimes as strings
+    (default=str) so the trail records exactly what was meant, never a float
+    approximation."""
+
+    def __init__(self, pool: asyncpg.Pool, clock: Clock) -> None:
+        self._pool = pool
+        self._clock = clock
+
+    async def record_attempt(
+        self,
+        *,
+        actor: str,
+        action: str,
+        request: Any,
+        risk_decision: str,
+        master_address: str | None = None,
+        signer_address: str | None = None,
+    ) -> AuditedAttempt:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO execution_audit
+                (occurred_at, actor, action, master_address, signer_address,
+                 request, outcome, risk_decision)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
+            RETURNING id
+            """,
+            self._clock.now(),
+            actor,
+            action,
+            _lower(master_address),
+            _lower(signer_address),
+            _json(request),
+            SUBMITTED,
+            risk_decision,
+        )
+        assert row is not None
+        return AuditedAttempt(
+            id=row["id"],
+            actor=actor,
+            action=action,
+            master_address=_lower(master_address),
+            signer_address=_lower(signer_address),
+            risk_decision=risk_decision,
+        )
+
+    async def record_outcome(
+        self, attempt: AuditedAttempt, *, outcome: str, detail: Any = None
+    ) -> None:
+        await self._pool.execute(
+            """
+            INSERT INTO execution_audit
+                (occurred_at, actor, action, master_address, signer_address,
+                 request, outcome, detail, risk_decision, attempt_of)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10)
+            """,
+            self._clock.now(),
+            attempt.actor,
+            attempt.action,
+            attempt.master_address,
+            attempt.signer_address,
+            _json({"attempt_of": attempt.id}),
+            outcome,
+            _json(detail),
+            attempt.risk_decision,
+            attempt.id,
+        )
+
+    async def record_event(
+        self,
+        *,
+        actor: str,
+        action: str,
+        risk_decision: str,
+        detail: Any = None,
+        master_address: str | None = None,
+        conn: asyncpg.Connection | None = None,
+    ) -> None:
+        """A safety-state change. `conn` lets a state module write the event
+        inside the same transaction as the state row it describes (halt.py),
+        so state and trail can never disagree about whether it happened."""
+        db: asyncpg.Pool | asyncpg.Connection = conn if conn is not None else self._pool
+        await db.execute(
+            """
+            INSERT INTO execution_audit
+                (occurred_at, actor, action, master_address, request, outcome,
+                 detail, risk_decision)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
+            """,
+            self._clock.now(),
+            actor,
+            action,
+            _lower(master_address),
+            _json({}),
+            EVENT,
+            _json(detail),
+            risk_decision,
+        )
+
+
+class AuditedExecutionGateway:
+    """An ExecutionGateway whose every call leaves attempt/outcome rows —
+    wrap the real gateway once and no code path can sign unaudited.
+
+    `decision` is the risk decision recorded with the NEXT call(s); the
+    acting process sets it before each action (the watchdog re-states it per
+    cycle). A deliberate plain attribute, not a constructor freeze: the
+    authorization genuinely changes call to call while the gateway instance —
+    one per signer per process, the nonce contract — must not."""
+
+    def __init__(
+        self,
+        inner: ExecutionGateway,
+        audit: ExecutionAudit,
+        *,
+        actor: str,
+        master_address: str,
+        signer_address: str,
+    ) -> None:
+        self._inner = inner
+        self._audit = audit
+        self._actor = actor
+        self._master_address = master_address
+        self._signer_address = signer_address
+        self.decision: str = "unspecified"
+
+    async def place_orders(
+        self,
+        orders: list[OrderSpec],
+        *,
+        grouping: Grouping = Grouping.NA,
+        builder: BuilderFee | None = None,
+    ) -> list[OrderResult]:
+        request = {
+            "orders": [_order_json(order) for order in orders],
+            "grouping": grouping.value,
+            "builder": None
+            if builder is None
+            else {"address": builder.address, "fee_tenth_bp": builder.fee_tenth_bp},
+        }
+        return await self._audited(
+            "order",
+            request,
+            lambda: self._inner.place_orders(orders, grouping=grouping, builder=builder),
+            _order_results_json,
+        )
+
+    async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
+        request = {"cancels": [{"asset": c.asset, "oid": c.oid} for c in cancels]}
+        return await self._audited(
+            "cancel",
+            request,
+            lambda: self._inner.cancel_orders(cancels),
+            _cancel_results_json,
+        )
+
+    async def cancel_orders_by_cloid(self, cancels: list[CloidCancelSpec]) -> list[CancelResult]:
+        request = {"cancels": [{"asset": c.asset, "cloid": c.cloid} for c in cancels]}
+        return await self._audited(
+            "cancelByCloid",
+            request,
+            lambda: self._inner.cancel_orders_by_cloid(cancels),
+            _cancel_results_json,
+        )
+
+    async def modify_orders(self, modifies: list[ModifySpec]) -> list[OrderResult]:
+        request = {
+            "modifies": [{"oid": m.oid, "order": _order_json(m.order)} for m in modifies]
+        }
+        return await self._audited(
+            "batchModify",
+            request,
+            lambda: self._inner.modify_orders(modifies),
+            _order_results_json,
+        )
+
+    async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
+        request = {"asset": asset, "leverage": leverage, "is_cross": is_cross}
+        await self._audited(
+            "updateLeverage",
+            request,
+            lambda: self._inner.update_leverage(asset, leverage, is_cross=is_cross),
+            lambda _: None,
+        )
+
+    async def schedule_cancel(self, at: datetime | None) -> None:
+        request = {"time": None if at is None else at.isoformat()}
+        await self._audited(
+            "scheduleCancel",
+            request,
+            lambda: self._inner.schedule_cancel(at),
+            lambda _: None,
+        )
+
+    async def _audited(
+        self,
+        action: str,
+        request: Any,
+        call: Callable[[], Awaitable[T]],
+        result_json: Callable[[T], Any],
+    ) -> T:
+        attempt = await self._audit.record_attempt(
+            actor=self._actor,
+            action=action,
+            request=request,
+            risk_decision=self.decision,
+            master_address=self._master_address,
+            signer_address=self._signer_address,
+        )
+        try:
+            result = await call()
+        except ActionRejectedError as exc:
+            await self._audit.record_outcome(
+                attempt,
+                outcome=REJECTED,
+                detail={"reason": exc.reason.value, "message": exc.message},
+            )
+            raise
+        except AmbiguousExecutionError as exc:
+            await self._audit.record_outcome(
+                attempt,
+                outcome=AMBIGUOUS,
+                detail={"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        except Exception as exc:
+            # ExecutionError (nothing sent) and anything unforeseen alike:
+            # the trail must never lose a failure, whatever its shape.
+            await self._audit.record_outcome(
+                attempt,
+                outcome=ERROR,
+                detail={"type": type(exc).__name__, "message": str(exc)},
+            )
+            raise
+        await self._audit.record_outcome(attempt, outcome=OK, detail=result_json(result))
+        return result
+
+
+def _json(value: Any) -> str:
+    return json.dumps(value, default=str)
+
+
+def _lower(address: str | None) -> str | None:
+    return None if address is None else address.lower()
+
+
+def _order_json(order: OrderSpec) -> dict[str, Any]:
+    return {
+        "asset": order.asset,
+        "is_buy": order.is_buy,
+        "size": str(order.size),
+        "limit_price": str(order.limit_price),
+        "tif": order.tif.value,
+        "reduce_only": order.reduce_only,
+        "trigger": None
+        if order.trigger is None
+        else {
+            "trigger_price": str(order.trigger.trigger_price),
+            "is_market": order.trigger.is_market,
+            "tpsl": order.trigger.tpsl.value,
+        },
+        "cloid": order.cloid,
+    }
+
+
+def _order_results_json(results: list[OrderResult]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for result in results:
+        if isinstance(result, OrderResting):
+            serialized.append({"status": "resting", "oid": result.oid, "cloid": result.cloid})
+        elif isinstance(result, OrderFilled):
+            serialized.append(
+                {
+                    "status": "filled",
+                    "oid": result.oid,
+                    "total_size": str(result.total_size),
+                    "avg_price": str(result.avg_price),
+                    "cloid": result.cloid,
+                }
+            )
+        else:
+            serialized.append(
+                {
+                    "status": "rejected",
+                    "reason": result.reason.value,
+                    "message": result.message,
+                }
+            )
+    return serialized
+
+
+def _cancel_results_json(results: list[CancelResult]) -> list[dict[str, Any]]:
+    return [
+        {"status": "ok"}
+        if isinstance(result, CancelOk)
+        else {"status": "rejected", "reason": result.reason.value, "message": result.message}
+        for result in results
+    ]

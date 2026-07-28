@@ -202,6 +202,12 @@ class RejectReason(Enum):
     NO_IMMEDIATE_MATCH = "no_immediate_match"  # Ioc/market found no liquidity
     OPEN_INTEREST_CAP = "open_interest_cap"
     MISSING_ORDER = "missing_order"  # cancel/modify of an unknown oid
+    # A cumulative-traded-volume eligibility gate (funded probe 2026-07-28):
+    # scheduleCancel ("Cannot set scheduled cancel time until enough volume
+    # traded. Required: $1000000. Traded: $0.") and createSubAccount ($100k)
+    # both refuse with this shape. The dead-man's-switch eligibility probe
+    # (issue #135) keys on this reason — the refusal string is unambiguous.
+    VOLUME_GATED = "volume_gated"
     # A throttle the exchange voices as reject PROSE (e.g. the address-based
     # budget's trickle) rather than as HTTP 429 — the 429 path surfaces as
     # ExecutionRateLimitedError after in-place retry instead (research §5).
@@ -236,6 +242,9 @@ _REJECT_PATTERNS: tuple[tuple[str, RejectReason], ...] = (
     ("open interest", RejectReason.OPEN_INTEREST_CAP),
     ("never placed", RejectReason.MISSING_ORDER),
     ("already canceled", RejectReason.MISSING_ORDER),
+    # Observed live 2026-07-28 (funded probe, module docstring): the shared
+    # tail of every cumulative-volume eligibility refusal.
+    ("until enough volume traded", RejectReason.VOLUME_GATED),
     # "too many REQUESTS" specifically — a bare "too many" would misread a
     # "Too many open orders" cap (research §5's 1,000-order limit) as a
     # throttle; an order-count cap has no arm yet and classifies UNKNOWN.
