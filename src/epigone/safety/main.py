@@ -107,6 +107,10 @@ async def main() -> None:
             actor=WATCHDOG_ACTOR,
             master_address=master_address,
             signer_address=signer.address,
+            # The safety path's discipline (PR #143 review): a Postgres
+            # outage must never suppress a protective cancel — best-effort
+            # audit, guaranteed action.
+            best_effort_audit=True,
         )
         deadman = DeadMansSwitch(
             exec_gateway,
@@ -124,7 +128,9 @@ async def main() -> None:
             audit,
             budget,
             master_address=master_address,
+            signer_address=signer.address,
             executor_stale=config.executor_stale,
+            capability_interval=config.capability_interval,
         )
         # "Which mechanism(s) are active" starts here on the trail: the
         # watchdog is primary the moment it runs; the deadman announces its

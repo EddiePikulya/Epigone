@@ -15,8 +15,14 @@ thing it watches:
 
 One cycle: beat own heartbeat (the #52 monitor watches the watcher) → trip
 if the executor's heartbeat exists but went stale → sweep whatever halt is
-active (watchdog-tripped or operator /kill alike) → nothing else. A halt
-whose sweep isn't finished is re-swept every cycle until it is.
+active (watchdog-tripped or operator /kill alike) → verify, on a slow
+cadence, that this watchdog's agent key is still approved ON-CHAIN
+(extraAgents — a beating-but-impotent watchdog must page BEFORE an incident,
+PR #143 review). A halt whose sweep isn't finished is re-swept every cycle
+until it is. The sweep is ACCOUNT-WIDE: core plus every builder dex in the
+live perpDexs listing, because the agent key is account-wide and an order
+surviving a kill on an uncovered venue would be the silent version of the
+gap this module exists to close.
 
 THE SWEEP NEVER TRUSTS A CANCEL'S WORD. `swept_at` is stamped only when a
 FRESH enumeration of the book answers empty — cancel results, however clean,
@@ -40,18 +46,15 @@ import asyncpg
 from epigone.budget import Budget
 from epigone.clock import Clock
 from epigone.gateway import (
-    POSITION_VENUES,
     GatewayError,
     HyperliquidGateway,
     OpenOrder,
     Position,
     fetch_asset_ids,
-    fetch_open_orders,
-    fetch_open_positions,
 )
 from epigone.gateway.execution import CancelSpec
 from epigone.safety import heartbeat
-from epigone.safety.audit import AuditedExecutionGateway, ExecutionAudit
+from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
 from epigone.safety.halt import (
     HOLD_POLICY,
     WATCHDOG_SOURCE,
@@ -68,7 +71,12 @@ log = logging.getLogger(__name__)
 # stream/orders.py — change those, change these).
 ORDERS_WEIGHT = 20  # frontendOpenOrders, per venue
 POSITIONS_WEIGHT = 2  # clearinghouseState, per venue
-META_WEIGHT = 20  # meta (per venue) and perpDexs alike — the info default
+META_WEIGHT = 20  # meta (per venue), perpDexs, extraAgents — the info default
+
+# A failed capability read (network blip, info outage) retries on this short
+# fuse instead of waiting out the full check interval — but never every
+# cycle, which would burn 20 weight per 10s on a persistent outage.
+CAPABILITY_RETRY = timedelta(minutes=5)
 
 
 class Watchdog:
@@ -85,7 +93,9 @@ class Watchdog:
         budget: Budget,
         *,
         master_address: str,
+        signer_address: str,
         executor_stale: timedelta,
+        capability_interval: timedelta,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -94,7 +104,11 @@ class Watchdog:
         self._audit = audit
         self._budget = budget
         self._master = master_address.lower()
+        self._signer_address = signer_address.lower()
         self._executor_stale = executor_stale
+        self._capability_interval = capability_interval
+        self._capable: bool | None = None  # last on-chain verdict; None = unchecked
+        self._next_capability_at: datetime | None = None  # None → due now
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
@@ -107,6 +121,72 @@ class Watchdog:
             halt = await self._trip_if_executor_stale(now)
         if halt is not None and halt.swept_at is None:
             await self._sweep(halt)
+        # After the protective work, never before it: the capability probe is
+        # advisory, and its failures must not delay a sweep by one second.
+        try:
+            await self._verify_capability(now)
+        except Exception:
+            log.exception("capability probe failed; retrying next cycle")
+
+    async def _verify_capability(self, now: datetime) -> None:
+        """The beating-but-impotent guard (PR #143 review): verify ON-CHAIN —
+        via the public extraAgents readback, no signing, no trading action —
+        that this watchdog's agent key is still approved and unexpired, so a
+        mid-run deregistration or an unrestarted rotation pages the operator
+        BEFORE an incident needs the cancel, not during. Verdict state lands
+        beside the heartbeat (migration 0025) for the #52 monitor; verdict
+        TRANSITIONS go to the audit trail."""
+        if self._next_capability_at is not None and now < self._next_capability_at:
+            return
+        await self._budget.spend(META_WEIGHT)
+        try:
+            agents = await self._read.get_extra_agents(self._master)
+        except GatewayError:
+            log.warning(
+                "capability probe: extraAgents read failed; retrying in %ds",
+                int(CAPABILITY_RETRY.total_seconds()),
+                exc_info=True,
+            )
+            self._next_capability_at = now + CAPABILITY_RETRY
+            return
+        approval = next((a for a in agents if a.address == self._signer_address), None)
+        if approval is None:
+            capable = False
+            detail = (
+                f"agent {self._signer_address} is NOT among {self._master}'s approved "
+                f"agents — deregistered on-chain (or never approved); every cancel "
+                f"this watchdog issued would be rejected"
+            )
+        elif approval.valid_until <= now:
+            capable = False
+            detail = (
+                f"agent {self._signer_address} approval EXPIRED "
+                f"{approval.valid_until:%Y-%m-%d %H:%M} UTC — rotate the watchdog "
+                f"lane and restart the service (agent-key-rotation runbook)"
+            )
+        else:
+            capable = True
+            detail = (
+                f"approved on-chain as {approval.name or 'unnamed'} "
+                f"until {approval.valid_until:%Y-%m-%d}"
+            )
+        if capable != self._capable:
+            # Event before state (the deadman's rule): a lost event write
+            # leaves the verdict unclaimed and the next cycle re-derives it.
+            await self._audit.record_event(
+                actor=WATCHDOG_ACTOR,
+                action="watchdog_capable" if capable else "watchdog_impotent",
+                risk_decision="on-chain capability probe (extraAgents)",
+                detail={"verdict": detail},
+                master_address=self._master,
+            )
+            self._capable = capable
+            if not capable:
+                log.error("watchdog IMPOTENT: %s", detail)
+        await heartbeat.record_capability(
+            self._pool, heartbeat.WATCHDOG_PROCESS, capable=capable, detail=detail, now=now
+        )
+        self._next_capability_at = now + self._capability_interval
 
     async def _trip_if_executor_stale(self, now: datetime) -> Halt | None:
         """The trip condition: the executor HAS run (its row exists) and its
@@ -135,12 +215,26 @@ class Watchdog:
         book, cancel what rests, list AGAIN, and only an empty second listing
         stamps the sweep done — with the position snapshot and the unwind
         policy recorded. Any failure leaves the halt unswept for the next
-        cycle; enumeration is idempotent and cancels tolerate re-issue."""
+        cycle; enumeration is idempotent and cancels tolerate re-issue.
+
+        ACCOUNT-WIDE by construction (PR #143 review): the agent key is
+        account-wide, so the sweep enumerates the core venue plus EVERY
+        builder dex in the live perpDexs listing — not just the venues the
+        product covers for tracking (POSITION_VENUES). A dex added to
+        trading, or an order that somehow landed on an uncovered dex, is
+        swept with no code change here. (Sub-accounts are a different axis:
+        agent-reachable per the #142 findings but separate ACCOUNTS, outside
+        this master's book — the runbook carries that boundary until A5's
+        risk policy forbids or includes them.)"""
         self._exec.decision = f"halt #{halt.id} ({halt.source}): {halt.reason}"
-        orders = await self._open_orders()
+        dexs = await self._perp_dexs()
+        orders = await self._open_orders(dexs)
         if orders:
             await self._exec.cancel_orders(await self._cancels_for(orders))
-            orders = await self._open_orders()  # the fresh, deciding enumeration
+            # The fresh, deciding enumeration — over a fresh listing too, so
+            # a dex appearing mid-sweep cannot hide an order from the verify.
+            dexs = await self._perp_dexs()
+            orders = await self._open_orders(dexs)
         if orders:
             log.warning(
                 "halt #%d sweep: %d order(s) still resting after cancel; retrying next cycle",
@@ -148,7 +242,7 @@ class Watchdog:
                 len(orders),
             )
             return
-        positions = await self._open_positions()
+        positions = await self._open_positions(dexs)
         await mark_swept(
             self._pool,
             self._clock,
@@ -158,15 +252,24 @@ class Watchdog:
             unwind_policy=HOLD_POLICY,
         )
         log.error(
-            "halt #%d swept: book empty; %d open position(s) HELD per %s "
-            "(docs/runbooks/halt-and-unwind.md)",
+            "halt #%d swept: book empty across %d venue(s); %d open position(s) HELD "
+            "per %s (docs/runbooks/halt-and-unwind.md)",
             halt.id,
+            len(dexs) + 1,
             len(positions),
             HOLD_POLICY,
         )
 
     async def _cancels_for(self, orders: list[OpenOrder]) -> list[CancelSpec]:
-        asset_ids = await self._asset_ids()
+        # Map exactly the dexs the enumerated orders sit on (namespaced
+        # `dex:COIN` coins), plus the core universe fetch_asset_ids always
+        # reads. Billing: core meta + perpDexs (when any dex is needed) +
+        # one meta per needed dex.
+        needed = sorted({order.coin.split(":", 1)[0] for order in orders if ":" in order.coin})
+        spends = 1 + (1 + len(needed) if needed else 0)
+        for _ in range(spends):
+            await self._budget.spend(META_WEIGHT)
+        asset_ids = await fetch_asset_ids(self._read, dexs=needed)
         cancels: list[CancelSpec] = []
         for order in orders:
             asset = asset_ids.get(order.coin)
@@ -180,21 +283,23 @@ class Watchdog:
             cancels.append(CancelSpec(asset=asset, oid=order.order_id))
         return cancels
 
-    async def _open_orders(self) -> list[OpenOrder]:
-        for _ in POSITION_VENUES:
+    async def _perp_dexs(self) -> list[str]:
+        await self._budget.spend(META_WEIGHT)
+        return await self._read.get_perp_dexs()
+
+    async def _open_orders(self, dexs: list[str]) -> list[OpenOrder]:
+        orders: list[OpenOrder] = []
+        for dex in [None, *dexs]:
             await self._budget.spend(ORDERS_WEIGHT)
-        return await fetch_open_orders(self._read, self._master)
+            orders.extend(await self._read.get_open_orders(self._master, dex=dex))
+        return orders
 
-    async def _open_positions(self) -> list[Position]:
-        for _ in POSITION_VENUES:
+    async def _open_positions(self, dexs: list[str]) -> list[Position]:
+        positions: list[Position] = []
+        for dex in [None, *dexs]:
             await self._budget.spend(POSITIONS_WEIGHT)
-        return await fetch_open_positions(self._read, self._master)
-
-    async def _asset_ids(self) -> dict[str, int]:
-        # One meta per venue plus the perpDexs listing (fetch_asset_ids).
-        for _ in range(len(POSITION_VENUES) + 1):
-            await self._budget.spend(META_WEIGHT)
-        return await fetch_asset_ids(self._read)
+            positions.extend(await self._read.get_open_positions(self._master, dex=dex))
+        return positions
 
 
 def _position_json(position: Position) -> dict[str, str]:

@@ -36,3 +36,28 @@ async def last_beat(pool: asyncpg.Pool, process: str) -> datetime | None:
         "SELECT beaten_at FROM process_heartbeats WHERE process = $1", process
     )
     return beaten
+
+
+async def record_capability(
+    pool: asyncpg.Pool, process: str, *, capable: bool, detail: str, now: datetime
+) -> None:
+    """The on-chain capability verdict (migration 0025): can this process's
+    agent key actually act? Stored beside the heartbeat so the #52 monitor
+    can tell a beating-but-impotent watchdog from a healthy one (PR #143
+    review). Upserts like beat(): the verdict must land even if a check runs
+    before the first beat of a cycle."""
+    await pool.execute(
+        """
+        INSERT INTO process_heartbeats
+            (process, beaten_at, capable, capability_detail, capability_checked_at)
+        VALUES ($1, $2, $3, $4, $2)
+        ON CONFLICT (process) DO UPDATE
+        SET capable = EXCLUDED.capable,
+            capability_detail = EXCLUDED.capability_detail,
+            capability_checked_at = EXCLUDED.capability_checked_at
+        """,
+        process,
+        now,
+        capable,
+        detail,
+    )

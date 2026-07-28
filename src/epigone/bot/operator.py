@@ -30,9 +30,18 @@ from epigone.bot.delete import with_delete_button
 from epigone.clock import Clock
 from epigone.safety import heartbeat
 from epigone.safety.audit import ExecutionAudit
-from epigone.safety.halt import KILL_SOURCE, active_halt, request_halt, resume
+from epigone.safety.halt import (
+    KILL_SOURCE,
+    HaltContentionError,
+    active_halt,
+    request_halt,
+    resume,
+)
 
-RESUME_CONFIRM_CALLBACK = "resumeconfirm"
+# The confirm carries the halt id it was offered for (PR #143 review): a
+# stale prompt must never lift a different, later halt — halt.resume() only
+# closes the exact id, and ids never recycle (halt rows are history).
+RESUME_CONFIRM_PREFIX = "resumeconfirm:"
 RESUME_CANCEL_CALLBACK = "resumecancel"
 
 KILLED_TEXT = (
@@ -60,21 +69,37 @@ RESUME_PROMPT_TEXT = (
     "executor heartbeat is still stale the watchdog halts again within one "
     "cycle."
 )
+RESUME_SWEEP_PENDING_LINE = (
+    "⚠️ Sweep PENDING — the book has not been verified empty; resting orders "
+    "may still be live."
+)
 RESUMED_TEXT = (
     "▶️ Halt lifted. Nothing was re-placed — what happens next is the "
     "executor's decision, order by order."
 )
 RESUME_CANCELLED_TEXT = "Still halted — resume cancelled."
-RESUME_GONE_TEXT = "Nothing to resume — the halt was already lifted."
-
-_RESUME_CONFIRM_KB = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [
-            InlineKeyboardButton(text="▶️ Resume trading", callback_data=RESUME_CONFIRM_CALLBACK),
-            InlineKeyboardButton(text="◀ Cancel", callback_data=RESUME_CANCEL_CALLBACK),
-        ]
-    ]
+KILL_CONTENTION_TEXT = (
+    "⚠️ Halt state is being contended (halts opening and resuming "
+    "concurrently) — run /kill again NOW."
 )
+RESUME_GONE_TEXT = (
+    "Nothing to resume — that halt is no longer the active one. If a newer "
+    "halt is standing, run /resume again for it."
+)
+
+
+def _resume_confirm_kb(halt_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="▶️ Resume trading",
+                    callback_data=f"{RESUME_CONFIRM_PREFIX}{halt_id}",
+                ),
+                InlineKeyboardButton(text="◀ Cancel", callback_data=RESUME_CANCEL_CALLBACK),
+            ]
+        ]
+    )
 
 
 async def cmd_kill(
@@ -92,14 +117,20 @@ async def cmd_kill(
     reason = f"operator /kill by {user.id}"
     if command.args:
         reason += f": {command.args.strip()}"
-    halt, created = await request_halt(
-        pool,
-        clock,
-        ExecutionAudit(pool, clock),
-        source=KILL_SOURCE,
-        reason=reason,
-        requested_by=user.id,
-    )
+    try:
+        halt, created = await request_halt(
+            pool,
+            clock,
+            ExecutionAudit(pool, clock),
+            source=KILL_SOURCE,
+            reason=reason,
+            requested_by=user.id,
+        )
+    except HaltContentionError:
+        # /kill must ALWAYS answer — even the pathological livelock gets a
+        # reply telling the operator to hit it again, never a silent crash.
+        await message.answer(KILL_CONTENTION_TEXT, reply_markup=with_delete_button())
+        return
     if not created:
         await message.answer(
             f"Already halted — {halt.source} halt since "
@@ -123,10 +154,14 @@ async def cmd_resume(
     if not _is_admin(message.from_user, admin_telegram_id):
         await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
         return
-    if await active_halt(pool) is None:
+    halt = await active_halt(pool)
+    if halt is None:
         await message.answer(NOT_HALTED_TEXT, reply_markup=with_delete_button())
         return
-    await message.answer(RESUME_PROMPT_TEXT, reply_markup=_RESUME_CONFIRM_KB)
+    prompt = RESUME_PROMPT_TEXT
+    if halt.swept_at is None:
+        prompt = f"{RESUME_PROMPT_TEXT}\n\n{RESUME_SWEEP_PENDING_LINE}"
+    await message.answer(prompt, reply_markup=_resume_confirm_kb(halt.id))
 
 
 async def on_resume_confirm(
@@ -138,9 +173,19 @@ async def on_resume_confirm(
     if not _is_admin(callback.from_user, admin_telegram_id):
         await callback.answer(ADMIN_ONLY_TEXT, show_alert=True)
         return
-    closed = await resume(
-        pool, clock, ExecutionAudit(pool, clock), resumed_by=callback.from_user.id
-    )
+    payload = (callback.data or "").removeprefix(RESUME_CONFIRM_PREFIX)
+    closed = None
+    # Callback data is client-forgeable: non-digits AND digit strings past
+    # BIGINT's 18 safe digits are garbage (an overflow at bind time would
+    # crash the handler instead of answering "stale").
+    if payload.isdigit() and len(payload) <= 18:
+        closed = await resume(
+            pool,
+            clock,
+            ExecutionAudit(pool, clock),
+            halt_id=int(payload),
+            resumed_by=callback.from_user.id,
+        )
     text = RESUME_GONE_TEXT if closed is None else RESUMED_TEXT
     if isinstance(callback.message, Message):
         await callback.message.edit_text(text, reply_markup=with_delete_button())
@@ -160,5 +205,5 @@ def register(router: Router) -> None:
     these on the dispatcher, and each handler still enforces owner-only."""
     router.message.register(cmd_kill, Command("kill"))
     router.message.register(cmd_resume, Command("resume"))
-    router.callback_query.register(on_resume_confirm, F.data == RESUME_CONFIRM_CALLBACK)
+    router.callback_query.register(on_resume_confirm, F.data.startswith(RESUME_CONFIRM_PREFIX))
     router.callback_query.register(on_resume_cancel, F.data == RESUME_CANCEL_CALLBACK)

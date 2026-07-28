@@ -28,6 +28,7 @@ import aiohttp
 
 from epigone.clock import Clock
 from epigone.gateway import (
+    ExtraAgent,
     Fill,
     GatewayError,
     LeaderboardEntry,
@@ -184,6 +185,13 @@ class HttpHyperliquidGateway:
         except aiohttp.ClientError as exc:
             raise GatewayError(f"perpDexs request failed: {exc}") from exc
         return parse_perp_dexs(payload)
+
+    async def get_extra_agents(self, address: str) -> list[ExtraAgent]:
+        try:
+            payload = await self._info_json("extraAgents", address)
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"extraAgents request failed for {address}: {exc}") from exc
+        return parse_extra_agents(payload)
 
     async def _request_json(
         self, method: str, url: str, *, json_body: dict[str, Any] | None = None
@@ -373,6 +381,27 @@ def parse_perp_dexs(payload: Any) -> list[str]:
         return [str(entry["name"]) for entry in payload[1:]]
     except (KeyError, TypeError) as exc:
         raise GatewayError(f"unexpected perpDexs payload shape: {exc!r}") from exc
+
+
+def parse_extra_agents(payload: Any) -> list[ExtraAgent]:
+    """An extraAgents payload — [{"address", "name", "validUntil" (ms)}] as
+    read back live during the #134 ceremony verification — to typed records.
+    The watchdog's capability verdict rides this parse, so a shape surprise
+    fails loudly rather than read as "no agents" (which would page a healthy
+    watchdog as impotent — the wrong false alarm, but an alarm; silently
+    empty would be the dangerous direction for OTHER callers auditing
+    authority)."""
+    try:
+        return [
+            ExtraAgent(
+                address=str(entry["address"]).lower(),
+                name=str(entry["name"]) if entry.get("name") is not None else None,
+                valid_until=datetime.fromtimestamp(entry["validUntil"] / 1000, tz=UTC),
+            )
+            for entry in payload
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GatewayError(f"unexpected extraAgents payload shape: {exc!r}") from exc
 
 
 def _opt_decimal(value: Any) -> Decimal | None:

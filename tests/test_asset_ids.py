@@ -39,6 +39,22 @@ async def test_covered_dex_missing_from_listing_raises(
         await fetch_asset_ids(gateway)
 
 
+async def test_explicit_dexs_select_beyond_the_covered_venues(
+    gateway: FakeHyperliquidGateway,
+) -> None:
+    # The watchdog's account-wide sweep (PR #143 review) maps exactly the
+    # dexs its enumerated orders sit on — including ones POSITION_VENUES
+    # doesn't cover, like `flip` (listing position 1 → offset 120000).
+    gateway.perp_universes["flip"] = ["flip:GME"]
+    ids = await fetch_asset_ids(gateway, dexs=["flip"])
+    assert ids["flip:GME"] == 120_000
+    assert "xyz:META" not in ids  # only what was asked for, plus core
+    assert ids["BTC"] == 0
+    # And dexs=[] maps the core universe alone — no perpDexs read needed.
+    core_only = await fetch_asset_ids(gateway, dexs=[])
+    assert core_only == {"BTC": 0, "ETH": 1, "SOL": 2}
+
+
 def test_parse_perp_universe_namespaces_builder_coins() -> None:
     payload = {"universe": [{"name": "META"}, {"name": "BB"}]}
     assert parse_perp_universe(payload, "xyz") == ["xyz:META", "xyz:BB"]

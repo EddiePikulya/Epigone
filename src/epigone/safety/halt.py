@@ -36,6 +36,13 @@ WATCHDOG_SOURCE = "watchdog"
 HOLD_POLICY = "hold-and-alert"
 
 
+class HaltContentionError(RuntimeError):
+    """request_halt's bounded-retry backstop: halts kept appearing and
+    resuming concurrently for every attempt. Pathological by construction —
+    but /kill catches it and answers with a retry prompt, because a kill
+    switch that crashes without a reply is the one unacceptable outcome."""
+
+
 @dataclass(frozen=True)
 class Halt:
     id: int
@@ -61,37 +68,51 @@ async def request_halt(
 ) -> tuple[Halt, bool]:
     """Open a halt, or join the one already active. Returns (halt, created);
     created=False means a halt was already standing and NO new state or audit
-    row was written — /kill during a watchdog halt is one incident, not two."""
-    now = clock.now()
-    async with pool.acquire() as conn:
-        try:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    """
-                    INSERT INTO execution_halts (halted_at, source, reason, requested_by)
-                    VALUES ($1, $2, $3, $4)
-                    RETURNING *
-                    """,
-                    now,
-                    source,
-                    reason,
-                    requested_by,
-                )
-                assert row is not None
-                await audit.record_event(
-                    actor=OPERATOR_ACTOR if source == KILL_SOURCE else WATCHDOG_ACTOR,
-                    action="halt",
-                    risk_decision=reason,
-                    detail={"halt_id": row["id"], "source": source,
-                            "requested_by": requested_by},
-                    conn=conn,
-                )
-                return _halt(row), True
-        except asyncpg.UniqueViolationError:
-            pass  # a halt is already standing; fall through to join it
-    standing = await active_halt(pool)
-    assert standing is not None  # the unique violation proved one exists
-    return standing, False
+    row was written — /kill during a watchdog halt is one incident, not two.
+
+    Race-proof by retry (PR #143 review): a unique violation proves a halt
+    was standing at insert time, but it can be RESUMED before the re-read —
+    in that window neither "created" nor "joined" is true yet, so the loop
+    simply tries again. A crashing kill switch is the one unacceptable
+    outcome; the bound exists only to turn a pathological livelock into a
+    loud, catchable error instead of a silent spin."""
+    for _ in range(10):
+        now = clock.now()  # per attempt: a retried halt starts when it lands
+        async with pool.acquire() as conn:
+            try:
+                async with conn.transaction():
+                    row = await conn.fetchrow(
+                        """
+                        INSERT INTO execution_halts (halted_at, source, reason, requested_by)
+                        VALUES ($1, $2, $3, $4)
+                        RETURNING *
+                        """,
+                        now,
+                        source,
+                        reason,
+                        requested_by,
+                    )
+                    assert row is not None
+                    await audit.record_event(
+                        actor=OPERATOR_ACTOR if source == KILL_SOURCE else WATCHDOG_ACTOR,
+                        action="halt",
+                        risk_decision=reason,
+                        detail={"halt_id": row["id"], "source": source,
+                                "requested_by": requested_by},
+                        conn=conn,
+                    )
+                    return _halt(row), True
+            except asyncpg.UniqueViolationError:
+                pass  # a halt was standing at insert time; try to join it
+        standing = await active_halt(pool)
+        if standing is not None:
+            return standing, False
+        # The standing halt was resumed between the violation and the
+        # re-read — loop and insert again.
+    raise HaltContentionError(
+        "request_halt could not settle: halts kept appearing and resuming "
+        "concurrently across 10 attempts"
+    )
 
 
 async def active_halt(pool: asyncpg.Pool) -> Halt | None:
@@ -151,11 +172,18 @@ async def mark_swept(
 
 
 async def resume(
-    pool: asyncpg.Pool, clock: Clock, audit: ExecutionAudit, *, resumed_by: int
+    pool: asyncpg.Pool,
+    clock: Clock,
+    audit: ExecutionAudit,
+    *,
+    halt_id: int,
+    resumed_by: int,
 ) -> Halt | None:
-    """Close the active halt (the operator confirmed /resume). Returns the
-    closed halt, or None when nothing was active. Nothing is re-placed; if
-    the executor heartbeat is still stale the watchdog will halt again within
+    """Close halt `halt_id` IF it is the standing one (the operator confirmed
+    /resume for that specific halt). Returns the closed halt, or None when
+    that halt is not the active one — a stale confirm tap must never lift a
+    different, later halt (PR #143 review). Nothing is re-placed; if the
+    executor heartbeat is still stale the watchdog will halt again within
     one cycle — resume is consent to trade, not an override of the switch."""
     now = clock.now()
     async with pool.acquire() as conn:
@@ -163,11 +191,12 @@ async def resume(
             row = await conn.fetchrow(
                 """
                 UPDATE execution_halts SET resumed_at = $1, resumed_by = $2
-                WHERE resumed_at IS NULL
+                WHERE resumed_at IS NULL AND id = $3
                 RETURNING *
                 """,
                 now,
                 resumed_by,
+                halt_id,
             )
             if row is None:
                 return None

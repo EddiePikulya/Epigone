@@ -54,6 +54,14 @@ CRITICAL = "critical"
 # not a tunable — the operator tunes *when* to be warned via HEALTHCHECK_DISK_PERCENT.
 DISK_CRITICAL_PERCENT = 95
 
+# A watchdog capability verdict older than this is unverified (issue #135):
+# the probe runs ~6-hourly with a 5-minute failure retry, so a day of silence
+# means the on-chain check has been failing for ~4 cycles straight — long
+# enough that a stale capable=TRUE could be masking a deregistration. Fixed
+# like the disk escalation band, not a tunable: 4× the probe's own default
+# cadence, generous against any sane WATCHDOG_CAPABILITY_CHECK_HOURS.
+CAPABILITY_VERDICT_STALE = timedelta(hours=24)
+
 
 class DiskProbe(Protocol):
     """Host disk visibility, injected so tests feed a synthetic percentage and
@@ -123,6 +131,15 @@ class HealthSnapshot:
     # watchdog check decides what each combination means.
     executor_beaten_at: datetime | None = None
     watchdog_beaten_at: datetime | None = None
+    # The watchdog's on-chain capability verdict (migration 0025, PR #143
+    # review): None = never checked, False = beating but IMPOTENT — its agent
+    # key can't cancel anything; detail says why. `checked_at` is when the
+    # verdict last landed — a verdict the probe hasn't refreshed in a long
+    # time is unverified, not trustworthy (an info outage must not let a
+    # stale capable=TRUE mask a deregistration forever).
+    watchdog_capable: bool | None = None
+    watchdog_capability_detail: str | None = None
+    watchdog_capability_checked_at: datetime | None = None
     # The active execution halt, if any (issue #135) — raw fields off the one
     # active execution_halts row; all None when trading is not halted.
     active_halt_since: datetime | None = None
@@ -178,6 +195,12 @@ async def gather_snapshot(
                 AS executor_beaten_at,
             (SELECT beaten_at FROM process_heartbeats WHERE process = 'watchdog')
                 AS watchdog_beaten_at,
+            (SELECT capable FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capable,
+            (SELECT capability_detail FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_detail,
+            (SELECT capability_checked_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_checked_at,
             (SELECT halted_at FROM execution_halts WHERE resumed_at IS NULL)
                 AS active_halt_since,
             (SELECT source FROM execution_halts WHERE resumed_at IS NULL)
@@ -210,6 +233,9 @@ async def gather_snapshot(
         nearest_agent_key_expiry=row["nearest_agent_key_expiry"],
         executor_beaten_at=row["executor_beaten_at"],
         watchdog_beaten_at=row["watchdog_beaten_at"],
+        watchdog_capable=row["watchdog_capable"],
+        watchdog_capability_detail=row["watchdog_capability_detail"],
+        watchdog_capability_checked_at=row["watchdog_capability_checked_at"],
         active_halt_since=row["active_halt_since"],
         active_halt_source=row["active_halt_source"],
         active_halt_reason=row["active_halt_reason"],
@@ -450,8 +476,11 @@ def _watchdog_check(snapshot: HealthSnapshot, stale: timedelta) -> CheckResult:
     the PRIMARY dead-man's switch (scheduleCancel is volume-gated, PR #141),
     so its death is critical the moment there is anything to guard:
 
-    - watchdog beating recently → healthy;
+    - watchdog beating recently AND on-chain capable → healthy;
     - watchdog silent past the window → critical: the switch is down;
+    - watchdog beating but IMPOTENT (its agent deregistered/expired on-chain,
+      the migration-0025 verdict) → critical: heartbeats without the power to
+      cancel are the false safety the PR #143 review flagged;
     - watchdog NEVER ran while the executor HAS a heartbeat → critical: an
       executor without its watchdog is exactly the unguarded state A3 forbids;
     - neither ever ran → quiet, like the empty keystore: the pre-deploy state
@@ -485,6 +514,34 @@ def _watchdog_check(snapshot: HealthSnapshot, stale: timedelta) -> CheckResult:
                 f"Watchdog: last heartbeat {_ago(age)} ago (threshold "
                 f"{_ago(stale)}) — the dead-man's switch is DOWN; resting orders "
                 f"are unguarded (issue #135)"
+            ),
+        )
+    if snapshot.watchdog_capable is False:
+        return CheckResult(
+            WATCHDOG,
+            "Watchdog",
+            ok=False,
+            severity=CRITICAL,
+            detail=(
+                f"Watchdog: beating but IMPOTENT — "
+                f"{snapshot.watchdog_capability_detail or 'agent not approved on-chain'}; "
+                f"re-approve/rotate the watchdog lane and restart the service "
+                f"(agent-key-rotation runbook)"
+            ),
+        )
+    checked = snapshot.watchdog_capability_checked_at
+    if checked is not None and snapshot.now - checked > CAPABILITY_VERDICT_STALE:
+        # A verdict the probe cannot refresh is unverified: an info outage
+        # must not let a stale capable=TRUE mask a mid-run deregistration.
+        return CheckResult(
+            WATCHDOG,
+            "Watchdog",
+            ok=False,
+            severity=WARNING,
+            detail=(
+                f"Watchdog: on-chain capability UNVERIFIED for "
+                f"{_ago(snapshot.now - checked)} (probe failing?) — the last verdict "
+                f"may be stale; check the watchdog logs and the info endpoint"
             ),
         )
     return CheckResult(

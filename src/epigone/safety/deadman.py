@@ -84,7 +84,9 @@ class DeadMansSwitch:
         except ActionRejectedError as exc:
             if exc.reason is RejectReason.VOLUME_GATED:
                 if self.state != INELIGIBLE:
-                    self.state = INELIGIBLE
+                    # Event BEFORE state (PR #143 review): if the event write
+                    # fails, the state stays unchanged and the next due probe
+                    # retries both — a transition can never outrun its trail.
                     await self._audit.record_event(
                         actor=WATCHDOG_ACTOR,
                         action="deadman_ineligible",
@@ -92,6 +94,7 @@ class DeadMansSwitch:
                         detail={"exchange": exc.message},
                         master_address=self._master_address,
                     )
+                    self.state = INELIGIBLE
                 self._next_attempt_at = now + self._reprobe
                 return
             # An unexpected reject: nothing new was armed — and if a
@@ -111,11 +114,11 @@ class DeadMansSwitch:
                     detail={"exchange": exc.message, "was": self.state},
                     master_address=self._master_address,
                 )
-            self.state = UNKNOWN
+                self.state = UNKNOWN
             self._next_attempt_at = now + self._reprobe
             return
         if self.state != ACTIVE:
-            self.state = ACTIVE
+            # Event before state, same rule as the ineligible branch.
             await self._audit.record_event(
                 actor=WATCHDOG_ACTOR,
                 action="deadman_activated",
@@ -127,6 +130,7 @@ class DeadMansSwitch:
                 },
                 master_address=self._master_address,
             )
+            self.state = ACTIVE
         # Push forward well before the horizon arrives: half-cadence leaves a
         # full half-horizon of slack for a slow cycle before a spurious fire.
         self._next_attempt_at = now + self._horizon / 2

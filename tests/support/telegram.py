@@ -236,10 +236,6 @@ def is_delete_button_exempt(text: str) -> bool:
         # reprompt. The terminal cancel is not exempt (it carries the row).
         controls.GLOBAL_MIN_PROMPT_TEXT,
         controls.MIN_SIZE_UNREADABLE_TEXT,
-        # Resume-confirm prompt (bot/operator.py, #135) — mid-flow, carries its
-        # own confirm/cancel keyboard. The terminal resumed/cancelled/killed
-        # replies are NOT exempt: they carry the row like any other.
-        operator.RESUME_PROMPT_TEXT,
     }
     if text in exact:
         return True
@@ -267,6 +263,11 @@ def is_delete_button_exempt(text: str) -> bool:
         # confirmations (saved / name-cleared / no-longer-tracking) carry the row.
         "✏️ Rename ",  # rename prompt (named wallet)
         "✏️ Name ",  # rename prompt (unnamed wallet)
+        # Resume-confirm prompt (bot/operator.py, #135) — mid-flow, carries its
+        # own confirm/cancel keyboard, optionally with the sweep-pending line
+        # appended (hence a marker, not an exact match). The terminal
+        # resumed/cancelled/killed replies are NOT exempt.
+        operator.RESUME_PROMPT_TEXT.splitlines()[0],  # "Resume trading?"
     )
     return any(marker in text for marker in markers)
 

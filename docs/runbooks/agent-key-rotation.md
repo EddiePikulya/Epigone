@@ -17,6 +17,13 @@ hold their own key (`--lane` on every keystore command below, default
 (funded probe, PR #141), so the overlap slot only exists for one lane's
 rotation at a time.
 
+**After rotating the watchdog lane, RESTART the watchdog service**
+(`docker compose restart watchdog`): it loads its signer once at startup, so
+until the restart it keeps signing with the old key — and once the old agent
+is deregistered (step 4) it is beating-but-impotent. The ~6-hourly on-chain
+capability probe will page 🚨 if you forget, but the restart is what fixes
+it, and doing it inside the overlap window means zero impotent minutes.
+
 ## Steps
 
 1. **Approve the new agent first, under the alternate name.** Run the

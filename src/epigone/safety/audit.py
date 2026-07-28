@@ -28,6 +28,7 @@ call is paired with its rows.
 """
 
 import json
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -52,6 +53,8 @@ from epigone.gateway.execution import (
     OrderResult,
     OrderSpec,
 )
+
+log = logging.getLogger(__name__)
 
 # Who acted. The operator acts through bot commands (/kill, /resume); the
 # watchdog and (future, A4+) executor are processes with their own signers.
@@ -193,7 +196,20 @@ class AuditedExecutionGateway:
     acting process sets it before each action (the watchdog re-states it per
     cycle). A deliberate plain attribute, not a constructor freeze: the
     authorization genuinely changes call to call while the gateway instance —
-    one per signer per process, the nonce contract — must not."""
+    one per signer per process, the nonce contract — must not.
+
+    TWO AUDIT DISCIPLINES, chosen at construction (PR #143 review):
+
+    - write-ahead (default): the attempt row must land BEFORE the wire — no
+      evidence, no action. Right for the executor's ORDER path, where the
+      dangerous failure is an order without a record.
+    - best_effort_audit=True: the wire call proceeds even when an audit
+      write fails (logged loudly, never silently). Right — and mandatory —
+      for the SAFETY path (watchdog cancel-all, deadman): its dangerous
+      failure is the opposite one, a protective cancel suppressed because
+      Postgres was down at the exact moment the account most needed
+      protecting. Best-effort is about DB failures only; action failures
+      still raise exactly as always."""
 
     def __init__(
         self,
@@ -203,12 +219,14 @@ class AuditedExecutionGateway:
         actor: str,
         master_address: str,
         signer_address: str,
+        best_effort_audit: bool = False,
     ) -> None:
         self._inner = inner
         self._audit = audit
         self._actor = actor
         self._master_address = master_address
         self._signer_address = signer_address
+        self._best_effort_audit = best_effort_audit
         self.decision: str = "unspecified"
 
     async def place_orders(
@@ -286,25 +304,18 @@ class AuditedExecutionGateway:
         call: Callable[[], Awaitable[T]],
         result_json: Callable[[T], Any],
     ) -> T:
-        attempt = await self._audit.record_attempt(
-            actor=self._actor,
-            action=action,
-            request=request,
-            risk_decision=self.decision,
-            master_address=self._master_address,
-            signer_address=self._signer_address,
-        )
+        attempt = await self._record_attempt(action, request)
         try:
             result = await call()
         except ActionRejectedError as exc:
-            await self._audit.record_outcome(
+            await self._record_outcome(
                 attempt,
                 outcome=REJECTED,
                 detail={"reason": exc.reason.value, "message": exc.message},
             )
             raise
         except AmbiguousExecutionError as exc:
-            await self._audit.record_outcome(
+            await self._record_outcome(
                 attempt,
                 outcome=AMBIGUOUS,
                 detail={"type": type(exc).__name__, "message": str(exc)},
@@ -313,14 +324,58 @@ class AuditedExecutionGateway:
         except Exception as exc:
             # ExecutionError (nothing sent) and anything unforeseen alike:
             # the trail must never lose a failure, whatever its shape.
-            await self._audit.record_outcome(
+            await self._record_outcome(
                 attempt,
                 outcome=ERROR,
                 detail={"type": type(exc).__name__, "message": str(exc)},
             )
             raise
-        await self._audit.record_outcome(attempt, outcome=OK, detail=result_json(result))
+        await self._record_outcome(attempt, outcome=OK, detail=result_json(result))
         return result
+
+    async def _record_attempt(self, action: str, request: Any) -> AuditedAttempt | None:
+        """The write-ahead attempt row — or, in best-effort mode, None when
+        the write fails: the SAFETY action must proceed unaudited rather than
+        be suppressed by a DB outage (class docstring)."""
+        try:
+            return await self._audit.record_attempt(
+                actor=self._actor,
+                action=action,
+                request=request,
+                risk_decision=self.decision,
+                master_address=self._master_address,
+                signer_address=self._signer_address,
+            )
+        except Exception:
+            if not self._best_effort_audit:
+                raise
+            log.exception(
+                "AUDIT WRITE FAILED for %s attempt (%s) — proceeding UNAUDITED: "
+                "best-effort audit, the protective action must not be suppressed",
+                action,
+                self.decision,
+            )
+            return None
+
+    async def _record_outcome(
+        self, attempt: AuditedAttempt | None, *, outcome: str, detail: Any
+    ) -> None:
+        if attempt is None:
+            # Best-effort mode lost the attempt row to a DB outage; there is
+            # nothing to link an outcome to. The action itself was the point.
+            return
+        try:
+            await self._audit.record_outcome(attempt, outcome=outcome, detail=detail)
+        except Exception:
+            if not self._best_effort_audit:
+                raise
+            log.exception(
+                "AUDIT WRITE FAILED for %s outcome %r (attempt %d) — the action "
+                "already ran; reconcile the trail from the exchange if it matters",
+                attempt.action,
+                outcome,
+                attempt.id,
+            )
 
 
 def _json(value: Any) -> str:

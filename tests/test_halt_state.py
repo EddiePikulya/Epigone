@@ -97,13 +97,13 @@ async def test_sweep_stamps_once_with_positions(
 async def test_resume_requires_an_active_halt_and_keeps_history(
     pool: asyncpg.Pool, clock: FakeClock, audit: ExecutionAudit
 ) -> None:
-    assert await resume(pool, clock, audit, resumed_by=ADMIN) is None
+    assert await resume(pool, clock, audit, halt_id=1, resumed_by=ADMIN) is None
 
     first, _ = await request_halt(
         pool, clock, audit, source=KILL_SOURCE, reason="operator /kill", requested_by=ADMIN
     )
     clock.advance(60)
-    closed = await resume(pool, clock, audit, resumed_by=ADMIN)
+    closed = await resume(pool, clock, audit, halt_id=first.id, resumed_by=ADMIN)
     assert closed is not None
     assert closed.id == first.id
     assert closed.resumed_at == clock.now()
@@ -122,6 +122,62 @@ async def test_resume_requires_an_active_halt_and_keeps_history(
         ("operator", "resume"),
         ("watchdog", "halt"),
     ]
+
+
+async def test_resume_is_bound_to_the_halt_id(
+    pool: asyncpg.Pool, clock: FakeClock, audit: ExecutionAudit
+) -> None:
+    """A stale confirm must never lift a different, later halt (PR #143
+    review): resuming id A after A was closed and B opened is a refusal, not
+    a resume of B."""
+    first, _ = await request_halt(
+        pool, clock, audit, source=KILL_SOURCE, reason="/kill", requested_by=ADMIN
+    )
+    await resume(pool, clock, audit, halt_id=first.id, resumed_by=ADMIN)
+    second, _ = await request_halt(
+        pool, clock, audit, source=WATCHDOG_SOURCE, reason="stale again"
+    )
+    assert await resume(pool, clock, audit, halt_id=first.id, resumed_by=ADMIN) is None
+    assert await is_halted(pool)  # the second halt still stands
+    closed = await resume(pool, clock, audit, halt_id=second.id, resumed_by=ADMIN)
+    assert closed is not None and closed.id == second.id
+
+
+async def test_request_halt_survives_a_kill_resume_race(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The race (PR #143 review): the insert hits the one-active unique
+    violation, but the standing halt is RESUMED before the join re-read.
+    request_halt must retry into a fresh halt — a crashing kill switch is the
+    one unacceptable outcome. Simulated by blanking the first re-read."""
+    from epigone.safety import halt as halt_module
+
+    standing, _ = await request_halt(
+        pool, clock, audit, source=WATCHDOG_SOURCE, reason="first"
+    )
+    real_active_halt = halt_module.active_halt
+    blanked = {"remaining": 1}
+
+    async def racy_active_halt(p: asyncpg.Pool) -> object | None:
+        if blanked["remaining"]:
+            blanked["remaining"] -= 1
+            # The resumed-between window: the violation happened, then the
+            # halt vanished before the re-read…
+            await real_active_halt(p)  # (exercise the real read too)
+            await resume(pool, clock, audit, halt_id=standing.id, resumed_by=ADMIN)
+            return None
+        return await real_active_halt(p)
+
+    monkeypatch.setattr(halt_module, "active_halt", racy_active_halt)
+    halt, created = await request_halt(
+        pool, clock, audit, source=KILL_SOURCE, reason="/kill", requested_by=ADMIN
+    )
+    assert created  # the retry inserted a fresh halt instead of crashing
+    assert halt.source == KILL_SOURCE
+    assert await is_halted(pool)
 
 
 async def test_heartbeats_upsert_and_read(pool: asyncpg.Pool, clock: FakeClock) -> None:

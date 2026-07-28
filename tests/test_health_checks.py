@@ -326,6 +326,43 @@ def test_stale_watchdog_is_critical() -> None:
     assert "11m" in check.detail and "dead-man" in check.detail
 
 
+def test_beating_but_impotent_watchdog_is_critical() -> None:
+    # Heartbeats without the power to cancel are false safety (PR #143
+    # review): the on-chain verdict (migration 0025) must page.
+    snapshot = replace(
+        HEALTHY,
+        watchdog_beaten_at=NOW - timedelta(seconds=12),
+        watchdog_capable=False,
+        watchdog_capability_detail="agent 0xcd… approval EXPIRED 2026-07-01 00:00 UTC",
+    )
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == CRITICAL
+    assert "IMPOTENT" in check.detail and "EXPIRED" in check.detail
+
+
+def test_unchecked_capability_does_not_page() -> None:
+    # capable=None means the probe hasn't answered yet — not a verdict.
+    snapshot = replace(HEALTHY, watchdog_beaten_at=NOW - timedelta(seconds=12))
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG).ok
+
+
+def test_a_verdict_the_probe_cannot_refresh_warns_as_unverified() -> None:
+    # An info outage must not let a stale capable=TRUE mask a mid-run
+    # deregistration forever: past the fixed staleness band the verdict is
+    # unverified and says so.
+    fresh = replace(
+        HEALTHY,
+        watchdog_beaten_at=NOW - timedelta(seconds=12),
+        watchdog_capable=True,
+        watchdog_capability_checked_at=NOW - timedelta(hours=6),
+    )
+    assert _by_name(evaluate_checks(fresh, THRESHOLDS), WATCHDOG).ok
+    stale = replace(fresh, watchdog_capability_checked_at=NOW - timedelta(hours=30))
+    check = _by_name(evaluate_checks(stale, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == WARNING
+    assert "UNVERIFIED" in check.detail
+
+
 def test_executor_without_watchdog_is_critical() -> None:
     # An executor heartbeat with NO watchdog ever run = trading unguarded —
     # exactly the state the A3 safety layer exists to forbid.

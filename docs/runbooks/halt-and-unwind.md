@@ -94,13 +94,36 @@ the audit trail is where history lives, and it is append-only.)
 |---|---|---|
 | kills resting orders | ✅ cancel-all, verified by enumeration | ✅ exchange-side, all at once |
 | closes positions | ❌ (this policy) | ❌ |
-| needs Epigone alive | its own process only — not the executor | no — fires even if the host is gone |
+| needs alive | its own process **plus Postgres** (heartbeat + halt state ride the ADR-0002 seam) — never the executor | nothing — fires exchange-side even if the whole host and its database are gone |
 | available today | ✅ | ❌ $1M cumulative-volume gate (verified live 2026-07-28; operator ~$58k) |
 | status | always on (`--profile execution`) | eligibility-probed every 6h, self-activates on acceptance, transitions on the audit trail |
 
-The watchdog's own liveness is a 🚨 health-monitor check
-(`HEALTHCHECK_WATCHDOG_STALE_SECONDS`, default 300); an executor heartbeat
-with no watchdog ever run is likewise 🚨 — trading never runs unguarded.
+Stated honestly (PR #143 review): the watchdog is independent of the
+*executor*, not of the infrastructure — a Postgres outage blinds it (it
+cannot read halt state or the executor heartbeat). What it does NOT depend
+on is the audit trail: on the safety path the audit write is best-effort —
+a cancel is never suppressed because its evidence couldn't land (the
+executor's order path keeps the opposite, write-ahead discipline). The only
+fully infrastructure-independent layer is scheduleCancel, which is exactly
+why it stays implemented-and-probing despite being volume-gated inactive.
+
+**Sweep coverage:** the cancel-all is ACCOUNT-WIDE — the core venue plus
+every builder dex in the live `perpDexs` listing, re-fetched each sweep, so
+a venue added to trading is swept with no code change. The boundary that
+remains: **sub-accounts.** The #142 probes showed an approved agent can
+create and fund sub-accounts — separate accounts whose books this master's
+sweep never sees. Until A5's risk policy either forbids sub-account use by
+the executor or adds their books to the sweep, treat any sub-account
+activity as OUTSIDE the kill switch's reach.
+
+The watchdog's own health is a 🚨 health-monitor check on two axes: liveness
+(`HEALTHCHECK_WATCHDOG_STALE_SECONDS`, default 300) and CAPABILITY — every
+~6h (`WATCHDOG_CAPABILITY_CHECK_HOURS`) it verifies on-chain, via the public
+`extraAgents` readback, that its agent key is still approved and unexpired,
+so a beating-but-impotent watchdog (mid-run deregistration, an unrestarted
+rotation) pages before an incident instead of during one. An executor
+heartbeat with no watchdog ever run is likewise 🚨 — trading never runs
+unguarded.
 
 ## Revisit (when this policy is wrong)
 

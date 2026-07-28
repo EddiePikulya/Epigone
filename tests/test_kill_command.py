@@ -12,19 +12,27 @@ from aiogram import Bot, Dispatcher
 from epigone.bot.access import ADMIN_ONLY_TEXT
 from epigone.bot.handlers import build_router
 from epigone.bot.operator import (
+    KILL_CONTENTION_TEXT,
     NOT_HALTED_TEXT,
     RESUME_CANCEL_CALLBACK,
     RESUME_CANCELLED_TEXT,
-    RESUME_CONFIRM_CALLBACK,
+    RESUME_CONFIRM_PREFIX,
     RESUME_GONE_TEXT,
     RESUME_PROMPT_TEXT,
+    RESUME_SWEEP_PENDING_LINE,
     RESUMED_TEXT,
     WATCHDOG_SILENT_WARNING,
 )
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.safety import heartbeat
-from epigone.safety.audit import EVENT
-from epigone.safety.halt import KILL_SOURCE, active_halt, is_halted
+from epigone.safety.audit import EVENT, ExecutionAudit
+from epigone.safety.halt import (
+    HOLD_POLICY,
+    KILL_SOURCE,
+    active_halt,
+    is_halted,
+    mark_swept,
+)
 from tests.support.clock import FakeClock
 from tests.support.telegram import RecordingSession, feed_callback, feed_text
 
@@ -99,22 +107,48 @@ async def test_kill_while_halted_joins_not_stacks(
     assert "Already halted" in (session.sent_messages()[-1].text or "")
 
 
+async def _active_halt_id(pool: asyncpg.Pool) -> int:
+    halt = await active_halt(pool)
+    assert halt is not None
+    return halt.id
+
+
 async def test_resume_confirm_flow(
     admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await feed_text(admin_dp, bot, "/kill", user_id=ADMIN)
     await feed_text(admin_dp, bot, "/resume", user_id=ADMIN)
     prompt = session.sent_messages()[-1]
-    assert prompt.text == RESUME_PROMPT_TEXT
+    # The /kill halt is not swept yet, and the prompt must say so.
+    assert prompt.text == f"{RESUME_PROMPT_TEXT}\n\n{RESUME_SWEEP_PENDING_LINE}"
     assert prompt.reply_markup is not None  # the confirm/cancel keyboard
 
-    await feed_callback(admin_dp, bot, RESUME_CONFIRM_CALLBACK, user_id=ADMIN)
+    halt_id = await _active_halt_id(pool)
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}{halt_id}", user_id=ADMIN)
     assert not await is_halted(pool)
     assert session.edited_messages()[-1].text == RESUMED_TEXT
     events = await pool.fetch(
         "SELECT action FROM execution_audit WHERE outcome = $1 ORDER BY id", EVENT
     )
     assert [r["action"] for r in events] == ["halt", "resume"]
+
+
+async def test_swept_halt_prompts_without_the_pending_warning(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    await feed_text(admin_dp, bot, "/kill", user_id=ADMIN)
+    halt = await active_halt(pool)
+    assert halt is not None
+    await mark_swept(
+        pool, clock, ExecutionAudit(pool, clock),
+        halt=halt, positions=[], unwind_policy=HOLD_POLICY,
+    )
+    await feed_text(admin_dp, bot, "/resume", user_id=ADMIN)
+    assert session.sent_messages()[-1].text == RESUME_PROMPT_TEXT
 
 
 async def test_resume_cancel_keeps_the_halt(
@@ -131,10 +165,56 @@ async def test_resume_confirm_is_owner_only_even_as_callback(
     admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await feed_text(admin_dp, bot, "/kill", user_id=ADMIN)
+    halt_id = await _active_halt_id(pool)
     # A forged/stray tap from a non-owner must not lift the halt.
-    await feed_callback(admin_dp, bot, RESUME_CONFIRM_CALLBACK, user_id=GUEST)
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}{halt_id}", user_id=GUEST)
     assert await is_halted(pool)
     assert (session.callback_answers()[-1].text or "") == ADMIN_ONLY_TEXT
+
+
+async def test_stale_confirm_never_lifts_a_later_halt(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The id binding (PR #143 review): a confirm offered for halt A must be
+    inert once A is closed and B stands — an old prompt in scrollback is not
+    consent to resume the NEXT incident."""
+    await feed_text(admin_dp, bot, "/kill first", user_id=ADMIN)
+    old_id = await _active_halt_id(pool)
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}{old_id}", user_id=ADMIN)
+    assert not await is_halted(pool)
+
+    await feed_text(admin_dp, bot, "/kill second", user_id=ADMIN)
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}{old_id}", user_id=ADMIN)
+    assert await is_halted(pool)  # the stale tap changed nothing
+    assert session.edited_messages()[-1].text == RESUME_GONE_TEXT
+    # Garbage payloads (client-forgeable) are equally inert — including a
+    # digit string past BIGINT's range, which must answer stale, not crash.
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}nonsense", user_id=ADMIN)
+    assert await is_halted(pool)
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}{'9' * 25}", user_id=ADMIN)
+    assert await is_halted(pool)
+    assert session.edited_messages()[-1].text == RESUME_GONE_TEXT
+
+
+async def test_kill_answers_even_under_halt_contention(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The livelock backstop: even if request_halt exhausts its retries,
+    /kill must ANSWER — a kill switch that crashes silently is the one
+    unacceptable outcome."""
+    from epigone.bot import operator as operator_module
+    from epigone.safety.halt import HaltContentionError
+
+    async def contended(*args: object, **kwargs: object) -> object:
+        raise HaltContentionError("contended")
+
+    monkeypatch.setattr(operator_module, "request_halt", contended)
+    await feed_text(admin_dp, bot, "/kill", user_id=ADMIN)
+    assert session.sent_messages()[-1].text == KILL_CONTENTION_TEXT
 
 
 async def test_resume_without_a_halt(
@@ -143,5 +223,5 @@ async def test_resume_without_a_halt(
     await feed_text(admin_dp, bot, "/resume", user_id=ADMIN)
     assert session.sent_messages()[-1].text == NOT_HALTED_TEXT
     # A stale confirm tap (halt already gone) is a no-op with a clear edit.
-    await feed_callback(admin_dp, bot, RESUME_CONFIRM_CALLBACK, user_id=ADMIN)
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}999", user_id=ADMIN)
     assert session.edited_messages()[-1].text == RESUME_GONE_TEXT

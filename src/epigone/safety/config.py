@@ -39,6 +39,10 @@ DEFAULT_DEADMAN_HORIZON_SECONDS = 300
 # trading speed, so hours, not cycles. Four probes a day keeps the audit
 # trail legible.
 DEFAULT_DEADMAN_REPROBE_HOURS = 6
+# On-chain capability check cadence (PR #143 review): agent approvals change
+# at ceremony speed (rotations, revocations), so a few checks a day bounds
+# the beating-but-impotent window to hours while costing almost nothing.
+DEFAULT_CAPABILITY_CHECK_HOURS = 6
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,7 @@ class WatchdogConfig:
     executor_stale: timedelta
     deadman_horizon: timedelta
     deadman_reprobe: timedelta
+    capability_interval: timedelta
     exchange_url: str
     info_url: str
 
@@ -80,6 +85,13 @@ class WatchdogConfig:
                     os.environ.get("WATCHDOG_DEADMAN_REPROBE_HOURS"),
                     default=DEFAULT_DEADMAN_REPROBE_HOURS,
                     name="WATCHDOG_DEADMAN_REPROBE_HOURS",
+                )
+            ),
+            capability_interval=timedelta(
+                hours=parse_positive_int(
+                    os.environ.get("WATCHDOG_CAPABILITY_CHECK_HOURS"),
+                    default=DEFAULT_CAPABILITY_CHECK_HOURS,
+                    name="WATCHDOG_CAPABILITY_CHECK_HOURS",
                 )
             ),
             exchange_url=exchange_url,

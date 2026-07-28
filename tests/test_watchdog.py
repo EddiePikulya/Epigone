@@ -16,7 +16,7 @@ import asyncpg
 import pytest
 
 from epigone.budget import WeightBudget
-from epigone.gateway import GatewayError, OpenOrder, Position, Side
+from epigone.gateway import ExtraAgent, GatewayError, OpenOrder, Position, Side
 from epigone.gateway.execution import AmbiguousExecutionError, CancelSpec
 from epigone.gateway.execution_fake import FakeExecutionGateway
 from epigone.gateway.fake import FakeHyperliquidGateway
@@ -72,13 +72,25 @@ def _position(coin: str) -> Position:
     )
 
 
+APPROVED_UNTIL = datetime(2026, 12, 1, tzinfo=UTC)
+CAPABILITY_INTERVAL = timedelta(hours=6)
+
+
 @pytest.fixture
 def read_gateway() -> FakeHyperliquidGateway:
     fake = FakeHyperliquidGateway()
     fake.perp_universes[None] = ["BTC", "ETH", "SOL"]
-    fake.perp_dex_listing = ["xyz", "mkts"]
+    # `flip` is deliberately NOT in POSITION_VENUES: the sweep is account-wide
+    # over the live listing, so an uncovered dex must be swept too.
+    fake.perp_dex_listing = ["xyz", "flip", "mkts"]
     fake.perp_universes["xyz"] = ["xyz:META", "xyz:BB"]
+    fake.perp_universes["flip"] = ["flip:GME"]
     fake.perp_universes["mkts"] = ["mkts:US500"]
+    # The watchdog agent is approved and unexpired by default; impotence is
+    # arranged explicitly by the capability tests.
+    fake.extra_agents[MASTER] = [
+        ExtraAgent(address=SIGNER, name="epigone-watchdog-a", valid_until=APPROVED_UNTIL)
+    ]
     return fake
 
 
@@ -117,7 +129,9 @@ def watchdog(
         audit,
         WeightBudget(1_000_000, clock),
         master_address=MASTER,
+        signer_address=SIGNER,
         executor_stale=STALE,
+        capability_interval=CAPABILITY_INTERVAL,
     )
 
 
@@ -131,10 +145,20 @@ def _cancels(exec_gateway: FakeExecutionGateway) -> list[CancelSpec]:
 
 
 async def _events(pool: asyncpg.Pool) -> list[str]:
+    """Halt-lifecycle events only: the capability probe's verdict events have
+    their own tests and would otherwise ride along in every cycle-driven
+    sequence assertion (the first verdict is always evented by design)."""
     rows = await pool.fetch(
         "SELECT action FROM execution_audit WHERE outcome = $1 ORDER BY id", EVENT
     )
-    return [r["action"] for r in rows]
+    return [r["action"] for r in rows if not r["action"].startswith("watchdog_")]
+
+
+async def _capability_events(pool: asyncpg.Pool) -> list[str]:
+    rows = await pool.fetch(
+        "SELECT action FROM execution_audit WHERE outcome = $1 ORDER BY id", EVENT
+    )
+    return [r["action"] for r in rows if r["action"].startswith("watchdog_")]
 
 
 async def test_simulated_stall_trips_and_cancel_alls(
@@ -328,10 +352,127 @@ async def test_resume_with_a_still_stale_executor_retrips(
     await watchdog.run_cycle()
     first = await active_halt(pool)
     assert first is not None
-    await resume(pool, clock, audit, resumed_by=ADMIN)
+    await resume(pool, clock, audit, halt_id=first.id, resumed_by=ADMIN)
 
     await watchdog.run_cycle()
     second = await active_halt(pool)
     assert second is not None
     assert second.id != first.id
     assert second.source == WATCHDOG_SOURCE
+
+
+# --- the on-chain capability probe (PR #143 review) ---
+
+
+async def test_capable_watchdog_records_its_verdict_once(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+) -> None:
+    await watchdog.run_cycle()
+    row = await pool.fetchrow(
+        "SELECT capable, capability_detail FROM process_heartbeats WHERE process = 'watchdog'"
+    )
+    assert row is not None and row["capable"] is True
+    assert "epigone-watchdog-a" in row["capability_detail"]
+    assert await _capability_events(pool) == ["watchdog_capable"]
+    assert read_gateway.extra_agents_calls == [MASTER]
+
+    # Within the interval: no re-read. Past it, unchanged verdict: a fresh
+    # read but NO second event — events mark transitions only.
+    await watchdog.run_cycle()
+    assert read_gateway.extra_agents_calls == [MASTER]
+    clock.advance(CAPABILITY_INTERVAL.total_seconds())
+    await watchdog.run_cycle()
+    assert read_gateway.extra_agents_calls == [MASTER, MASTER]
+    assert await _capability_events(pool) == ["watchdog_capable"]
+
+
+async def test_deregistered_agent_pages_as_impotent(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    read_gateway: FakeHyperliquidGateway,
+) -> None:
+    """The beating-but-impotent hazard: heartbeats keep landing, but the
+    on-chain verdict must flip to impotent so the monitor pages BEFORE an
+    incident needs the cancel."""
+    read_gateway.extra_agents[MASTER] = []  # deregistered mid-run
+    await watchdog.run_cycle()
+    row = await pool.fetchrow(
+        "SELECT beaten_at, capable, capability_detail FROM process_heartbeats "
+        "WHERE process = 'watchdog'"
+    )
+    assert row is not None
+    assert row["beaten_at"] is not None  # still beating…
+    assert row["capable"] is False  # …but powerless, and the row says so
+    assert "deregistered" in row["capability_detail"]
+    assert await _capability_events(pool) == ["watchdog_impotent"]
+
+
+async def test_expired_approval_is_impotent(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+) -> None:
+    read_gateway.extra_agents[MASTER] = [
+        ExtraAgent(
+            address=SIGNER,
+            name="epigone-watchdog-a",
+            valid_until=clock.now() - timedelta(hours=1),
+        )
+    ]
+    await watchdog.run_cycle()
+    row = await pool.fetchrow(
+        "SELECT capable, capability_detail FROM process_heartbeats WHERE process = 'watchdog'"
+    )
+    assert row is not None and row["capable"] is False
+    assert "EXPIRED" in row["capability_detail"]
+
+
+async def test_capability_read_failure_neither_flaps_nor_blocks(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """An info outage is not a verdict — and, above all, must not delay the
+    sweep (the probe runs after the protective work and swallows failures)."""
+    read_gateway.extra_agents_errors[MASTER] = GatewayError("info down")
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    await watchdog.run_cycle()  # sweeps (empty book) despite the probe failing
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None
+    row = await pool.fetchrow(
+        "SELECT capable FROM process_heartbeats WHERE process = 'watchdog'"
+    )
+    assert row is not None and row["capable"] is None  # no verdict recorded
+    assert await _capability_events(pool) == []
+
+
+# --- account-wide sweep coverage (PR #143 review) ---
+
+
+async def test_sweep_covers_dexs_outside_position_venues(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """The agent key is account-wide, so the kill must be too: an order on
+    `flip` — listed on-chain but NOT in POSITION_VENUES — is enumerated and
+    cancelled with the offset its listing position fixes (110000 + 1×10000)."""
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    read_gateway.set_open_orders(MASTER, [_order("flip:GME", 51)], dex="flip")
+
+    await watchdog.run_cycle()
+
+    assert _cancels(exec_gateway) == [CancelSpec(asset=120_000, oid=51)]
+    read_gateway.set_open_orders(MASTER, [], dex="flip")
+    await watchdog.run_cycle()
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None

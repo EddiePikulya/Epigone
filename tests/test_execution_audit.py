@@ -175,6 +175,65 @@ async def test_decision_is_read_per_call(
     assert decisions == ["first", "second"]
 
 
+# --- the two audit disciplines (PR #143 review) ---
+
+
+async def test_write_ahead_mode_refuses_to_act_without_evidence(
+    database_url: str, fake: FakeExecutionGateway, clock: FakeClock
+) -> None:
+    """The executor's discipline: audit DB down → the action is NOT sent."""
+    dead_pool = await asyncpg.create_pool(database_url)
+    assert dead_pool is not None
+    await dead_pool.close()
+    gateway = AuditedExecutionGateway(
+        fake,
+        ExecutionAudit(dead_pool, clock),
+        actor=WATCHDOG_ACTOR,
+        master_address=MASTER,
+        signer_address=SIGNER,
+    )
+    with pytest.raises(asyncpg.InterfaceError):  # the closed pool's refusal
+        await gateway.cancel_orders([CancelSpec(asset=1, oid=7)])
+    assert fake.actions == []  # nothing reached the exchange
+
+
+async def test_best_effort_mode_cancels_even_with_the_audit_db_down(
+    database_url: str, fake: FakeExecutionGateway, clock: FakeClock
+) -> None:
+    """THE safety-path guarantee: Postgres being down at the worst moment
+    must never suppress a protective cancel — best-effort audit, guaranteed
+    action (the fix-1 requirement)."""
+    dead_pool = await asyncpg.create_pool(database_url)
+    assert dead_pool is not None
+    await dead_pool.close()
+    gateway = AuditedExecutionGateway(
+        fake,
+        ExecutionAudit(dead_pool, clock),
+        actor=WATCHDOG_ACTOR,
+        master_address=MASTER,
+        signer_address=SIGNER,
+        best_effort_audit=True,
+    )
+    results = await gateway.cancel_orders([CancelSpec(asset=1, oid=7)])
+    assert len(results) == 1  # the cancel went through, unaudited but ALIVE
+    assert [name for name, _ in fake.actions] == ["cancel_orders"]
+
+
+async def test_best_effort_mode_still_audits_when_the_db_is_up(
+    pool: asyncpg.Pool, fake: FakeExecutionGateway, audit: ExecutionAudit
+) -> None:
+    # Best-effort degrades on failure only — a healthy DB gets the full
+    # attempt/outcome pair exactly like write-ahead.
+    gateway = AuditedExecutionGateway(
+        fake, audit,
+        actor=WATCHDOG_ACTOR, master_address=MASTER, signer_address=SIGNER,
+        best_effort_audit=True,
+    )
+    await gateway.cancel_orders([CancelSpec(asset=1, oid=7)])
+    rows = await _rows(pool)
+    assert [r["outcome"] for r in rows] == [SUBMITTED, OK]
+
+
 # --- standalone safety events ---
 
 

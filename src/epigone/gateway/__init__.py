@@ -6,7 +6,7 @@ reads — goes through this interface and nowhere else (ADR-0001; V1 spec
 the real client.
 """
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -204,6 +204,19 @@ class OpenOrder:
 
 
 @dataclass(frozen=True)
+class ExtraAgent:
+    """One approved agent key on a master account, as the public `extraAgents`
+    info endpoint reports it (issue #135) — the same query any user can run to
+    audit Epigone's authority from outside our system (ADR-0005). The watchdog
+    reads it to verify its OWN approval still stands on-chain: present and
+    unexpired means its cancels would be accepted."""
+
+    address: str  # lowercased, like every address in the system
+    name: str | None
+    valid_until: datetime
+
+
+@dataclass(frozen=True)
 class Fill:
     """One fill from a Trader's history — the raw material of fine metrics (issue #8).
 
@@ -314,6 +327,15 @@ class HyperliquidGateway(Protocol):
         listing whose shape would make the offsets a guess."""
         ...
 
+    async def get_extra_agents(self, address: str) -> list[ExtraAgent]:
+        """A master account's approved agent keys (the `extraAgents` info
+        endpoint) — public, no signature, no trading action. The watchdog's
+        capability probe reads it (issue #135, PR #143 review): a watchdog
+        whose agent was deregistered or expired on-chain must page as
+        impotent instead of reporting healthy heartbeats. Raises
+        GatewayError on failure."""
+        ...
+
     async def get_fills_since(self, address: str, start: datetime) -> list[Fill]:
         """A Trader's fills at or after `start` — the same regular ∪ TWAP-slice
         union as get_fills (userFillsByTime plus userTwapSliceFillsByTime) —
@@ -385,26 +407,33 @@ BUILDER_DEX_ASSET_BASE = 110_000
 BUILDER_DEX_ASSET_STRIDE = 10_000
 
 
-async def fetch_asset_ids(gateway: HyperliquidGateway) -> dict[str, int]:
-    """Coin name → the integer asset id `/exchange` actions take, across every
-    venue Epigone covers (POSITION_VENUES) — the mapping a cancel-by-oid needs
-    to name an OpenOrder's asset (issue #135; the read gateway owns the
-    coin↔asset mapping, per the execution seam's contract).
+async def fetch_asset_ids(
+    gateway: HyperliquidGateway, *, dexs: Sequence[str] | None = None
+) -> dict[str, int]:
+    """Coin name → the integer asset id `/exchange` actions take — the mapping
+    a cancel-by-oid needs to name an OpenOrder's asset (issue #135; the read
+    gateway owns the coin↔asset mapping, per the execution seam's contract).
+
+    `dexs` selects which builder DEXes to map beside the core universe:
+    default is the covered POSITION_VENUES; the watchdog's ACCOUNT-WIDE sweep
+    (PR #143 review) passes exactly the dexs its enumerated orders sit on, so
+    the map is complete for any venue the agent could have placed on, not
+    just the covered ones.
 
     Keys match exactly what positions/orders carry: bare tickers for core,
     namespaced `dex:COIN` for builder DEXes. All-or-raise like the other
     fetch helpers: a partial map would turn an unmapped coin into an
-    uncancelable order at exactly the moment a sweep needs it — and a covered
-    dex missing from the perpDexs listing raises rather than guessing an
-    offset, because a wrong asset id cancels (or leaves alive) the wrong
-    order."""
+    uncancelable order at exactly the moment a sweep needs it — and a
+    requested dex missing from the perpDexs listing raises rather than
+    guessing an offset, because a wrong asset id cancels (or leaves alive)
+    the wrong order."""
     ids: dict[str, int] = {}
     for index, coin in enumerate(await gateway.get_perp_universe(None)):
         ids[coin] = index
-    covered = [dex for dex in POSITION_VENUES if dex is not None]
-    if covered:
+    wanted = [dex for dex in POSITION_VENUES if dex is not None] if dexs is None else list(dexs)
+    if wanted:
         listing = await gateway.get_perp_dexs()
-        for dex in covered:
+        for dex in wanted:
             if dex not in listing:
                 raise GatewayError(f"perp dex {dex!r} missing from perpDexs listing {listing!r}")
             offset = BUILDER_DEX_ASSET_BASE + listing.index(dex) * BUILDER_DEX_ASSET_STRIDE

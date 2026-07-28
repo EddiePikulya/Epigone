@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from epigone.gateway import Fill, LeaderboardEntry, OpenOrder, Position
+from epigone.gateway import ExtraAgent, Fill, LeaderboardEntry, OpenOrder, Position
 
 
 class FakeHyperliquidGateway:
@@ -35,6 +35,13 @@ class FakeHyperliquidGateway:
         # fixes the offsets.
         self.perp_universes: dict[str | None, list[str]] = {}
         self.perp_dex_listing: list[str] = []
+        # Approved agents by master address (the extraAgents readback, issue
+        # #135): what the watchdog's capability probe sees on-chain.
+        # `extra_agents_calls` records each read so tests can pin the probe's
+        # cadence (checks are hours apart, never per-cycle).
+        self.extra_agents: dict[str, list[ExtraAgent]] = {}
+        self.extra_agents_errors: dict[str, Exception] = {}
+        self.extra_agents_calls: list[str] = []
         self.fills: dict[str, list[Fill]] = {}
         self.fills_errors: dict[str, Exception] = {}
         self.fills_calls: list[str] = []
@@ -61,6 +68,14 @@ class FakeHyperliquidGateway:
 
     async def get_perp_dexs(self) -> list[str]:
         return list(self.perp_dex_listing)
+
+    async def get_extra_agents(self, address: str) -> list[ExtraAgent]:
+        key = address.lower()
+        self.extra_agents_calls.append(key)
+        error = self.extra_agents_errors.get(key)
+        if error is not None:
+            raise error
+        return list(self.extra_agents.get(key, []))
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
         self.leaderboard_calls += 1
