@@ -13,6 +13,7 @@ from epigone.bot.access import ADMIN_ONLY_TEXT
 from epigone.bot.handlers import build_router
 from epigone.bot.operator import (
     KILL_CONTENTION_TEXT,
+    KILL_FAILED_TEXT,
     NOT_HALTED_TEXT,
     RESUME_CANCEL_CALLBACK,
     RESUME_CANCELLED_TEXT,
@@ -194,6 +195,54 @@ async def test_stale_confirm_never_lifts_a_later_halt(
     await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}{'9' * 25}", user_id=ADMIN)
     assert await is_halted(pool)
     assert session.edited_messages()[-1].text == RESUME_GONE_TEXT
+    # And Unicode digits int() refuses ("²" is isdigit but not isdecimal —
+    # round 2 item 6): stale, never a crash.
+    await feed_callback(admin_dp, bot, f"{RESUME_CONFIRM_PREFIX}²", user_id=ADMIN)
+    assert await is_halted(pool)
+    assert session.edited_messages()[-1].text == RESUME_GONE_TEXT
+
+
+async def test_kill_replies_when_the_halt_cannot_be_recorded(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 item 5: the REALISTIC outage (a plain database error, not the
+    contrived livelock) must produce an explicit NOT-halted reply, never a
+    silent crash that reads as 'maybe halted'."""
+    from epigone.bot import operator as operator_module
+
+    async def db_down(*args: object, **kwargs: object) -> object:
+        raise ConnectionError("connection refused")
+
+    monkeypatch.setattr(operator_module, "request_halt", db_down)
+    await feed_text(admin_dp, bot, "/kill", user_id=ADMIN)
+    assert session.sent_messages()[-1].text == KILL_FAILED_TEXT
+    assert not await is_halted(pool)
+
+
+async def test_kill_still_confirms_when_the_followup_read_fails(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 item 5, the other half: once the halt row COMMITTED, the
+    reply must confirm it even if the watchdog-heartbeat read then fails —
+    the operator must never read 'kill failed' for a kill that succeeded.
+    The unreadable heartbeat degrades to the conservative silent warning."""
+    async def read_down(*args: object, **kwargs: object) -> object:
+        raise ConnectionError("read refused")
+
+    monkeypatch.setattr(heartbeat, "last_beat", read_down)
+    await feed_text(admin_dp, bot, "/kill", user_id=ADMIN)
+    assert await is_halted(pool)  # the halt stands…
+    reply = session.sent_messages()[-1].text or ""
+    assert "halted" in reply.lower()  # …and the reply says so…
+    assert WATCHDOG_SILENT_WARNING in reply  # …warning, not promising
 
 
 async def test_kill_answers_even_under_halt_contention(

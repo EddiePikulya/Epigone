@@ -57,9 +57,11 @@ DISK_CRITICAL_PERCENT = 95
 # A watchdog capability verdict older than this is unverified (issue #135):
 # the probe runs ~6-hourly with a 5-minute failure retry, so a day of silence
 # means the on-chain check has been failing for ~4 cycles straight — long
-# enough that a stale capable=TRUE could be masking a deregistration. Fixed
-# like the disk escalation band, not a tunable: 4× the probe's own default
-# cadence, generous against any sane WATCHDOG_CAPABILITY_CHECK_HOURS.
+# enough that a stale capable=TRUE could be masking a deregistration. The
+# SAME band is the never-verified grace period from process start (PR #143
+# round 2): one ladder, whether the last verdict is old or has never landed.
+# Fixed like the disk escalation band, not a tunable: 4× the probe's own
+# default cadence, generous against any sane WATCHDOG_CAPABILITY_CHECK_HOURS.
 CAPABILITY_VERDICT_STALE = timedelta(hours=24)
 
 
@@ -140,6 +142,11 @@ class HealthSnapshot:
     watchdog_capable: bool | None = None
     watchdog_capability_detail: str | None = None
     watchdog_capability_checked_at: datetime | None = None
+    # When the watchdog process last started (migration 0026): the clock a
+    # NEVER-verified capability ages against — a probe that has not succeeded
+    # once since launch must escalate on the same ladder as a stale verdict,
+    # never read as healthy forever (PR #143 round 2).
+    watchdog_started_at: datetime | None = None
     # The active execution halt, if any (issue #135) — raw fields off the one
     # active execution_halts row; all None when trading is not halted.
     active_halt_since: datetime | None = None
@@ -201,6 +208,8 @@ async def gather_snapshot(
                 AS watchdog_capability_detail,
             (SELECT capability_checked_at FROM process_heartbeats WHERE process = 'watchdog')
                 AS watchdog_capability_checked_at,
+            (SELECT started_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_started_at,
             (SELECT halted_at FROM execution_halts WHERE resumed_at IS NULL)
                 AS active_halt_since,
             (SELECT source FROM execution_halts WHERE resumed_at IS NULL)
@@ -236,6 +245,7 @@ async def gather_snapshot(
         watchdog_capable=row["watchdog_capable"],
         watchdog_capability_detail=row["watchdog_capability_detail"],
         watchdog_capability_checked_at=row["watchdog_capability_checked_at"],
+        watchdog_started_at=row["watchdog_started_at"],
         active_halt_since=row["active_halt_since"],
         active_halt_source=row["active_halt_source"],
         active_halt_reason=row["active_halt_reason"],
@@ -529,19 +539,30 @@ def _watchdog_check(snapshot: HealthSnapshot, stale: timedelta) -> CheckResult:
                 f"(agent-key-rotation runbook)"
             ),
         )
+    # One ladder for "how long has the verdict gone unrefreshed" (PR #143
+    # round 2): a verified verdict ages from its last check; a NEVER-verified
+    # one ages from process start — because a fresh deploy with a blocked
+    # info endpoint may hold a key that was never approved on-chain at all,
+    # and NULL-forever must not read as healthy.
     checked = snapshot.watchdog_capability_checked_at
-    if checked is not None and snapshot.now - checked > CAPABILITY_VERDICT_STALE:
-        # A verdict the probe cannot refresh is unverified: an info outage
-        # must not let a stale capable=TRUE mask a mid-run deregistration.
+    basis = checked if checked is not None else snapshot.watchdog_started_at
+    if basis is not None and snapshot.now - basis > CAPABILITY_VERDICT_STALE:
+        gap_detail = (
+            f"NEVER verified since the process started {_ago(snapshot.now - basis)} ago "
+            f"— the probe has not succeeded once; the agent may not be approved "
+            f"on-chain at all"
+            if checked is None
+            else f"UNVERIFIED for {_ago(snapshot.now - checked)} (probe failing?) — "
+            f"the last verdict may be stale"
+        )
         return CheckResult(
             WATCHDOG,
             "Watchdog",
             ok=False,
             severity=WARNING,
             detail=(
-                f"Watchdog: on-chain capability UNVERIFIED for "
-                f"{_ago(snapshot.now - checked)} (probe failing?) — the last verdict "
-                f"may be stale; check the watchdog logs and the info endpoint"
+                f"Watchdog: on-chain capability {gap_detail}; check the watchdog "
+                f"logs and the info endpoint"
             ),
         )
     return CheckResult(

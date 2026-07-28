@@ -18,6 +18,7 @@ Both are owner-only, gated exactly like the allowlist commands
 (bot/access.py): the admin id from config, re-checked on the callback too —
 callback payloads are client-forgeable."""
 
+import logging
 from datetime import timedelta
 
 import asyncpg
@@ -37,6 +38,8 @@ from epigone.safety.halt import (
     request_halt,
     resume,
 )
+
+log = logging.getLogger(__name__)
 
 # The confirm carries the halt id it was offered for (PR #143 review): a
 # stale prompt must never lift a different, later halt — halt.resume() only
@@ -81,6 +84,13 @@ RESUME_CANCELLED_TEXT = "Still halted — resume cancelled."
 KILL_CONTENTION_TEXT = (
     "⚠️ Halt state is being contended (halts opening and resuming "
     "concurrently) — run /kill again NOW."
+)
+KILL_FAILED_TEXT = (
+    "🚨 /kill FAILED to record the halt (database error) — Epigone is NOT "
+    "halted. Retry /kill now. If Postgres is down, the watchdog blind-sweeps "
+    "resting orders after its threshold (WATCHDOG_DB_BLIND_SECONDS, "
+    "halt-and-unwind runbook) — but the halt itself is not recorded until "
+    "the database answers."
 )
 RESUME_GONE_TEXT = (
     "Nothing to resume — that halt is no longer the active one. If a newer "
@@ -131,6 +141,13 @@ async def cmd_kill(
         # reply telling the operator to hit it again, never a silent crash.
         await message.answer(KILL_CONTENTION_TEXT, reply_markup=with_delete_button())
         return
+    except Exception:
+        # The realistic outage (connection refused, timeout): same rule.
+        # The halt row did NOT commit — say so plainly; a silent crash here
+        # would read as "maybe halted", the worst possible answer.
+        log.exception("/kill could not record the halt")
+        await message.answer(KILL_FAILED_TEXT, reply_markup=with_delete_button())
+        return
     if not created:
         await message.answer(
             f"Already halted — {halt.source} halt since "
@@ -139,10 +156,16 @@ async def cmd_kill(
             reply_markup=with_delete_button(),
         )
         return
-    reply = KILLED_TEXT
-    beaten = await heartbeat.last_beat(pool, heartbeat.WATCHDOG_PROCESS)
-    if beaten is None or clock.now() - beaten > WATCHDOG_SILENT_AFTER:
-        reply = f"{KILLED_TEXT}\n\n{WATCHDOG_SILENT_WARNING}"
+    # From here the halt IS committed: every path below must still confirm
+    # it (round 2 item 5) — a follow-up read failure must not turn a
+    # successful kill into a "kill failed" in the operator's eyes.
+    try:
+        beaten = await heartbeat.last_beat(pool, heartbeat.WATCHDOG_PROCESS)
+        silent = beaten is None or clock.now() - beaten > WATCHDOG_SILENT_AFTER
+    except Exception:
+        log.exception("/kill: watchdog heartbeat unreadable after the halt committed")
+        silent = True  # cannot confirm a live watchdog — warn, don't promise
+    reply = KILLED_TEXT if not silent else f"{KILLED_TEXT}\n\n{WATCHDOG_SILENT_WARNING}"
     await message.answer(reply, reply_markup=with_delete_button())
 
 
@@ -175,10 +198,11 @@ async def on_resume_confirm(
         return
     payload = (callback.data or "").removeprefix(RESUME_CONFIRM_PREFIX)
     closed = None
-    # Callback data is client-forgeable: non-digits AND digit strings past
+    # Callback data is client-forgeable: non-decimals (isdecimal, not
+    # isdigit — "²" is a digit int() refuses) AND digit strings past
     # BIGINT's 18 safe digits are garbage (an overflow at bind time would
     # crash the handler instead of answering "stale").
-    if payload.isdigit() and len(payload) <= 18:
+    if payload.isdecimal() and len(payload) <= 18:
         closed = await resume(
             pool,
             clock,

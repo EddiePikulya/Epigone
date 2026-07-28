@@ -11,18 +11,36 @@ thing it watches:
 - its own GATEWAY instance (one signer, one nonce lane — the execution
   seam's contract),
 - and only the DB heartbeat row as its view of the executor (ADR-0002:
-  processes meet in Postgres).
+  processes meet in Postgres) — WITHOUT hard-depending on that database for
+  the decision→wire path (below).
 
-One cycle: beat own heartbeat (the #52 monitor watches the watcher) → trip
-if the executor's heartbeat exists but went stale → sweep whatever halt is
-active (watchdog-tripped or operator /kill alike) → verify, on a slow
+One cycle: beat own heartbeat (best-effort — a failed beat never skips the
+protective work) → read halt state and executor liveness → trip on a stale
+executor heartbeat → sweep whatever halt is active → verify, on a slow
 cadence, that this watchdog's agent key is still approved ON-CHAIN
-(extraAgents — a beating-but-impotent watchdog must page BEFORE an incident,
-PR #143 review). A halt whose sweep isn't finished is re-swept every cycle
+(extraAgents). A halt whose sweep isn't finished is re-swept every cycle
 until it is. The sweep is ACCOUNT-WIDE: core plus every builder dex in the
-live perpDexs listing, because the agent key is account-wide and an order
-surviving a kill on an uncovered venue would be the silent version of the
-gap this module exists to close.
+live perpDexs listing (degrading to the covered POSITION_VENUES — a partial
+sweep that says so — when the listing endpoint is down; partial coverage
+never stamps swept_at).
+
+THE TRIP→WIRE PATH SURVIVES POSTGRES (PR #143 round 2). The failure modes
+are CORRELATED: the likeliest reason the executor is dead is infrastructure
+trouble — precisely when a DB-dependent watchdog would be blind. So:
+
+- the rate budget degrades (safety.budget.FallbackBudget): a dead
+  rate_budget row never queues a cancel;
+- a halt row that cannot be written never suppresses the cancel — the sweep
+  runs unrecorded and the halt row is RECONCILED when Postgres returns;
+- cannot-read-Postgres is ITSELF a trip: blind past `db_blind_after`
+  (default 3× the executor-stall threshold — a deliberate, conservative
+  call: cancelling resting orders is cheap and recoverable, the executor
+  re-places when it returns, and nothing here closes positions or spends —
+  whereas sitting blind through a correlated outage is the exact incident
+  this layer exists to prevent), the watchdog cancels every resting order
+  each cycle until the database answers again, then writes the halt row
+  with a DISTINCT "DB-blind sweep" reason so the operator can tell it from
+  a real executor stall.
 
 THE SWEEP NEVER TRUSTS A CANCEL'S WORD. `swept_at` is stamped only when a
 FRESH enumeration of the book answers empty — cancel results, however clean,
@@ -39,6 +57,7 @@ to the operator.
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncpg
@@ -46,6 +65,7 @@ import asyncpg
 from epigone.budget import Budget
 from epigone.clock import Clock
 from epigone.gateway import (
+    POSITION_VENUES,
     GatewayError,
     HyperliquidGateway,
     OpenOrder,
@@ -73,10 +93,28 @@ ORDERS_WEIGHT = 20  # frontendOpenOrders, per venue
 POSITIONS_WEIGHT = 2  # clearinghouseState, per venue
 META_WEIGHT = 20  # meta (per venue), perpDexs, extraAgents — the info default
 
-# A failed capability read (network blip, info outage) retries on this short
-# fuse instead of waiting out the full check interval — but never every
-# cycle, which would burn 20 weight per 10s on a persistent outage.
+# A failed capability probe (network blip, info outage, unwritable verdict)
+# retries on this short fuse instead of waiting out the full check interval —
+# but never every cycle, which would burn 20 weight per 10s on a persistent
+# outage. The fuse advances on EVERY failure shape (round 2 item 4): a bare
+# TimeoutError must not re-fire the probe per-cycle just because it isn't a
+# GatewayError.
 CAPABILITY_RETRY = timedelta(minutes=5)
+
+
+@dataclass(frozen=True)
+class _BlindIncident:
+    """An in-process trip that Postgres couldn't record: either the database
+    was unreadable past the blind threshold (`db_blind=True`), or a REAL
+    observed stall tripped but the halt row was unwritable (`db_blind=False`
+    — the distinction the reconciled halt's headline must preserve, so the
+    operator can tell them apart). Held until a cycle can write the halt
+    row — the reconcile — so the state machinery and the operator alert
+    catch up with what the wire already did."""
+
+    since: datetime
+    reason: str
+    db_blind: bool
 
 
 class Watchdog:
@@ -95,6 +133,7 @@ class Watchdog:
         master_address: str,
         signer_address: str,
         executor_stale: timedelta,
+        db_blind_after: timedelta,
         capability_interval: timedelta,
     ) -> None:
         self._pool = pool
@@ -106,19 +145,44 @@ class Watchdog:
         self._master = master_address.lower()
         self._signer_address = signer_address.lower()
         self._executor_stale = executor_stale
+        self._db_blind_after = db_blind_after
         self._capability_interval = capability_interval
         self._capable: bool | None = None  # last on-chain verdict; None = unchecked
         self._next_capability_at: datetime | None = None  # None → due now
+        # Postgres-independence state (module docstring): when the DB last
+        # answered the liveness question (process start counts as answered —
+        # startup itself requires the DB), and the unrecorded trip awaiting
+        # its halt row, if any.
+        self._db_readable_at: datetime = clock.now()
+        self._blind: _BlindIncident | None = None
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
-        # Beat FIRST: a cycle that then fails still proves the process alive,
-        # while a DB outage stops the beat and trips the monitor's check —
-        # exactly the two signals the #52 monitor wants.
-        await heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now)
-        halt = await active_halt(self._pool)
-        if halt is None:
-            halt = await self._trip_if_executor_stale(now)
+        try:
+            await heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now)
+        except Exception:
+            # Best-effort beat (round 2 item 1c): losing the liveness signal
+            # is bad; skipping the cycle's protective work over it is worse.
+            log.exception("heartbeat write failed — continuing the protective cycle")
+        try:
+            halt = await active_halt(self._pool)
+            stall_reason = None if halt is not None else await self._executor_stall(now)
+        except Exception:
+            # Deliberately ANY failure of the liveness reads, not just
+            # connection errors: a watchdog that cannot answer "is the
+            # executor alive" is blind whatever the cause, and blind fails
+            # protective (a spurious blind trip cancels recoverable orders;
+            # the inverse mistake strands them).
+            log.warning(
+                "watchdog: Postgres cannot answer the liveness question", exc_info=True
+            )
+            await self._run_blind(now)
+            return
+        self._db_readable_at = now
+        if self._blind is not None:
+            halt = await self._settle_blind_debt(now)
+        elif halt is None and stall_reason is not None:
+            halt = await self._trip(stall_reason, now)
         if halt is not None and halt.swept_at is None:
             await self._sweep(halt)
         # After the protective work, never before it: the capability probe is
@@ -128,67 +192,70 @@ class Watchdog:
         except Exception:
             log.exception("capability probe failed; retrying next cycle")
 
-    async def _verify_capability(self, now: datetime) -> None:
-        """The beating-but-impotent guard (PR #143 review): verify ON-CHAIN —
-        via the public extraAgents readback, no signing, no trading action —
-        that this watchdog's agent key is still approved and unexpired, so a
-        mid-run deregistration or an unrestarted rotation pages the operator
-        BEFORE an incident needs the cancel, not during. Verdict state lands
-        beside the heartbeat (migration 0025) for the #52 monitor; verdict
-        TRANSITIONS go to the audit trail."""
-        if self._next_capability_at is not None and now < self._next_capability_at:
-            return
-        await self._budget.spend(META_WEIGHT)
-        try:
-            agents = await self._read.get_extra_agents(self._master)
-        except GatewayError:
-            log.warning(
-                "capability probe: extraAgents read failed; retrying in %ds",
-                int(CAPABILITY_RETRY.total_seconds()),
-                exc_info=True,
-            )
-            self._next_capability_at = now + CAPABILITY_RETRY
-            return
-        approval = next((a for a in agents if a.address == self._signer_address), None)
-        if approval is None:
-            capable = False
-            detail = (
-                f"agent {self._signer_address} is NOT among {self._master}'s approved "
-                f"agents — deregistered on-chain (or never approved); every cancel "
-                f"this watchdog issued would be rejected"
-            )
-        elif approval.valid_until <= now:
-            capable = False
-            detail = (
-                f"agent {self._signer_address} approval EXPIRED "
-                f"{approval.valid_until:%Y-%m-%d %H:%M} UTC — rotate the watchdog "
-                f"lane and restart the service (agent-key-rotation runbook)"
-            )
-        else:
-            capable = True
-            detail = (
-                f"approved on-chain as {approval.name or 'unnamed'} "
-                f"until {approval.valid_until:%Y-%m-%d}"
-            )
-        if capable != self._capable:
-            # Event before state (the deadman's rule): a lost event write
-            # leaves the verdict unclaimed and the next cycle re-derives it.
-            await self._audit.record_event(
-                actor=WATCHDOG_ACTOR,
-                action="watchdog_capable" if capable else "watchdog_impotent",
-                risk_decision="on-chain capability probe (extraAgents)",
-                detail={"verdict": detail},
-                master_address=self._master,
-            )
-            self._capable = capable
-            if not capable:
-                log.error("watchdog IMPOTENT: %s", detail)
-        await heartbeat.record_capability(
-            self._pool, heartbeat.WATCHDOG_PROCESS, capable=capable, detail=detail, now=now
-        )
-        self._next_capability_at = now + self._capability_interval
+    # --- Postgres-blind operation (round 2 item 1) ---
 
-    async def _trip_if_executor_stale(self, now: datetime) -> Halt | None:
+    async def _run_blind(self, now: datetime) -> None:
+        """The database cannot say whether the executor is alive or a halt
+        stands. Within the blind threshold: wait (a DB blip is not an
+        incident). Past it — or with an unrecorded trip already pending —
+        cancel every resting order, every cycle, until Postgres answers
+        again; the halt row and audit events are reconciled on recovery."""
+        blind_for = now - self._db_readable_at
+        if self._blind is None:
+            if blind_for <= self._db_blind_after:
+                log.warning(
+                    "watchdog: Postgres unreachable for %ds (blind trip at %ds)",
+                    int(blind_for.total_seconds()),
+                    int(self._db_blind_after.total_seconds()),
+                )
+                return
+            self._blind = _BlindIncident(
+                since=now,
+                reason=(
+                    f"Postgres unreachable since "
+                    f"{self._db_readable_at:%Y-%m-%d %H:%M:%S} UTC — blind for "
+                    f"{int(blind_for.total_seconds())}s > "
+                    f"{int(self._db_blind_after.total_seconds())}s; the executor's "
+                    f"liveness is unknowable, which is indistinguishable from death"
+                ),
+                db_blind=True,
+            )
+            log.error(
+                "watchdog BLIND TRIP: %s — cancelling resting orders without halt state",
+                self._blind.reason,
+            )
+        await self._cancel_resting(f"DB-blind sweep: {self._blind.reason}")
+
+    async def _settle_blind_debt(self, now: datetime) -> Halt | None:
+        """Postgres answers again after an unrecorded trip: write the halt
+        row (joining any halt that appeared meanwhile) under a headline that
+        PRESERVES which trip it was — "DB-blind sweep" for the unreadable-
+        database trip, "unrecorded trip" for a real observed stall whose
+        halt row couldn't be written — so the operator can tell them apart.
+        The normal sweep machinery then verifies the book and stamps
+        swept_at with the position snapshot."""
+        assert self._blind is not None
+        headline = "DB-blind sweep reconciled" if self._blind.db_blind else (
+            "unrecorded trip reconciled (halt row was unwritable)"
+        )
+        halt, created = await request_halt(
+            self._pool,
+            self._clock,
+            self._audit,
+            source=WATCHDOG_SOURCE,
+            reason=(
+                f"{headline}: {self._blind.reason}; resting orders were being "
+                f"cancelled unrecorded since "
+                f"{self._blind.since:%Y-%m-%d %H:%M:%S} UTC; Postgres answered "
+                f"again at {now:%Y-%m-%d %H:%M:%S} UTC"
+            ),
+        )
+        if created:
+            log.error("watchdog: unrecorded sweep reconciled into halt #%d", halt.id)
+        self._blind = None
+        return halt
+
+    async def _executor_stall(self, now: datetime) -> str | None:
         """The trip condition: the executor HAS run (its row exists) and its
         heartbeat is older than the threshold. No row means no executor was
         ever deployed — nothing to protect, not an emergency (decommissioning
@@ -199,47 +266,67 @@ class Watchdog:
         age = now - beaten
         if age <= self._executor_stale:
             return None
-        reason = (
+        return (
             f"executor heartbeat stale: {int(age.total_seconds())}s > "
             f"{int(self._executor_stale.total_seconds())}s"
         )
-        halt, created = await request_halt(
-            self._pool, self._clock, self._audit, source=WATCHDOG_SOURCE, reason=reason
-        )
+
+    async def _trip(self, reason: str, now: datetime) -> Halt | None:
+        """A real stall trip. The halt row is attempted first (state before
+        wire, when the state store works) — but an unwritable halt row must
+        never suppress the cancel (round 2 item 1a): the sweep runs
+        unrecorded and reconciles like a blind trip."""
+        try:
+            halt, created = await request_halt(
+                self._pool, self._clock, self._audit, source=WATCHDOG_SOURCE, reason=reason
+            )
+        except Exception:
+            log.exception(
+                "watchdog TRIPPED (%s) but the halt row is unwritable — cancelling "
+                "without it; the halt will be reconciled when Postgres returns",
+                reason,
+            )
+            self._blind = _BlindIncident(since=now, reason=reason, db_blind=False)
+            await self._cancel_resting(f"unrecorded trip: {reason} (halt row unwritable)")
+            return None
         if created:
             log.error("watchdog TRIPPED: %s — sweeping resting orders", reason)
         return halt
 
-    async def _sweep(self, halt: Halt) -> None:
-        """Cancel-all with verify-by-enumeration (module docstring): list the
-        book, cancel what rests, list AGAIN, and only an empty second listing
-        stamps the sweep done — with the position snapshot and the unwind
-        policy recorded. Any failure leaves the halt unswept for the next
-        cycle; enumeration is idempotent and cancels tolerate re-issue.
+    # --- the sweep ---
 
-        ACCOUNT-WIDE by construction (PR #143 review): the agent key is
-        account-wide, so the sweep enumerates the core venue plus EVERY
-        builder dex in the live perpDexs listing — not just the venues the
-        product covers for tracking (POSITION_VENUES). A dex added to
-        trading, or an order that somehow landed on an uncovered dex, is
-        swept with no code change here. (Sub-accounts are a different axis:
-        agent-reachable per the #142 findings but separate ACCOUNTS, outside
-        this master's book — the runbook carries that boundary until A5's
-        risk policy forbids or includes them.)"""
-        self._exec.decision = f"halt #{halt.id} ({halt.source}): {halt.reason}"
-        dexs = await self._perp_dexs()
-        orders = await self._open_orders(dexs)
-        if orders:
-            await self._exec.cancel_orders(await self._cancels_for(orders))
-            # The fresh, deciding enumeration — over a fresh listing too, so
-            # a dex appearing mid-sweep cannot hide an order from the verify.
-            dexs = await self._perp_dexs()
+    async def _sweep(self, halt: Halt) -> None:
+        """Cancel-all with verify-by-enumeration (module docstring): cancel
+        what rests, then list AGAIN over a fresh venue listing, and only an
+        empty, COMPLETE-coverage listing stamps the sweep done — with the
+        position snapshot and the unwind policy recorded. Any failure leaves
+        the halt unswept for the next cycle; enumeration is idempotent and
+        cancels tolerate re-issue.
+
+        ACCOUNT-WIDE by construction (PR #143 review): every builder dex in
+        the live perpDexs listing, not just POSITION_VENUES. (Sub-accounts
+        are a different axis: agent-reachable per the #142 findings but
+        separate ACCOUNTS, outside this master's book — the runbook carries
+        that boundary until A5's risk policy forbids or includes them.)"""
+        dexs, complete, cancelled = await self._cancel_resting(
+            f"halt #{halt.id} ({halt.source}): {halt.reason}"
+        )
+        if cancelled:
+            # Cancels went out: the deciding enumeration must be FRESH —
+            # listing included, so a dex appearing mid-sweep can't hide an
+            # order from the verify. An already-empty book needs no second
+            # look (its first enumeration IS the verify).
+            dexs, complete = await self._sweep_venues()
             orders = await self._open_orders(dexs)
-        if orders:
+        else:
+            orders = []
+        if orders or not complete:
             log.warning(
-                "halt #%d sweep: %d order(s) still resting after cancel; retrying next cycle",
+                "halt #%d sweep incomplete: %d order(s) resting, venue coverage %s; "
+                "retrying next cycle",
                 halt.id,
                 len(orders),
+                "complete" if complete else "PARTIAL (perpDexs unavailable)",
             )
             return
         positions = await self._open_positions(dexs)
@@ -259,6 +346,39 @@ class Watchdog:
             len(positions),
             HOLD_POLICY,
         )
+
+    async def _cancel_resting(self, decision: str) -> tuple[list[str], bool, list[OpenOrder]]:
+        """Enumerate account-wide and cancel whatever rests — the shared
+        kernel of the normal sweep and the DB-blind sweep. No verification,
+        no stamping: callers own what "done" means. Returns what it saw —
+        (venues, coverage-complete, the orders it cancelled) — so the normal
+        sweep can treat an already-empty first enumeration as its verify
+        instead of re-billing a second one."""
+        self._exec.decision = decision
+        dexs, complete = await self._sweep_venues()
+        orders = await self._open_orders(dexs)
+        if orders:
+            await self._exec.cancel_orders(await self._cancels_for(orders))
+        return dexs, complete, orders
+
+    async def _sweep_venues(self) -> tuple[list[str], bool]:
+        """The builder-dex listing for an account-wide sweep — or, when the
+        listing endpoint is down, the covered POSITION_VENUES with
+        complete=False (round 2 item 3): a partial sweep that says so beats
+        a total abort that cancels nothing, but partial coverage can never
+        stamp swept_at."""
+        await self._budget.spend(META_WEIGHT)
+        try:
+            return await self._read.get_perp_dexs(), True
+        except Exception:
+            fallback = [dex for dex in POSITION_VENUES if dex is not None]
+            log.error(
+                "perpDexs listing unavailable — sweep coverage degraded to the "
+                "covered venues %s (PARTIAL; swept_at withheld)",
+                fallback,
+                exc_info=True,
+            )
+            return fallback, False
 
     async def _cancels_for(self, orders: list[OpenOrder]) -> list[CancelSpec]:
         # Map exactly the dexs the enumerated orders sit on (namespaced
@@ -283,10 +403,6 @@ class Watchdog:
             cancels.append(CancelSpec(asset=asset, oid=order.order_id))
         return cancels
 
-    async def _perp_dexs(self) -> list[str]:
-        await self._budget.spend(META_WEIGHT)
-        return await self._read.get_perp_dexs()
-
     async def _open_orders(self, dexs: list[str]) -> list[OpenOrder]:
         orders: list[OpenOrder] = []
         for dex in [None, *dexs]:
@@ -300,6 +416,78 @@ class Watchdog:
             await self._budget.spend(POSITIONS_WEIGHT)
             positions.extend(await self._read.get_open_positions(self._master, dex=dex))
         return positions
+
+    # --- the on-chain capability probe (advisory) ---
+
+    async def _verify_capability(self, now: datetime) -> None:
+        """The beating-but-impotent guard (PR #143 review): verify ON-CHAIN —
+        via the public extraAgents readback, no signing, no trading action —
+        that this watchdog's agent key is still approved and unexpired, so a
+        mid-run deregistration or an unrestarted rotation pages the operator
+        BEFORE an incident needs the cancel, not during. Verdict state lands
+        beside the heartbeat (migration 0025) for the #52 monitor; verdict
+        TRANSITIONS go to the audit trail. EVERY failure shape — read errors
+        of any type, an unwritable verdict — advances the retry fuse, so no
+        outage flavor can re-fire the probe per-cycle (round 2 item 4)."""
+        if self._next_capability_at is not None and now < self._next_capability_at:
+            return
+        await self._budget.spend(META_WEIGHT)
+        try:
+            agents = await self._read.get_extra_agents(self._master)
+        except Exception:
+            self._defer_capability_retry(now, "extraAgents read failed")
+            return
+        approval = next((a for a in agents if a.address == self._signer_address), None)
+        if approval is None:
+            capable = False
+            detail = (
+                f"agent {self._signer_address} is NOT among {self._master}'s approved "
+                f"agents — deregistered on-chain (or never approved); every cancel "
+                f"this watchdog issued would be rejected"
+            )
+        elif approval.valid_until <= now:
+            capable = False
+            detail = (
+                f"agent {self._signer_address} approval EXPIRED "
+                f"{approval.valid_until:%Y-%m-%d %H:%M} UTC — rotate the watchdog "
+                f"lane and restart the service (agent-key-rotation runbook)"
+            )
+        else:
+            capable = True
+            detail = (
+                f"approved on-chain as {approval.name or 'unnamed'} "
+                f"until {approval.valid_until:%Y-%m-%d}"
+            )
+        try:
+            if capable != self._capable:
+                # Event before state (the deadman's rule): a lost event write
+                # leaves the verdict unclaimed and re-derived on retry.
+                await self._audit.record_event(
+                    actor=WATCHDOG_ACTOR,
+                    action="watchdog_capable" if capable else "watchdog_impotent",
+                    risk_decision="on-chain capability probe (extraAgents)",
+                    detail={"verdict": detail},
+                    master_address=self._master,
+                )
+                self._capable = capable
+                if not capable:
+                    log.error("watchdog IMPOTENT: %s", detail)
+            await heartbeat.record_capability(
+                self._pool, heartbeat.WATCHDOG_PROCESS, capable=capable, detail=detail, now=now
+            )
+        except Exception:
+            self._defer_capability_retry(now, "verdict unrecordable (Postgres?)")
+            return
+        self._next_capability_at = now + self._capability_interval
+
+    def _defer_capability_retry(self, now: datetime, what: str) -> None:
+        log.warning(
+            "capability probe: %s; retrying in %ds",
+            what,
+            int(CAPABILITY_RETRY.total_seconds()),
+            exc_info=True,
+        )
+        self._next_capability_at = now + CAPABILITY_RETRY
 
 
 def _position_json(position: Position) -> dict[str, str]:

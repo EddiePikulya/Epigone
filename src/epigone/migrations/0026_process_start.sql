@@ -1,0 +1,13 @@
+-- Migration 0026: process start stamp (issue #135, PR #143 round 2).
+--
+-- The never-verified capability state needs a clock to age against: a
+-- watchdog whose on-chain probe has NEVER succeeded must escalate on the
+-- same ladder as a stale verdict (round-2 item 2 — a fresh deploy with a
+-- blocked info endpoint may hold a key that was never approved on-chain at
+-- all, and NULL-verdict-forever must not read as healthy). "Never, since
+-- WHEN" is measured from process start: the watchdog stamps started_at once
+-- per launch (startup already requires Postgres — migrate and the keystore
+-- run first — so the stamp is reliable), and the #52 monitor ages a NULL
+-- verdict from it exactly as it ages a stale one from capability_checked_at.
+-- Additive, no wipe.
+ALTER TABLE process_heartbeats ADD COLUMN started_at TIMESTAMPTZ;

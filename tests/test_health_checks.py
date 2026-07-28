@@ -340,8 +340,28 @@ def test_beating_but_impotent_watchdog_is_critical() -> None:
     assert "IMPOTENT" in check.detail and "EXPIRED" in check.detail
 
 
-def test_unchecked_capability_does_not_page() -> None:
-    # capable=None means the probe hasn't answered yet — not a verdict.
+def test_never_verified_capability_escalates_after_the_grace_period() -> None:
+    """Round 2 item 2 — this REPLACES the test that pinned the wrong
+    behaviour (a NULL verdict read as healthy forever). Never-verified is
+    quiet only inside the grace window from process start; past it, it
+    escalates on the same ladder as a stale verdict, because the agent may
+    never have been approved on-chain at all."""
+    fresh = replace(
+        HEALTHY,
+        watchdog_beaten_at=NOW - timedelta(seconds=12),
+        watchdog_started_at=NOW - timedelta(hours=2),
+    )
+    assert _by_name(evaluate_checks(fresh, THRESHOLDS), WATCHDOG).ok
+    never = replace(fresh, watchdog_started_at=NOW - timedelta(hours=30))
+    check = _by_name(evaluate_checks(never, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == WARNING
+    assert "NEVER verified" in check.detail
+
+
+def test_a_pre_migration_row_without_a_start_stamp_stays_quiet() -> None:
+    # No started_at and no verdict (a row from before migration 0026, or a
+    # process that predates the stamp): nothing to age against — quiet until
+    # the next restart stamps it.
     snapshot = replace(HEALTHY, watchdog_beaten_at=NOW - timedelta(seconds=12))
     assert _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG).ok
 

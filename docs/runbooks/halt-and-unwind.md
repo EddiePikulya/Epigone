@@ -98,18 +98,45 @@ the audit trail is where history lives, and it is append-only.)
 | available today | ✅ | ❌ $1M cumulative-volume gate (verified live 2026-07-28; operator ~$58k) |
 | status | always on (`--profile execution`) | eligibility-probed every 6h, self-activates on acceptance, transitions on the audit trail |
 
-Stated honestly (PR #143 review): the watchdog is independent of the
-*executor*, not of the infrastructure — a Postgres outage blinds it (it
-cannot read halt state or the executor heartbeat). What it does NOT depend
-on is the audit trail: on the safety path the audit write is best-effort —
-a cancel is never suppressed because its evidence couldn't land (the
-executor's order path keeps the opposite, write-ahead discipline). The only
-fully infrastructure-independent layer is scheduleCancel, which is exactly
-why it stays implemented-and-probing despite being volume-gated inactive.
+Stated precisely (PR #143 review, round 2 — no sentence here is broader
+than what the code guarantees):
+
+- **What a Postgres outage does NOT stop:** the cancel path. The safety
+  lane's rate budget degrades to in-process pacing (`FallbackBudget`), the
+  audit write is best-effort (a cancel is never suppressed because its
+  evidence couldn't land), a failed heartbeat write never skips the cycle,
+  and an unwritable halt row never suppresses a trip's cancel — the sweep
+  runs unrecorded and the halt row is reconciled when the database returns.
+- **What a Postgres outage DOES change:** the watchdog cannot *read*
+  executor liveness or halt state, so it cannot distinguish stall from
+  health. Its answer is the **blind trip**: unreadable past
+  `WATCHDOG_DB_BLIND_SECONDS` (default 180 = 3× the stall threshold — a
+  deliberate call: cancelling resting orders is cheap and recoverable, and
+  a correlated infra outage is the *likeliest* cause of a dead executor),
+  it cancels every resting order each cycle until the database answers,
+  then writes the halt row with a distinct "DB-blind sweep" reason so you
+  can tell it from a real executor stall. What is LOST while blind:
+  `swept_at` verification stamps, the position snapshot, heartbeats, and
+  audit rows for that window — reconciled or backfilled by the trail's
+  gap, never silently faked.
+- **What still needs Postgres:** `/kill` recording a halt (the bot tells
+  you plainly when it could not), `/resume`, the monitor's view, and the
+  executor's own `is_halted` gate. The only layer needing NOTHING of ours
+  is scheduleCancel — exactly why it stays implemented-and-probing despite
+  being volume-gated inactive.
+- The executor's ORDER path keeps the opposite discipline end to end
+  (write-ahead audit, shared budget, hard halt gate): evidence and pacing
+  before money is spent; action before losses continue. The asymmetry is
+  the design.
 
 **Sweep coverage:** the cancel-all is ACCOUNT-WIDE — the core venue plus
 every builder dex in the live `perpDexs` listing, re-fetched each sweep, so
-a venue added to trading is swept with no code change. The boundary that
+a venue added to trading is swept with no code change. If the listing
+endpoint itself is down, coverage degrades to the covered POSITION_VENUES:
+those venues are still swept, but `swept_at` is deliberately withheld — so
+a halt alert that keeps saying "sweep PENDING" for more than a cycle or two
+means either orders that won't die or degraded venue coverage; the watchdog
+log says which. The boundary that
 remains: **sub-accounts.** The #142 probes showed an approved agent can
 create and fund sub-accounts — separate accounts whose books this master's
 sweep never sees. Until A5's risk policy either forbids sub-account use by

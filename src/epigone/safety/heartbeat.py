@@ -38,6 +38,23 @@ async def last_beat(pool: asyncpg.Pool, process: str) -> datetime | None:
     return beaten
 
 
+async def record_start(pool: asyncpg.Pool, process: str, now: datetime) -> None:
+    """Stamp the process's launch (migration 0026): the #52 monitor measures
+    the never-verified capability grace period from here, so a probe that has
+    never succeeded in this process's life eventually escalates instead of
+    reading as healthy forever (PR #143 round 2)."""
+    await pool.execute(
+        """
+        INSERT INTO process_heartbeats (process, beaten_at, started_at)
+        VALUES ($1, $2, $2)
+        ON CONFLICT (process) DO UPDATE
+        SET started_at = EXCLUDED.started_at, beaten_at = EXCLUDED.beaten_at
+        """,
+        process,
+        now,
+    )
+
+
 async def record_capability(
     pool: asyncpg.Pool, process: str, *, capable: bool, detail: str, now: datetime
 ) -> None:

@@ -31,6 +31,14 @@ DEFAULT_INTERVAL_SECONDS = 10
 # of silence is a dead or wedged process, not a slow cycle. /kill latency is
 # bounded by the INTERVAL, not this: an operator halt sweeps next cycle.
 DEFAULT_EXECUTOR_STALE_SECONDS = 60
+# DB-blind trip threshold (PR #143 round 2, a deliberate call): if Postgres
+# cannot answer the liveness question for this long, the watchdog cancels
+# resting orders rather than sit blind — the outage that blinds it is the
+# likeliest cause of a dead executor (correlated failures), cancelling is
+# cheap and recoverable, and nothing here closes positions or spends. 3× the
+# executor-stall default: a DB blip must ride out several stall windows
+# before the conservative trip, but a real outage trips within minutes.
+DEFAULT_DB_BLIND_SECONDS = 3 * DEFAULT_EXECUTOR_STALE_SECONDS
 # scheduleCancel horizon (the upgrade path, deadman.py): long enough that a
 # deploy restart (seconds) or one slow cycle can't spuriously fire it, short
 # enough that total host death strands resting orders for minutes, not hours.
@@ -49,6 +57,7 @@ DEFAULT_CAPABILITY_CHECK_HOURS = 6
 class WatchdogConfig:
     interval: timedelta
     executor_stale: timedelta
+    db_blind_after: timedelta
     deadman_horizon: timedelta
     deadman_reprobe: timedelta
     capability_interval: timedelta
@@ -71,6 +80,13 @@ class WatchdogConfig:
                     os.environ.get("WATCHDOG_EXECUTOR_STALE_SECONDS"),
                     default=DEFAULT_EXECUTOR_STALE_SECONDS,
                     name="WATCHDOG_EXECUTOR_STALE_SECONDS",
+                )
+            ),
+            db_blind_after=timedelta(
+                seconds=parse_positive_int(
+                    os.environ.get("WATCHDOG_DB_BLIND_SECONDS"),
+                    default=DEFAULT_DB_BLIND_SECONDS,
+                    name="WATCHDOG_DB_BLIND_SECONDS",
                 )
             ),
             deadman_horizon=timedelta(

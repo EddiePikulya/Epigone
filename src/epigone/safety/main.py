@@ -10,8 +10,11 @@ Wiring notes, each load-bearing:
   (docs/runbooks/agent-key-ceremony.md) before enabling the service.
 - Phase A is operator-only: the account under protection is the operator's
   (ADMIN_TELEGRAM_ID names the keystore row). Multi-account is Phase B.
-- One SharedWeightBudget spender at reserve 0 — the execution lane's
-  priority (issue #133): a kill sweep never queues behind backfill.
+- The rate budget is a FallbackBudget over a SharedWeightBudget at
+  reserve 0 — execution-lane priority (issue #133) while Postgres answers,
+  in-process pacing when it doesn't (PR #143 round 2): a dead rate_budget
+  row must never queue a cancel. Safety lane only; the executor's order
+  lane keeps the shared bucket un-degraded.
 - The deadman upgrade path shares the cycle but not the cycle's fate: its
   ambiguity is logged and retried, and any cycle error is logged and
   retried — a broken cycle must never stop the loop (the monitor alerts on
@@ -35,7 +38,9 @@ from epigone.gateway.execution import AmbiguousExecutionError
 from epigone.gateway.execution_http import HttpExecutionGateway
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.keystore import WATCHDOG_LANE, AgentKeystore, KeystoreError, load_kek
+from epigone.safety import heartbeat
 from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
+from epigone.safety.budget import FallbackBudget
 from epigone.safety.config import WatchdogConfig
 from epigone.safety.deadman import DeadMansSwitch
 from epigone.safety.watchdog import Watchdog
@@ -91,7 +96,10 @@ async def main() -> None:
     master_address = record.master_address
 
     audit = ExecutionAudit(pool, clock)
-    budget = SharedWeightBudget(pool, clock, reserve=0)
+    budget = FallbackBudget(SharedWeightBudget(pool, clock, reserve=0), clock)
+    # The never-verified capability grace period ages from this stamp
+    # (migration 0026); startup requires Postgres anyway, so it always lands.
+    await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, clock.now())
     async with aiohttp.ClientSession() as session:
         read_gateway = HttpHyperliquidGateway(session, clock, info_url=config.info_url)
         exec_gateway = AuditedExecutionGateway(
@@ -107,9 +115,11 @@ async def main() -> None:
             actor=WATCHDOG_ACTOR,
             master_address=master_address,
             signer_address=signer.address,
-            # The safety path's discipline (PR #143 review): a Postgres
-            # outage must never suppress a protective cancel — best-effort
-            # audit, guaranteed action.
+            # The safety path's discipline (PR #143 review, both rounds): a
+            # Postgres outage must never suppress a protective cancel. This
+            # flag is the audit leg; FallbackBudget is the pacing leg; the
+            # watchdog's blind trip is the decision leg (watchdog.py module
+            # docstring states the full guarantee precisely).
             best_effort_audit=True,
         )
         deadman = DeadMansSwitch(
@@ -130,6 +140,7 @@ async def main() -> None:
             master_address=master_address,
             signer_address=signer.address,
             executor_stale=config.executor_stale,
+            db_blind_after=config.db_blind_after,
             capability_interval=config.capability_interval,
         )
         # "Which mechanism(s) are active" starts here on the trail: the

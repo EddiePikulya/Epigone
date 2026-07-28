@@ -35,6 +35,7 @@ class FakeHyperliquidGateway:
         # fixes the offsets.
         self.perp_universes: dict[str | None, list[str]] = {}
         self.perp_dex_listing: list[str] = []
+        self.perp_dex_error: Exception | None = None
         # Approved agents by master address (the extraAgents readback, issue
         # #135): what the watchdog's capability probe sees on-chain.
         # `extra_agents_calls` records each read so tests can pin the probe's
@@ -67,6 +68,8 @@ class FakeHyperliquidGateway:
         return list(self.perp_universes.get(dex, []))
 
     async def get_perp_dexs(self) -> list[str]:
+        if self.perp_dex_error is not None:
+            raise self.perp_dex_error
         return list(self.perp_dex_listing)
 
     async def get_extra_agents(self, address: str) -> list[ExtraAgent]:

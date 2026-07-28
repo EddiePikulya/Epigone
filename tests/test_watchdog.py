@@ -15,7 +15,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
-from epigone.budget import WeightBudget
+from epigone.budget import SharedWeightBudget, WeightBudget
 from epigone.gateway import ExtraAgent, GatewayError, OpenOrder, Position, Side
 from epigone.gateway.execution import AmbiguousExecutionError, CancelSpec
 from epigone.gateway.execution_fake import FakeExecutionGateway
@@ -28,6 +28,7 @@ from epigone.safety.audit import (
     AuditedExecutionGateway,
     ExecutionAudit,
 )
+from epigone.safety.budget import FallbackBudget
 from epigone.safety.halt import (
     HOLD_POLICY,
     KILL_SOURCE,
@@ -74,6 +75,7 @@ def _position(coin: str) -> Position:
 
 APPROVED_UNTIL = datetime(2026, 12, 1, tzinfo=UTC)
 CAPABILITY_INTERVAL = timedelta(hours=6)
+DB_BLIND = timedelta(seconds=180)
 
 
 @pytest.fixture
@@ -131,6 +133,7 @@ def watchdog(
         master_address=MASTER,
         signer_address=SIGNER,
         executor_stale=STALE,
+        db_blind_after=DB_BLIND,
         capability_interval=CAPABILITY_INTERVAL,
     )
 
@@ -476,3 +479,206 @@ async def test_sweep_covers_dexs_outside_position_venues(
     await watchdog.run_cycle()
     halt = await active_halt(pool)
     assert halt is not None and halt.swept_at is not None
+
+
+# --- Postgres independence: the trip→wire path (PR #143 round 2) ---
+
+
+async def test_blind_trip_cancels_at_the_real_budget_seam(
+    database_url: str,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+) -> None:
+    """THE round-2 structural guarantee, tested with the production wiring
+    shape: pool dead, SharedWeightBudget over that same dead pool (the
+    FOR UPDATE seam the round-1 test never touched), best-effort audit —
+    and the cancel still reaches the exchange. Within the blind threshold
+    the watchdog waits (a blip is not an incident); past it, it trips."""
+    dead_pool = await asyncpg.create_pool(database_url)
+    assert dead_pool is not None
+    await dead_pool.close()
+    audit = ExecutionAudit(dead_pool, clock)
+    audited = AuditedExecutionGateway(
+        exec_gateway, audit,
+        actor=WATCHDOG_ACTOR, master_address=MASTER, signer_address=SIGNER,
+        best_effort_audit=True,
+    )
+    watchdog = Watchdog(
+        dead_pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        FallbackBudget(SharedWeightBudget(dead_pool, clock, reserve=0), clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+    )
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 61)])
+
+    await watchdog.run_cycle()  # blind for 0s: wait, don't trip, don't raise
+    assert _cancels(exec_gateway) == []
+
+    clock.advance(DB_BLIND.total_seconds() + 1)
+    await watchdog.run_cycle()  # blind past threshold: the wire still works
+    assert _cancels(exec_gateway) == [CancelSpec(asset=1, oid=61)]
+
+    # And it KEEPS sweeping while blind — the book stays empty all outage.
+    clock.advance(10)
+    await watchdog.run_cycle()
+    assert len(_cancels(exec_gateway)) == 2
+
+
+async def test_blind_sweep_reconciles_into_a_distinct_halt_on_recovery(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from epigone.safety import watchdog as watchdog_module
+
+    async def db_down(_pool: asyncpg.Pool) -> None:
+        raise ConnectionError("postgres unreachable")
+
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 62)])
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    clock.advance(DB_BLIND.total_seconds() + 1)
+    await watchdog.run_cycle()  # blind trip: cancelled, nothing recorded
+    assert len(_cancels(exec_gateway)) == 1
+    assert await pool.fetchval("SELECT count(*) FROM execution_halts") == 0
+
+    # Postgres answers again: the halt row lands with the DISTINCT blind
+    # reason (operator can tell it from a real stall), then the normal sweep
+    # verifies the (now empty) book and stamps it.
+    monkeypatch.undo()
+    read_gateway.set_open_orders(MASTER, [])
+    await watchdog.run_cycle()
+    halt = await active_halt(pool)
+    assert halt is not None
+    assert halt.source == WATCHDOG_SOURCE
+    assert "DB-blind sweep reconciled" in halt.reason
+    assert "Postgres unreachable" in halt.reason
+    assert halt.swept_at is not None
+
+
+async def test_beat_failure_never_skips_the_protective_work(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def beat_down(*args: object) -> None:
+        raise ConnectionError("heartbeat write refused")
+
+    monkeypatch.setattr(heartbeat, "beat", beat_down)
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    await watchdog.run_cycle()  # the sweep must run despite the failed beat
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None
+
+
+async def test_unwritable_halt_row_never_suppresses_the_trip_cancel(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from epigone.safety import watchdog as watchdog_module
+
+    async def halt_write_down(*args: object, **kwargs: object) -> object:
+        raise ConnectionError("halt row unwritable")
+
+    await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
+    clock.advance(120)  # a REAL stall, with only the halt WRITE failing
+    read_gateway.set_open_orders(MASTER, [_order("SOL", 63)])
+    monkeypatch.setattr(watchdog_module, "request_halt", halt_write_down)
+    await watchdog.run_cycle()
+    assert _cancels(exec_gateway) == [CancelSpec(asset=2, oid=63)]
+    assert await pool.fetchval("SELECT count(*) FROM execution_halts") == 0
+
+    # Recovery: the halt is reconciled and carries the ORIGINAL stall reason.
+    monkeypatch.undo()
+    read_gateway.set_open_orders(MASTER, [])
+    await watchdog.run_cycle()
+    halt = await active_halt(pool)
+    assert halt is not None
+    assert "unrecorded trip reconciled" in halt.reason  # NOT labelled DB-blind
+    assert "executor heartbeat stale" in halt.reason
+    assert halt.swept_at is not None
+
+
+async def test_perp_dexs_outage_degrades_to_a_partial_sweep(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """Round 2 item 3: a dead listing endpoint must not abort the whole
+    sweep — core-venue orders still die (partial coverage, reported) — but
+    partial coverage can never stamp swept_at."""
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 64)])
+    read_gateway.perp_dex_error = GatewayError("perpDexs down")
+
+    await watchdog.run_cycle()
+    assert _cancels(exec_gateway) == [CancelSpec(asset=1, oid=64)]
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is None  # PARTIAL ≠ swept
+
+    # Even with an EMPTY book, partial coverage withholds the stamp…
+    read_gateway.set_open_orders(MASTER, [])
+    await watchdog.run_cycle()
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is None
+    # …and full coverage restored completes the sweep.
+    read_gateway.perp_dex_error = None
+    await watchdog.run_cycle()
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None
+
+
+async def test_capability_fuse_advances_on_any_failure_shape(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+) -> None:
+    """Round 2 item 4: a bare TimeoutError (not a GatewayError) must hit the
+    5-minute retry fuse, not re-fire the probe every cycle."""
+    read_gateway.extra_agents_errors[MASTER] = TimeoutError("info hang")
+    await watchdog.run_cycle()
+    assert read_gateway.extra_agents_calls == [MASTER]
+    clock.advance(10)
+    await watchdog.run_cycle()  # inside the fuse: no re-read
+    assert read_gateway.extra_agents_calls == [MASTER]
+    clock.advance(5 * 60)
+    await watchdog.run_cycle()  # past the fuse: retried
+    assert read_gateway.extra_agents_calls == [MASTER, MASTER]
+
+
+async def test_unrecordable_verdict_also_hits_the_fuse(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def verdict_write_down(*args: object, **kwargs: object) -> None:
+        raise ConnectionError("postgres refused")
+
+    monkeypatch.setattr(heartbeat, "record_capability", verdict_write_down)
+    await watchdog.run_cycle()
+    assert read_gateway.extra_agents_calls == [MASTER]
+    clock.advance(10)
+    await watchdog.run_cycle()  # write failure advanced the fuse too
+    assert read_gateway.extra_agents_calls == [MASTER]
