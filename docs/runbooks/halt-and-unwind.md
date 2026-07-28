@@ -98,36 +98,58 @@ the audit trail is where history lives, and it is append-only.)
 | available today | ✅ | ❌ $1M cumulative-volume gate (verified live 2026-07-28; operator ~$58k) |
 | status | always on (`--profile execution`) | eligibility-probed every 6h, self-activates on acceptance, transitions on the audit trail |
 
-Stated precisely (PR #143 review, round 2 — no sentence here is broader
-than what the code guarantees):
+Stated precisely (PR #143 review, rounds 2–3 — no sentence here is broader
+than what the code guarantees, and the whole section covers an
+**already-running watchdog only**; see the cold-start boundary below):
 
-- **What a Postgres outage does NOT stop:** the cancel path. The safety
-  lane's rate budget degrades to in-process pacing (`FallbackBudget`), the
-  audit write is best-effort (a cancel is never suppressed because its
-  evidence couldn't land), a failed heartbeat write never skips the cycle,
-  and an unwritable halt row never suppresses a trip's cancel — the sweep
-  runs unrecorded and the halt row is reconciled when the database returns.
+- **What a Postgres outage does NOT stop:** cancelling. Every safety-path
+  DB touch is bounded (its own pool: connect, per-query, and lock-wait
+  timeouts — `epigone.safety.db` — so hang-shaped outages, the way a
+  partitioned host actually fails, raise instead of blocking), the rate
+  budget degrades to in-process pacing (`FallbackBudget`, including behind
+  a lock row whose holder died mid-transaction), the audit write is
+  best-effort, a failed heartbeat write never skips the cycle, and an
+  unwritable halt row never suppresses cancelling — not at trip time and
+  not afterwards: a failing reconcile logs and falls through to another
+  cancel pass, every cycle, until writes recover.
 - **What a Postgres outage DOES change:** the watchdog cannot *read*
   executor liveness or halt state, so it cannot distinguish stall from
-  health. Its answer is the **blind trip**: unreadable past
-  `WATCHDOG_DB_BLIND_SECONDS` (default 180 = 3× the stall threshold — a
-  deliberate call: cancelling resting orders is cheap and recoverable, and
-  a correlated infra outage is the *likeliest* cause of a dead executor),
-  it cancels every resting order each cycle until the database answers,
-  then writes the halt row with a distinct "DB-blind sweep" reason so you
-  can tell it from a real executor stall. What is LOST while blind:
-  `swept_at` verification stamps, the position snapshot, heartbeats, and
-  audit rows for that window — reconciled or backfilled by the trail's
-  gap, never silently faked.
+  health. Its answer is the **blind trip**: unreadable *continuously* —
+  an unbroken failure streak; any successful read resets the clock, so a
+  single dropped connection never trips it — past
+  `WATCHDOG_DB_BLIND_SECONDS` (default 180 = 3× the stall threshold), it
+  attempts a cancel pass every cycle until the database answers. "Every
+  cycle" stretches under a hung database by the bounded DB touches (each
+  ≤5s), never by TCP retransmission timescales. Worst-case time from outage
+  onset to the first blind cancel LANDING: up to one poll interval before
+  the streak opens, plus the streak threshold, plus a cycle's bounded DB
+  touches, plus the venue enumeration's own HTTP legs (exchange I/O at its
+  30s-per-request timeout — bounded by the read gateway, not by this page's
+  DB timeouts). What is LOST while blind: `swept_at` verification
+  stamps, the position snapshot, heartbeats, and per-cancel audit rows for
+  that window.
+- **What recovery reconciles, always durably:** a halt row under a
+  headline that preserves which trip it was ("DB-blind sweep" vs a real
+  stall's "unrecorded trip" — when no halt already stands; a standing
+  /kill halt is joined, not duplicated), plus in every case a
+  `blind_window_reconciled` audit event recording the window's span and
+  how many unrecorded cancel passes ran — so a blind window can never
+  exist only in process logs.
 - **What still needs Postgres:** `/kill` recording a halt (the bot tells
-  you plainly when it could not), `/resume`, the monitor's view, and the
-  executor's own `is_halted` gate. The only layer needing NOTHING of ours
-  is scheduleCancel — exactly why it stays implemented-and-probing despite
-  being volume-gated inactive.
+  you plainly when it could not), `/resume`, the monitor's view, the
+  executor's own `is_halted` gate — and the watchdog's **cold start**:
+  startup needs the pool, migrations, and the keystore, so a watchdog
+  crash/reboot/deploy *during* the outage leaves no cancel path until
+  Postgres returns (filed separately; not covered by this page's
+  guarantees). The only layer needing NOTHING of ours is scheduleCancel —
+  exactly why it stays implemented-and-probing despite being volume-gated
+  inactive.
 - The executor's ORDER path keeps the opposite discipline end to end
-  (write-ahead audit, shared budget, hard halt gate): evidence and pacing
-  before money is spent; action before losses continue. The asymmetry is
-  the design.
+  (write-ahead audit, shared budget with its burst cap and send gate, hard
+  halt gate): evidence and pacing before money is spent; action before
+  losses continue. The asymmetry is the design — which is also why the
+  safety lane's degraded in-process bucket deliberately trades the shared
+  burst discipline for availability during the incident window.
 
 **Sweep coverage:** the cancel-all is ACCOUNT-WIDE — the core venue plus
 every builder dex in the live `perpDexs` listing, re-fetched each sweep, so

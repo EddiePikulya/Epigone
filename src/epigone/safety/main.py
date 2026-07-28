@@ -42,6 +42,7 @@ from epigone.safety import heartbeat
 from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
 from epigone.safety.budget import FallbackBudget
 from epigone.safety.config import WatchdogConfig
+from epigone.safety.db import create_safety_pool
 from epigone.safety.deadman import DeadMansSwitch
 from epigone.safety.watchdog import Watchdog
 
@@ -81,9 +82,21 @@ async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = Settings.from_env()
     config = WatchdogConfig.from_env()
-    pool = await create_pool(settings.database_url)
-    await migrate(pool)
     clock = SystemClock()
+
+    # STARTUP runs on a plain, unbounded pool — migrations legitimately take
+    # long on a fresh database and must not inherit incident-tuned timeouts.
+    # RUNTIME then switches to the safety pool, where every DB touch is
+    # bounded (connect, per-query, lock waits) so a HANGING database becomes
+    # the exception the degradation design handles instead of a stuck await
+    # (epigone.safety.db, PR #143 round 3). Startup needing Postgres at all
+    # is the cold-start boundary the runbook states plainly.
+    startup_pool = await create_pool(settings.database_url)
+    try:
+        await migrate(startup_pool)
+    finally:
+        await startup_pool.close()
+    pool = await create_safety_pool(settings.database_url)
 
     kek_path = os.environ.get("KEYSTORE_KEK_FILE")
     if not kek_path:

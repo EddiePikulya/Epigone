@@ -7,18 +7,25 @@ before signing a cancel. That made the kill path hard-depend on Postgres at
 the exact moment a correlated infrastructure outage is the likeliest reason
 the executor is dead. This wrapper closes that hole for the SAFETY lane
 only: try the shared bucket; if the database cannot grant, log loudly,
-degrade to an in-process bucket at the same pace, and PROCEED — rate-limit
-risk during an incident is strictly less bad than not cancelling.
+degrade to an in-process bucket, and PROCEED — rate-limit risk during an
+incident is strictly less bad than not cancelling. (The lock-wedged case —
+a holder dead mid-transaction — surfaces as an exception at all only
+because the safety pool bounds lock waits: epigone.safety.db.)
 
 The executor's ORDER lane must never use this: overspending to place orders
 is the opposite trade (evidence and pacing before we spend money; action
 before we stop losing it — the audit module's asymmetry, applied to pacing).
 
-Degraded-mode honesty: the in-process bucket starts full and is not
-coordinated with other processes, so a flapping database can briefly let
-combined spend exceed the shared pace. Accepted and documented — the safety
-lane's traffic is a handful of cancels and enumerations during an incident,
-and the alternative is a kill switch queued behind a dead lock row.
+Degraded-mode honesty (round 3 item 6): the fallback matches the shared
+REFILL rate (900/min) but NOT the shared design's burst discipline — it
+starts full at 900 capacity versus the shared bucket's 240 burst cap, and
+has no 20/s send gate, both of which exist because unsmoothed spikes 429
+(issue #41). So a degraded incident can briefly burst harder than the
+healthy system ever would. Accepted deliberately, not equivalence-claimed:
+a sweep cycle is ~40–260 weight, the window lasts only while Postgres is
+down, and the alternative is a kill switch queued behind a dead lock row.
+It is also uncoordinated with other processes during flapping — same
+acceptance, same reasoning.
 """
 
 import logging

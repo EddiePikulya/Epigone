@@ -28,19 +28,28 @@ THE TRIP→WIRE PATH SURVIVES POSTGRES (PR #143 round 2). The failure modes
 are CORRELATED: the likeliest reason the executor is dead is infrastructure
 trouble — precisely when a DB-dependent watchdog would be blind. So:
 
-- the rate budget degrades (safety.budget.FallbackBudget): a dead
-  rate_budget row never queues a cancel;
-- a halt row that cannot be written never suppresses the cancel — the sweep
-  runs unrecorded and the halt row is RECONCILED when Postgres returns;
-- cannot-read-Postgres is ITSELF a trip: blind past `db_blind_after`
+- every DB touch on this path is BOUNDED (epigone.safety.db: connect,
+  per-query, lock waits), so a HANGING database — the shape a partitioned
+  host actually fails in — becomes the exception the rest of this design
+  handles instead of a stuck await (round 3);
+- the rate budget degrades (safety.budget.FallbackBudget): a dead or
+  lock-wedged rate_budget row never queues a cancel;
+- a halt row that cannot be written never suppresses cancelling — neither
+  at trip time nor for as long as it stays unwritable: reconciliation is
+  bookkeeping, and a failing reconcile falls through to cancelling every
+  cycle until writes recover (round 3);
+- cannot-read-Postgres is ITSELF a trip: unreadable CONTINUOUSLY past
+  `db_blind_after` — a failure streak, reset by any successful read, so
+  one dropped connection after a long healthy cycle never trips it
   (default 3× the executor-stall threshold — a deliberate, conservative
   call: cancelling resting orders is cheap and recoverable, the executor
   re-places when it returns, and nothing here closes positions or spends —
   whereas sitting blind through a correlated outage is the exact incident
   this layer exists to prevent), the watchdog cancels every resting order
-  each cycle until the database answers again, then writes the halt row
-  with a DISTINCT "DB-blind sweep" reason so the operator can tell it from
-  a real executor stall.
+  each cycle until the database answers again, then reconciles: the halt
+  row under a DISTINCT headline ("DB-blind sweep" vs a real stall's
+  "unrecorded trip"), plus a durable blind-window audit event even when a
+  standing halt is joined.
 
 THE SWEEP NEVER TRUSTS A CANCEL'S WORD. `swept_at` is stamped only when a
 FRESH enumeration of the book answers empty — cancel results, however clean,
@@ -149,12 +158,15 @@ class Watchdog:
         self._capability_interval = capability_interval
         self._capable: bool | None = None  # last on-chain verdict; None = unchecked
         self._next_capability_at: datetime | None = None  # None → due now
-        # Postgres-independence state (module docstring): when the DB last
-        # answered the liveness question (process start counts as answered —
-        # startup itself requires the DB), and the unrecorded trip awaiting
-        # its halt row, if any.
-        self._db_readable_at: datetime = clock.now()
+        # Postgres-independence state (module docstring): the onset of the
+        # CURRENT unbroken streak of liveness-read failures (None = the last
+        # read succeeded — any success resets it, so the blind threshold
+        # means "continuously unreadable", never "one failure landing long
+        # after the last success"; round 3 item 3), the unrecorded trip
+        # awaiting its halt row, and how many cancel passes ran unrecorded.
+        self._db_failing_since: datetime | None = None
         self._blind: _BlindIncident | None = None
+        self._blind_passes = 0
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
@@ -176,11 +188,28 @@ class Watchdog:
             log.warning(
                 "watchdog: Postgres cannot answer the liveness question", exc_info=True
             )
+            if self._db_failing_since is None:
+                self._db_failing_since = now  # a new failure streak opens
             await self._run_blind(now)
             return
-        self._db_readable_at = now
+        self._db_failing_since = None  # any successful read breaks the streak
         if self._blind is not None:
-            halt = await self._settle_blind_debt(now)
+            try:
+                halt = await self._settle_blind_debt(now)
+            except Exception:
+                # Reconciliation is BOOKKEEPING and must never gate
+                # protection (round 3 item 2): reads recovered but writes
+                # didn't (read-only recovery, full WAL, a locked halt table)
+                # — keep the incident open and keep cancelling; the halt row
+                # lands when writes do.
+                log.exception(
+                    "blind-incident reconcile failed (writes still broken?) — "
+                    "continuing to cancel unrecorded"
+                )
+                await self._unrecorded_pass(
+                    f"unreconciled blind incident: {self._blind.reason}"
+                )
+                halt = None
         elif halt is None and stall_reason is not None:
             halt = await self._trip(stall_reason, now)
         if halt is not None and halt.swept_at is None:
@@ -196,15 +225,19 @@ class Watchdog:
 
     async def _run_blind(self, now: datetime) -> None:
         """The database cannot say whether the executor is alive or a halt
-        stands. Within the blind threshold: wait (a DB blip is not an
-        incident). Past it — or with an unrecorded trip already pending —
-        cancel every resting order, every cycle, until Postgres answers
-        again; the halt row and audit events are reconciled on recovery."""
-        blind_for = now - self._db_readable_at
+        stands. While the CONTINUOUS failure streak (any successful read
+        resets it — round 3 item 3: one dropped connection after a long
+        healthy cycle must never read as an outage) is inside the blind
+        threshold: wait, a blip is not an incident. Past it — or with an
+        unrecorded trip already pending — cancel every resting order, every
+        cycle, until Postgres answers again; the halt row and a durable
+        blind-window audit event are reconciled on recovery."""
+        assert self._db_failing_since is not None  # run_cycle stamped the streak
+        blind_for = now - self._db_failing_since
         if self._blind is None:
             if blind_for <= self._db_blind_after:
                 log.warning(
-                    "watchdog: Postgres unreachable for %ds (blind trip at %ds)",
+                    "watchdog: Postgres unreadable for %ds unbroken (blind trip at %ds)",
                     int(blind_for.total_seconds()),
                     int(self._db_blind_after.total_seconds()),
                 )
@@ -212,19 +245,27 @@ class Watchdog:
             self._blind = _BlindIncident(
                 since=now,
                 reason=(
-                    f"Postgres unreachable since "
-                    f"{self._db_readable_at:%Y-%m-%d %H:%M:%S} UTC — blind for "
+                    f"Postgres unreadable without interruption since "
+                    f"{self._db_failing_since:%Y-%m-%d %H:%M:%S} UTC — blind for "
                     f"{int(blind_for.total_seconds())}s > "
                     f"{int(self._db_blind_after.total_seconds())}s; the executor's "
                     f"liveness is unknowable, which is indistinguishable from death"
                 ),
                 db_blind=True,
             )
+            self._blind_passes = 0
             log.error(
                 "watchdog BLIND TRIP: %s — cancelling resting orders without halt state",
                 self._blind.reason,
             )
-        await self._cancel_resting(f"DB-blind sweep: {self._blind.reason}")
+        await self._unrecorded_pass(f"DB-blind sweep: {self._blind.reason}")
+
+    async def _unrecorded_pass(self, decision: str) -> None:
+        """One cancel pass that Postgres cannot record, COUNTED as it runs:
+        the counter is audit evidence (blind_window_reconciled reports it),
+        so it is welded to the pass here — a call site cannot forget it."""
+        self._blind_passes += 1
+        await self._cancel_resting(decision)
 
     async def _settle_blind_debt(self, now: datetime) -> Halt | None:
         """Postgres answers again after an unrecorded trip: write the halt
@@ -232,8 +273,12 @@ class Watchdog:
         PRESERVES which trip it was — "DB-blind sweep" for the unreadable-
         database trip, "unrecorded trip" for a real observed stall whose
         halt row couldn't be written — so the operator can tell them apart.
-        The normal sweep machinery then verifies the book and stamps
-        swept_at with the position snapshot."""
+        The blind window ALWAYS leaves a durable audit event (round 3
+        item 4): joining a standing halt writes no new halt state by design,
+        and the blind sweeps' own best-effort audit rows likely failed with
+        the same outage, so without this event a whole blind window could
+        exist nowhere but process logs. The normal sweep machinery then
+        verifies the book and stamps swept_at with the position snapshot."""
         assert self._blind is not None
         headline = "DB-blind sweep reconciled" if self._blind.db_blind else (
             "unrecorded trip reconciled (halt row was unwritable)"
@@ -250,9 +295,28 @@ class Watchdog:
                 f"again at {now:%Y-%m-%d %H:%M:%S} UTC"
             ),
         )
+        await self._audit.record_event(
+            actor=WATCHDOG_ACTOR,
+            action="blind_window_reconciled",
+            risk_decision=headline,
+            detail={
+                "reason": self._blind.reason,
+                "blind_since": self._blind.since.isoformat(),
+                "recovered_at": now.isoformat(),
+                "unrecorded_cancel_passes": self._blind_passes,
+                "halt_id": halt.id,
+                "joined_standing_halt": not created,
+            },
+            master_address=self._master,
+        )
         if created:
             log.error("watchdog: unrecorded sweep reconciled into halt #%d", halt.id)
+        else:
+            log.error(
+                "watchdog: blind window recorded against standing halt #%d", halt.id
+            )
         self._blind = None
+        self._blind_passes = 0
         return halt
 
     async def _executor_stall(self, now: datetime) -> str | None:
@@ -287,7 +351,8 @@ class Watchdog:
                 reason,
             )
             self._blind = _BlindIncident(since=now, reason=reason, db_blind=False)
-            await self._cancel_resting(f"unrecorded trip: {reason} (halt row unwritable)")
+            self._blind_passes = 0
+            await self._unrecorded_pass(f"unrecorded trip: {reason} (halt row unwritable)")
             return None
         if created:
             log.error("watchdog TRIPPED: %s — sweeping resting orders", reason)

@@ -547,8 +547,10 @@ async def test_blind_sweep_reconciles_into_a_distinct_halt_on_recovery(
 
     read_gateway.set_open_orders(MASTER, [_order("ETH", 62)])
     monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    await watchdog.run_cycle()  # the failure STREAK opens here (round 3 item 3)
+    assert _cancels(exec_gateway) == []
     clock.advance(DB_BLIND.total_seconds() + 1)
-    await watchdog.run_cycle()  # blind trip: cancelled, nothing recorded
+    await watchdog.run_cycle()  # unbroken past the threshold: blind trip
     assert len(_cancels(exec_gateway)) == 1
     assert await pool.fetchval("SELECT count(*) FROM execution_halts") == 0
 
@@ -562,7 +564,7 @@ async def test_blind_sweep_reconciles_into_a_distinct_halt_on_recovery(
     assert halt is not None
     assert halt.source == WATCHDOG_SOURCE
     assert "DB-blind sweep reconciled" in halt.reason
-    assert "Postgres unreachable" in halt.reason
+    assert "Postgres unreadable without interruption" in halt.reason
     assert halt.swept_at is not None
 
 
@@ -682,3 +684,152 @@ async def test_unrecordable_verdict_also_hits_the_fuse(
     clock.advance(10)
     await watchdog.run_cycle()  # write failure advanced the fuse too
     assert read_gateway.extra_agents_calls == [MASTER]
+
+
+# --- round 3: hangs handled elsewhere (test_safety_db); here, the half-
+# --- recovered database and the blind clock's semantics ---
+
+
+async def test_writes_broken_window_keeps_cancelling_every_cycle(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 item 2: reads recovered, writes broken (read-only recovery,
+    full WAL). Reconciliation is bookkeeping — it must never gate
+    protection: the cancel pass runs EVERY cycle of the writes-broken
+    window, not just once at trip time."""
+    from epigone.safety import watchdog as watchdog_module
+
+    async def writes_broken(*args: object, **kwargs: object) -> object:
+        raise ConnectionError("read-only transaction")
+
+    await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
+    clock.advance(120)  # a REAL stall
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 71)])
+    monkeypatch.setattr(watchdog_module, "request_halt", writes_broken)
+
+    for cycle in range(1, 5):  # trip + three writes-still-broken cycles
+        await watchdog.run_cycle()
+        cancel_calls = [n for n, _ in exec_gateway.actions if n == "cancel_orders"]
+        assert len(cancel_calls) == cycle  # a cancel pass EVERY cycle
+        clock.advance(10)
+    assert await pool.fetchval("SELECT count(*) FROM execution_halts") == 0
+
+    # Writes recover: the halt lands under the real-stall headline, the
+    # blind window's audit event counts every unrecorded pass, and the
+    # (now empty) book sweeps.
+    monkeypatch.undo()
+    read_gateway.set_open_orders(MASTER, [])
+    await watchdog.run_cycle()
+    halt = await active_halt(pool)
+    assert halt is not None
+    assert "unrecorded trip reconciled" in halt.reason
+    assert halt.swept_at is not None
+    event = await pool.fetchrow(
+        "SELECT detail FROM execution_audit WHERE action = 'blind_window_reconciled'"
+    )
+    assert event is not None
+    assert '"unrecorded_cancel_passes": 4' in event["detail"]
+
+
+async def test_alternating_read_failures_never_blind_trip(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 item 3: the threshold means 'unreadable CONTINUOUSLY', not
+    'one failure landing long after the last success'. Long gaps between
+    cycles (a degraded exchange stretching each cycle) plus isolated
+    dropped connections must never sum into a false account-wide cancel."""
+    from epigone.safety import watchdog as watchdog_module
+
+    real_active_halt = watchdog_module.active_halt
+    calls = {"n": 0}
+
+    async def flaky_active_halt(p: asyncpg.Pool) -> object | None:
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:  # every other cycle drops its connection
+            raise ConnectionError("connection reset by peer")
+        return await real_active_halt(p)
+
+    monkeypatch.setattr(watchdog_module, "active_halt", flaky_active_halt)
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 72)])
+    for _ in range(6):
+        clock.advance(200)  # every gap alone exceeds the 180s threshold
+        await watchdog.run_cycle()
+    assert _cancels(exec_gateway) == []  # never tripped: each success reset the streak
+    assert await pool.fetchval("SELECT count(*) FROM execution_halts") == 0
+
+
+async def test_unbroken_failure_streak_still_trips(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from epigone.safety import watchdog as watchdog_module
+
+    async def db_down(p: asyncpg.Pool) -> object | None:
+        raise ConnectionError("still down")
+
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 73)])
+    await watchdog.run_cycle()  # streak opens here; 0s blind → wait
+    assert _cancels(exec_gateway) == []
+    clock.advance(100)
+    await watchdog.run_cycle()  # 100s unbroken → still waiting
+    assert _cancels(exec_gateway) == []
+    clock.advance(100)
+    await watchdog.run_cycle()  # 200s unbroken → trip
+    assert _cancels(exec_gateway) == [CancelSpec(asset=1, oid=73)]
+
+
+async def test_blind_window_joining_a_standing_halt_still_leaves_a_trace(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 item 4: /kill stands, THEN Postgres dies, blind sweeps run
+    (their best-effort audit rows failing with the same outage), recovery
+    joins the standing halt — which by design writes no new halt state. The
+    blind window must still land durably: the reconcile event is
+    unconditional."""
+    from epigone.safety import watchdog as watchdog_module
+
+    await request_halt(
+        pool, clock, audit, source=KILL_SOURCE, reason="operator /kill", requested_by=ADMIN
+    )
+
+    async def db_down(p: asyncpg.Pool) -> object | None:
+        raise ConnectionError("down")
+
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    clock.advance(DB_BLIND.total_seconds() + 1)
+    await watchdog.run_cycle()  # streak opens
+    clock.advance(DB_BLIND.total_seconds() + 1)
+    await watchdog.run_cycle()  # blind trip + first unrecorded pass
+
+    monkeypatch.undo()
+    await watchdog.run_cycle()  # reconcile: joins the /kill halt
+    assert await pool.fetchval("SELECT count(*) FROM execution_halts") == 1
+    halt = await active_halt(pool)
+    assert halt is not None and halt.source == KILL_SOURCE  # joined, not replaced
+    event = await pool.fetchrow(
+        "SELECT detail, risk_decision FROM execution_audit "
+        "WHERE action = 'blind_window_reconciled'"
+    )
+    assert event is not None
+    assert '"joined_standing_halt": true' in event["detail"]
+    assert "DB-blind sweep" in event["risk_decision"]

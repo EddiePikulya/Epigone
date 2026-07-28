@@ -31,13 +31,19 @@ DEFAULT_INTERVAL_SECONDS = 10
 # of silence is a dead or wedged process, not a slow cycle. /kill latency is
 # bounded by the INTERVAL, not this: an operator halt sweeps next cycle.
 DEFAULT_EXECUTOR_STALE_SECONDS = 60
-# DB-blind trip threshold (PR #143 round 2, a deliberate call): if Postgres
-# cannot answer the liveness question for this long, the watchdog cancels
-# resting orders rather than sit blind — the outage that blinds it is the
+# DB-blind trip threshold (PR #143 rounds 2–3, a deliberate call): if
+# Postgres cannot answer the liveness question CONTINUOUSLY for this long —
+# a failure streak; any successful read resets it — the watchdog cancels
+# resting orders rather than sit blind: the outage that blinds it is the
 # likeliest cause of a dead executor (correlated failures), cancelling is
 # cheap and recoverable, and nothing here closes positions or spends. 3× the
-# executor-stall default: a DB blip must ride out several stall windows
-# before the conservative trip, but a real outage trips within minutes.
+# executor-stall default. The threshold is a REAL bound only because every
+# safety-path DB touch is itself bounded (epigone.safety.db): worst-case
+# time to the first blind cancel is one poll interval (for the streak to
+# open) + this threshold + a cycle's bounded DB touches (each ≤5s) + the
+# venue enumeration's own HTTP timeouts — hang-shaped outages included —
+# for an ALREADY-RUNNING watchdog (cold-start during an outage has no
+# cancel path; see the runbook).
 DEFAULT_DB_BLIND_SECONDS = 3 * DEFAULT_EXECUTOR_STALE_SECONDS
 # scheduleCancel horizon (the upgrade path, deadman.py): long enough that a
 # deploy restart (seconds) or one slow cycle can't spuriously fire it, short
