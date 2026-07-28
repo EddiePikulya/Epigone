@@ -21,12 +21,15 @@ PUBLIC_COMMANDS = [
     BotCommand(command="help", description="List all commands"),
 ]
 
-# Owner-only runtime controls over the invite-only allowlist (#33), appended
-# after the public set and shown only in the admin's chat.
+# Owner-only runtime controls — the invite-only allowlist (#33) and the
+# execution kill switch (#135) — appended after the public set and shown only
+# in the admin's chat.
 ADMIN_COMMANDS = [
     BotCommand(command="allow", description="Grant a user access (by Telegram id)"),
     BotCommand(command="revoke", description="Remove a user's access"),
     BotCommand(command="allowed", description="List who has access"),
+    BotCommand(command="kill", description="HALT execution: sweep orders, hold positions"),
+    BotCommand(command="resume", description="Lift the execution halt (asks to confirm)"),
 ]
 
 

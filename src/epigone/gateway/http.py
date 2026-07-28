@@ -28,6 +28,7 @@ import aiohttp
 
 from epigone.clock import Clock
 from epigone.gateway import (
+    ExtraAgent,
     Fill,
     GatewayError,
     LeaderboardEntry,
@@ -44,6 +45,10 @@ log = logging.getLogger(__name__)
 
 LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 INFO_URL = "https://api.hyperliquid.xyz/info"
+# The watchdog (issue #135) reads the OPERATOR's testnet book while the
+# product's trader-tracking reads stay mainnet: `info_url` is constructor-
+# injected for that one consumer; everything else keeps the mainnet default.
+TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=30)
 
@@ -67,10 +72,12 @@ class HttpHyperliquidGateway:
         session: aiohttp.ClientSession,
         clock: Clock,
         *,
+        info_url: str = INFO_URL,
         rng: Callable[[], float] = random.random,
     ) -> None:
         self._session = session
         self._clock = clock
+        self._info_url = info_url
         self._rng = rng
 
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
@@ -134,7 +141,7 @@ class HttpHyperliquidGateway:
         try:
             return await self._request_json(
                 "POST",
-                INFO_URL,
+                self._info_url,
                 json_body={"type": request_type, "user": address.lower(), **extra},
             )
         except aiohttp.ClientError as exc:
@@ -145,7 +152,7 @@ class HttpHyperliquidGateway:
         if dex is not None:
             body["dex"] = dex  # a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21)
         try:
-            payload = await self._request_json("POST", INFO_URL, json_body=body)
+            payload = await self._request_json("POST", self._info_url, json_body=body)
         except aiohttp.ClientError as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
         return parse_positions(payload, dex)
@@ -155,10 +162,36 @@ class HttpHyperliquidGateway:
         if dex is not None:
             body["dex"] = dex  # per-dex like clearinghouseState (verified live 2026-07-24)
         try:
-            payload = await self._request_json("POST", INFO_URL, json_body=body)
+            payload = await self._request_json("POST", self._info_url, json_body=body)
         except aiohttp.ClientError as exc:
             raise GatewayError(f"frontendOpenOrders request failed for {address}: {exc}") from exc
         return parse_open_orders(payload, dex)
+
+    async def get_perp_universe(self, dex: str | None = None) -> list[str]:
+        body: dict[str, str] = {"type": "meta"}
+        if dex is not None:
+            body["dex"] = dex
+        try:
+            payload = await self._request_json("POST", self._info_url, json_body=body)
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"meta request failed for dex {dex!r}: {exc}") from exc
+        return parse_perp_universe(payload, dex)
+
+    async def get_perp_dexs(self) -> list[str]:
+        try:
+            payload = await self._request_json(
+                "POST", self._info_url, json_body={"type": "perpDexs"}
+            )
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"perpDexs request failed: {exc}") from exc
+        return parse_perp_dexs(payload)
+
+    async def get_extra_agents(self, address: str) -> list[ExtraAgent]:
+        try:
+            payload = await self._info_json("extraAgents", address)
+        except aiohttp.ClientError as exc:
+            raise GatewayError(f"extraAgents request failed for {address}: {exc}") from exc
+        return parse_extra_agents(payload)
 
     async def _request_json(
         self, method: str, url: str, *, json_body: dict[str, Any] | None = None
@@ -322,6 +355,53 @@ def parse_open_orders(payload: Any, dex: str | None = None) -> list[OpenOrder]:
         return orders
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected frontendOpenOrders payload shape: {exc!r}") from exc
+
+
+def parse_perp_universe(payload: Any, dex: str | None = None) -> list[str]:
+    """A meta payload's universe as coin names in asset-index order, builder-
+    DEX names namespaced like positions and orders. Order IS the data here —
+    a coin's list position becomes the asset id a cancel signs over — so any
+    shape surprise fails loudly rather than risk a shifted index."""
+    try:
+        return [
+            _namespaced_coin(str(entry["name"]), dex) for entry in payload["universe"]
+        ]
+    except (KeyError, TypeError) as exc:
+        raise GatewayError(f"unexpected meta payload shape: {exc!r}") from exc
+
+
+def parse_perp_dexs(payload: Any) -> list[str]:
+    """A perpDexs payload as builder-dex names in listing order. The first
+    entry is the core venue's null placeholder (the SDK skips [0] the same
+    way); its presence is asserted, not assumed — builder offsets count from
+    position 1, and guessing them cancels the wrong asset."""
+    if not isinstance(payload, list) or not payload or payload[0] is not None:
+        raise GatewayError(f"unexpected perpDexs payload shape: {payload!r}")
+    try:
+        return [str(entry["name"]) for entry in payload[1:]]
+    except (KeyError, TypeError) as exc:
+        raise GatewayError(f"unexpected perpDexs payload shape: {exc!r}") from exc
+
+
+def parse_extra_agents(payload: Any) -> list[ExtraAgent]:
+    """An extraAgents payload — [{"address", "name", "validUntil" (ms)}] as
+    read back live during the #134 ceremony verification — to typed records.
+    The watchdog's capability verdict rides this parse, so a shape surprise
+    fails loudly rather than read as "no agents" (which would page a healthy
+    watchdog as impotent — the wrong false alarm, but an alarm; silently
+    empty would be the dangerous direction for OTHER callers auditing
+    authority)."""
+    try:
+        return [
+            ExtraAgent(
+                address=str(entry["address"]).lower(),
+                name=str(entry["name"]) if entry.get("name") is not None else None,
+                valid_until=datetime.fromtimestamp(entry["validUntil"] / 1000, tz=UTC),
+            )
+            for entry in payload
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GatewayError(f"unexpected extraAgents payload shape: {exc!r}") from exc
 
 
 def _opt_decimal(value: Any) -> Decimal | None:

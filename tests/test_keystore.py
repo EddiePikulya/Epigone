@@ -20,7 +20,9 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 
 from epigone.keystore import (
+    EXECUTOR_LANE,
     MAX_AGENT_KEY_DAYS,
+    WATCHDOG_LANE,
     AgentKeystore,
     KeystoreError,
     generate_kek,
@@ -121,8 +123,69 @@ async def test_generated_key_yields_a_working_signer(
 
 
 async def test_signer_without_a_key_is_a_clear_error(keystore: AgentKeystore) -> None:
-    with pytest.raises(KeystoreError, match="no active agent key"):
+    with pytest.raises(KeystoreError, match="no active executor-lane agent key"):
         await keystore.signer(OPERATOR)
+
+
+# --- signing lanes (issue #135): one key per process, per user ---
+
+
+async def test_lanes_hold_independent_keys(
+    keystore: AgentKeystore, clock: FakeClock
+) -> None:
+    executor = await keystore.generate_agent_key(
+        user_id=OPERATOR, master_address=MASTER, agent_name="epigone-a",
+        expires_at=_expiry(clock),
+    )
+    watchdog = await keystore.generate_agent_key(
+        user_id=OPERATOR, master_address=MASTER, agent_name="epigone-watchdog-a",
+        expires_at=_expiry(clock), lane=WATCHDOG_LANE,
+    )
+    assert executor.lane == EXECUTOR_LANE
+    assert watchdog.lane == WATCHDOG_LANE
+    assert executor.agent_address != watchdog.agent_address
+    # Each lane resolves to its own signer — separate nonce sets on-chain.
+    assert (await keystore.signer(OPERATOR)).address.lower() == executor.agent_address
+    assert (
+        await keystore.signer(OPERATOR, WATCHDOG_LANE)
+    ).address.lower() == watchdog.agent_address
+
+
+async def test_one_active_key_per_lane(keystore: AgentKeystore, clock: FakeClock) -> None:
+    await keystore.generate_agent_key(
+        user_id=OPERATOR, master_address=MASTER, agent_name="wd-a",
+        expires_at=_expiry(clock), lane=WATCHDOG_LANE,
+    )
+    with pytest.raises(KeystoreError, match="watchdog-lane"):
+        await keystore.generate_agent_key(
+            user_id=OPERATOR, master_address=MASTER, agent_name="wd-b",
+            expires_at=_expiry(clock), lane=WATCHDOG_LANE,
+        )
+
+
+async def test_revoke_is_lane_scoped(keystore: AgentKeystore, clock: FakeClock) -> None:
+    await keystore.generate_agent_key(
+        user_id=OPERATOR, master_address=MASTER, agent_name="epigone-a",
+        expires_at=_expiry(clock),
+    )
+    await keystore.generate_agent_key(
+        user_id=OPERATOR, master_address=MASTER, agent_name="epigone-watchdog-a",
+        expires_at=_expiry(clock), lane=WATCHDOG_LANE,
+    )
+    revoked = await keystore.revoke(OPERATOR, lane=WATCHDOG_LANE)
+    assert revoked.lane == WATCHDOG_LANE
+    # The executor lane's key is untouched; the watchdog lane is now empty.
+    await keystore.signer(OPERATOR)
+    with pytest.raises(KeystoreError, match="no active watchdog-lane"):
+        await keystore.signer(OPERATOR, WATCHDOG_LANE)
+
+
+async def test_unknown_lane_is_refused(keystore: AgentKeystore, clock: FakeClock) -> None:
+    with pytest.raises(KeystoreError, match="unknown signing lane"):
+        await keystore.generate_agent_key(
+            user_id=OPERATOR, master_address=MASTER, agent_name="x",
+            expires_at=_expiry(clock), lane="exectuor",
+        )
 
 
 # --- encryption at rest ---
@@ -283,7 +346,7 @@ async def test_agent_addresses_are_never_reused(
 
 
 async def test_revoke_without_a_key_is_a_clear_error(keystore: AgentKeystore) -> None:
-    with pytest.raises(KeystoreError, match="no active agent key"):
+    with pytest.raises(KeystoreError, match="no active executor-lane agent key"):
         await keystore.revoke(OPERATOR)
 
 

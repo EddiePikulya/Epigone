@@ -38,6 +38,11 @@ DEFAULT_DISK_PATH = "/"
 # ≤180-day agent key lapses leaves room to schedule the rotation ceremony —
 # a manual master-wallet re-approval (ADR-0005) — around operator availability.
 DEFAULT_AGENT_KEY_WARN_DAYS = 14
+# Watchdog staleness (issue #135): the watchdog beats every cycle (~10s), so
+# five minutes of silence is a dead process by an order of magnitude — while
+# comfortably surviving a deploy restart. Critical when tripped: the PRIMARY
+# dead-man's switch is down.
+DEFAULT_WATCHDOG_STALE_SECONDS = 300
 # Coarse metrics older than this multiple of the seed interval mean the re-seed
 # likely stopped (issue #52). Default = 2× the configured cadence.
 COARSE_STALE_SEED_MULTIPLE = 2
@@ -124,6 +129,13 @@ class MonitorConfig:
                         os.environ.get("HEALTHCHECK_AGENT_KEY_WARN_DAYS"),
                         default=DEFAULT_AGENT_KEY_WARN_DAYS,
                         name="HEALTHCHECK_AGENT_KEY_WARN_DAYS",
+                    )
+                ),
+                watchdog_stale=timedelta(
+                    seconds=parse_positive_int(
+                        os.environ.get("HEALTHCHECK_WATCHDOG_STALE_SECONDS"),
+                        default=DEFAULT_WATCHDOG_STALE_SECONDS,
+                        name="HEALTHCHECK_WATCHDOG_STALE_SECONDS",
                     )
                 ),
             ),

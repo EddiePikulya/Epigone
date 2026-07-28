@@ -211,7 +211,7 @@ def is_delete_button_exempt(text: str) -> bool:
     handful of distinctive prefixes/markers for prompts whose text is assembled
     inline. Keep this the single source of truth — a new exemption belongs here,
     next to the others, and nowhere else."""
-    from epigone.bot import access, controls, criteria, names
+    from epigone.bot import access, controls, criteria, names, operator
 
     # Fully-static messages, keyed off the real constant so a wording change in
     # the bot moves the exemption with it (no stale literal to drift).
@@ -263,6 +263,11 @@ def is_delete_button_exempt(text: str) -> bool:
         # confirmations (saved / name-cleared / no-longer-tracking) carry the row.
         "✏️ Rename ",  # rename prompt (named wallet)
         "✏️ Name ",  # rename prompt (unnamed wallet)
+        # Resume-confirm prompt (bot/operator.py, #135) — mid-flow, carries its
+        # own confirm/cancel keyboard, optionally with the sweep-pending line
+        # appended (hence a marker, not an exact match). The terminal
+        # resumed/cancelled/killed replies are NOT exempt.
+        operator.RESUME_PROMPT_TEXT.splitlines()[0],  # "Resume trading?"
     )
     return any(marker in text for marker in markers)
 

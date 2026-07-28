@@ -119,6 +119,15 @@ python -m epigone.keystore import --user <operator telegram id> \
     --master <master account address> --name epigone-a --days <until the noted expiry>
 ```
 
+**Lanes (issue #135):** each signing *process* gets its own agent key —
+Hyperliquid tracks nonces per signer, and the watchdog must not depend on
+the executor's key to clean up after the executor. The default lane is
+`executor`; the watchdog's key is the same ceremony with `--lane watchdog`
+and its own name pair (`epigone-watchdog-a`/`-b`). Mind the slot budget: a
+zero-volume account has exactly **3** agent slots (funded probe, PR #141) —
+two lanes plus one rotation-overlap slot is all of it, so rotate one lane at
+a time.
+
 6. Paste the key at the stdin prompt (never on the command line — argv lands
    in shell history and `ps`). `--days` must match step 3: the stored expiry
    drives the monitor's rotation reminder, and Hyperliquid's clock is the

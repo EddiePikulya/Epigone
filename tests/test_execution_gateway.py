@@ -136,6 +136,18 @@ def test_trigger_rejects_a_non_positive_price() -> None:
         ("Invalid TP/SL price. asset=4", RejectReason.BAD_TRIGGER_PRICE),
         ("Order would exceed the open interest cap.", RejectReason.OPEN_INTEREST_CAP),
         ("Too many requests from this address.", RejectReason.RATE_LIMITED),
+        # The cumulative-volume eligibility gates, verbatim as observed live
+        # (funded probe 2026-07-28, #141) — the dead-man's-switch eligibility
+        # probe (issue #135) keys on this classification.
+        (
+            "Cannot set scheduled cancel time until enough volume traded. "
+            "Required: $1000000. Traded: $0.",
+            RejectReason.VOLUME_GATED,
+        ),
+        (
+            "Cannot create sub-accounts until enough volume traded. Required: $100000",
+            RejectReason.VOLUME_GATED,
+        ),
         # An order-COUNT cap is not a throttle (PR #140 review): no arm yet,
         # so it must fall through to UNKNOWN, never RATE_LIMITED.
         ("Too many open orders.", RejectReason.UNKNOWN),

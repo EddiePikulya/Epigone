@@ -12,6 +12,7 @@ import pytest
 
 from epigone.gateway import GatewayError, Window
 from epigone.gateway.http import (
+    parse_extra_agents,
     parse_fills,
     parse_leaderboard,
     parse_open_orders,
@@ -307,3 +308,29 @@ def test_parse_open_orders_rejects_unexpected_shape() -> None:
     with pytest.raises(GatewayError):
         # An unknown side must fail loudly, never silently parse as a sell.
         parse_open_orders([dict(OPEN_ORDERS_PAYLOAD[0], side="X")])
+
+
+def test_parse_extra_agents_maps_the_ceremony_readback_shape() -> None:
+    # The shape read back live during the #134 ceremony verification:
+    # [{"address", "name", "validUntil" (ms)}]. Addresses lowercase on parse.
+    payload = [
+        {
+            "address": "0xF5D8A3BD12AEF7A8CA4D3F4A02DB4A71FF3C9E21",
+            "name": "epigone-watchdog-a",
+            "validUntil": 1786000000000,
+        }
+    ]
+    (agent,) = parse_extra_agents(payload)
+    assert agent.address == "0xf5d8a3bd12aef7a8ca4d3f4a02db4a71ff3c9e21"
+    assert agent.name == "epigone-watchdog-a"
+    assert agent.valid_until == datetime.fromtimestamp(1786000000000 / 1000, tz=UTC)
+    assert parse_extra_agents([]) == []
+
+
+def test_parse_extra_agents_rejects_unexpected_shape() -> None:
+    # The watchdog's capability verdict rides this parse: a shape surprise
+    # must fail loudly, never read as "no agents approved".
+    with pytest.raises(GatewayError):
+        parse_extra_agents([{"agent": "0xabc"}])
+    with pytest.raises(GatewayError):
+        parse_extra_agents({"agents": []})

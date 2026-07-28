@@ -6,7 +6,12 @@ requires-python = ">=3.12"
 dependencies = [
     "aiogram>=3.15",
     "aiohttp>=3.9",
-    "asyncpg>=0.30",
+    # Pinned to the verified minor (PR #143 rounds 4-5): the safety pool's
+    # acquire/release-budget seam and the untimed-cancel_waiter workaround
+    # were verified against 0.31's internals, and drift there degrades
+    # SILENTLY — an asyncpg upgrade must be a deliberate visit to
+    # epigone/safety/db.py and its black-hole tests, never an accident.
+    "asyncpg>=0.31,<0.32",
     "cryptography>=49.0.0",
     "eth-account>=0.13.7",
     "hyperliquid-python-sdk>=0.24.0",
@@ -16,6 +21,7 @@ dependencies = [
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
+    "pytest-timeout>=2.3",
     "mypy>=1.14",
     "ruff>=0.9",
     "hyperliquid-python-sdk>=0.24.0",
@@ -31,6 +37,11 @@ packages = ["src/epigone"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# A reverted safety fix must FAIL CI, not hang it (PR #143 round 5): the
+# black-hole regression tests would otherwise wait on asyncpg's untimed
+# cancel path until the CI job timeout. Generous against the slowest real
+# test (~30s of genuine timeout exercise); anything past it is a hang.
+timeout = 120
 
 [tool.mypy]
 python_version = "3.12"

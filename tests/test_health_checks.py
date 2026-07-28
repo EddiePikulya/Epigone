@@ -15,9 +15,11 @@ from epigone.monitor.checks import (
     DATABASE,
     DISK,
     FINE_SUCCESS,
+    HALT,
     INGEST,
     RATE,
     WARNING,
+    WATCHDOG,
     CheckResult,
     CheckThresholds,
     HealthSnapshot,
@@ -38,6 +40,7 @@ THRESHOLDS = CheckThresholds(
     starvation_window=timedelta(minutes=45),
     starvation_min_due=50,
     agent_key_warn=timedelta(days=14),
+    watchdog_stale=timedelta(seconds=300),
 )
 
 HEALTHY = HealthSnapshot(
@@ -72,6 +75,8 @@ def test_a_healthy_system_trips_no_check() -> None:
         DISK,
         FINE_SUCCESS,
         AGENT_KEY,
+        WATCHDOG,
+        HALT,
     }
 
 
@@ -298,3 +303,141 @@ def test_heartbeat_digest_says_expired_not_zero_left() -> None:
     )
     assert "agent key EXPIRED" in digest and "0s left" not in digest
     assert "disk 47%" in digest
+
+
+# --- watchdog liveness: the watcher, watched (issue #135) ---
+
+
+def test_no_execution_processes_keeps_the_watchdog_check_quiet() -> None:
+    # Pre-ceremony dev boxes and the pre-A4 server have neither process:
+    # not an incident, like the empty keystore.
+    assert _by_name(evaluate_checks(HEALTHY, THRESHOLDS), WATCHDOG).ok
+
+
+def test_beating_watchdog_is_healthy() -> None:
+    snapshot = replace(HEALTHY, watchdog_beaten_at=NOW - timedelta(seconds=12))
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG).ok
+
+
+def test_stale_watchdog_is_critical() -> None:
+    snapshot = replace(HEALTHY, watchdog_beaten_at=NOW - timedelta(minutes=11))
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == CRITICAL
+    assert "11m" in check.detail and "dead-man" in check.detail
+
+
+def test_beating_but_impotent_watchdog_is_critical() -> None:
+    # Heartbeats without the power to cancel are false safety (PR #143
+    # review): the on-chain verdict (migration 0025) must page.
+    snapshot = replace(
+        HEALTHY,
+        watchdog_beaten_at=NOW - timedelta(seconds=12),
+        watchdog_capable=False,
+        watchdog_capability_detail="agent 0xcd… approval EXPIRED 2026-07-01 00:00 UTC",
+    )
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == CRITICAL
+    assert "IMPOTENT" in check.detail and "EXPIRED" in check.detail
+
+
+def test_never_verified_capability_escalates_after_the_grace_period() -> None:
+    """Round 2 item 2 — this REPLACES the test that pinned the wrong
+    behaviour (a NULL verdict read as healthy forever). Never-verified is
+    quiet only inside the grace window from process start; past it, it
+    escalates on the same ladder as a stale verdict, because the agent may
+    never have been approved on-chain at all."""
+    fresh = replace(
+        HEALTHY,
+        watchdog_beaten_at=NOW - timedelta(seconds=12),
+        watchdog_started_at=NOW - timedelta(hours=2),
+    )
+    assert _by_name(evaluate_checks(fresh, THRESHOLDS), WATCHDOG).ok
+    never = replace(fresh, watchdog_started_at=NOW - timedelta(hours=30))
+    check = _by_name(evaluate_checks(never, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == WARNING
+    assert "NEVER verified" in check.detail
+
+
+def test_a_pre_migration_row_without_a_start_stamp_stays_quiet() -> None:
+    # No started_at and no verdict (a row from before migration 0026, or a
+    # process that predates the stamp): nothing to age against — quiet until
+    # the next restart stamps it.
+    snapshot = replace(HEALTHY, watchdog_beaten_at=NOW - timedelta(seconds=12))
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG).ok
+
+
+def test_a_verdict_the_probe_cannot_refresh_warns_as_unverified() -> None:
+    # An info outage must not let a stale capable=TRUE mask a mid-run
+    # deregistration forever: past the fixed staleness band the verdict is
+    # unverified and says so.
+    fresh = replace(
+        HEALTHY,
+        watchdog_beaten_at=NOW - timedelta(seconds=12),
+        watchdog_capable=True,
+        watchdog_capability_checked_at=NOW - timedelta(hours=6),
+    )
+    assert _by_name(evaluate_checks(fresh, THRESHOLDS), WATCHDOG).ok
+    stale = replace(fresh, watchdog_capability_checked_at=NOW - timedelta(hours=30))
+    check = _by_name(evaluate_checks(stale, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == WARNING
+    assert "UNVERIFIED" in check.detail
+
+
+def test_executor_without_watchdog_is_critical() -> None:
+    # An executor heartbeat with NO watchdog ever run = trading unguarded —
+    # exactly the state the A3 safety layer exists to forbid.
+    snapshot = replace(HEALTHY, executor_beaten_at=NOW - timedelta(seconds=3))
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), WATCHDOG)
+    assert not check.ok and check.severity == CRITICAL
+    assert "UNGUARDED" in check.detail
+
+
+# --- the active-halt alert (issue #135) ---
+
+
+def test_no_halt_is_healthy() -> None:
+    assert _by_name(evaluate_checks(HEALTHY, THRESHOLDS), HALT).ok
+
+
+def test_active_halt_is_critical_and_actionable() -> None:
+    snapshot = replace(
+        HEALTHY,
+        active_halt_since=NOW - timedelta(minutes=4),
+        active_halt_source="watchdog",
+        active_halt_reason="executor heartbeat stale: 95s > 60s",
+        active_halt_swept_at=NOW - timedelta(minutes=3),
+        active_halt_positions=2,
+    )
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), HALT)
+    assert not check.ok and check.severity == CRITICAL
+    assert "watchdog" in check.detail
+    assert "95s > 60s" in check.detail
+    assert "orders swept" in check.detail
+    assert "2 open position(s) HELD" in check.detail
+
+
+def test_unswept_halt_says_orders_may_still_rest() -> None:
+    # Sweep pending is the dangerous half: the alert must not read as "done".
+    snapshot = replace(
+        HEALTHY,
+        active_halt_since=NOW - timedelta(seconds=30),
+        active_halt_source="kill",
+        active_halt_reason="operator /kill by 370818090",
+    )
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), HALT)
+    assert not check.ok
+    assert "sweep PENDING" in check.detail
+
+
+def test_digest_carries_watchdog_and_halt_state() -> None:
+    quiet = heartbeat_digest(HEALTHY)
+    assert "watchdog" not in quiet and "HALTED" not in quiet
+    live = heartbeat_digest(
+        replace(
+            HEALTHY,
+            watchdog_beaten_at=NOW - timedelta(seconds=8),
+            active_halt_since=NOW - timedelta(minutes=2),
+        )
+    )
+    assert "watchdog beat 8s ago" in live
+    assert "execution HALTED" in live

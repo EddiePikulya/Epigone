@@ -43,6 +43,8 @@ RATE = "rate"
 FINE_SUCCESS = "fine_success"
 DISK = "disk"
 AGENT_KEY = "agent_key"
+WATCHDOG = "watchdog"
+HALT = "halt"
 
 WARNING = "warning"
 CRITICAL = "critical"
@@ -51,6 +53,16 @@ CRITICAL = "critical"
 # nearly full and the alert escalates to critical (🚨). A fixed escalation band,
 # not a tunable — the operator tunes *when* to be warned via HEALTHCHECK_DISK_PERCENT.
 DISK_CRITICAL_PERCENT = 95
+
+# A watchdog capability verdict older than this is unverified (issue #135):
+# the probe runs ~6-hourly with a 5-minute failure retry, so a day of silence
+# means the on-chain check has been failing for ~4 cycles straight — long
+# enough that a stale capable=TRUE could be masking a deregistration. The
+# SAME band is the never-verified grace period from process start (PR #143
+# round 2): one ladder, whether the last verdict is old or has never landed.
+# Fixed like the disk escalation band, not a tunable: 4× the probe's own
+# default cadence, generous against any sane WATCHDOG_CAPABILITY_CHECK_HOURS.
+CAPABILITY_VERDICT_STALE = timedelta(hours=24)
 
 
 class DiskProbe(Protocol):
@@ -85,6 +97,10 @@ class CheckThresholds:
     # (docs/runbooks/agent-key-rotation.md) happens on a reminder, never as an
     # outage response.
     agent_key_warn: timedelta
+    # Watchdog liveness (issue #135): the watchdog beats every cycle (~10s);
+    # silence past this window means the PRIMARY dead-man's switch is down —
+    # the watcher must itself be watched, and this is where.
+    watchdog_stale: timedelta
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,33 @@ class HealthSnapshot:
     # Soonest expires_at over ACTIVE agent keys (issue #134); None means the
     # keystore is empty — a valid Phase A state, not a failure.
     nearest_agent_key_expiry: datetime | None = None
+    # Execution-process heartbeats (issue #135). None means the process never
+    # ran — a valid pre-A4 (executor) / pre-ceremony (watchdog) state; the
+    # watchdog check decides what each combination means.
+    executor_beaten_at: datetime | None = None
+    watchdog_beaten_at: datetime | None = None
+    # The watchdog's on-chain capability verdict (migration 0025, PR #143
+    # review): None = never checked, False = beating but IMPOTENT — its agent
+    # key can't cancel anything; detail says why. `checked_at` is when the
+    # verdict last landed — a verdict the probe hasn't refreshed in a long
+    # time is unverified, not trustworthy (an info outage must not let a
+    # stale capable=TRUE mask a deregistration forever).
+    watchdog_capable: bool | None = None
+    watchdog_capability_detail: str | None = None
+    watchdog_capability_checked_at: datetime | None = None
+    # When the watchdog process last started (migration 0026): the clock a
+    # NEVER-verified capability ages against — a probe that has not succeeded
+    # once since launch must escalate on the same ladder as a stale verdict,
+    # never read as healthy forever (PR #143 round 2).
+    watchdog_started_at: datetime | None = None
+    # The active execution halt, if any (issue #135) — raw fields off the one
+    # active execution_halts row; all None when trading is not halted.
+    active_halt_since: datetime | None = None
+    active_halt_source: str | None = None
+    active_halt_reason: str | None = None
+    active_halt_swept_at: datetime | None = None
+    # jsonb_array_length of the sweep's position snapshot; None until swept.
+    active_halt_positions: int | None = None
 
 
 @dataclass(frozen=True)
@@ -154,7 +197,29 @@ async def gather_snapshot(
             (SELECT count(*) FROM rate_limit_events WHERE occurred_at >= $3)
                 AS recent_rate_limits,
             (SELECT min(expires_at) FROM agent_keys WHERE revoked_at IS NULL)
-                AS nearest_agent_key_expiry
+                AS nearest_agent_key_expiry,
+            (SELECT beaten_at FROM process_heartbeats WHERE process = 'executor')
+                AS executor_beaten_at,
+            (SELECT beaten_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_beaten_at,
+            (SELECT capable FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capable,
+            (SELECT capability_detail FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_detail,
+            (SELECT capability_checked_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_checked_at,
+            (SELECT started_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_started_at,
+            (SELECT halted_at FROM execution_halts WHERE resumed_at IS NULL)
+                AS active_halt_since,
+            (SELECT source FROM execution_halts WHERE resumed_at IS NULL)
+                AS active_halt_source,
+            (SELECT reason FROM execution_halts WHERE resumed_at IS NULL)
+                AS active_halt_reason,
+            (SELECT swept_at FROM execution_halts WHERE resumed_at IS NULL)
+                AS active_halt_swept_at,
+            (SELECT jsonb_array_length(positions) FROM execution_halts
+                WHERE resumed_at IS NULL) AS active_halt_positions
         """,
         _start_of_day(now),
         MAX_DELIVERY_ATTEMPTS,
@@ -175,6 +240,17 @@ async def gather_snapshot(
         recent_rate_limits=row["recent_rate_limits"],
         disk_percent_used=disk.percent_used(),
         nearest_agent_key_expiry=row["nearest_agent_key_expiry"],
+        executor_beaten_at=row["executor_beaten_at"],
+        watchdog_beaten_at=row["watchdog_beaten_at"],
+        watchdog_capable=row["watchdog_capable"],
+        watchdog_capability_detail=row["watchdog_capability_detail"],
+        watchdog_capability_checked_at=row["watchdog_capability_checked_at"],
+        watchdog_started_at=row["watchdog_started_at"],
+        active_halt_since=row["active_halt_since"],
+        active_halt_source=row["active_halt_source"],
+        active_halt_reason=row["active_halt_reason"],
+        active_halt_swept_at=row["active_halt_swept_at"],
+        active_halt_positions=row["active_halt_positions"],
     )
 
 
@@ -214,6 +290,8 @@ def evaluate_checks(
         ),
         _disk_check(snapshot, thresholds.disk_percent),
         _agent_key_check(snapshot, thresholds.agent_key_warn),
+        _watchdog_check(snapshot, thresholds.watchdog_stale),
+        _halt_check(snapshot),
     ]
 
 
@@ -403,6 +481,129 @@ def _agent_key_check(snapshot: HealthSnapshot, warn: timedelta) -> CheckResult:
     )
 
 
+def _watchdog_check(snapshot: HealthSnapshot, stale: timedelta) -> CheckResult:
+    """Watchdog liveness (issue #135) — the watcher, watched. The watchdog is
+    the PRIMARY dead-man's switch (scheduleCancel is volume-gated, PR #141),
+    so its death is critical the moment there is anything to guard:
+
+    - watchdog beating recently AND on-chain capable → healthy;
+    - watchdog silent past the window → critical: the switch is down;
+    - watchdog beating but IMPOTENT (its agent deregistered/expired on-chain,
+      the migration-0025 verdict) → critical: heartbeats without the power to
+      cancel are the false safety the PR #143 review flagged;
+    - watchdog NEVER ran while the executor HAS a heartbeat → critical: an
+      executor without its watchdog is exactly the unguarded state A3 forbids;
+    - neither ever ran → quiet, like the empty keystore: the pre-deploy state
+      of a dev box or a pre-ceremony server is not an incident."""
+    beaten = snapshot.watchdog_beaten_at
+    if beaten is None:
+        if snapshot.executor_beaten_at is not None:
+            return CheckResult(
+                WATCHDOG,
+                "Watchdog",
+                ok=False,
+                severity=CRITICAL,
+                detail=(
+                    "Watchdog: never ran, but the executor has a heartbeat — trading "
+                    "is UNGUARDED; start the watchdog service (compose profile "
+                    "`execution`, issue #135)"
+                ),
+            )
+        return CheckResult(
+            WATCHDOG, "Watchdog", ok=True, severity=CRITICAL,
+            detail="Watchdog not deployed (no execution processes)",
+        )
+    age = snapshot.now - beaten
+    if age > stale:
+        return CheckResult(
+            WATCHDOG,
+            "Watchdog",
+            ok=False,
+            severity=CRITICAL,
+            detail=(
+                f"Watchdog: last heartbeat {_ago(age)} ago (threshold "
+                f"{_ago(stale)}) — the dead-man's switch is DOWN; resting orders "
+                f"are unguarded (issue #135)"
+            ),
+        )
+    if snapshot.watchdog_capable is False:
+        return CheckResult(
+            WATCHDOG,
+            "Watchdog",
+            ok=False,
+            severity=CRITICAL,
+            detail=(
+                f"Watchdog: beating but IMPOTENT — "
+                f"{snapshot.watchdog_capability_detail or 'agent not approved on-chain'}; "
+                f"re-approve/rotate the watchdog lane and restart the service "
+                f"(agent-key-rotation runbook)"
+            ),
+        )
+    # One ladder for "how long has the verdict gone unrefreshed" (PR #143
+    # round 2): a verified verdict ages from its last check; a NEVER-verified
+    # one ages from process start — because a fresh deploy with a blocked
+    # info endpoint may hold a key that was never approved on-chain at all,
+    # and NULL-forever must not read as healthy.
+    checked = snapshot.watchdog_capability_checked_at
+    basis = checked if checked is not None else snapshot.watchdog_started_at
+    if basis is not None and snapshot.now - basis > CAPABILITY_VERDICT_STALE:
+        gap_detail = (
+            f"NEVER verified since the process started {_ago(snapshot.now - basis)} ago "
+            f"— the probe has not succeeded once; the agent may not be approved "
+            f"on-chain at all"
+            if checked is None
+            else f"UNVERIFIED for {_ago(snapshot.now - checked)} (probe failing?) — "
+            f"the last verdict may be stale"
+        )
+        return CheckResult(
+            WATCHDOG,
+            "Watchdog",
+            ok=False,
+            severity=WARNING,
+            detail=(
+                f"Watchdog: on-chain capability {gap_detail}; check the watchdog "
+                f"logs and the info endpoint"
+            ),
+        )
+    return CheckResult(
+        WATCHDOG, "Watchdog", ok=True, severity=CRITICAL, detail="Watchdog beating"
+    )
+
+
+def _halt_check(snapshot: HealthSnapshot) -> CheckResult:
+    """An active execution halt (issue #135) is CRITICAL for as long as it
+    stands: this is the alert path that pages the operator when the watchdog
+    trips (or confirms a /kill took), and the reminder cadence keeps re-paging
+    while it is unresolved. The detail carries what the operator needs to act:
+    who halted, why, whether the book is actually swept yet, and how many
+    positions are being HELD per the unwind policy."""
+    since = snapshot.active_halt_since
+    if since is None:
+        return CheckResult(HALT, "Execution halt", ok=True, severity=CRITICAL,
+                           detail="No execution halt")
+    sweep = (
+        "orders swept"
+        if snapshot.active_halt_swept_at is not None
+        else "sweep PENDING — orders may still rest"
+    )
+    positions = (
+        f"{snapshot.active_halt_positions} open position(s) HELD"
+        if snapshot.active_halt_positions is not None
+        else "positions not yet snapshotted"
+    )
+    return CheckResult(
+        HALT,
+        "Execution halt",
+        ok=False,
+        severity=CRITICAL,
+        detail=(
+            f"Execution HALTED by {snapshot.active_halt_source} {_ago(snapshot.now - since)} "
+            f"ago ({snapshot.active_halt_reason}) — {sweep}; {positions} per the unwind "
+            f"policy (docs/runbooks/halt-and-unwind.md); /resume lifts it"
+        ),
+    )
+
+
 def heartbeat_digest(snapshot: HealthSnapshot) -> str:
     """The daily positive digest (user story #6): the key liveness numbers so
     silence genuinely means healthy and a dead checker is noticeable by its
@@ -428,6 +629,13 @@ def heartbeat_digest(snapshot: HealthSnapshot) -> str:
         parts.append(
             "agent key EXPIRED" if runway <= timedelta(0) else f"agent key {_ago(runway)} left"
         )
+    # Execution safety (issue #135): clauses only once the processes exist,
+    # like the keystore clause above. A standing halt must say so — "healthy"
+    # beside a silent halt would be a lie of omission.
+    if snapshot.watchdog_beaten_at is not None:
+        parts.append(f"watchdog beat {_ago(snapshot.now - snapshot.watchdog_beaten_at)} ago")
+    if snapshot.active_halt_since is not None:
+        parts.append("execution HALTED")
     return "✅ Epigone healthy · " + " · ".join(parts)
 
 
