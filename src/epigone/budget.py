@@ -32,13 +32,17 @@ coordination is not the point (the fake-in-src convention of
 epigone.gateway.fake).
 """
 
+import asyncio
 import logging
+from collections.abc import Coroutine
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol, TypeVar
 
 import asyncpg
 
 from epigone.clock import Clock
+
+_T = TypeVar("_T")
 
 log = logging.getLogger(__name__)
 
@@ -164,12 +168,28 @@ class SharedWeightBudget:
     IP's instantaneous rate, which 429s regardless of who is sending.
     """
 
-    def __init__(self, pool: asyncpg.Pool, clock: Clock, *, reserve: int = 0) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        clock: Clock,
+        *,
+        reserve: int = 0,
+        attempt_ceiling: float | None = None,
+    ) -> None:
         self._pool = pool
         self._clock = clock
         self._reserve = float(reserve)
         self._capacity = float(BURST_WEIGHT)
         self._rate_per_second = SHARED_WEIGHT_PER_MINUTE / 60.0
+        # Optional hard real-time bound on each DATABASE attempt (the
+        # acquire+transaction block), for the safety lane (issue #135
+        # round 5): a partitioned host hangs a mid-transaction attempt past
+        # every pool timeout (asyncpg's transaction exit awaits an untimed
+        # cancel_waiter), and the kill path must never queue behind that.
+        # None — the scanner lanes' default — keeps today's unbounded
+        # behavior; the ceiling never touches the PACING sleeps between
+        # attempts, which may legitimately run long.
+        self._attempt_ceiling = attempt_ceiling
 
     async def spend(self, weight: int) -> None:
         """Block (via the injected clock) until `weight` fits above this spender's
@@ -180,7 +200,7 @@ class SharedWeightBudget:
                 f"exceeds bucket capacity {self._capacity}"
             )
         while True:
-            wait = await self._try_spend(weight)
+            wait = await self._ceilinged(self._try_spend(weight))
             if wait <= 0:
                 return
             await self._clock.sleep(max(wait, PACING_SLEEP_FLOOR_SECONDS))
@@ -191,6 +211,9 @@ class SharedWeightBudget:
         off. The gate advances too, so the smoothed rate reflects real weight."""
         if weight <= 0:
             return
+        await self._ceilinged(self._settle_attempt(weight))
+
+    async def _settle_attempt(self, weight: int) -> None:
         now = self._clock.now()
         async with self._pool.acquire() as conn, conn.transaction():
             row = await self._locked_row(conn, now)
@@ -198,6 +221,14 @@ class SharedWeightBudget:
             gate = max(row["next_send_at"], now) + _gate_window(weight)
             started_at, spent = _roll_meter(now, row["minute_started_at"], row["minute_spent"])
             await self._store(conn, available, now, row, gate, started_at, spent + weight)
+
+    async def _ceilinged(self, attempt: Coroutine[Any, Any, _T]) -> _T:
+        """One database attempt, under the optional real-time ceiling (the
+        constructor comment): a hang the pool timeouts cannot reach becomes
+        a TimeoutError the caller's degradation path already handles."""
+        if self._attempt_ceiling is None:
+            return await attempt
+        return await asyncio.wait_for(attempt, self._attempt_ceiling)
 
     async def _try_spend(self, weight: int) -> float:
         """Refill the shared row and take `weight` if it fits above the reserve

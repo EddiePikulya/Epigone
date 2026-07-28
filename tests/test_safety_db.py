@@ -264,3 +264,73 @@ async def test_a_black_holed_established_connection_is_bounded_on_the_release_le
     finally:
         pool.terminate()  # abortive on purpose: graceful close would hang here
         await proxy.stop()
+
+
+async def test_a_mid_transaction_black_hole_is_bounded_by_the_ceiling(
+    database_url: str,
+) -> None:
+    """THE round-5 shape all four earlier rounds of tests missed: the black
+    hole flips after BEGIN, before COMMIT. The failing statement times out,
+    then Transaction.__aexit__ issues ROLLBACK — and every asyncpg protocol
+    op awaits an UNTIMED cancel_waiter before its own command_timeout arms
+    (protocol.pyx), so no pool bound applies. The production answer is the
+    hard wait_for ceiling around every DB block (watchdog.py): cancellation
+    lands in the hanging wait, and the SHIELDED pool release then terminates
+    the wedged connection within the round-4 acquire budget. This test pins
+    that composition with real wall-clock bounds."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(database_url)
+    assert parts.hostname is not None and parts.port is not None
+    proxy = _BlackholeProxy(parts.hostname, parts.port)
+    proxy_port = await proxy.start()
+    query = f"?{parts.query}" if parts.query else ""
+    proxied_url = (
+        f"postgresql://{parts.username}:{parts.password}"
+        f"@127.0.0.1:{proxy_port}{parts.path}{query}"
+    )
+    pool = await create_safety_pool(proxied_url, timeout_seconds=0.5)
+    try:
+        await pool.execute("SELECT 1")  # healthy, pooled
+
+        async def txn_touch() -> None:
+            async with pool.acquire() as conn, conn.transaction():
+                await conn.execute("SELECT 1")
+                proxy.blackholed = True  # the partition strikes MID-transaction
+                await conn.execute("SELECT 1")  # times out; ROLLBACK then hangs untimed
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(txn_touch(), 2.0)  # the production ceiling shape
+        assert time.monotonic() - started < ELAPSED_CEILING
+    finally:
+        pool.terminate()
+        await proxy.stop()
+
+
+async def test_the_shared_buckets_attempt_ceiling_bounds_an_untimed_lock_wait(
+    pool: asyncpg.Pool, database_url: str, clock: FakeClock
+) -> None:
+    """Round 5's normal-mode belt: the shared bucket's own attempt ceiling
+    (SharedWeightBudget attempt_ceiling) bounds a database attempt even on a
+    pool WITHOUT lock_timeout — the FOR UPDATE would otherwise wait forever
+    and no pool timeout applies. This is the seam every safety-lane spend
+    passes through, the gateway's pre-sign spend included."""
+    await SharedWeightBudget(pool, clock, reserve=0).spend(1)  # the row exists
+    plain_pool = await asyncpg.create_pool(database_url)  # no lock_timeout at all
+    assert plain_pool is not None
+    wedge = await asyncpg.connect(database_url)
+    try:
+        wedge_tx = wedge.transaction()
+        await wedge_tx.start()
+        await wedge.execute("SELECT * FROM rate_budget FOR UPDATE")
+
+        ceilinged = SharedWeightBudget(plain_pool, clock, reserve=0, attempt_ceiling=0.5)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await ceilinged.spend(20)
+        assert time.monotonic() - started < ELAPSED_CEILING
+        await wedge_tx.rollback()
+    finally:
+        await wedge.close()
+        plain_pool.terminate()

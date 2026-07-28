@@ -209,7 +209,19 @@ class AuditedExecutionGateway:
       failure is the opposite one, a protective cancel suppressed because
       Postgres was down at the exact moment the account most needed
       protecting. Best-effort is about DB failures only; action failures
-      still raise exactly as always."""
+      still raise exactly as always.
+
+    Plus one INCIDENT posture on top of best-effort (PR #143 round 5):
+    `wire_first=True` (a plain attribute the watchdog flips while an
+    incident is declared) moves the attempt row AFTER the wire call, so a
+    declared incident performs ZERO Postgres work before the cancel — the
+    attempt-then-outcome pair still lands (best-effort) once the call
+    returns or fails. The trade is explicit: while wire_first is on, a
+    process crash between signing and returning leaves NO attempt row —
+    accepted, because the mode only runs during incidents, when the
+    database is presumed unreachable and the write-ahead row would have
+    failed anyway. Meaningful only with best_effort_audit; the executor's
+    order path never sets it."""
 
     def __init__(
         self,
@@ -228,6 +240,7 @@ class AuditedExecutionGateway:
         self._signer_address = signer_address
         self._best_effort_audit = best_effort_audit
         self.decision: str = "unspecified"
+        self.wire_first: bool = False
 
     async def place_orders(
         self,
@@ -304,10 +317,14 @@ class AuditedExecutionGateway:
         call: Callable[[], Awaitable[T]],
         result_json: Callable[[T], Any],
     ) -> T:
-        attempt = await self._record_attempt(action, request)
+        # wire_first (incident posture, class docstring): the attempt row is
+        # deferred to after the call, so nothing touches Postgres pre-wire.
+        attempt = None if self.wire_first else await self._record_attempt(action, request)
         try:
             result = await call()
         except ActionRejectedError as exc:
+            if attempt is None and self.wire_first:
+                attempt = await self._record_attempt(action, request)
             await self._record_outcome(
                 attempt,
                 outcome=REJECTED,
@@ -315,6 +332,8 @@ class AuditedExecutionGateway:
             )
             raise
         except AmbiguousExecutionError as exc:
+            if attempt is None and self.wire_first:
+                attempt = await self._record_attempt(action, request)
             await self._record_outcome(
                 attempt,
                 outcome=AMBIGUOUS,
@@ -324,12 +343,16 @@ class AuditedExecutionGateway:
         except Exception as exc:
             # ExecutionError (nothing sent) and anything unforeseen alike:
             # the trail must never lose a failure, whatever its shape.
+            if attempt is None and self.wire_first:
+                attempt = await self._record_attempt(action, request)
             await self._record_outcome(
                 attempt,
                 outcome=ERROR,
                 detail={"type": type(exc).__name__, "message": str(exc)},
             )
             raise
+        if attempt is None and self.wire_first:
+            attempt = await self._record_attempt(action, request)
         await self._record_outcome(attempt, outcome=OK, detail=result_json(result))
         return result
 

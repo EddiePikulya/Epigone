@@ -40,7 +40,7 @@ from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.keystore import WATCHDOG_LANE, AgentKeystore, KeystoreError, load_kek
 from epigone.safety import heartbeat
 from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
-from epigone.safety.budget import FallbackBudget
+from epigone.safety.budget import PRIMARY_ATTEMPT_CEILING_SECONDS, FallbackBudget
 from epigone.safety.config import WatchdogConfig
 from epigone.safety.db import create_safety_pool
 from epigone.safety.deadman import DeadMansSwitch
@@ -109,7 +109,12 @@ async def main() -> None:
     master_address = record.master_address
 
     audit = ExecutionAudit(pool, clock)
-    budget = FallbackBudget(SharedWeightBudget(pool, clock, reserve=0), clock)
+    budget = FallbackBudget(
+        SharedWeightBudget(
+            pool, clock, reserve=0, attempt_ceiling=PRIMARY_ATTEMPT_CEILING_SECONDS
+        ),
+        clock,
+    )
     # The never-verified capability grace period ages from this stamp
     # (migration 0026); startup requires Postgres anyway, so it always lands.
     await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, clock.now())

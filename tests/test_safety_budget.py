@@ -32,3 +32,37 @@ async def test_healthy_shared_bucket_is_actually_used(
     from epigone.budget import BURST_WEIGHT
 
     assert row["available"] <= BURST_WEIGHT - 20  # …for the full weight
+
+
+class _RecordingDeadPrimary:
+    """A shared-bucket stand-in that records every attempt and then fails —
+    normal mode must ATTEMPT it (and degrade); incident mode must not touch
+    it at all."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def spend(self, weight: int) -> None:
+        self.calls += 1
+        raise ConnectionError("shared bucket unreachable")
+
+    async def settle(self, weight: int) -> None:
+        self.calls += 1
+        raise ConnectionError("shared bucket unreachable")
+
+
+async def test_incident_mode_never_touches_the_shared_bucket(clock: FakeClock) -> None:
+    """Round 5: during a declared incident the shared Postgres bucket is not
+    attempted AT ALL — Postgres-free by construction, not by exception
+    handling. Normal mode still tries it first and degrades."""
+    primary = _RecordingDeadPrimary()
+    budget = FallbackBudget(primary, clock)
+
+    budget.incident_mode = True
+    await budget.spend(20)
+    await budget.settle(5)
+    assert primary.calls == 0  # zero Postgres on the incident path
+
+    budget.incident_mode = False
+    await budget.spend(20)  # attempted, failed, degraded — the normal shape
+    assert primary.calls == 1

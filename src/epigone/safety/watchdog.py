@@ -24,24 +24,38 @@ live perpDexs listing (degrading to the covered POSITION_VENUES — a partial
 sweep that says so — when the listing endpoint is down; partial coverage
 never stamps swept_at).
 
-THE TRIP→WIRE PATH SURVIVES POSTGRES (PR #143 round 2). The failure modes
-are CORRELATED: the likeliest reason the executor is dead is infrastructure
-trouble — precisely when a DB-dependent watchdog would be blind. So:
+AN INCIDENT DOES NOT TOUCH POSTGRES BEFORE THE WIRE (PR #143 rounds 2–5).
+The failure modes are CORRELATED: the likeliest reason the executor is dead
+is infrastructure trouble — precisely when a DB-dependent watchdog would be
+blind. Rounds 2–4 bounded one hanging database leg at a time (command
+timeout, then release, then rollback) and each time the same bug reappeared
+one layer deeper — asyncpg's transaction exit awaits an UNTIMED
+cancel_waiter before any per-op timeout arms — so round 5 removed the
+dependency instead of bounding another leg:
 
-- every DB touch on this path is BOUNDED (epigone.safety.db: connect,
-  per-query, lock waits, AND the release-time cancel-wait — the asyncpg
-  leg that would otherwise await an untimed CancelRequest connection,
-  round 4), so a HANGING database — the shape a partitioned host actually
-  fails in — becomes the exception the rest of this design handles instead
-  of a stuck await; a fully hung touch costs roughly 2× the configured
-  timeout (query bound + release budget), never TCP-retransmission
-  timescales;
-- the rate budget degrades (safety.budget.FallbackBudget): a dead or
-  lock-wedged rate_budget row never queues a cancel;
-- a halt row that cannot be written never suppresses cancelling — neither
-  at trip time nor for as long as it stays unwritable: reconciliation is
-  bookkeeping, and a failing reconcile falls through to cancelling every
-  cycle until writes recover (round 3);
+- once an incident is DECLARED — a DB-blind window or a real stall trip —
+  the cycle performs ZERO Postgres work before the cancel pass reaches the
+  wire: no heartbeat, no reads, no halt row, the rate budget drops to its
+  in-process bucket (FallbackBudget.incident_mode) without attempting the
+  shared row, and even the audit wrapper defers its attempt row to after
+  the call (AuditedExecutionGateway.wire_first). Postgres-free by
+  construction, not by exception handling: nothing left to hang;
+- everything durable — halt row, audit events, sweep verification — runs
+  AFTER the cancel attempt, best-effort, under a hard real-time ceiling
+  (DB_BLOCK_CEILING_SECONDS; safe because Pool.release is shielded, so a
+  cancelled block's connection is still terminated within the round-4
+  acquire budget). Reconciliation is bookkeeping and never gates
+  protection: a failing reconcile keeps the incident open and the next
+  cycle cancels again;
+- NORMAL operation keeps its bounded DB touches (epigone.safety.db:
+  connect, per-query, lock waits, release budget), the same wait_for
+  ceiling around every state block of run_cycle, and a per-attempt ceiling
+  inside the shared rate bucket itself (SharedWeightBudget's
+  attempt_ceiling, wired in main.py — the seam every budget spend passes
+  through, the gateway's pre-sign spend included), so even the leg the
+  pool timeouts cannot reach (the mid-transaction rollback) costs a
+  bounded cycle, never a hung loop that could starve the blind machinery
+  of the cycles it needs;
 - cannot-read-Postgres is ITSELF a trip: unreadable CONTINUOUSLY past
   `db_blind_after` — a failure streak, reset by any successful read, so
   one dropped connection after a long healthy cycle never trips it
@@ -49,12 +63,13 @@ trouble — precisely when a DB-dependent watchdog would be blind. So:
   call: cancelling resting orders is cheap and recoverable, the executor
   re-places when it returns, and nothing here closes positions or spends —
   whereas sitting blind through a correlated outage is the exact incident
-  this layer exists to prevent), the watchdog cancels every resting order
-  each cycle until the database answers again, then reconciles: the halt
-  row under a DISTINCT headline ("DB-blind sweep" vs a real stall's
-  "unrecorded trip"), plus a blind-window audit event even when a standing
-  halt is joined (durable in every case except a watchdog death inside the
-  recovery-to-reconcile window — the runbook's one carve-out).
+  this layer exists to prevent). On recovery the incident reconciles: the
+  halt row under a DISTINCT headline ("DB-blind sweep" vs a real stall's
+  "unrecorded trip"; a trip reconciled within its own cycle keeps the
+  plain stall reason), plus a blind-window audit event for any window that
+  spanned cycles, even when a standing halt is joined (durable in every
+  case except a watchdog death inside the recovery-to-reconcile window —
+  the runbook's one carve-out).
 
 THE SWEEP NEVER TRUSTS A CANCEL'S WORD. `swept_at` is stamped only when a
 FRESH enumeration of the book answers empty — cancel results, however clean,
@@ -70,6 +85,7 @@ position snapshot on the halt row, and the monitor's halt alert carries it
 to the operator.
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -89,6 +105,8 @@ from epigone.gateway import (
 from epigone.gateway.execution import CancelSpec
 from epigone.safety import heartbeat
 from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
+from epigone.safety.budget import FallbackBudget
+from epigone.safety.db import SAFETY_DB_TIMEOUT_SECONDS
 from epigone.safety.halt import (
     HOLD_POLICY,
     WATCHDOG_SOURCE,
@@ -106,6 +124,16 @@ log = logging.getLogger(__name__)
 ORDERS_WEIGHT = 20  # frontendOpenOrders, per venue
 POSITIONS_WEIGHT = 2  # clearinghouseState, per venue
 META_WEIGHT = 20  # meta (per venue), perpDexs, extraAgents — the info default
+
+# The hard REAL-TIME ceiling on every durable/state block of a cycle
+# (round 5): asyncpg's per-op timeouts cannot reach a transaction exit — a
+# ROLLBACK awaits an UNTIMED cancel_waiter before any command timeout arms —
+# so instead of bounding one more library leg, every DB block is wrapped in
+# asyncio.wait_for at this ceiling. The composition is safe: Pool.release is
+# asyncio.shield'ed, so the cancelled block's connection is still terminated
+# within the acquire budget (the round-4 pool). Real time, not the injected
+# clock: this bounds actual awaits, and the fakes finish instantly.
+DB_BLOCK_CEILING_SECONDS = 4 * SAFETY_DB_TIMEOUT_SECONDS
 
 # A failed capability probe (network blip, info outage, unwritable verdict)
 # retries on this short fuse instead of waiting out the full check interval —
@@ -175,15 +203,25 @@ class Watchdog:
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
+        # INCIDENT-FIRST (round 5, the structural rule): an open incident
+        # reaches the wire before this cycle touches Postgres AT ALL — no
+        # beat, no reads, no state. Durable catch-up comes after the cancel.
+        if self._blind is not None:
+            await self._incident_cycle(now)
+            return
         try:
-            await heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now)
+            await asyncio.wait_for(
+                heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now),
+                DB_BLOCK_CEILING_SECONDS,
+            )
         except Exception:
             # Best-effort beat (round 2 item 1c): losing the liveness signal
             # is bad; skipping the cycle's protective work over it is worse.
             log.exception("heartbeat write failed — continuing the protective cycle")
         try:
-            halt = await active_halt(self._pool)
-            stall_reason = None if halt is not None else await self._executor_stall(now)
+            halt, stall_reason = await asyncio.wait_for(
+                self._read_liveness(now), DB_BLOCK_CEILING_SECONDS
+            )
         except Exception:
             # Deliberately ANY failure of the liveness reads, not just
             # connection errors: a watchdog that cannot answer "is the
@@ -193,30 +231,22 @@ class Watchdog:
             log.warning(
                 "watchdog: Postgres cannot answer the liveness question", exc_info=True
             )
-            if self._db_failing_since is None:
-                self._db_failing_since = now  # a new failure streak opens
-            await self._run_blind(now)
+            self._handle_unreadable(now)
+            if self._blind is not None:  # declared just now: cancel THIS cycle
+                await self._incident_cycle(now, reconcile=False)  # reads just failed
             return
         self._db_failing_since = None  # any successful read breaks the streak
-        if self._blind is not None:
-            try:
-                halt = await self._settle_blind_debt(now)
-            except Exception:
-                # Reconciliation is BOOKKEEPING and must never gate
-                # protection (round 3 item 2): reads recovered but writes
-                # didn't (read-only recovery, full WAL, a locked halt table)
-                # — keep the incident open and keep cancelling; the halt row
-                # lands when writes do.
-                log.exception(
-                    "blind-incident reconcile failed (writes still broken?) — "
-                    "continuing to cancel unrecorded"
-                )
-                await self._unrecorded_pass(
-                    f"unreconciled blind incident: {self._blind.reason}"
-                )
-                halt = None
-        elif halt is None and stall_reason is not None:
-            halt = await self._trip(stall_reason, now)
+        if halt is None and stall_reason is not None:
+            # A REAL stall is an incident too (round 5): the cancel goes to
+            # the wire before the halt row is attempted — the executor is
+            # already presumed dead (that IS the trip), and the sweep's
+            # verify-by-enumeration catches anything racing the halt write.
+            self._declare(_BlindIncident(since=now, reason=stall_reason, db_blind=False))
+            log.error(
+                "watchdog TRIPPED: %s — cancelling before any state write", stall_reason
+            )
+            await self._incident_cycle(now, declared_now=True)
+            return
         if halt is not None and halt.swept_at is None:
             await self._sweep(halt)
         # After the protective work, never before it: the capability probe is
@@ -226,44 +256,118 @@ class Watchdog:
         except Exception:
             log.exception("capability probe failed; retrying next cycle")
 
-    # --- Postgres-blind operation (round 2 item 1) ---
+    async def _read_liveness(self, now: datetime) -> tuple[Halt | None, str | None]:
+        halt = await active_halt(self._pool)
+        stall = None if halt is not None else await self._executor_stall(now)
+        return halt, stall
 
-    async def _run_blind(self, now: datetime) -> None:
-        """The database cannot say whether the executor is alive or a halt
-        stands. While the CONTINUOUS failure streak (any successful read
-        resets it — round 3 item 3: one dropped connection after a long
-        healthy cycle must never read as an outage) is inside the blind
-        threshold: wait, a blip is not an incident. Past it — or with an
-        unrecorded trip already pending — cancel every resting order, every
-        cycle, until Postgres answers again; the halt row and a durable
-        blind-window audit event are reconciled on recovery."""
-        assert self._db_failing_since is not None  # run_cycle stamped the streak
+    # --- incident operation (rounds 2–5) ---
+
+    def _declare(self, incident: _BlindIncident) -> None:
+        """Open an incident: from here until reconcile, cancel passes run
+        with ZERO Postgres before the wire — the rate budget drops to its
+        in-process bucket (FallbackBudget.incident_mode) instead of
+        attempting the shared row, and the audit wrapper defers its attempt
+        row to after the call (wire_first)."""
+        self._blind = incident
+        self._blind_passes = 0
+        self._set_incident_posture(True)
+
+    def _clear_incident(self) -> None:
+        self._blind = None
+        self._blind_passes = 0
+        self._set_incident_posture(False)
+
+    def _set_incident_posture(self, on: bool) -> None:
+        # In-process test budgets (WeightBudget) lack the flag — and are
+        # already Postgres-free, so there is nothing to switch off.
+        if isinstance(self._budget, FallbackBudget):
+            self._budget.incident_mode = on
+        self._exec.wire_first = on
+
+    def _handle_unreadable(self, now: datetime) -> None:
+        """A liveness read failed. Open (or age) the CONTINUOUS failure
+        streak — any successful read resets it (round 3 item 3: one dropped
+        connection after a long healthy cycle must never read as an outage)
+        — and declare the blind incident once the streak outlives the
+        threshold: past it, an unknowable executor is indistinguishable
+        from a dead one, and blind fails protective."""
+        if self._db_failing_since is None:
+            self._db_failing_since = now  # a new failure streak opens
         blind_for = now - self._db_failing_since
-        if self._blind is None:
-            if blind_for <= self._db_blind_after:
-                log.warning(
-                    "watchdog: Postgres unreadable for %ds unbroken (blind trip at %ds)",
-                    int(blind_for.total_seconds()),
-                    int(self._db_blind_after.total_seconds()),
-                )
-                return
-            self._blind = _BlindIncident(
-                since=now,
-                reason=(
-                    f"Postgres unreadable without interruption since "
-                    f"{self._db_failing_since:%Y-%m-%d %H:%M:%S} UTC — blind for "
-                    f"{int(blind_for.total_seconds())}s > "
-                    f"{int(self._db_blind_after.total_seconds())}s; the executor's "
-                    f"liveness is unknowable, which is indistinguishable from death"
-                ),
-                db_blind=True,
+        if blind_for <= self._db_blind_after:
+            log.warning(
+                "watchdog: Postgres unreadable for %ds unbroken (blind trip at %ds)",
+                int(blind_for.total_seconds()),
+                int(self._db_blind_after.total_seconds()),
             )
-            self._blind_passes = 0
-            log.error(
-                "watchdog BLIND TRIP: %s — cancelling resting orders without halt state",
-                self._blind.reason,
+            return
+        incident = _BlindIncident(
+            since=now,
+            reason=(
+                f"Postgres unreadable without interruption since "
+                f"{self._db_failing_since:%Y-%m-%d %H:%M:%S} UTC — blind for "
+                f"{int(blind_for.total_seconds())}s > "
+                f"{int(self._db_blind_after.total_seconds())}s; the executor's "
+                f"liveness is unknowable, which is indistinguishable from death"
+            ),
+            db_blind=True,
+        )
+        self._declare(incident)
+        log.error(
+            "watchdog BLIND TRIP: %s — cancelling resting orders without halt state",
+            incident.reason,
+        )
+
+    async def _incident_cycle(
+        self, now: datetime, *, reconcile: bool = True, declared_now: bool = False
+    ) -> None:
+        """One cycle of a declared incident: THE WIRE FIRST — the cancel
+        pass performs zero Postgres work (in-process budget, wire-first
+        audit) — then the durable catch-up (halt row, events, sweep
+        verification), best-effort and hard-ceilinged so no wedged rollback
+        can stall the next cycle. `reconcile=False` skips the catch-up on
+        cycles where the liveness reads JUST failed — the database has
+        already answered the question. `declared_now` carries the explicit
+        "this trip opened this very cycle" fact into the reconcile, which
+        keys the plain-reason/no-window-event shape on it rather than
+        inferring it from timestamp equality."""
+        assert self._blind is not None
+        kind = "DB-blind sweep" if self._blind.db_blind else "unrecorded trip"
+        try:
+            await self._unrecorded_pass(f"{kind}: {self._blind.reason}")
+        except Exception:
+            # An exchange-side failure must not block the reconcile attempt:
+            # the halt row is valuable even while cancels are failing.
+            log.exception("incident cancel pass failed; reconcile still attempted")
+        if reconcile:
+            await self._try_reconcile(now, declared_now=declared_now)
+
+    async def _try_reconcile(self, now: datetime, *, declared_now: bool = False) -> None:
+        """Close the incident's books, AFTER the wire: halt row + events
+        under a hard real-time ceiling (a wedged transaction rollback hangs
+        in asyncpg BEFORE any per-op timeout arms — the ceiling cancels the
+        block, and the shielded pool release then terminates the wedged
+        connection within the acquire budget). Reconciliation is BOOKKEEPING
+        and must never gate protection (round 3 item 2): failure keeps the
+        incident open and next cycle cancels again."""
+        assert self._blind is not None
+        try:
+            halt = await asyncio.wait_for(
+                self._settle_blind_debt(now, same_cycle_trip=declared_now),
+                DB_BLOCK_CEILING_SECONDS,
             )
-        await self._unrecorded_pass(f"DB-blind sweep: {self._blind.reason}")
+        except Exception:
+            log.exception(
+                "incident reconcile failed (bounded) — the incident stays open and "
+                "the next cycle cancels again"
+            )
+            return
+        if halt is not None and halt.swept_at is None:
+            # The incident pass WAS the cancel; this sweep only verifies and
+            # stamps — re-cancelling what the pass just killed would be
+            # redundant wire work between two enumerations of the same book.
+            await self._sweep(halt, skip_cancel=True)
 
     async def _unrecorded_pass(self, decision: str) -> None:
         """One cancel pass that Postgres cannot record, counted AFTER it
@@ -276,59 +380,69 @@ class Watchdog:
         await self._cancel_resting(decision)
         self._blind_passes += 1
 
-    async def _settle_blind_debt(self, now: datetime) -> Halt | None:
-        """Postgres answers again after an unrecorded trip: write the halt
-        row (joining any halt that appeared meanwhile) under a headline that
-        PRESERVES which trip it was — "DB-blind sweep" for the unreadable-
-        database trip, "unrecorded trip" for a real observed stall whose
-        halt row couldn't be written — so the operator can tell them apart.
-        The blind window leaves a durable audit event whenever this
-        reconcile RUNS (round 3 item 4): joining a standing halt writes no
-        new halt state by design, and the blind sweeps' own best-effort
-        audit rows likely failed with the same outage, so without this
-        event a whole blind window could exist nowhere but process logs.
-        The one hole — the watchdog dying between DB recovery and this
-        cycle, taking the in-process marker with it — is carved out in the
-        runbook, not papered over here. The normal sweep machinery then
+    async def _settle_blind_debt(
+        self, now: datetime, *, same_cycle_trip: bool = False
+    ) -> Halt | None:
+        """Postgres can record the incident: write the halt row (joining any
+        halt that appeared meanwhile) under a headline that PRESERVES which
+        trip it was — "DB-blind sweep" for the unreadable-database trip,
+        "unrecorded trip" for a real observed stall — so the operator can
+        tell them apart. A trip reconciled in the SAME cycle it was declared
+        (the healthy-database normal case since round 5 put the cancel
+        before the halt write) keeps the plain stall reason and skips the
+        window event: nothing ran in the dark, and the trail's cancel rows
+        landed normally. An incident that SPANNED cycles leaves the durable
+        blind-window event whenever this reconcile runs (round 3 item 4):
+        joining a standing halt writes no new halt state by design, and the
+        window's own best-effort audit rows likely failed with the same
+        outage. The one hole — the watchdog dying between DB recovery and
+        this cycle, taking the in-process marker with it — is carved out in
+        the runbook, not papered over here. The normal sweep machinery then
         verifies the book and stamps swept_at with the position snapshot."""
         assert self._blind is not None
-        headline = "DB-blind sweep reconciled" if self._blind.db_blind else (
-            "unrecorded trip reconciled (halt row was unwritable)"
-        )
-        halt, created = await request_halt(
-            self._pool,
-            self._clock,
-            self._audit,
-            source=WATCHDOG_SOURCE,
-            reason=(
+        # A trip can only be "same cycle" via the explicit declared_now flag
+        # from the trip branch (not timestamp equality — a frozen or
+        # coarse clock must never turn a spanning window into a quiet trip).
+        if same_cycle_trip:
+            assert not self._blind.db_blind  # blind windows always span cycles
+            headline = "trip"
+            reason = self._blind.reason
+        else:
+            headline = "DB-blind sweep reconciled" if self._blind.db_blind else (
+                "unrecorded trip reconciled (halt row was unwritable)"
+            )
+            reason = (
                 f"{headline}: {self._blind.reason}; resting orders were being "
                 f"cancelled unrecorded since "
                 f"{self._blind.since:%Y-%m-%d %H:%M:%S} UTC; Postgres answered "
                 f"again at {now:%Y-%m-%d %H:%M:%S} UTC"
-            ),
-        )
-        await self._audit.record_event(
-            actor=WATCHDOG_ACTOR,
-            action="blind_window_reconciled",
-            risk_decision=headline,
-            detail={
-                "reason": self._blind.reason,
-                "blind_since": self._blind.since.isoformat(),
-                "recovered_at": now.isoformat(),
-                "unrecorded_cancel_passes": self._blind_passes,
-                "halt_id": halt.id,
-                "joined_standing_halt": not created,
-            },
-            master_address=self._master,
-        )
-        if created:
-            log.error("watchdog: unrecorded sweep reconciled into halt #%d", halt.id)
-        else:
-            log.error(
-                "watchdog: blind window recorded against standing halt #%d", halt.id
             )
-        self._blind = None
-        self._blind_passes = 0
+        halt, created = await request_halt(
+            self._pool, self._clock, self._audit, source=WATCHDOG_SOURCE, reason=reason
+        )
+        if not same_cycle_trip:
+            await self._audit.record_event(
+                actor=WATCHDOG_ACTOR,
+                action="blind_window_reconciled",
+                risk_decision=headline,
+                detail={
+                    "reason": self._blind.reason,
+                    "blind_since": self._blind.since.isoformat(),
+                    "recovered_at": now.isoformat(),
+                    "unrecorded_cancel_passes": self._blind_passes,
+                    "halt_id": halt.id,
+                    "joined_standing_halt": not created,
+                },
+                master_address=self._master,
+            )
+            log.error(
+                "watchdog: unrecorded window reconciled into halt #%d (joined=%s)",
+                halt.id,
+                not created,
+            )
+        elif created:
+            log.error("watchdog: trip recorded as halt #%d", halt.id)
+        self._clear_incident()
         return halt
 
     async def _executor_stall(self, now: datetime) -> str | None:
@@ -347,32 +461,9 @@ class Watchdog:
             f"{int(self._executor_stale.total_seconds())}s"
         )
 
-    async def _trip(self, reason: str, now: datetime) -> Halt | None:
-        """A real stall trip. The halt row is attempted first (state before
-        wire, when the state store works) — but an unwritable halt row must
-        never suppress the cancel (round 2 item 1a): the sweep runs
-        unrecorded and reconciles like a blind trip."""
-        try:
-            halt, created = await request_halt(
-                self._pool, self._clock, self._audit, source=WATCHDOG_SOURCE, reason=reason
-            )
-        except Exception:
-            log.exception(
-                "watchdog TRIPPED (%s) but the halt row is unwritable — cancelling "
-                "without it; the halt will be reconciled when Postgres returns",
-                reason,
-            )
-            self._blind = _BlindIncident(since=now, reason=reason, db_blind=False)
-            self._blind_passes = 0
-            await self._unrecorded_pass(f"unrecorded trip: {reason} (halt row unwritable)")
-            return None
-        if created:
-            log.error("watchdog TRIPPED: %s — sweeping resting orders", reason)
-        return halt
-
     # --- the sweep ---
 
-    async def _sweep(self, halt: Halt) -> None:
+    async def _sweep(self, halt: Halt, *, skip_cancel: bool = False) -> None:
         """Cancel-all with verify-by-enumeration (module docstring): cancel
         what rests, then list AGAIN over a fresh venue listing, and only an
         empty, COMPLETE-coverage listing stamps the sweep done — with the
@@ -384,19 +475,28 @@ class Watchdog:
         the live perpDexs listing, not just POSITION_VENUES. (Sub-accounts
         are a different axis: agent-reachable per the #142 findings but
         separate ACCOUNTS, outside this master's book — the runbook carries
-        that boundary until A5's risk policy forbids or includes them.)"""
-        dexs, complete, cancelled = await self._cancel_resting(
-            f"halt #{halt.id} ({halt.source}): {halt.reason}"
-        )
-        if cancelled:
-            # Cancels went out: the deciding enumeration must be FRESH —
-            # listing included, so a dex appearing mid-sweep can't hide an
-            # order from the verify. An already-empty book needs no second
-            # look (its first enumeration IS the verify).
+        that boundary until A5's risk policy forbids or includes them.)
+
+        `skip_cancel` is the incident-reconcile shape (round 5): the
+        incident's own pass already cancelled, so this call only enumerates
+        and stamps — an order that somehow still rests leaves the halt
+        unswept and the NEXT cycle's full sweep cancels it."""
+        if skip_cancel:
             dexs, complete = await self._sweep_venues()
             orders = await self._open_orders(dexs)
         else:
-            orders = []
+            dexs, complete, cancelled = await self._cancel_resting(
+                f"halt #{halt.id} ({halt.source}): {halt.reason}"
+            )
+            if cancelled:
+                # Cancels went out: the deciding enumeration must be FRESH —
+                # listing included, so a dex appearing mid-sweep can't hide
+                # an order from the verify. An already-empty book needs no
+                # second look (its first enumeration IS the verify).
+                dexs, complete = await self._sweep_venues()
+                orders = await self._open_orders(dexs)
+            else:
+                orders = []
         if orders or not complete:
             log.warning(
                 "halt #%d sweep incomplete: %d order(s) resting, venue coverage %s; "
@@ -407,13 +507,19 @@ class Watchdog:
             )
             return
         positions = await self._open_positions(dexs)
-        await mark_swept(
-            self._pool,
-            self._clock,
-            self._audit,
-            halt=halt,
-            positions=[_position_json(p) for p in positions],
-            unwind_policy=HOLD_POLICY,
+        # Durable write, hard-ceilinged like every state block (round 5): a
+        # partition striking mid-transaction here must cost a bounded cycle,
+        # not a hung loop that can never reach the blind machinery.
+        await asyncio.wait_for(
+            mark_swept(
+                self._pool,
+                self._clock,
+                self._audit,
+                halt=halt,
+                positions=[_position_json(p) for p in positions],
+                unwind_policy=HOLD_POLICY,
+            ),
+            DB_BLOCK_CEILING_SECONDS,
         )
         log.error(
             "halt #%d swept: book empty across %d venue(s); %d open position(s) HELD "
@@ -536,26 +642,31 @@ class Watchdog:
                 f"until {approval.valid_until:%Y-%m-%d}"
             )
         try:
-            if capable != self._capable:
-                # Event before state (the deadman's rule): a lost event write
-                # leaves the verdict unclaimed and re-derived on retry.
-                await self._audit.record_event(
-                    actor=WATCHDOG_ACTOR,
-                    action="watchdog_capable" if capable else "watchdog_impotent",
-                    risk_decision="on-chain capability probe (extraAgents)",
-                    detail={"verdict": detail},
-                    master_address=self._master,
-                )
-                self._capable = capable
-                if not capable:
-                    log.error("watchdog IMPOTENT: %s", detail)
-            await heartbeat.record_capability(
-                self._pool, heartbeat.WATCHDOG_PROCESS, capable=capable, detail=detail, now=now
+            await asyncio.wait_for(
+                self._store_verdict(capable, detail, now), DB_BLOCK_CEILING_SECONDS
             )
         except Exception:
             self._defer_capability_retry(now, "verdict unrecordable (Postgres?)")
             return
         self._next_capability_at = now + self._capability_interval
+
+    async def _store_verdict(self, capable: bool, detail: str, now: datetime) -> None:
+        if capable != self._capable:
+            # Event before state (the deadman's rule): a lost event write
+            # leaves the verdict unclaimed and re-derived on retry.
+            await self._audit.record_event(
+                actor=WATCHDOG_ACTOR,
+                action="watchdog_capable" if capable else "watchdog_impotent",
+                risk_decision="on-chain capability probe (extraAgents)",
+                detail={"verdict": detail},
+                master_address=self._master,
+            )
+            self._capable = capable
+            if not capable:
+                log.error("watchdog IMPOTENT: %s", detail)
+        await heartbeat.record_capability(
+            self._pool, heartbeat.WATCHDOG_PROCESS, capable=capable, detail=detail, now=now
+        )
 
     def _defer_capability_retry(self, now: datetime, what: str) -> None:
         log.warning(

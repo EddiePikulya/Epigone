@@ -102,36 +102,40 @@ Stated precisely (PR #143 review, rounds 2–3 — no sentence here is broader
 than what the code guarantees, and the whole section covers an
 **already-running watchdog only**; see the cold-start boundary below):
 
-- **What a Postgres outage does NOT stop:** cancelling. Every safety-path
-  DB touch is bounded (its own pool: connect, per-query, lock-wait, and
-  release-time cancel-wait timeouts — `epigone.safety.db`; the last one is
-  the asyncpg trap where a timed-out query's CancelRequest rides an
-  untimed fresh TCP connection that release then awaits — so hang-shaped
-  outages, the way a partitioned host actually fails, raise instead of
-  blocking, at ~2× the 5s DB timeout per fully hung touch), the rate
-  budget degrades to in-process pacing (`FallbackBudget`, including behind
-  a lock row whose holder died mid-transaction), the audit write is
-  best-effort, a failed heartbeat write never skips the cycle, and an
-  unwritable halt row never suppresses cancelling — not at trip time and
-  not afterwards: a failing reconcile logs and falls through to another
-  cancel pass, every cycle, until writes recover.
+- **What a Postgres outage does NOT stop:** cancelling — because once an
+  incident is declared, the cancel path does not use Postgres AT ALL
+  (round 5): no heartbeat, no reads, no halt row, the rate budget runs on
+  its in-process bucket without attempting the shared row, and the audit
+  wrapper defers its attempt row to after the wire (wire-first audit) for
+  the incident's duration. Durable bookkeeping — halt row, events, sweep
+  stamps, the deferred audit pair — happens AFTER each cancel attempt
+  under a hard ~20s ceiling, and a failing reconcile just leaves the
+  incident open: the next cycle cancels again, every cycle, until writes
+  recover. Getting TO the declaration is bounded too: normal-operation DB
+  touches ride the safety pool's connect/per-query/lock-wait/release
+  budgets (~2× the 5s bound per fully hung touch), every state block of
+  the cycle sits under the same hard ceiling, and the shared rate bucket
+  ceilings each of its own database attempts — together covering even the
+  transaction-exit leg asyncpg cannot time (an untimed cancel-wait before
+  ROLLBACK, the round-5 finding that ended the bound-one-more-leg
+  approach).
 - **What a Postgres outage DOES change:** the watchdog cannot *read*
   executor liveness or halt state, so it cannot distinguish stall from
   health. Its answer is the **blind trip**: unreadable *continuously* —
   an unbroken failure streak; any successful read resets the clock, so a
   single dropped connection never trips it — past
   `WATCHDOG_DB_BLIND_SECONDS` (default 180 = 3× the stall threshold), it
-  attempts a cancel pass every cycle until the database answers. "Every
-  cycle" stretches under a hung database by the bounded DB touches (each
-  ≤~10s: the 5s query bound plus the 5s release budget for the cancel-wait
-  — `epigone.safety.db`), never by TCP retransmission timescales.
-  Worst-case time from outage onset to the first blind cancel LANDING: up
-  to one poll interval before the streak opens, plus the streak threshold,
-  plus up to one more poll interval and one waiting cycle's bounded
-  touches (the trip fires at the first cycle START past the threshold),
-  plus the trip cycle's own bounded touches, plus the venue enumeration's
-  HTTP legs (exchange I/O at its 30s-per-request timeout — bounded by the
-  read gateway, not by this page's DB timeouts). What is LOST while blind: `swept_at` verification
+  attempts a cancel pass every cycle until the database answers — and
+  incident cycles touch Postgres only AFTER the cancel, under a hard
+  ceiling, so "every cycle" stretches by at most the post-cancel reconcile
+  ceiling (~20s), never by TCP retransmission timescales. Worst-case time
+  from outage onset to the first blind cancel LANDING: up to one poll
+  interval before the streak opens, plus the streak threshold, plus up to
+  one more poll interval and one waiting cycle's ceilinged DB blocks (the
+  trip fires at the first cycle START past the threshold), plus the venue
+  enumeration's HTTP legs on the trip cycle itself (exchange I/O at its
+  30s-per-request timeout — the only thing left between the trip and the
+  wire). What is LOST while blind: `swept_at` verification
   stamps, the position snapshot, heartbeats, and per-cancel audit rows for
   that window.
 - **What recovery reconciles, durably:** a halt row under a headline that

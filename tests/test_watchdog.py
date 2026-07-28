@@ -609,6 +609,7 @@ async def test_unwritable_halt_row_never_suppresses_the_trip_cancel(
     # Recovery: the halt is reconciled and carries the ORIGINAL stall reason.
     monkeypatch.undo()
     read_gateway.set_open_orders(MASTER, [])
+    clock.advance(10)  # a later cycle: this is a reconciled window, not a same-cycle trip
     await watchdog.run_cycle()
     halt = await active_halt(pool)
     assert halt is not None
@@ -733,7 +734,9 @@ async def test_writes_broken_window_keeps_cancelling_every_cycle(
         "SELECT detail FROM execution_audit WHERE action = 'blind_window_reconciled'"
     )
     assert event is not None
-    assert '"unrecorded_cancel_passes": 4' in event["detail"]
+    # 4 passes across the writes-broken cycles + 1 on the recovery cycle
+    # (the incident cancels BEFORE reconciling — round 5's wire-first rule).
+    assert '"unrecorded_cancel_passes": 5' in event["detail"]
 
 
 async def test_alternating_read_failures_never_blind_trip(
@@ -833,3 +836,69 @@ async def test_blind_window_joining_a_standing_halt_still_leaves_a_trace(
     assert event is not None
     assert '"joined_standing_halt": true' in event["detail"]
     assert "DB-blind sweep" in event["risk_decision"]
+
+
+async def test_a_trip_reaches_the_wire_before_any_halt_state_is_written(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    audit: ExecutionAudit,
+    audited: AuditedExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5's ordering rule, pinned: a real stall trip cancels BEFORE the
+    halt row is attempted, and the cancel pass itself runs with the rate
+    budget in incident mode — the shared Postgres bucket untouched."""
+    from epigone.safety import watchdog as watchdog_module
+    from tests.test_safety_budget import _RecordingDeadPrimary
+
+    shared = _RecordingDeadPrimary()
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        FallbackBudget(shared, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+    )
+    real_request_halt = watchdog_module.request_halt
+    observed = {"cancels_at_halt_write": -1, "shared_calls_at_halt_write": -1}
+
+    async def order_asserting_request_halt(*args: object, **kwargs: object) -> object:
+        observed["cancels_at_halt_write"] = len(
+            [n for n, _ in exec_gateway.actions if n == "cancel_orders"]
+        )
+        observed["shared_calls_at_halt_write"] = shared.calls
+        return await real_request_halt(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(watchdog_module, "request_halt", order_asserting_request_halt)
+    # And the audit wrapper itself must not write pre-wire during the
+    # incident (wire_first): every attempt row lands with the cancel already
+    # on the fake gateway's tape.
+    real_record_attempt = audit.record_attempt
+    attempt_orderings: list[int] = []
+
+    async def order_recording_attempt(*args: object, **kwargs: object) -> object:
+        attempt_orderings.append(
+            len([n for n, _ in exec_gateway.actions if n == "cancel_orders"])
+        )
+        return await real_record_attempt(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(audit, "record_attempt", order_recording_attempt)
+    await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
+    clock.advance(120)
+    read_gateway.set_open_orders(MASTER, [_order("ETH", 81)])
+
+    await watchdog.run_cycle()
+
+    assert observed["cancels_at_halt_write"] == 1  # the wire came FIRST
+    assert observed["shared_calls_at_halt_write"] == 0  # and touched no shared bucket
+    assert attempt_orderings and all(c >= 1 for c in attempt_orderings)  # audit after wire
+    halt = await active_halt(pool)
+    assert halt is not None and "stale" in halt.reason
