@@ -13,6 +13,7 @@ import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 
 import aiohttp
@@ -472,12 +473,76 @@ async def test_a_non_nonce_rejection_after_a_429_retry_stays_a_clean_rejection(
     assert excinfo.value.reason is RejectReason.INSUFFICIENT_MARGIN
 
 
-async def test_a_connection_failure_raises_execution_error(replaying: Any) -> None:
+async def test_a_never_established_connection_is_the_one_unambiguous_failure(
+    replaying: Any,
+) -> None:
+    # Nothing was ever sent, so nothing can have executed: plain
+    # ExecutionError, NOT the ambiguous subclass — the only transport
+    # failure allowed to say so.
     h = await replaying()
     h.gateway._session = aiohttp.ClientSession()  # type: ignore[attr-defined]
     try:
         h.gateway._exchange_url = "http://127.0.0.1:1/exchange"  # type: ignore[attr-defined]
-        with pytest.raises(ExecutionError):
+        with pytest.raises(ExecutionError) as excinfo:
             await h.gateway.schedule_cancel(None)
+        assert not isinstance(excinfo.value, AmbiguousExecutionError)
     finally:
         await h.gateway._session.close()  # type: ignore[attr-defined]
+
+
+class _Flaky429ThenConnectFailSession:
+    """First post answers 429; the second raises as if the connection never
+    established — the sequence where even a connect failure is ambiguous,
+    because the 429'd attempt may have been processed."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def post(self, url: str, *, json: Any, timeout: Any) -> Any:
+        self.calls += 1
+        if self.calls > 1:
+            # str(ClientConnectorError) reads host/port/ssl off the
+            # connection key, so give it a minimal stand-in.
+            key = SimpleNamespace(host="127.0.0.1", port=1, ssl=None)
+            raise aiohttp.ClientConnectorError(
+                key,  # type: ignore[arg-type]
+                OSError("connection refused"),
+            )
+
+        class _Response:
+            status = 429
+            headers: dict[str, str] = {}
+
+            async def __aenter__(self) -> "_Response":
+                return self
+
+            async def __aexit__(self, *exc: object) -> None:
+                return None
+
+        return _Response()
+
+
+async def test_a_connect_failure_after_a_429_attempt_is_ambiguous() -> None:
+    session = _Flaky429ThenConnectFailSession()
+    gateway = HttpExecutionGateway(
+        session,  # type: ignore[arg-type]
+        FakeClock(),
+        RecordingBudget(),
+        signer=AGENT,
+        master_address=MASTER,
+        exchange_url="http://127.0.0.1:1/exchange",
+        rng=lambda: 1.0,
+    )
+    with pytest.raises(AmbiguousExecutionError):
+        await gateway.schedule_cancel(None)
+    assert session.calls == 2
+
+
+async def test_an_unreadable_ok_response_is_ambiguous(replaying: Any) -> None:
+    # HTTP 200 means the exchange processed SOMETHING; a body we can't map
+    # must never read as "nothing happened".
+    h = await replaying({"status": "ok", "response": {"type": "order", "data": {"statuses": [42]}}})
+    with pytest.raises(AmbiguousExecutionError):
+        await h.gateway.place_orders(
+            [OrderSpec(asset=4, is_buy=True, size=Decimal("0.5"), limit_price=Decimal("1800"))]
+        )

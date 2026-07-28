@@ -106,27 +106,35 @@ class Signer(Protocol):
 
 
 class ExecutionError(Exception):
-    """An exchange write failed in transport (network, HTTP, malformed payload)."""
+    """An exchange write failed BEFORE anything reached the exchange (a
+    connection that never established, a refused construction). Nothing
+    executed. Failures where that guarantee cannot be made are the subclass
+    below — the split is the load-bearing part of this hierarchy."""
 
 
 class AmbiguousExecutionError(ExecutionError):
-    """The action MAY have executed and the gateway cannot know (issue #133
-    review). Raised for a timeout (the response died in flight) and for an
-    invalid-nonce reject that follows a 429 retry (if — UNVERIFIED, see
-    ExecutionRateLimitedError — a 429'd attempt can ever have been processed,
-    the same-nonce retry would answer "Invalid nonce" for an order that is
-    LIVE). Callers MUST reconcile through the read gateway (open orders /
-    fills) before re-issuing anything that is not idempotent — treating this
-    as a clean rejection is the silent-live-order hazard in money code."""
+    """The action MAY have executed and the gateway cannot know (PR #140
+    review). Raised whenever failure happened AFTER the request may have
+    reached the exchange: a timeout, a post-send transport error, a 200
+    whose body we cannot parse (the exchange processed SOMETHING), and an
+    invalid-nonce reject following a 429 retry — if a 429'd attempt can
+    ever have been processed (UNVERIFIED, see ExecutionRateLimitedError),
+    the same-nonce retry answers "Invalid nonce" for an order that is LIVE.
+    Callers MUST reconcile through the read gateway (open orders / fills)
+    before re-issuing anything that is not idempotent — treating this as a
+    clean failure is the silent-live-order hazard in money code."""
 
 
-class ExecutionRateLimitedError(ExecutionError):
+class ExecutionRateLimitedError(AmbiguousExecutionError):
     """The exchange kept answering 429 after backoff-and-retry (the issue #28
-    convention). Pacing, not an outage. Whether a 429'd action is ALWAYS
-    rejected before processing is UNVERIFIED against the live limiter —
-    confirm on funded testnet (#133 probe, pending); until then assume a
-    sustained-429 submission is ambiguous and reconcile via the read gateway
-    before re-issuing non-idempotent work."""
+    convention). Pacing, not an outage. THE UNVERIFIED 429 ASSUMPTION (the
+    one citation point — everything else refers here): whether a 429'd
+    /exchange submission is ALWAYS rejected before processing has never been
+    observed against the live limiter (funded-testnet probe #4, module
+    docstring); until it is, a 429'd attempt counts as possibly-processed,
+    which is why this subclasses AmbiguousExecutionError — reconcile before
+    re-issuing. Downgrade to a plain ExecutionError sibling only if the
+    probe proves 429s are pre-processing rejects."""
 
 
 class MasterKeySignerError(ValueError):
@@ -450,13 +458,13 @@ class ExecutionGateway(Protocol):
       instance, one signer, one process lane.
     - A whole-action pre-validation failure raises ActionRejectedError
       (nothing executed); per-item verdicts come back as typed results.
-    - Transport failures raise ExecutionError. AMBIGUOUS outcomes — a
-      timeout, or an invalid-nonce reject after a 429 retry — raise
-      AmbiguousExecutionError instead: the action MAY have executed, and the
-      caller must reconcile via the read gateway before re-issuing.
-      Sustained 429 raises ExecutionRateLimitedError; whether a 429'd
-      action was ever processed is UNVERIFIED (funded-testnet probe
-      pending), so treat that as ambiguous too.
+    - Failures split on one question: could anything have reached the
+      exchange? No → ExecutionError (nothing executed). Maybe →
+      AmbiguousExecutionError (reconcile via the read gateway before
+      re-issuing; its docstring enumerates the cases). Sustained 429 →
+      ExecutionRateLimitedError, an AmbiguousExecutionError subclass while
+      the 429 assumption stays unverified (see its docstring, the one
+      citation point).
 
     Two deliberate deltas from issue #133's action list, recorded here per
     the honest-deviation convention:

@@ -11,13 +11,14 @@ the SDK's own recover helper.
 429s back off and retry like the read gateway (issue #28) — but here the
 retry re-posts the SAME signed payload: nonces are single-use per signer, so
 a replay can never execute TWICE (chain-enforced). Whether a 429'd attempt
-was ever processed at all is UNVERIFIED (funded-testnet probe pending), so
-an invalid-nonce reject on a retried submission — the exact signature a
-processed-then-retried action would leave — surfaces as
-AmbiguousExecutionError, never as a clean rejection. A persistent 429
-streak escapes as ExecutionRateLimitedError; timeouts raise
-AmbiguousExecutionError WITHOUT retry — in every ambiguous case only the
-caller, via the read gateway, can reconcile.
+was ever processed at all is a separate, unverified question (the one
+citation point: ExecutionRateLimitedError's docstring); its consequence
+here is that an invalid-nonce reject on a RETRIED submission — the exact
+signature a processed-then-retried action would leave — surfaces as
+AmbiguousExecutionError, never as a clean rejection. Timeouts and post-send
+transport failures are ambiguous without retry; _post's docstring carries
+the full failure split. In every ambiguous case only the caller, via the
+read gateway, can reconcile.
 
 Base URL is constructor-injected and testnet-only by construction: Phase
 A1–A4 points at TESTNET_EXCHANGE_URL, and a MAINNET URL is refused at
@@ -105,8 +106,12 @@ class HttpExecutionGateway:
         # The A5 gate (PR #140 review): mainnet is unreachable BY
         # CONSTRUCTION until the safety layer exists. Nothing in the
         # codebase passes allow_mainnet=True; A5 (risk policy v0 — caps,
-        # allowlist, kill switch) is the slice that gets to wire it.
-        if exchange_url == MAINNET_EXCHANGE_URL and not allow_mainnet:
+        # allowlist, kill switch) is the slice that gets to wire it. The
+        # guard shares _is_mainnet's predicate on purpose: any URL variant
+        # that slipped past a different check would still sign with the
+        # testnet phantom-agent source and be rejected by mainnet.
+        is_mainnet = exchange_url == MAINNET_EXCHANGE_URL
+        if is_mainnet and not allow_mainnet:
             raise MainnetNotEnabledError(
                 "mainnet execution is gated behind the A5 safety layer "
                 "(ADR-0005): pass allow_mainnet=True only from A5's wiring, "
@@ -124,7 +129,7 @@ class HttpExecutionGateway:
         self._signer = signer
         self._master_address = master_address.lower()
         self._exchange_url = exchange_url
-        self._is_mainnet = exchange_url == MAINNET_EXCHANGE_URL
+        self._is_mainnet = is_mainnet
         self._rng = rng
         self._nonces = NonceSource(clock)
 
@@ -190,11 +195,10 @@ class HttpExecutionGateway:
         """Spend the execution lane's weight, sign once, post (with same-
         payload 429 retry), and unwrap the response envelope to its `data`.
         Raises ActionRejectedError on {"status": "err"} — EXCEPT an
-        invalid-nonce reject on a RETRIED submission, which is ambiguous
-        (PR #140 review): 429-means-not-processed is unverified, so if the
-        429'd attempt WAS processed, the same-nonce retry answers "Invalid
-        nonce" for an action that is live. That case must never read as a
-        clean rejection."""
+        invalid-nonce reject on a RETRIED submission, which is exactly what
+        a processed-then-retried action would answer (the unverified 429
+        assumption, ExecutionRateLimitedError's docstring) and so raises
+        AmbiguousExecutionError, never a clean rejection."""
         await self._budget.spend(exchange_action_weight(batch_len))
         nonce = self._nonces.next()
         signature = sign_l1_action(self._signer, action, None, nonce, None, self._is_mainnet)
@@ -221,7 +225,16 @@ class HttpExecutionGateway:
         """POST the signed payload, retrying 429s with the IDENTICAL body
         (single-use nonces make the replay at-most-once). Returns (json body,
         whether any retry happened) — the retry flag is what lets _submit
-        treat a subsequent invalid-nonce reject as ambiguous."""
+        treat a subsequent invalid-nonce reject as ambiguous.
+
+        The failure split (the ExecutionError hierarchy's question — could
+        anything have reached the exchange?): only a connection that never
+        established, on a submission with no prior 429'd attempt, raises
+        plain ExecutionError. Everything else — timeout, post-send transport
+        error, HTTP error status, unparseable 200 body — may follow a
+        request the exchange received, and any failure after a 429'd attempt
+        inherits that attempt's possibly-processed status (the unverified
+        429 assumption, see ExecutionRateLimitedError) — all ambiguous."""
         for attempt in range(RATE_LIMIT_MAX_TRIES):
             try:
                 async with self._session.post(
@@ -240,8 +253,20 @@ class HttpExecutionGateway:
                     f"exchange request timed out — the action may have executed; "
                     f"reconcile before re-issuing: {exc!r}"
                 ) from exc
+            except aiohttp.ClientConnectorError as exc:
+                if attempt > 0:
+                    raise AmbiguousExecutionError(
+                        f"connection failed after a 429'd attempt — that attempt "
+                        f"may have been processed; reconcile before re-issuing: {exc}"
+                    ) from exc
+                # The connection never established and nothing was ever sent:
+                # the one transport failure that is honestly unambiguous.
+                raise ExecutionError(f"exchange connection failed: {exc}") from exc
             except aiohttp.ClientError as exc:
-                raise ExecutionError(f"exchange request failed: {exc}") from exc
+                raise AmbiguousExecutionError(
+                    f"exchange request failed after send — the action may have "
+                    f"executed; reconcile before re-issuing: {exc}"
+                ) from exc
             if attempt + 1 < RATE_LIMIT_MAX_TRIES:
                 log.warning(
                     "429 from %s: backing off %.1fs (try %d)",
@@ -287,26 +312,33 @@ def _order_wire(order: OrderSpec) -> dict[str, Any]:
 def _unwrap(body: Any) -> Any:
     """The response envelope: {"status": "ok", "response": {"type": ...,
     "data": ...}} or {"status": "err", "response": "<prose>"} (research §2).
-    Returns the inner data (None for ack-only types like "default")."""
+    Returns the inner data (None for ack-only types like "default").
+
+    A body this cannot read arrived on an HTTP 200 — the exchange processed
+    SOMETHING we failed to interpret — so shape failures here (and in the
+    status parsers below) are AmbiguousExecutionError: reconcile, don't
+    assume nothing happened."""
     try:
         status = body["status"]
         response = body["response"]
     except (KeyError, TypeError) as exc:
-        raise ExecutionError(f"unexpected exchange response shape: {body!r}") from exc
+        raise AmbiguousExecutionError(f"unexpected exchange response shape: {body!r}") from exc
     if status == "err":
         raise ActionRejectedError(str(response))
     if status != "ok":
-        raise ExecutionError(f"unexpected exchange response status: {body!r}")
+        raise AmbiguousExecutionError(f"unexpected exchange response status: {body!r}")
     if isinstance(response, dict):
         return response.get("data")
-    raise ExecutionError(f"unexpected exchange response shape: {body!r}")
+    raise AmbiguousExecutionError(f"unexpected exchange response shape: {body!r}")
 
 
 def parse_order_statuses(data: Any, *, expected: int) -> list[OrderResult]:
     """Map an order/batchModify response's per-order statuses (research §2:
     resting{oid} / filled{totalSz, avgPx, oid} / error{...}) to typed
     results. A count mismatch fails loudly — silently zipping misaligned
-    statuses to orders would attribute verdicts to the wrong legs."""
+    statuses to orders would attribute verdicts to the wrong legs. Failures
+    are ambiguous (the _unwrap rule): the action DID execute, we just can't
+    read what it did."""
     try:
         statuses = data["statuses"]
         results: list[OrderResult] = []
@@ -330,15 +362,18 @@ def parse_order_statuses(data: Any, *, expected: int) -> list[OrderResult]:
             else:
                 raise ValueError(f"unknown order status {status!r}")
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-        raise ExecutionError(f"unexpected order response shape: {data!r}") from exc
+        raise AmbiguousExecutionError(f"unexpected order response shape: {data!r}") from exc
     if len(results) != expected:
-        raise ExecutionError(f"expected {expected} order statuses, got {len(results)}: {data!r}")
+        raise AmbiguousExecutionError(
+            f"expected {expected} order statuses, got {len(results)}: {data!r}"
+        )
     return results
 
 
 def parse_cancel_statuses(data: Any, *, expected: int) -> list[CancelResult]:
     """Map a cancel/cancelByCloid response's statuses ("success" or
-    {"error": ...}) to typed results, with the same count check as orders."""
+    {"error": ...}) to typed results, with the same count check — and the
+    same ambiguity rule — as orders."""
     try:
         statuses = data["statuses"]
         results: list[CancelResult] = []
@@ -351,7 +386,9 @@ def parse_cancel_statuses(data: Any, *, expected: int) -> list[CancelResult]:
             else:
                 raise ValueError(f"unknown cancel status {status!r}")
     except (KeyError, TypeError, ValueError) as exc:
-        raise ExecutionError(f"unexpected cancel response shape: {data!r}") from exc
+        raise AmbiguousExecutionError(f"unexpected cancel response shape: {data!r}") from exc
     if len(results) != expected:
-        raise ExecutionError(f"expected {expected} cancel statuses, got {len(results)}: {data!r}")
+        raise AmbiguousExecutionError(
+            f"expected {expected} cancel statuses, got {len(results)}: {data!r}"
+        )
     return results
