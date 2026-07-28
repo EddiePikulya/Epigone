@@ -34,6 +34,10 @@ DEFAULT_STARVATION_WINDOW_MINUTES = 45
 DEFAULT_STARVATION_MIN_DUE = 50
 DEFAULT_DISK_PERCENT = 85
 DEFAULT_DISK_PATH = "/"
+# Agent-key expiry runway (issue #134): two weeks of reminders before a
+# ≤180-day agent key lapses leaves room to schedule the rotation ceremony —
+# a manual master-wallet re-approval (ADR-0005) — around operator availability.
+DEFAULT_AGENT_KEY_WARN_DAYS = 14
 # Coarse metrics older than this multiple of the seed interval mean the re-seed
 # likely stopped (issue #52). Default = 2× the configured cadence.
 COARSE_STALE_SEED_MULTIPLE = 2
@@ -115,6 +119,13 @@ class MonitorConfig:
                     name="HEALTHCHECK_STARVATION_MIN_DUE",
                 ),
                 disk_percent=_parse_disk_percent(os.environ.get("HEALTHCHECK_DISK_PERCENT")),
+                agent_key_warn=timedelta(
+                    days=parse_positive_int(
+                        os.environ.get("HEALTHCHECK_AGENT_KEY_WARN_DAYS"),
+                        default=DEFAULT_AGENT_KEY_WARN_DAYS,
+                        name="HEALTHCHECK_AGENT_KEY_WARN_DAYS",
+                    )
+                ),
             ),
             disk_path=os.environ.get("HEALTHCHECK_DISK_PATH") or DEFAULT_DISK_PATH,
         )

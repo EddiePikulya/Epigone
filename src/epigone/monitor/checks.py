@@ -42,6 +42,7 @@ ALERTS = "alerts"
 RATE = "rate"
 FINE_SUCCESS = "fine_success"
 DISK = "disk"
+AGENT_KEY = "agent_key"
 
 WARNING = "warning"
 CRITICAL = "critical"
@@ -79,6 +80,11 @@ class CheckThresholds:
     starvation_window: timedelta
     starvation_min_due: int
     disk_percent: float
+    # Agent-key expiry runway (issue #134): warn once the soonest-expiring
+    # active agent key is within this window, so the ≤180-day rotation ceremony
+    # (docs/runbooks/agent-key-rotation.md) happens on a reminder, never as an
+    # outage response.
+    agent_key_warn: timedelta
 
 
 @dataclass(frozen=True)
@@ -103,6 +109,9 @@ class HealthSnapshot:
     # at gather time so the pure check only compares it to the threshold.
     recent_rate_limits: int | None = None
     disk_percent_used: float | None = None
+    # Soonest expires_at over ACTIVE agent keys (issue #134); None means the
+    # keystore is empty — a valid Phase A state, not a failure.
+    nearest_agent_key_expiry: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -143,7 +152,9 @@ async def gather_snapshot(
                 WHERE delivered_at IS NULL AND attempts < $2)
                 AS oldest_undelivered_alert,
             (SELECT count(*) FROM rate_limit_events WHERE occurred_at >= $3)
-                AS recent_rate_limits
+                AS recent_rate_limits,
+            (SELECT min(expires_at) FROM agent_keys WHERE revoked_at IS NULL)
+                AS nearest_agent_key_expiry
         """,
         _start_of_day(now),
         MAX_DELIVERY_ATTEMPTS,
@@ -163,6 +174,7 @@ async def gather_snapshot(
         oldest_undelivered_alert=row["oldest_undelivered_alert"],
         recent_rate_limits=row["recent_rate_limits"],
         disk_percent_used=disk.percent_used(),
+        nearest_agent_key_expiry=row["nearest_agent_key_expiry"],
     )
 
 
@@ -201,6 +213,7 @@ def evaluate_checks(
             snapshot, thresholds.starvation_window, thresholds.starvation_min_due
         ),
         _disk_check(snapshot, thresholds.disk_percent),
+        _agent_key_check(snapshot, thresholds.agent_key_warn),
     ]
 
 
@@ -351,6 +364,45 @@ def _disk_check(snapshot: HealthSnapshot, limit: float) -> CheckResult:
     return CheckResult(DISK, "Disk", ok=True, severity=WARNING, detail="Disk headroom fine")
 
 
+def _agent_key_check(snapshot: HealthSnapshot, warn: timedelta) -> CheckResult:
+    """Agent-key expiry runway (issue #134). Hyperliquid agent keys expire in
+    ≤180 days; rotation is an operator ceremony (a master-wallet re-approval,
+    which no automation may do — ADR-0005), so the monitor's job is to make it
+    happen early. Quiet while the keystore is empty, a warning inside the warn
+    window, and critical once expired — an expired key means the keystore
+    refuses to sign and trading is down, not merely at risk."""
+    nearest = snapshot.nearest_agent_key_expiry
+    if nearest is None:
+        return CheckResult(
+            AGENT_KEY, "Agent key", ok=True, severity=WARNING, detail="No agent keys stored"
+        )
+    if nearest <= snapshot.now:
+        return CheckResult(
+            AGENT_KEY,
+            "Agent key",
+            ok=False,
+            severity=CRITICAL,
+            detail=(
+                f"Agent key: expired {_ago(snapshot.now - nearest)} ago — trading is down; "
+                f"run the rotation runbook (docs/runbooks/agent-key-rotation.md)"
+            ),
+        )
+    if nearest - snapshot.now <= warn:
+        return CheckResult(
+            AGENT_KEY,
+            "Agent key",
+            ok=False,
+            severity=WARNING,
+            detail=(
+                f"Agent key: soonest expiry in {_ago(nearest - snapshot.now)} — "
+                f"schedule the rotation ceremony (docs/runbooks/agent-key-rotation.md)"
+            ),
+        )
+    return CheckResult(
+        AGENT_KEY, "Agent key", ok=True, severity=WARNING, detail="Agent key expiry far off"
+    )
+
+
 def heartbeat_digest(snapshot: HealthSnapshot) -> str:
     """The daily positive digest (user story #6): the key liveness numbers so
     silence genuinely means healthy and a dead checker is noticeable by its
@@ -368,6 +420,14 @@ def heartbeat_digest(snapshot: HealthSnapshot) -> str:
     parts.append(f"{_count(snapshot.recent_rate_limits)} rate errors")
     if snapshot.disk_percent_used is not None:
         parts.append(f"disk {snapshot.disk_percent_used:.0f}%")
+    # Empty keystore → no clause, like the missing disk reading (issue #134).
+    # An expired key must say so — format_duration clamps negatives to "0s",
+    # which would read healthy right beside the critical alert.
+    if snapshot.nearest_agent_key_expiry is not None:
+        runway = snapshot.nearest_agent_key_expiry - snapshot.now
+        parts.append(
+            "agent key EXPIRED" if runway <= timedelta(0) else f"agent key {_ago(runway)} left"
+        )
     return "✅ Epigone healthy · " + " · ".join(parts)
 
 

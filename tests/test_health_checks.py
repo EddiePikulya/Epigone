@@ -8,6 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 from epigone.monitor.checks import (
+    AGENT_KEY,
     ALERTS,
     COARSE,
     CRITICAL,
@@ -36,6 +37,7 @@ THRESHOLDS = CheckThresholds(
     disk_percent=85,
     starvation_window=timedelta(minutes=45),
     starvation_min_due=50,
+    agent_key_warn=timedelta(days=14),
 )
 
 HEALTHY = HealthSnapshot(
@@ -69,6 +71,7 @@ def test_a_healthy_system_trips_no_check() -> None:
         RATE,
         DISK,
         FINE_SUCCESS,
+        AGENT_KEY,
     }
 
 
@@ -238,6 +241,32 @@ def test_a_missing_disk_reading_is_treated_as_healthy() -> None:
     assert _by_name(evaluate_checks(replace(HEALTHY, disk_percent_used=None), THRESHOLDS), DISK).ok
 
 
+def test_no_agent_keys_stays_quiet() -> None:
+    # Phase A may run long before the first ceremony: an empty keystore is not
+    # a failing check (like the ingest check's caught-up-is-idle nuance).
+    assert _by_name(evaluate_checks(HEALTHY, THRESHOLDS), AGENT_KEY).ok
+
+
+def test_agent_key_with_runway_is_healthy() -> None:
+    snapshot = replace(HEALTHY, nearest_agent_key_expiry=NOW + timedelta(days=90))
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), AGENT_KEY).ok
+
+
+def test_agent_key_near_expiry_reminds_before_rotation_becomes_an_outage() -> None:
+    snapshot = replace(HEALTHY, nearest_agent_key_expiry=NOW + timedelta(days=9))
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), AGENT_KEY)
+    assert not check.ok and check.severity == WARNING
+    assert "9d" in check.detail and "rotation" in check.detail
+
+
+def test_expired_agent_key_escalates_to_critical() -> None:
+    # An expired key means the signer refuses and trading is down, not merely at risk.
+    snapshot = replace(HEALTHY, nearest_agent_key_expiry=NOW - timedelta(hours=5))
+    check = _by_name(evaluate_checks(snapshot, THRESHOLDS), AGENT_KEY)
+    assert not check.ok and check.severity == CRITICAL
+    assert "expired" in check.detail
+
+
 def test_db_down_reports_only_the_critical_database_check() -> None:
     results = evaluate_checks(db_down(NOW), THRESHOLDS)
     assert len(results) == 1
@@ -252,4 +281,20 @@ def test_heartbeat_digest_carries_the_key_liveness_numbers() -> None:
     assert "0 due" in digest
     assert "coarse fresh 12m ago" in digest
     assert "0 rate errors" in digest
+    # No agent keys → no agent-key clause, mirroring the missing-disk reading.
+    assert "agent key" not in digest
+
+
+def test_heartbeat_digest_carries_the_agent_key_runway() -> None:
+    digest = heartbeat_digest(
+        replace(HEALTHY, nearest_agent_key_expiry=NOW + timedelta(days=90))
+    )
+    assert "agent key 90d left" in digest
+
+
+def test_heartbeat_digest_says_expired_not_zero_left() -> None:
+    digest = heartbeat_digest(
+        replace(HEALTHY, nearest_agent_key_expiry=NOW - timedelta(hours=5))
+    )
+    assert "agent key EXPIRED" in digest and "0s left" not in digest
     assert "disk 47%" in digest
