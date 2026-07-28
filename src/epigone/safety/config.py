@@ -38,12 +38,16 @@ DEFAULT_EXECUTOR_STALE_SECONDS = 60
 # likeliest cause of a dead executor (correlated failures), cancelling is
 # cheap and recoverable, and nothing here closes positions or spends. 3× the
 # executor-stall default. The threshold is a REAL bound only because every
-# safety-path DB touch is itself bounded (epigone.safety.db): worst-case
-# time to the first blind cancel is one poll interval (for the streak to
-# open) + this threshold + a cycle's bounded DB touches (each ≤5s) + the
-# venue enumeration's own HTTP timeouts — hang-shaped outages included —
-# for an ALREADY-RUNNING watchdog (cold-start during an outage has no
-# cancel path; see the runbook).
+# safety-path DB touch is itself bounded (epigone.safety.db — including the
+# release-time cancel-wait, the asyncpg leg round 4 found unbounded): a
+# fully hung touch costs ~2× the 5s DB timeout. Worst case to the first
+# blind cancel: up to one poll interval for the streak to open, + this
+# threshold, + up to one more poll interval plus one waiting cycle's
+# bounded touches (the trip quantizes to cycle starts), + the trip cycle's
+# own bounded touches, + the venue enumeration's HTTP legs (30s/request,
+# the read gateway's own bound) — hang-shaped outages included — for an
+# ALREADY-RUNNING watchdog (cold-start during an outage has no cancel
+# path; see the runbook).
 DEFAULT_DB_BLIND_SECONDS = 3 * DEFAULT_EXECUTOR_STALE_SECONDS
 # scheduleCancel horizon (the upgrade path, deadman.py): long enough that a
 # deploy restart (seconds) or one slow cycle can't spuriously fire it, short

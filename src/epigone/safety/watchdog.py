@@ -29,9 +29,13 @@ are CORRELATED: the likeliest reason the executor is dead is infrastructure
 trouble — precisely when a DB-dependent watchdog would be blind. So:
 
 - every DB touch on this path is BOUNDED (epigone.safety.db: connect,
-  per-query, lock waits), so a HANGING database — the shape a partitioned
-  host actually fails in — becomes the exception the rest of this design
-  handles instead of a stuck await (round 3);
+  per-query, lock waits, AND the release-time cancel-wait — the asyncpg
+  leg that would otherwise await an untimed CancelRequest connection,
+  round 4), so a HANGING database — the shape a partitioned host actually
+  fails in — becomes the exception the rest of this design handles instead
+  of a stuck await; a fully hung touch costs roughly 2× the configured
+  timeout (query bound + release budget), never TCP-retransmission
+  timescales;
 - the rate budget degrades (safety.budget.FallbackBudget): a dead or
   lock-wedged rate_budget row never queues a cancel;
 - a halt row that cannot be written never suppresses cancelling — neither
@@ -48,8 +52,9 @@ trouble — precisely when a DB-dependent watchdog would be blind. So:
   this layer exists to prevent), the watchdog cancels every resting order
   each cycle until the database answers again, then reconciles: the halt
   row under a DISTINCT headline ("DB-blind sweep" vs a real stall's
-  "unrecorded trip"), plus a durable blind-window audit event even when a
-  standing halt is joined.
+  "unrecorded trip"), plus a blind-window audit event even when a standing
+  halt is joined (durable in every case except a watchdog death inside the
+  recovery-to-reconcile window — the runbook's one carve-out).
 
 THE SWEEP NEVER TRUSTS A CANCEL'S WORD. `swept_at` is stamped only when a
 FRESH enumeration of the book answers empty — cancel results, however clean,
@@ -261,11 +266,15 @@ class Watchdog:
         await self._unrecorded_pass(f"DB-blind sweep: {self._blind.reason}")
 
     async def _unrecorded_pass(self, decision: str) -> None:
-        """One cancel pass that Postgres cannot record, COUNTED as it runs:
-        the counter is audit evidence (blind_window_reconciled reports it),
-        so it is welded to the pass here — a call site cannot forget it."""
-        self._blind_passes += 1
+        """One cancel pass that Postgres cannot record, counted AFTER it
+        completes: the counter is audit evidence (blind_window_reconciled
+        reports it), so it counts completions, not attempts. The chosen
+        error direction: a pass that dies mid-flight counts zero even if
+        some cancels landed before the failure — the trail may UNDERcount
+        blind activity, never claim passes that didn't finish. Welded to
+        the pass here so a call site can neither forget nor miscount it."""
         await self._cancel_resting(decision)
+        self._blind_passes += 1
 
     async def _settle_blind_debt(self, now: datetime) -> Halt | None:
         """Postgres answers again after an unrecorded trip: write the halt
@@ -273,11 +282,14 @@ class Watchdog:
         PRESERVES which trip it was — "DB-blind sweep" for the unreadable-
         database trip, "unrecorded trip" for a real observed stall whose
         halt row couldn't be written — so the operator can tell them apart.
-        The blind window ALWAYS leaves a durable audit event (round 3
-        item 4): joining a standing halt writes no new halt state by design,
-        and the blind sweeps' own best-effort audit rows likely failed with
-        the same outage, so without this event a whole blind window could
-        exist nowhere but process logs. The normal sweep machinery then
+        The blind window leaves a durable audit event whenever this
+        reconcile RUNS (round 3 item 4): joining a standing halt writes no
+        new halt state by design, and the blind sweeps' own best-effort
+        audit rows likely failed with the same outage, so without this
+        event a whole blind window could exist nowhere but process logs.
+        The one hole — the watchdog dying between DB recovery and this
+        cycle, taking the in-process marker with it — is carved out in the
+        runbook, not papered over here. The normal sweep machinery then
         verifies the book and stamps swept_at with the position snapshot."""
         assert self._blind is not None
         headline = "DB-blind sweep reconciled" if self._blind.db_blind else (

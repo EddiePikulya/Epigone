@@ -175,3 +175,92 @@ async def test_time_to_first_cancel_is_bounded_under_a_fully_hanging_database(
     finally:
         await wedge.close()
         await safety_pool.close()
+
+
+class _BlackholeProxy:
+    """A TCP proxy to the real Postgres that can turn into a black hole
+    MID-LIFE: connections established before `blackholed` keep their sockets
+    open but all bytes are silently dropped — the partitioned-host shape for
+    an ALREADY-POOLED connection, which the round-3 tests never covered."""
+
+    def __init__(self, upstream_host: str, upstream_port: int) -> None:
+        self._upstream = (upstream_host, upstream_port)
+        self.blackholed = False
+        self._server: asyncio.Server | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
+        port: int = self._server.sockets[0].getsockname()[1]
+        return port
+
+    async def _handle(
+        self, client_r: asyncio.StreamReader, client_w: asyncio.StreamWriter
+    ) -> None:
+        up_r, up_w = await asyncio.open_connection(*self._upstream)
+        for src, dst in ((client_r, up_w), (up_r, client_w)):
+            task = asyncio.get_running_loop().create_task(self._pump(src, dst))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _pump(self, src: asyncio.StreamReader, dst: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                data = await src.read(65536)
+                if not data:
+                    break
+                if not self.blackholed:  # the black hole: drop, keep sockets open
+                    dst.write(data)
+                    await dst.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            try:
+                dst.close()
+            except Exception:
+                pass
+
+    async def stop(self) -> None:
+        for task in list(self._tasks):
+            task.cancel()
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+
+async def test_a_black_holed_established_connection_is_bounded_on_the_release_leg(
+    database_url: str,
+) -> None:
+    """THE round-4 trap, at the real library seam (verified against asyncpg
+    0.31.0): when command_timeout fires, asyncpg sends the CancelRequest
+    over a fresh, UNTIMED TCP connection, and the pool's release awaits that
+    cancellation with the holder's budget — None for every plain touch — so
+    a black-holed ESTABLISHED connection costs 5s + a kernel SYN/hang
+    timeout per touch, not 5s. The safety pool's default acquire timeout is
+    the fix (it becomes the release budget); this test would hang for
+    minutes without it."""
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(database_url)
+    assert parts.hostname is not None and parts.port is not None
+    proxy = _BlackholeProxy(parts.hostname, parts.port)
+    proxy_port = await proxy.start()
+    query = f"?{parts.query}" if parts.query else ""
+    proxied_url = (
+        f"postgresql://{parts.username}:{parts.password}"
+        f"@127.0.0.1:{proxy_port}{parts.path}{query}"
+    )
+    pool = await create_safety_pool(proxied_url, timeout_seconds=0.5)
+    try:
+        await pool.execute("SELECT 1")  # healthy handshake; the connection POOLS
+        proxy.blackholed = True
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await pool.execute("SELECT 1")  # same pooled connection, now a black hole
+        # ~0.5s query bound + ~0.5s release budget for the cancel-wait, then
+        # asyncpg terminates the connection. Without the acquire-timeout
+        # default this awaits the untimed CancelRequest connection instead.
+        assert time.monotonic() - started < ELAPSED_CEILING
+    finally:
+        pool.terminate()  # abortive on purpose: graceful close would hang here
+        await proxy.stop()

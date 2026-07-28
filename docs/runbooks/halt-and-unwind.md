@@ -103,9 +103,12 @@ than what the code guarantees, and the whole section covers an
 **already-running watchdog only**; see the cold-start boundary below):
 
 - **What a Postgres outage does NOT stop:** cancelling. Every safety-path
-  DB touch is bounded (its own pool: connect, per-query, and lock-wait
-  timeouts — `epigone.safety.db` — so hang-shaped outages, the way a
-  partitioned host actually fails, raise instead of blocking), the rate
+  DB touch is bounded (its own pool: connect, per-query, lock-wait, and
+  release-time cancel-wait timeouts — `epigone.safety.db`; the last one is
+  the asyncpg trap where a timed-out query's CancelRequest rides an
+  untimed fresh TCP connection that release then awaits — so hang-shaped
+  outages, the way a partitioned host actually fails, raise instead of
+  blocking, at ~2× the 5s DB timeout per fully hung touch), the rate
   budget degrades to in-process pacing (`FallbackBudget`, including behind
   a lock row whose holder died mid-transaction), the audit write is
   best-effort, a failed heartbeat write never skips the cycle, and an
@@ -120,21 +123,29 @@ than what the code guarantees, and the whole section covers an
   `WATCHDOG_DB_BLIND_SECONDS` (default 180 = 3× the stall threshold), it
   attempts a cancel pass every cycle until the database answers. "Every
   cycle" stretches under a hung database by the bounded DB touches (each
-  ≤5s), never by TCP retransmission timescales. Worst-case time from outage
-  onset to the first blind cancel LANDING: up to one poll interval before
-  the streak opens, plus the streak threshold, plus a cycle's bounded DB
-  touches, plus the venue enumeration's own HTTP legs (exchange I/O at its
-  30s-per-request timeout — bounded by the read gateway, not by this page's
-  DB timeouts). What is LOST while blind: `swept_at` verification
+  ≤~10s: the 5s query bound plus the 5s release budget for the cancel-wait
+  — `epigone.safety.db`), never by TCP retransmission timescales.
+  Worst-case time from outage onset to the first blind cancel LANDING: up
+  to one poll interval before the streak opens, plus the streak threshold,
+  plus up to one more poll interval and one waiting cycle's bounded
+  touches (the trip fires at the first cycle START past the threshold),
+  plus the trip cycle's own bounded touches, plus the venue enumeration's
+  HTTP legs (exchange I/O at its 30s-per-request timeout — bounded by the
+  read gateway, not by this page's DB timeouts). What is LOST while blind: `swept_at` verification
   stamps, the position snapshot, heartbeats, and per-cancel audit rows for
   that window.
-- **What recovery reconciles, always durably:** a halt row under a
-  headline that preserves which trip it was ("DB-blind sweep" vs a real
-  stall's "unrecorded trip" — when no halt already stands; a standing
-  /kill halt is joined, not duplicated), plus in every case a
-  `blind_window_reconciled` audit event recording the window's span and
-  how many unrecorded cancel passes ran — so a blind window can never
-  exist only in process logs.
+- **What recovery reconciles, durably:** a halt row under a headline that
+  preserves which trip it was ("DB-blind sweep" vs a real stall's
+  "unrecorded trip" — when no halt already stands; a standing /kill halt
+  is joined, not duplicated), plus a `blind_window_reconciled` audit event
+  recording the window's span and how many unrecorded cancel passes
+  completed. ONE carve-out (the blind marker is process memory, and while
+  the database is down there is nowhere durable to put it): if the
+  watchdog itself dies in the narrow window between the database
+  recovering and its next cycle's reconcile (≈ one poll interval), the
+  blind window survives only in the dead process's logs — no halt row, no
+  event. In every other case a blind window cannot exist only in process
+  logs.
 - **What still needs Postgres:** `/kill` recording a halt (the bot tells
   you plainly when it could not), `/resume`, the monitor's view, the
   executor's own `is_halted` gate — and the watchdog's **cold start**:
