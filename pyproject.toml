@@ -9,6 +9,7 @@ dependencies = [
     "asyncpg>=0.30",
     "cryptography>=49.0.0",
     "eth-account>=0.13.7",
+    "hyperliquid-python-sdk>=0.24.0",
 ]
 
 [dependency-groups]
@@ -39,6 +40,10 @@ packages = ["epigone"]
 
 [[tool.mypy.overrides]]
 module = "asyncpg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "hyperliquid.*"
 ignore_missing_imports = true
 
 [tool.ruff]

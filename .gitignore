@@ -5,6 +5,9 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 .env
+
+# Throwaway TESTNET key material (issue #133 harness) — never committed.
+.testnet-keys.json
 # Keystore secrets (issue #134): the KEK and any exported key material live
 # OUTSIDE git, always. Belt-and-braces — nothing should ever write these here.
 *.kek

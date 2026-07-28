@@ -694,6 +694,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "cryptography" },
     { name = "eth-account" },
+    { name = "hyperliquid-python-sdk" },
 ]
 
 [package.dev-dependencies]
@@ -712,6 +713,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "cryptography", specifier = ">=49.0.0" },
     { name = "eth-account", specifier = ">=0.13.7" },
+    { name = "hyperliquid-python-sdk", specifier = ">=0.24.0" },
 ]
 
 [package.metadata.requires-dev]
