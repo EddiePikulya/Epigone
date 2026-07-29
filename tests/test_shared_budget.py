@@ -161,7 +161,8 @@ async def test_the_streams_worst_wait_includes_a_settled_surcharge(
 ) -> None:
     # A settled surcharge advances the gate too (real weight is what must be
     # smoothed), so the stream's true worst case is one ingest call plus a
-    # full fills response's surcharge — ~6s, still well inside the 20s poll.
+    # full fills response's surcharge — ~6s, which at the 10s poll interval is
+    # most of a cycle rather than slack (a delayed pass just lands late).
     await _seed_bucket(pool, clock.now(), available=BURST_WEIGHT)
     ingest = SharedWeightBudget(pool, clock, reserve=STREAM_RESERVE_WEIGHT)
     stream = SharedWeightBudget(pool, clock)

@@ -185,7 +185,7 @@ def order_relationship(order: OpenOrder, position: Position | None) -> str:
     the line carries the position they grow — its size and entry — so the alert
     is self-contained. Opposing orders *would reduce/close* the position, or
     *would flip* the side when the order's notional exceeds the position's.
-    Sizes are only as fresh as the last poll cycle (~20s), so a flip is always
+    Sizes are only as fresh as the last poll cycle (~10s), so a flip is always
     phrased conditionally, never as fact. No position on the coin is a *new
     position* — a stop-entry gains exactly this context.
 
