@@ -5,12 +5,12 @@ clearinghouseState, diffs against the persisted snapshots, and queues alerts. Th
 poll set is tracked Traders UNION Users' own linked wallets (issue #121): a linked
 wallet is snapshotted as its owner's holdings reference but never queues tracking
 alerts (only `tracks` followers are fanned out to). Every wallet is polled on each
-POSITION_VENUE per pass — the core perps, the xyz HIP-3 builder DEX (issue #21),
-and the mkts index DEX — because most non-core activity (equity/"stock" perps like
-`xyz:META`) lives off core. The venues' position lists merge before diffing; their
-coins are namespaced (`xyz:META`, `mkts:US500`) so the (trader, coin) snapshot key
-tracks the venues independently, with no schema change and no false OPEN/CLOSE from
-mixing them.
+POSITION_VENUE per pass — the core perps and the xyz HIP-3 builder DEX (issue #21;
+the mkts index DEX was dropped 2026-07-29, see epigone.gateway.POSITION_VENUES) —
+because most non-core activity (equity/"stock" perps like `xyz:META`) lives off
+core. The venues' position lists merge before diffing; their coins are namespaced
+(`xyz:META`) so the (trader, coin) snapshot key tracks the venues independently,
+with no schema change and no false OPEN/CLOSE from mixing them.
 
 Diff semantics (tested in tests/test_position_poller.py):
 
@@ -71,11 +71,11 @@ log = logging.getLogger(__name__)
 
 # The stream spends against the shared 900/min budget (epigone.budget, issue
 # #28) with priority over ingest. Each wallet in the poll set costs one
-# clearinghouseState call per POSITION_VENUE — core, the xyz builder DEX (#21),
-# and the mkts index DEX — so weight 6 per wallet per 10s poll. The poll set is
-# tracked wallets UNION Users' own linked wallets (#121), so a linked wallet adds
-# the same weight-6 as a tracked one; being one-per-User and only the followers'
-# own, they add a handful of wallets, not a multiplier, to that distinct count.
+# clearinghouseState call per POSITION_VENUE — core and the xyz builder DEX
+# (#21) — so weight 4 per wallet per 10s poll. The poll set is tracked wallets
+# UNION Users' own linked wallets (#121), so a linked wallet adds the same
+# weight-4 as a tracked one; being one-per-User and only the followers' own,
+# they add a handful of wallets, not a multiplier, to that distinct count.
 POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this once per DEX
 
 # A same-side size change alerts as SCALE-IN/SCALE-OUT (issue #10) only once it

@@ -244,6 +244,54 @@ async def test_0002_is_schema_noop_on_a_fresh_db(scratch_pool: asyncpg.Pool) -> 
     assert applied == [m.version for m in up_to_0002]
 
 
+async def test_0027_purges_mkts_snapshots_and_leaves_covered_venues_alone(
+    scratch_pool: asyncpg.Pool,
+) -> None:
+    """mkts left POSITION_VENUES (2026-07-29), and a snapshot for a venue that
+    is no longer fetched diffs exactly like a position that closed — a false
+    CLOSE alert on the first pass after deploy. 0027 deletes those rows so the
+    diff can never see them. Everything else must survive untouched: the purge
+    keys on the `dex:COIN` namespace, which core coins (no colon) and the still
+    covered xyz never match."""
+    before_0027 = [m for m in load_migrations() if m.version < 27]
+    assert any(m.version == 27 for m in load_migrations()), "0027 not packaged"
+    await migrate(scratch_pool, before_0027)
+
+    now = "2026-07-29 00:00:00+00"
+    async with scratch_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO traders (address, first_seen_at, last_seen_at) "
+            f"VALUES ('0xaaa', '{now}', '{now}')"
+        )
+        for coin in ("BTC", "xyz:META", "mkts:US500", "mkts:QQQ"):
+            await conn.execute(
+                "INSERT INTO position_snapshots (trader_address, coin, side, size_usd, "
+                "leverage, entry_price, unrealized_pnl, opened_at, updated_at) "
+                f"VALUES ('0xaaa', $1, 'long', 1000, 2, 100, 0, '{now}', '{now}')",
+                coin,
+            )
+        for order_id, coin in enumerate(("BTC", "xyz:META", "mkts:US500"), start=1):
+            await conn.execute(
+                "INSERT INTO order_snapshots (trader_address, order_id, coin, is_buy, size, "
+                "is_trigger, is_position_tpsl, reduce_only, first_seen_at) "
+                f"VALUES ('0xaaa', $1, $2, true, 1, false, false, false, '{now}')",
+                order_id,
+                coin,
+            )
+
+    await migrate(scratch_pool)
+
+    async with scratch_pool.acquire() as conn:
+        positions = [
+            r["coin"] for r in await conn.fetch("SELECT coin FROM position_snapshots ORDER BY coin")
+        ]
+        orders = [
+            r["coin"] for r in await conn.fetch("SELECT coin FROM order_snapshots ORDER BY coin")
+        ]
+    assert positions == ["BTC", "xyz:META"]
+    assert orders == ["BTC", "xyz:META"]
+
+
 async def test_concurrent_startups_apply_once(scratch_pool: asyncpg.Pool) -> None:
     """All three processes (ADR-0002) migrate at startup; the advisory lock
     must serialize them so a migration executes exactly once."""

@@ -126,7 +126,7 @@ async def test_first_poll_baselines_the_existing_ladder_without_alerts(
     state = await pool.fetchrow("SELECT * FROM order_poll_state")
     assert state is not None and state["trader_address"] == "0xaaa"
     # Every covered venue is queried, per the per-dex empirical contract (#115).
-    assert gateway.open_orders_calls == [("0xaaa", None), ("0xaaa", "xyz"), ("0xaaa", "mkts")]
+    assert gateway.open_orders_calls == [("0xaaa", None), ("0xaaa", "xyz")]
 
 
 async def test_a_new_order_alerts_every_follower_with_its_details(
@@ -318,12 +318,12 @@ async def test_budget_is_billed_per_venue_per_wallet(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
     await track(pool, clock, "0xaaa", 42)
-    # A budget with room for exactly one wallet's three venue calls: the pass
+    # A budget with room for exactly one wallet's two venue calls: the pass
     # must bill ORDERS_WEIGHT per POSITION_VENUES entry, in lockstep with the
     # calls the shared fetch makes (the #31 rule), and no more.
-    budget = WeightBudget(ORDERS_WEIGHT * 3, clock)
+    budget = WeightBudget(ORDERS_WEIGHT * 2, clock)
     await run_order_poll_pass(pool, gateway, budget, clock)
-    assert gateway.open_orders_calls == [("0xaaa", None), ("0xaaa", "xyz"), ("0xaaa", "mkts")]
+    assert gateway.open_orders_calls == [("0xaaa", None), ("0xaaa", "xyz")]
 
 
 async def test_gateway_failure_leaves_snapshots_untouched_for_retry(

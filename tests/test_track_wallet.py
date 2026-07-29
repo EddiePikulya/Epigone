@@ -521,7 +521,7 @@ async def test_positions_view_merges_core_and_xyz_venues(
     assert "xyz:SP500" in text and "LONG" in text  # the builder-DEX position
     # Every covered venue fetched, core then the builder DEXes — matching the
     # poller's coverage.
-    assert gateway.positions_calls[-3:] == [(WHALE, None), (WHALE, "xyz"), (WHALE, "mkts")]
+    assert gateway.positions_calls[-2:] == [(WHALE, None), (WHALE, "xyz")]
 
 
 async def test_tracked_list_summary_counts_core_and_xyz(
