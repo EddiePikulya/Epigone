@@ -81,7 +81,14 @@ EXECUTION_RESERVE_WEIGHT = 30
 # the 15/s refill so short bursts still clear quicker than steady-state pacing.
 # It also bounds how long a stream poll can wait behind ingest: one call's
 # window plus its settled surcharge — a full ~2000-fill response is ~120 real
-# weight, so ~6s worst case, well inside the 20s poll interval. Tune here after
+# weight, so ~6s worst case. At the 10s poll interval that worst case is most
+# of a cycle, not a rounding error as it was at 30s: a pass delayed behind a
+# full fills response simply lands late and the loop's max(0, interval-elapsed)
+# sleep runs the next one immediately, so the effective interval degrades toward
+# the pass duration rather than holding at 10s. Acceptable while the poll set is
+# small; if it stops being acceptable the fix is moving the stream off the REST
+# budget (websocket lane), not tightening this gate — lowering it would starve
+# ingest to buy the stream time it does not need on average. Tune here after
 # watching production; the final value is calibrated empirically against the
 # server IP (issue #41 notes).
 SMOOTHING_WEIGHT_PER_SECOND = PER_IP_WEIGHT_PER_MINUTE / 60
