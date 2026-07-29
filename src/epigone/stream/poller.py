@@ -72,7 +72,7 @@ log = logging.getLogger(__name__)
 # The stream spends against the shared 900/min budget (epigone.budget, issue
 # #28) with priority over ingest. Each wallet in the poll set costs one
 # clearinghouseState call per POSITION_VENUE — core, the xyz builder DEX (#21),
-# and the mkts index DEX — so weight 6 per wallet per 30s poll. The poll set is
+# and the mkts index DEX — so weight 6 per wallet per 20s poll. The poll set is
 # tracked wallets UNION Users' own linked wallets (#121), so a linked wallet adds
 # the same weight-6 as a tracked one; being one-per-User and only the followers'
 # own, they add a handful of wallets, not a multiplier, to that distinct count.
@@ -82,10 +82,10 @@ POSITIONS_WEIGHT = 2  # clearinghouseState, per call — a wallet spends this on
 # reaches this fraction of the last snapshot's notional size; anything smaller
 # stays a silent update. Conservative by design — a 25% swing is a deliberate
 # add or trim, not the incidental notional drift of a mark-price move (over a
-# 30s poll a real coin never moves 25%). Tune here to retune the signal.
+# 20s poll a real coin never moves 25%). Tune here to retune the signal.
 SCALE_SIGNIFICANCE_THRESHOLD = Decimal("0.25")
 
-POLL_INTERVAL_SECONDS = 30
+POLL_INTERVAL_SECONDS = 20
 
 # Same reasoning as the ingest passes: a sustained streak means Hyperliquid is
 # down, not that wallets are odd — stop burning budget and resume next cycle.
