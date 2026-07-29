@@ -175,11 +175,7 @@ async def test_fetch_open_orders_merges_every_covered_venue() -> None:
     fake.set_open_orders(WHALE, [LIT_ASK])
     fake.set_open_orders(WHALE, [XYZ_BID], dex="xyz")
     assert await fetch_open_orders(fake, WHALE) == [LIT_ASK, XYZ_BID]
-    assert fake.open_orders_calls == [
-        (WHALE.lower(), None),
-        (WHALE.lower(), "xyz"),
-        (WHALE.lower(), "mkts"),
-    ]
+    assert fake.open_orders_calls == [(WHALE.lower(), None), (WHALE.lower(), "xyz")]
 
 
 async def test_fetch_open_orders_raises_when_any_venue_fails() -> None:

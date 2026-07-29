@@ -1,13 +1,16 @@
-"""Ticket #23 acceptance: a User is capped at 15 tracked wallets. The cap is
-enforced at the one shared seam (`_track_address`), so it holds identically
-across both follow paths — the screener row and the trader profile's Follow tap.
+"""Ticket #23 acceptance, re-tiered 2026-07-29: an ordinary User is capped at 5
+tracked wallets and the admin (#33) at 15 — a higher ceiling, no longer the
+unlimited waiver the owner used to carry. The cap is enforced at the one shared
+seam (`track_address`), so it holds identically across every follow path — the
+screener row, the criteria results row, and the trader profile's Follow tap.
 Pasting no longer follows (#111), so it never touches the cap; it just opens the
-profile. Tested here at the handler seam, one path per acceptance bullet."""
+profile. Tested here at the handler seam, one path per acceptance bullet.
+"""
 
 import asyncpg
 from aiogram import Bot, Dispatcher
 
-from epigone.bot.handlers import MAX_TRACKED_WALLETS
+from epigone.bot.handlers import ADMIN_MAX_TRACKED_WALLETS, MAX_TRACKED_WALLETS
 from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
 from tests.test_screener_ux import _button_texts, _callback_data, add_trader
 
@@ -27,28 +30,31 @@ async def _tracked(pool: asyncpg.Pool, user_id: int) -> list[str]:
     return [r["trader_address"] for r in rows]
 
 
-async def _fill_to_cap(dp: Dispatcher, bot: Bot, user_id: int = USER) -> list[str]:
-    """Follow exactly MAX_TRACKED_WALLETS distinct wallets via the Follow tap."""
-    addresses = [_addr(i) for i in range(MAX_TRACKED_WALLETS)]
+async def _fill_to_cap(
+    dp: Dispatcher, bot: Bot, user_id: int = USER, limit: int = MAX_TRACKED_WALLETS
+) -> list[str]:
+    """Follow exactly `limit` distinct wallets via the Follow tap."""
+    addresses = [_addr(i) for i in range(limit)]
     for address in addresses:
         await follow_wallet(dp, bot, address, user_id=user_id)
     return addresses
 
 
-def test_the_limit_is_a_single_named_constant_set_to_15() -> None:
-    assert MAX_TRACKED_WALLETS == 15
+def test_the_two_limits_are_named_constants() -> None:
+    assert MAX_TRACKED_WALLETS == 5
+    assert ADMIN_MAX_TRACKED_WALLETS == 15
 
 
-async def test_following_the_fifteenth_wallet_still_succeeds(
+async def test_following_the_fifth_wallet_still_succeeds(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     addresses = await _fill_to_cap(dp, bot)
 
-    assert await _tracked(pool, USER) == addresses  # all 15 landed
+    assert await _tracked(pool, USER) == addresses  # all 5 landed
     assert "following" in (session.callback_answers()[-1].text or "").lower()
 
 
-async def test_following_a_sixteenth_wallet_is_refused_and_not_added(
+async def test_following_a_sixth_wallet_is_refused_and_not_added(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await _fill_to_cap(dp, bot)
@@ -56,18 +62,19 @@ async def test_following_a_sixteenth_wallet_is_refused_and_not_added(
     await follow_wallet(dp, bot, _addr(99), user_id=USER)
 
     tracked = await _tracked(pool, USER)
-    assert len(tracked) == MAX_TRACKED_WALLETS  # the 16th was not added
+    assert len(tracked) == MAX_TRACKED_WALLETS  # the 6th was not added
     assert _addr(99) not in tracked
     text = (session.callback_answers()[-1].text or "").lower()
     assert "limit" in text
+    assert "5 wallets" in text  # the User's own number, not the admin's
     assert "unfollow" in text  # tells the User how to make room
 
 
 async def test_pasting_at_the_cap_opens_a_profile_and_writes_nothing(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    # Pasting never touches the cap now — a sixteenth paste just opens that
-    # trader's profile (with a Follow it can't yet honor), leaving the 15 intact.
+    # Pasting never touches the cap now — a sixth paste just opens that trader's
+    # profile (with a Follow it can't yet honor), leaving the 5 intact.
     await _fill_to_cap(dp, bot)
 
     await feed_text(dp, bot, _addr(99), user_id=USER)
@@ -86,7 +93,7 @@ async def test_refollowing_an_already_tracked_wallet_at_the_cap_is_never_blocked
     # Re-tap Follow on a wallet already tracked while at the cap — idempotent, allowed.
     await feed_callback(dp, bot, f"pfollow:{addresses[0]}", user_id=USER)
 
-    assert await _tracked(pool, USER) == addresses  # unchanged, still 15
+    assert await _tracked(pool, USER) == addresses  # unchanged, still 5
     assert "already following" in (session.callback_answers()[-1].text or "").lower()
 
 
@@ -108,7 +115,7 @@ async def test_screener_follow_at_the_cap_is_refused_and_not_added(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
     await _fill_to_cap(dp, bot)
-    await add_trader(pool, "0xstar", month_roi="2.0")  # the 16th, via the screener
+    await add_trader(pool, "0xstar", month_roi="2.0")  # the 6th, via the screener
 
     await feed_text(dp, bot, "/screener", user_id=USER)
     data = _callback_data(session.sent_messages()[-1].reply_markup)
@@ -138,21 +145,55 @@ async def test_profile_follow_at_the_cap_is_refused_and_not_added(
     assert "pfollow:0xstar" in _callback_data(session.edited_messages()[-1].reply_markup)
 
 
-async def test_the_admin_follows_past_the_cap(
+async def test_the_admin_follows_past_the_ordinary_cap(
     dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
 ) -> None:
-    """The owner (#33) is cap-exempt: a sixteenth Follow lands instead of being
-    refused. Only the admin id — the exemption follows the id, not a flag a
-    user could reach."""
+    """The owner (#33) carries the higher tier: the follow that stops everyone
+    else lands, and keeps landing all the way to their own 15. The tier follows
+    the admin id — never a flag a User could reach."""
     dp["admin_telegram_id"] = USER
-    await _fill_to_cap(dp, bot)
+
+    addresses = await _fill_to_cap(dp, bot, limit=ADMIN_MAX_TRACKED_WALLETS)
+
+    assert await _tracked(pool, USER) == addresses
+    assert len(addresses) == ADMIN_MAX_TRACKED_WALLETS
+    assert "following" in (session.callback_answers()[-1].text or "").lower()
+
+
+async def test_the_admin_is_refused_at_their_own_higher_cap(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The waiver is gone: 15 is a real ceiling, and its toast quotes 15 rather
+    than the number everyone else sees."""
+    dp["admin_telegram_id"] = USER
+    await _fill_to_cap(dp, bot, limit=ADMIN_MAX_TRACKED_WALLETS)
 
     await follow_wallet(dp, bot, _addr(99), user_id=USER)
 
     tracked = await _tracked(pool, USER)
-    assert len(tracked) == MAX_TRACKED_WALLETS + 1
-    assert _addr(99) in tracked
-    assert "following" in (session.callback_answers()[-1].text or "").lower()
+    assert len(tracked) == ADMIN_MAX_TRACKED_WALLETS  # the 16th was not added
+    assert _addr(99) not in tracked
+    text = (session.callback_answers()[-1].text or "").lower()
+    assert "limit" in text
+    assert "15 wallets" in text
+
+
+async def test_the_admins_higher_cap_holds_on_the_screener_path_too(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """Every entry point passes the admin id into the same seam, so the tier
+    can't be right on the profile tap and wrong on the screener row."""
+    dp["admin_telegram_id"] = USER
+    await _fill_to_cap(dp, bot)  # 5 — past the ordinary cap, inside the admin's
+    await add_trader(pool, "0xstar", month_roi="2.0")
+
+    await feed_text(dp, bot, "/screener", user_id=USER)
+    data = _callback_data(session.sent_messages()[-1].reply_markup)
+    follow_data = next(d for d in data if d.startswith("sfollow:"))
+    await feed_callback(dp, bot, follow_data, user_id=USER)
+
+    assert "0xstar" in await _tracked(pool, USER)
+    assert "limit" not in (session.callback_answers()[-1].text or "").lower()
 
 
 async def test_a_non_admin_stays_capped_while_an_admin_exists(
@@ -165,5 +206,5 @@ async def test_a_non_admin_stays_capped_while_an_admin_exists(
     await follow_wallet(dp, bot, _addr(99), user_id=other)
 
     tracked = await _tracked(pool, other)
-    assert len(tracked) == MAX_TRACKED_WALLETS  # still refused
+    assert len(tracked) == MAX_TRACKED_WALLETS  # still refused at 5
     assert _addr(99) not in tracked

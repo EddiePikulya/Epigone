@@ -549,6 +549,7 @@ async def on_follow(
     screener and the paste path — it feeds the alert poller for free."""
     ref, _, rest = (callback.data or "").removeprefix("cfw:").partition(":")
     offset_raw, _, address = rest.partition(":")
+    is_admin = callback.from_user.id == admin_telegram_id
     async with pool.acquire() as conn, conn.transaction():
         outcome = await track_address(
             conn,
@@ -556,7 +557,7 @@ async def on_follow(
             callback.from_user.username,
             address,
             clock.now(),
-            cap_exempt=callback.from_user.id == admin_telegram_id,
+            is_admin=is_admin,
         )
     await _show_results(
         callback,
@@ -564,7 +565,7 @@ async def on_follow(
         drafts,
         ref=ref,
         offset=_parse_int(offset_raw) or 0,
-        toast=follow_toast(outcome, address),
+        toast=follow_toast(outcome, address, is_admin=is_admin),
     )
 
 

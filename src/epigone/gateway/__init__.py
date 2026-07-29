@@ -361,26 +361,41 @@ class HyperliquidGateway(Protocol):
 # so changing what a fetch hits means changing this number in the same file.
 FILL_ENDPOINTS = 2
 
-# The HIP-3 builder DEXes Epigone covers for POSITIONS (fills-side metrics are
+# The HIP-3 builder DEXes Epigone knows by name (fills-side metrics are
 # account-wide across all dexs regardless): xyz hosts ~90% of non-core activity
-# (equity/"stock" perps: xyz:META, xyz:BB, …); mkts (Markets by Kinetiq) adds
-# the index perps worth alerting on (mkts:US500, mkts:QQQ). Covering a venue
-# costs one weight-2 clearinghouseState call per tracked wallet per poll — three
-# venues = weight 6/wallet, so the stream reserve's instant-claim floor (120)
-# guarantees 20 wallets, not the 30 its weight-4 sizing note assumed; ample at
-# current tracking levels, revisit the reserve before raising the track cap.
-# Coins come back namespaced (`xyz:META`, `mkts:US500`), never colliding with
-# core. Hard-coded rather than discovered via perpDexs (stable deployments;
-# issue #21 left that lookup optional) — the remaining seven dexs are too thin
-# to justify their poll cost today.
+# (equity/"stock" perps: xyz:META, xyz:BB, …); mkts (Markets by Kinetiq) is the
+# index-perp venue (mkts:US500, mkts:QQQ). Covering a venue costs one weight-2
+# clearinghouseState call per tracked wallet per poll — at the two venues
+# actually polled that is weight 4/wallet, so the stream reserve's instant-claim
+# floor (120) guarantees 30 wallets, matching its weight-4 sizing note. Coins
+# come back namespaced (`xyz:META`, `mkts:US500`), never colliding with core.
+# Hard-coded rather than discovered via perpDexs (stable deployments; issue #21
+# left that lookup optional) — the remaining dexs are too thin to justify their
+# poll cost today.
 XYZ_DEX = "xyz"
 MKTS_DEX = "mkts"
 
 # Every venue fetch_open_positions queries per Trader, as `dex` args: the core
 # perps (None) then the covered builder DEXes. The poller bills budget one
 # spend per entry from this same tuple, so its weight accounting can never
-# drift from the calls the helper actually makes (issue #31).
-POSITION_VENUES: tuple[str | None, ...] = (None, XYZ_DEX, MKTS_DEX)
+# drift from the calls the helper actually makes (issue #31) — and the order
+# poller walks the same tuple in lockstep, so an entry here is billed by BOTH
+# pollers (positions weight 2/venue, orders weight 20/venue).
+#
+# mkts is deliberately OMITTED (operator decision 2026-07-29). Its index perps
+# are thin next to xyz, and as a third venue it cost a third of every wallet's
+# poll budget: dropping it takes positions 6 → 4 weight per pass and orders
+# 60 → 40. MKTS_DEX and the mkts focus-market listings stay defined precisely
+# so re-enabling is a one-token edit — put MKTS_DEX back in this tuple and
+# nothing else changes. Two caveats for whoever does:
+#   - Un-polling a venue whose snapshots survive diffs those coins as CLOSE
+#     (fetch_open_positions' all-or-raise rule is the same hazard, one pass
+#     later), so migration 0027 purged the `mkts:` snapshot rows.
+#   - Re-enabling is the mirror image: an already-baselined wallet's standing
+#     mkts positions and orders would surface as OPEN/new-order alerts on the
+#     first pass. Noisy, not wrong — flush the affected wallets' snapshots if
+#     that matters.
+POSITION_VENUES: tuple[str | None, ...] = (None, XYZ_DEX)
 
 
 async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> list[Position]:

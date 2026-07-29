@@ -1,0 +1,30 @@
+-- Migration 0027: purge the snapshots of the un-polled mkts venue
+-- (operator decision 2026-07-29).
+--
+-- mkts (Markets by Kinetiq index perps) left POSITION_VENUES, so neither
+-- poller queries it any more. The pollers are pure diffs of a live fetch
+-- against persisted snapshots, and a coin that stops being fetched reads
+-- exactly like a coin that vanished: every surviving `mkts:` row in
+-- position_snapshots would diff as a CLOSE on the first pass after deploy —
+-- a false close alert, with an invented realized PnL and holding time, for a
+-- position that is still open. order_snapshots is milder but not clean
+-- either: the ids prune silently, but a wallet holding a position-TP/SL on an
+-- mkts coin would see its id set "change" and queue a #125 anchor edit that
+-- rewrites a live TP/SL line off a book we no longer read.
+--
+-- Deleting the rows makes the diff structurally incapable of seeing them: the
+-- merged live list and the snapshot set are then both mkts-free, which is the
+-- same state a wallet that never held an mkts position was always in. The
+-- affected coins simply cease to exist for Epigone — no alert, no residue.
+--
+-- Production holds zero `mkts:` rows in either table (verified 2026-07-29), so
+-- this is expected to delete nothing. It ships anyway: "the query returned
+-- zero rows last Tuesday" is not a guarantee, a wallet followed between that
+-- check and the deploy could add one, and the failure mode is a false alert
+-- fired at a User rather than a crash we would notice.
+--
+-- The prefix is exact by construction: builder-DEX coins arrive namespaced
+-- `dex:COIN` (epigone.gateway.parse_perp_universe), and core coins carry no
+-- colon at all, so `mkts:%` can only match this venue.
+DELETE FROM position_snapshots WHERE coin LIKE 'mkts:%';
+DELETE FROM order_snapshots WHERE coin LIKE 'mkts:%';

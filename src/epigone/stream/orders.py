@@ -4,12 +4,12 @@
 A resting ladder is a trader's *plan* before it executes, so the stream polls
 every distinct tracked Trader's open orders (frontendOpenOrders across
 POSITION_VENUES — per-dex exactly like clearinghouseState, verified live
-2026-07-24) and alerts followers when NEW orders appear. It runs beside the
-position poller in the stream process, on its own much slower cadence
-(config.DEFAULT_ORDER_POLL_INTERVAL_SECONDS — resting orders live
-minutes-to-days) and spends against a budget carrying the ingest-style stream
-reserve, so order polling can never starve position polling (see
-epigone.stream.main).
+2026-07-24; core + xyz since mkts was dropped 2026-07-29) and alerts followers
+when NEW orders appear. It runs beside the position poller in the stream
+process, on its own slower cadence (config.DEFAULT_ORDER_POLL_INTERVAL_SECONDS
+— resting orders live minutes-to-days) and spends against a budget carrying the
+ingest-style stream reserve, so order polling can never starve position polling
+(see epigone.stream.main).
 
 Diff semantics (tested in tests/test_order_poller.py):
 
@@ -97,14 +97,25 @@ MAX_CONSECUTIVE_FAILURES = 5
 
 # Inter-wallet spacing inside one order pass, for SEND-GATE fairness. The
 # reserve floor protects the position poller's *tokens*, but the #41 send
-# gate is first-come-first-served: one wallet's three weight-20 venue calls
-# close the gate for ~3s (60 / SMOOTHING_WEIGHT_PER_SECOND), and a full pass
-# run back-to-back would keep it near-shut for a minute, stretching every
+# gate is first-come-first-served: one wallet's two weight-20 venue calls
+# close the gate for ~2s (40 / SMOOTHING_WEIGHT_PER_SECOND), and an unspaced
+# pass would keep it near-shut for as long as the pass ran, stretching every
 # concurrent position poll behind ~1s gate waits. Sleeping 5s between wallets
-# caps the order pass's gate duty cycle at ~3s busy / 8s (~40%), leaving the
-# position pass's weight-2 sends (0.1s windows apiece) ample open gate; the
-# pass stretches to ~8s per wallet — the full 15-wallet cap ≈ 2 minutes,
-# comfortably inside the 300s cadence.
+# caps the order pass's gate duty cycle at ~2s busy / 7s (~29%), leaving the
+# position pass's weight-2 sends (0.1s windows apiece) ample open gate.
+#
+# That 29% is the real invariant, and it is what the spacing is tuned for — it
+# holds however many wallets are polled and whatever the cadence, because it is
+# a property of one wallet's turn, not of the pass. The pass itself runs ~7s per
+# wallet (2s of sends, 5s of spacing, no sleep after the last), i.e. ~7N−5
+# seconds for N wallets: at the 100s cadence (config's
+# DEFAULT_ORDER_POLL_INTERVAL_SECONDS) a pass of ~15 wallets exactly fills its
+# cycle, and a larger poll set simply runs passes back-to-back — the loop sleeps
+# `max(0, interval − elapsed)`, so overrun costs alert latency (a wallet is
+# revisited every pass-length, not every 100s), never correctness and never a
+# budget blowout: the same spacing ceilings order polling at ~5.7 weight/s
+# whatever happens. Shorten this only against a measured gate-contention
+# problem; the tradeoff it buys is position-poll latency.
 ORDER_WALLET_SPACING_SECONDS = 5.0
 
 # Replace-detection's size leeway (module docstring): an appearing order
@@ -187,7 +198,7 @@ async def _fetch_orders(
     fetch_open_orders raises on any venue failure; the wallet then retries
     next pass with its id set untouched, never diffed against a half-empty
     book into a silent prune and a later ladder-wide re-alert. All venues are
-    billed up front, so a first-venue failure wastes the two unspent venues'
+    billed up front, so a first-venue failure wastes the unspent venues'
     weight — deliberately the conservative direction (the bucket refills in
     seconds; under-billing is the failure mode that 429s)."""
     for _venue in POSITION_VENUES:

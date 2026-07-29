@@ -124,14 +124,12 @@ async def test_a_new_position_emits_an_open_alert_to_every_follower(
         assert row["created_at"] == clock.now()
         assert row["delivered_at"] is None
     # Deduped across Users, and each pass polls every covered venue (core +
-    # xyz + mkts): baseline pass then this pass, three calls apiece.
+    # xyz): baseline pass then this pass, two calls apiece.
     assert gateway.positions_calls == [
         ("0xaaa", None),
         ("0xaaa", "xyz"),
-        ("0xaaa", "mkts"),
         ("0xaaa", None),
         ("0xaaa", "xyz"),
-        ("0xaaa", "mkts"),
     ]
 
 
@@ -288,8 +286,8 @@ async def test_a_refollowed_trader_rebaselines_instead_of_replaying_stale_diffs(
     clock.advance(30)
     gateway.set_positions("0xaaa", [])  # ...and the position closes unwatched
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
-    # Only the baseline's three calls (core + xyz + mkts); the pruned wallet isn't polled.
-    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz"), ("0xaaa", "mkts")]
+    # Only the baseline's two calls (core + xyz); the pruned wallet isn't polled.
+    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz")]
     assert await pool.fetchval("SELECT count(*) FROM position_snapshots") == 0
     assert await pool.fetchval("SELECT count(*) FROM position_poll_state") == 0
 
@@ -312,7 +310,7 @@ async def test_untracked_traders_are_not_polled(
     result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
     assert result.polled == 1
-    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz"), ("0xaaa", "mkts")]
+    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz")]
 
 
 async def test_one_failing_wallet_does_not_stop_the_pass(
@@ -378,13 +376,13 @@ async def test_the_pass_is_paced_by_the_weight_budget(
         await track(pool, clock, f"0x{i:03d}", 42)
 
     start = clock.now()
-    # 10 wallets x 3 calls (core + xyz + mkts) x 2 weight = 60 against a 4/min
-    # budget: the burst covers the first 2 calls, each of the other 28 refills 30s.
+    # 10 wallets x 2 calls (core + xyz) x 2 weight = 40 against a 4/min budget:
+    # the burst covers the first 2 calls, each of the other 18 refills 30s.
     await run_poll_pass(pool, gateway, WeightBudget(4, clock), clock)
 
-    assert (clock.now() - start).total_seconds() >= 28 * 30
+    assert (clock.now() - start).total_seconds() >= 18 * 30
     assert POSITIONS_WEIGHT == 2
-    assert len(gateway.positions_calls) == 30
+    assert len(gateway.positions_calls) == 20
 
 
 # --- xyz builder DEX coverage (issue #21) -----------------------------------
@@ -402,7 +400,7 @@ async def test_each_pass_polls_both_the_core_and_the_xyz_venue(
 
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
-    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz"), ("0xaaa", "mkts")]
+    assert gateway.positions_calls == [("0xaaa", None), ("0xaaa", "xyz")]
 
 
 async def test_first_poll_baselines_xyz_positions_without_alerts(
@@ -674,11 +672,13 @@ async def test_scale_fires_on_the_xyz_venue_too(
     assert row["kind"] == "scale_in" and row["coin"] == "xyz:META"
 
 
-async def test_an_mkts_open_emits_an_alert_naming_the_market(
+async def test_the_dropped_mkts_venue_is_never_polled_or_alerted(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
-    """The mkts venue (Markets by Kinetiq: index perps like mkts:US500) is
-    covered exactly like xyz — namespaced coins, same diff machinery."""
+    """mkts (Markets by Kinetiq index perps) left POSITION_VENUES on 2026-07-29,
+    so its positions are simply invisible: not fetched, not snapshotted, not
+    alerted. The venue constant survives for a one-token re-enable — this pins
+    that the tuple, not the constant, is what decides coverage."""
     await track(pool, clock, "0xaaa", 42)
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
@@ -686,10 +686,39 @@ async def test_an_mkts_open_emits_an_alert_naming_the_market(
     gateway.set_positions("0xaaa", [position(coin="mkts:US500")], dex="mkts")
     await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
 
-    rows = await alerts(pool)
-    assert len(rows) == 1
-    assert rows[0]["kind"] == "open"
-    assert rows[0]["coin"] == "mkts:US500"
+    assert await alerts(pool) == []
+    assert ("0xaaa", "mkts") not in gateway.positions_calls
+    assert await pool.fetchval("SELECT count(*) FROM position_snapshots") == 0
+
+
+async def test_a_leftover_mkts_snapshot_would_diff_into_a_false_close(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The hazard the migration closes, stated as a poller test. A snapshot row
+    for a venue that stopped being polled is indistinguishable from a position
+    that closed — so if one survived, the next pass would fire a CLOSE alert
+    (with invented realized PnL and holding time) for a position that is still
+    open. Migration 0027 deletes those rows, and the pollers write no new ones;
+    forcing one in here proves the alert this repo must never send, and pins
+    which layer is responsible for preventing it."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="BTC")])
+    await baseline(pool, gateway, clock)
+    # A pre-migration residue, hand-written: the poll set can no longer produce it.
+    await pool.execute(
+        """
+        INSERT INTO position_snapshots (trader_address, coin, side, size_usd, leverage,
+                                        entry_price, unrealized_pnl, opened_at, updated_at)
+        VALUES ('0xaaa', 'mkts:US500', 'long', 9000, 5, 100, 0, $1, $1)
+        """,
+        clock.now(),
+    )
+
+    clock.advance(30)
+    await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    # The false CLOSE — this is what the migration exists to make impossible.
+    assert [(r["kind"], r["coin"]) for r in await alerts(pool)] == [("close", "mkts:US500")]
 
 
 # --- My-wallet copy alerts (#121): linked wallets join the poll set as a

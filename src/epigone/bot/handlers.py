@@ -56,12 +56,28 @@ from epigone.screener import ScreenerRow, run_screener
 
 SCREENER_PAGE_SIZE = 5
 
-# The stream poller can only sustain ~110 distinct tracked wallets across ALL
-# Users within the shared weight budget (epigone.budget, #28; halved by the xyz
-# builder-DEX's second poll, #21), so an unbounded per-User follow list lets one
-# User exhaust the global ceiling. A per-User cap is the first guard (#23); tune
-# this constant to retune it.
-MAX_TRACKED_WALLETS = 15
+# The stream poller can only sustain a bounded number of distinct tracked
+# wallets across ALL Users within the shared weight budget (epigone.budget, #28;
+# each wallet costs one clearinghouseState call per POSITION_VENUE), so an
+# unbounded per-User follow list lets one User exhaust the global ceiling. A
+# per-User cap is the first guard (#23).
+#
+# Two tiers (operator decision 2026-07-29). Ordinary Users get 5: at the
+# single-operator scale Epigone actually runs at, a handful of Users' lists sum
+# to well inside what the poller sustains, and 5 is the size at which a follow
+# list stays a considered shortlist rather than a dragnet. The admin (#33) gets
+# 15 — the old global cap, now a real ceiling instead of the unlimited waiver
+# they used to carry: the owner needs room to watch candidates before promoting
+# them, but an unbounded owner list is exactly the thing the cap exists to
+# prevent, and the poll budget does not care who spent it.
+MAX_TRACKED_WALLETS = 5
+ADMIN_MAX_TRACKED_WALLETS = 15
+
+
+def track_limit_for(*, is_admin: bool) -> int:
+    """The follow cap that applies to one User. One definition so the check and
+    the toast that explains it can never quote different numbers."""
+    return ADMIN_MAX_TRACKED_WALLETS if is_admin else MAX_TRACKED_WALLETS
 
 
 class TrackOutcome(Enum):
@@ -156,8 +172,12 @@ DATA_DELAYED_TEXT = (
 # Shown when a User at the cap tries to follow one more (#23). Every Follow now
 # comes through a button (the screener row or the profile's Follow tap, #111), so
 # the cap surfaces through a callback answer's toast — the pasted-address path no
-# longer writes a Track, so its full-message form retired with it.
-TRACK_LIMIT_TOAST = f"Limit reached — {MAX_TRACKED_WALLETS} wallets max. Unfollow one first."
+# longer writes a Track, so its full-message form retired with it. Built per
+# User rather than frozen at import: the admin's cap differs from everyone
+# else's, and a toast quoting the wrong number is worse than no toast.
+def track_limit_toast(limit: int) -> str:
+    return f"Limit reached — {limit} wallets max. Unfollow one first."
+
 
 _ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
@@ -606,6 +626,7 @@ async def on_screener_follow(
     lands on the same page."""
     offset_str, _, address = (callback.data or "").removeprefix("sfollow:").partition(":")
     offset = _parse_offset(offset_str)
+    is_admin = callback.from_user.id == admin_telegram_id
     async with pool.acquire() as conn, conn.transaction():
         outcome = await track_address(
             conn,
@@ -613,14 +634,14 @@ async def on_screener_follow(
             callback.from_user.username,
             address,
             clock.now(),
-            cap_exempt=callback.from_user.id == admin_telegram_id,
+            is_admin=is_admin,
         )
     if isinstance(callback.message, Message):
         text, markup = await _render_screener_page(
             pool, callback.from_user.id, clock, offset=offset
         )
         await callback.message.edit_text(text, reply_markup=markup)
-    await callback.answer(follow_toast(outcome, address))
+    await callback.answer(follow_toast(outcome, address, is_admin=is_admin))
 
 
 async def on_profile(
@@ -683,6 +704,7 @@ async def on_profile_follow(
     admin_telegram_id: int | None,
 ) -> None:
     address = (callback.data or "").removeprefix("pfollow:")
+    is_admin = callback.from_user.id == admin_telegram_id
     async with pool.acquire() as conn, conn.transaction():
         outcome = await track_address(
             conn,
@@ -690,10 +712,10 @@ async def on_profile_follow(
             callback.from_user.username,
             address,
             clock.now(),
-            cap_exempt=callback.from_user.id == admin_telegram_id,
+            is_admin=is_admin,
         )
     await _refresh_profile_in_place(
-        callback, pool, gateway, clock, address, follow_toast(outcome, address)
+        callback, pool, gateway, clock, address, follow_toast(outcome, address, is_admin=is_admin)
     )
 
 
@@ -1156,7 +1178,7 @@ async def track_address(
     address: str,
     now: datetime,
     *,
-    cap_exempt: bool = False,
+    is_admin: bool = False,
 ) -> TrackOutcome:
     """Follow `address` for a User; idempotent. Returns the follow's outcome.
 
@@ -1167,10 +1189,11 @@ async def track_address(
     The per-User cap (#23) is enforced here so all three paths share one check.
     Re-touching an already-tracked wallet is always allowed (idempotent, never
     counts as a new follow), even at the cap — so the already-tracking test
-    comes before the count check. `cap_exempt` waives the cap: callers pass
-    `cap_exempt=<follower> == admin_telegram_id`, so only the owner (#33)
-    follows without limit — every extra tracked wallet costs poller budget, so
-    the waiver stays admin-only rather than a tier anyone can reach."""
+    comes before the count check. `is_admin` selects WHICH cap applies (see
+    track_limit_for): callers pass `is_admin=<follower> == admin_telegram_id`,
+    so the owner (#33) gets the higher of the two — a real ceiling, not the
+    waiver they used to carry. Every extra tracked wallet costs poller budget
+    on every pass, whoever followed it."""
     await upsert_user(conn, telegram_id, username)
     already_tracking = await conn.fetchval(
         "SELECT 1 FROM tracks WHERE user_telegram_id = $1 AND trader_address = $2",
@@ -1183,7 +1206,7 @@ async def track_address(
         "SELECT count(*) FROM tracks WHERE user_telegram_id = $1",
         telegram_id,
     )
-    if not cap_exempt and tracked_count >= MAX_TRACKED_WALLETS:
+    if tracked_count >= track_limit_for(is_admin=is_admin):
         return TrackOutcome.LIMIT_REACHED
     await conn.execute(
         """
@@ -1813,9 +1836,9 @@ def _summarize(positions: list[Position]) -> str:
     return f"{len(positions)} {noun}, uPnL {signed_usd(total_upnl)}"
 
 
-def follow_toast(outcome: TrackOutcome, address: str) -> str:
+def follow_toast(outcome: TrackOutcome, address: str, *, is_admin: bool = False) -> str:
     if outcome is TrackOutcome.LIMIT_REACHED:
-        return TRACK_LIMIT_TOAST
+        return track_limit_toast(track_limit_for(is_admin=is_admin))
     verb = "Now following" if outcome is TrackOutcome.FRESHLY_TRACKED else "Already following"
     return f"{verb} {short_address(address)}"
 

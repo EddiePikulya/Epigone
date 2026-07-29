@@ -25,17 +25,21 @@ async def test_core_and_builder_offsets(gateway: FakeHyperliquidGateway) -> None
     ids = await fetch_asset_ids(gateway)
     assert ids["BTC"] == 0
     assert ids["SOL"] == 2
-    # xyz is listing position 0 → offset 110000; mkts position 2 → 130000.
+    # xyz is listing position 0 → offset 110000.
     assert ids["xyz:META"] == 110_000
     assert ids["xyz:BB"] == 110_001
-    assert ids["mkts:US500"] == 130_000
+    # The default map follows POSITION_VENUES, which dropped mkts on 2026-07-29 —
+    # so an mkts coin is only mapped when a caller asks for that dex by name.
+    # The offset arithmetic is unchanged: mkts is listing position 2 → 130000.
+    assert "mkts:US500" not in ids
+    assert (await fetch_asset_ids(gateway, dexs=["mkts"]))["mkts:US500"] == 130_000
 
 
 async def test_covered_dex_missing_from_listing_raises(
     gateway: FakeHyperliquidGateway,
 ) -> None:
-    gateway.perp_dex_listing = ["xyz"]  # mkts vanished — offsets would be a guess
-    with pytest.raises(GatewayError, match="mkts"):
+    gateway.perp_dex_listing = ["flip"]  # xyz vanished — offsets would be a guess
+    with pytest.raises(GatewayError, match="xyz"):
         await fetch_asset_ids(gateway)
 
 

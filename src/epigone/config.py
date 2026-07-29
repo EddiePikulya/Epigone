@@ -22,21 +22,33 @@ DEFAULT_SEED_INTERVAL_MINUTES = 60
 DEFAULT_FINE_CHUNK_SIZE = 500
 
 # Order-poll cadence (issue #115): how often the stream diffs tracked wallets'
-# resting orders. Resting orders live minutes-to-days, so five-minute latency
-# loses nothing — and the cadence is what keeps the heavier endpoint cheap.
+# resting orders. Resting orders live minutes-to-days, so the cadence buys
+# alert latency, and it is also what keeps the heavier endpoint cheap.
+#
 # The math: one poll costs ORDERS_WEIGHT (20 nominal; ~8 measured, see
-# epigone.stream.orders) × 3 covered venues = 60 weight per wallet per cycle,
-# so at 300s each tracked wallet adds 60/5min = 12 nominal weight/min — the
-# full 15-wallet follow cap ≈ 180/min nominal (~72/min real) against the
-# 900/min shared refill, alongside position polling's ~6/wallet/min. Position
-# polls always win regardless: order spends carry the ingest-style stream
-# reserve (epigone.stream.main), so a mis-tuned interval degrades to slower
-# order alerts, never to starved Position Alerts. The reserve guards tokens;
-# the #41 send gate (FCFS) is guarded separately — the pass spaces its
-# wallets (stream.orders.ORDER_WALLET_SPACING_SECONDS) so its heavy sends
-# never saturate the gate position polls share.
+# epigone.stream.orders) × 2 covered venues = 40 weight per wallet per cycle,
+# so at 100s each tracked wallet adds 24 nominal weight/min (~10 real) —
+# alongside position polling's 8/wallet/min at its 30s interval, 32/min/wallet
+# against the 900/min shared refill, i.e. the stream alone would claim the whole
+# bucket at ~28 distinct wallets.
+#
+# 100s is deliberately past the point where the cadence, not the wallet count,
+# sets the pass duration: the pass spaces its wallets by
+# stream.orders.ORDER_WALLET_SPACING_SECONDS, so N wallets take ~7N−5 seconds
+# and anything over ~15 runs longer than one cycle. That is a soft edge, not a
+# cliff — the loop sleeps `max(0, interval − elapsed)` (epigone.stream.main), so
+# an over-long pass simply starts the next one immediately. What it costs is the
+# duty-cycle argument below: order polling then holds the #41 send gate ~29% of
+# the time continuously rather than in bursts, and its own spend ceilings out at
+# ~40/7 ≈ 5.7 weight/s (~343/min nominal) no matter how many wallets are
+# tracked. Watch order-alert latency, not the budget, when raising the cap.
+#
+# Position polls always win regardless: order spends carry the ingest-style
+# stream reserve (epigone.stream.main), so a mis-tuned interval degrades to
+# slower order alerts, never to starved Position Alerts. The reserve guards
+# tokens; the #41 send gate (FCFS) is guarded separately, by that same spacing.
 # Operator-tunable via ORDER_POLL_INTERVAL_SECONDS; a bad value falls back here.
-DEFAULT_ORDER_POLL_INTERVAL_SECONDS = 300
+DEFAULT_ORDER_POLL_INTERVAL_SECONDS = 100
 
 
 @dataclass(frozen=True)
