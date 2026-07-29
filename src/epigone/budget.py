@@ -81,7 +81,7 @@ EXECUTION_RESERVE_WEIGHT = 30
 # the 15/s refill so short bursts still clear quicker than steady-state pacing.
 # It also bounds how long a stream poll can wait behind ingest: one call's
 # window plus its settled surcharge — a full ~2000-fill response is ~120 real
-# weight, so ~6s worst case, well inside the 30s poll interval. Tune here after
+# weight, so ~6s worst case, well inside the 20s poll interval. Tune here after
 # watching production; the final value is calibrated empirically against the
 # server IP (issue #41 notes).
 SMOOTHING_WEIGHT_PER_SECOND = PER_IP_WEIGHT_PER_MINUTE / 60

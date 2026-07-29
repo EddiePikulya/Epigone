@@ -1,4 +1,4 @@
-"""Stream process: the ~30s tracked-wallet position poller (issue #4) plus the
+"""Stream process: the ~20s tracked-wallet position poller (issue #4) plus the
 slower resting-order poller (issue #115).
 
 Two loops share the process. Each cycle runs one pass over every distinct
