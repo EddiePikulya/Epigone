@@ -6,7 +6,7 @@ Research pass before writing the Epigone spec. Question: what existing APIs/CLIs
 
 ### Official Hyperliquid (free — our serving path, per ADR-0001)
 - **Info API** (`api.hyperliquid.xyz/info`): per-address `clearinghouseState` (weight 2), `userFills`/`userFillsByTime` (weight 20+, 2k fills/page), `portfolio` (windowed PnL/volume — the two-stage-scan coarse pass, see spec-defaults.md).
-- **Websocket**: market-level trades feed (counterparty addresses included → firehose path); user-specific subscriptions capped at 10 unique addresses/IP.
+- **Websocket**: market-level trades feed (counterparty addresses included → firehose path); user-specific subscriptions (`webData3`, `orderUpdates`, `userEvents`, `userFills`, `clearinghouseState`, `allDexsClearinghouseState`) take a `user` param and work for **any** address. ~~capped at 10 unique addresses/IP~~ — **corrected 2026-07-30** (ADR-0006): the 10 is a *connection* cap, not an address cap. Real limits are **10 connections, 30 new connections/min, 1000 subscriptions, 2000 outbound messages/min, 100 in-flight posts** — all a **separate budget from the 1200 weight/min REST cap**, so a websocket lane costs no REST weight. `allDexsClearinghouseState` covers every dex in one subscription where the REST poller spends one `clearinghouseState` call per venue.
 - **Undocumented leaderboard**: `stats-data.hyperliquid.xyz/Mainnet/leaderboard` — used by client libraries (e.g. hyperliquid-go); our Universe seed. Risk: undocumented, could change without notice.
 - **⭐ Official S3 archives** (major find for `ingest`):
   - `s3://hl-mainnet-node-data/node_fills_by_block` — every fill on the exchange streamed from a node (older formats: `node_fills`, `node_trades`).
