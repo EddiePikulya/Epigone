@@ -157,11 +157,9 @@ remembering to back up first (the #160 payoff). `scripts/deploy.sh`:
 through but conflict with schema changes, and migrations run at container
 startup (ADR-0003) — so the dump has to *finish* before anything comes up, not
 run alongside it. Getting a dump and a migration in the same window is how you
-get neither.
-
-The `git pull` stays outside the script on purpose: bash reads a script as it
-executes it, so a script that pulls itself can be re-read from a file that
-changed underneath it mid-run.
+get neither. The `git pull` stays outside the script for a separate reason; the
+script's header comment gives it, along with the rest of the reasoning behind
+the steps above.
 
 Optional knobs, both with safe defaults: `EPIGONE_DUMP_DIR`
 (`~/epigone-dumps`), `EPIGONE_DUMP_KEEP` (`3`; a value below 1 is refused

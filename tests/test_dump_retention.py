@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from epigone.backup import dump_name, dumps_in, prune_dumps
+from epigone.dump_retention import dump_name, dumps_in, prune_dumps
 
 
 def _touch_dumps(directory: Path, *stamps: str) -> None:

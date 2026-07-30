@@ -37,14 +37,19 @@ KEEP="${EPIGONE_DUMP_KEEP:-3}"
 # Matches POSTGRES_USER/POSTGRES_DB in docker-compose.yml.
 DB_USER=epigone
 DB_NAME=epigone
-BACKUP_PY="$REPO_DIR/src/epigone/backup.py"
+RETENTION_PY="$REPO_DIR/src/epigone/dump_retention.py"
 
 cd -- "$REPO_DIR"
 
 # Fail closed. If postgres is not up there is nothing to dump, and a deploy that
 # proceeds unprotected is the failure this script exists to remove. A first-ever
 # install has no database yet and follows docs/deploy.md sections 1-6 instead.
-if ! docker compose ps --services --filter status=running | grep -qx postgres; then
+#
+# Collected into a variable rather than piped straight into grep: under pipefail,
+# `grep -q` exits at its first match and can SIGPIPE the compose process, which
+# would read as "postgres is down" on a perfectly healthy server.
+running_services="$(docker compose ps --services --filter status=running)"
+if ! printf '%s\n' "$running_services" | grep -qx postgres; then
     echo "deploy: the postgres container is not running, so no dump can be taken." >&2
     echo "        Refusing to deploy unprotected. If this is a first install, follow" >&2
     echo "        docs/deploy.md sections 1-6; otherwise start postgres and retry." >&2
@@ -54,7 +59,7 @@ fi
 echo "==> deploying $(git rev-parse --short HEAD) ($(git log -1 --format=%s))"
 
 mkdir -p -- "$DUMP_DIR"
-dump="$DUMP_DIR/$(python3 -- "$BACKUP_PY" name)"
+dump="$DUMP_DIR/$(python3 -- "$RETENTION_PY" name)"
 partial="$dump.partial"
 # A dump that died halfway must leave nothing behind that a later restore could
 # mistake for a backup.
@@ -75,7 +80,7 @@ mv -- "$partial" "$dump"
 trap - EXIT
 echo "==> dump ok ($(du -h -- "$dump" | cut -f1)); restore: docs/runbooks/restore-from-dump.md"
 
-python3 -- "$BACKUP_PY" prune "$DUMP_DIR" --keep "$KEEP"
+python3 -- "$RETENTION_PY" prune "$DUMP_DIR" --keep "$KEEP"
 
 echo "==> starting containers (migrations run here, after the dump)"
 docker compose up -d --build
