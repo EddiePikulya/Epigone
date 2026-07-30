@@ -9,7 +9,8 @@ marked **[on your Mac]**. Paste output back at the `✅ verify` checkpoints.
 
 Sections 1–6 are the **first install**. Every deploy after that is
 ["Updating later"](#updating-later-after-a-merge-to-main) — `git pull &&
-./scripts/deploy.sh`, which dumps the database before it restarts anything.
+./scripts/deploy.sh`, which checks that the code on disk is reviewed main and
+dumps the database before it restarts anything.
 
 Placeholders: `<IP>` = server IP, `<MAC-REPO>` = `/Users/ediksymonian/SE/Epigone`.
 
@@ -140,17 +141,22 @@ docker compose logs stream --tail=3
 cd ~/epigone && git pull && ./scripts/deploy.sh
 ```
 
-That is the whole update flow — no hand-DDL (the #16/#37 payoff), and no
-remembering to back up first (the #160 payoff). `scripts/deploy.sh`:
+That is the whole update flow — no hand-DDL (the #16/#37 payoff), no
+remembering to back up first (the #160 payoff), and no way to ship the wrong
+commit by accident. `scripts/deploy.sh`:
 
-1. refuses to run if postgres isn't up — there would be nothing to dump, and a
+1. refuses unless the checkout is on `main`, has a clean working tree, and sits
+   at exactly `origin/main` — checked with a `git fetch`, which writes only
+   under `.git` and never moves the working tree. See ["When the guard
+   refuses"](#when-the-guard-refuses) below;
+2. refuses to run if postgres isn't up — there would be nothing to dump, and a
    deploy that proceeds unprotected is the thing it exists to prevent;
-2. dumps the database to `~/epigone-dumps/epigone-<UTC>.dump`
+3. dumps the database to `~/epigone-dumps/epigone-<UTC>.dump`
    (`--format=custom`, ~34 MB, ~5s) and reads the archive back end to end
    before accepting it. A dump that fails or comes back short stops the deploy
    here, with the old containers still running;
-3. deletes all but the **3 most recent** dumps;
-4. `docker compose up -d --build`, where `migrate()` applies any new numbered
+4. deletes all but the **3 most recent** dumps;
+5. `docker compose up -d --build`, where `migrate()` applies any new numbered
    migrations at startup.
 
 **The order is the point.** `pg_dump` takes locks that let reads and writes
@@ -160,6 +166,32 @@ run alongside it. Getting a dump and a migration in the same window is how you
 get neither. The `git pull` stays outside the script for a separate reason; the
 script's header comment gives it, along with the rest of the reasoning behind
 the steps above.
+
+### When the guard refuses
+
+Step 1 exists because the `git pull` runs outside the script, where nothing
+witnessed whether it worked. Its most valuable refusal is the boring one — HEAD
+is behind `origin/main` because the pull never ran or failed and scrolled past.
+Without the check the script rebuilds the identical commit, reports success at
+every step, and you conclude a change is live when it is not.
+
+The guard **asserts and stops; it never fixes the state itself.** A `checkout`
+inside the script would move the working tree out from under the running bash
+process — the same hazard that keeps the pull in your hands. So each refusal
+prints what is wrong and the command to run:
+
+| Refusal | What happened | Fix |
+| --- | --- | --- |
+| `HEAD is detached at <sha>` | a checkout of a bare sha, e.g. left over from poking at history | `git checkout main && git pull` |
+| `this checkout is on '<branch>'` | a feature branch was checked out here and never switched back | `git checkout main && git pull` |
+| `the working tree holds changes that are in no commit` | edits (or stray files) made on the server. The image is built from the working tree, so they *would* ship, under a commit hash that does not contain them | merge them properly, or `git stash --include-untracked` |
+| `Behind by <n>` | the pull did not run, or failed | `git pull && ./scripts/deploy.sh` |
+| `<n> commit(s) exist only here` | committed directly on the server, so it never went through review | push it through a PR, or `git reset --hard origin/main` |
+| `The two have diverged` | both of the above at once | `git log --oneline origin/main..HEAD` to see what is only here, then untangle it deliberately |
+| `cannot reach origin` | network, or the deploy key | `ssh -T github-epigone`, then retry |
+
+Nothing has been touched at that point: no dump, no containers. A refused
+deploy leaves production exactly as it was, still running the old code.
 
 Optional knobs, both with safe defaults: `EPIGONE_DUMP_DIR`
 (`~/epigone-dumps`), `EPIGONE_DUMP_KEEP` (`3`; a value below 1 is refused
