@@ -81,7 +81,11 @@ and it is a structural one, not a preference.
 the same transaction that updates `position_snapshots`. `_queue_alerts`
 becomes one consumer of the event list; the A4 executor becomes another.
 
-### Schema (migration 0028)
+### Schema (migration 0029)
+
+(Written as 0028; corrected when issue #155 — the coin-unit prefactor this ADR
+asks for, below — shipped first and took that number. A migration number is
+frozen once it ships and an unwritten one is not, so the ADR moves.)
 
 `position_events` carries everything `_Event` and `position_alerts` carry
 today, plus what execution needs and neither currently records:

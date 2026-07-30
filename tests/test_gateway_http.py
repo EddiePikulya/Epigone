@@ -144,6 +144,9 @@ async def test_parse_positions_namespaces_bare_dex_coins() -> None:
     (bare,) = parse_positions(payload, dex="xyz")
     assert bare.coin == "xyz:META"
     assert bare.side is Side.SHORT
+    # The coin-unit size rides the builder-DEX venue too (issue #155): one
+    # parser serves every venue, so "any covered venue" is one assertion here.
+    assert bare.size_coin == Decimal("10")
 
     # Already-namespaced coins (what the live API actually returns) pass through.
     payload["assetPositions"][0]["position"]["coin"] = "xyz:META"

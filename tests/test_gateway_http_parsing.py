@@ -10,7 +10,7 @@ from decimal import Decimal
 
 import pytest
 
-from epigone.gateway import GatewayError, Window
+from epigone.gateway import GatewayError, Side, Window
 from epigone.gateway.http import (
     parse_extra_agents,
     parse_fills,
@@ -98,6 +98,20 @@ def test_parse_positions_uses_exact_margin_and_return_when_present() -> None:
     (pos,) = parse_positions(_position_payload())
     assert pos.margin == Decimal("96.325")  # the API's exact marginUsed, not derived
     assert pos.return_on_margin == Decimal("3.57")
+
+
+def test_parse_positions_carries_the_coin_unit_size_beside_the_notional() -> None:
+    # szi's magnitude is the position in coin units — what an order is sized in
+    # (issue #155). Its sign still decides the side, and nothing else changes.
+    (long_pos,) = parse_positions(_position_payload())
+    assert long_pos.side is Side.LONG
+    assert long_pos.size_coin == Decimal("0.1")
+    assert long_pos.size_usd == Decimal("3853.0")
+
+    # A short's size is the same magnitude: unsigned units, side carries the sign.
+    (short_pos,) = parse_positions(_position_payload(szi="-0.1"))
+    assert short_pos.side is Side.SHORT
+    assert short_pos.size_coin == Decimal("0.1")
 
 
 # One perp close (recorded verbatim from userFills on 2026-07-10) and one

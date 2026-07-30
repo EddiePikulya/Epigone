@@ -300,6 +300,10 @@ def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:
                     leverage=Decimal(raw["leverage"]["value"]),
                     entry_price=Decimal(raw["entryPx"]),
                     unrealized_pnl=Decimal(raw["unrealizedPnl"]),
+                    # szi's magnitude, kept rather than discarded once its sign
+                    # has been read for the side (issue #155): the position in
+                    # coin units, the only unit an order can be placed in.
+                    size_coin=abs(size_in_coin),
                     # marginUsed / returnOnEquity ride the same call (issue #35);
                     # absent or null falls back to notional/leverage in Position.
                     margin_used=_opt_decimal(raw.get("marginUsed")),

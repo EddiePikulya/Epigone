@@ -1,0 +1,27 @@
+-- Migration 0028: the position snapshot records its size in coin units
+-- (issue #155, prefactor for ADR-0006).
+--
+-- clearinghouseState has always returned `szi` — the signed coin size — and
+-- the gateway has always read it, but only for its sign, to derive the side.
+-- The magnitude was discarded, so nothing downstream knew a position in the
+-- one unit Hyperliquid sizes ORDERS in. ADR-0006 builds a CLOSE event entirely
+-- from the stored snapshot (a live fetch would show the position already gone),
+-- so the value has to be durable here or a close can never state what closed.
+--
+-- Nullable, and deliberately not backfilled. The value is not derivable from
+-- anything already stored: size_usd is the mark-priced notional and entry_price
+-- is the average entry, so size_usd / entry_price is off by the whole unrealized
+-- move — a plausible-looking number that would be wrong by exactly as much as
+-- the position is winning or losing. A guess in a column an executor sizes
+-- orders from is worse than an absence, so rows written before this migration
+-- stay NULL and consumers read NULL as "size not mirrorable" rather than
+-- inventing units.
+--
+-- The gap closes on its own: _replace_snapshot upserts every column on every
+-- pass, so each live position backfills within one poll interval (10s). The
+-- only lasting NULL is a position that both predates the migration and closes
+-- in the very first pass after it — one event, correctly marked unknown.
+--
+-- Additive and alert-neutral: the diff reads side and size_usd only, so adding
+-- this column cannot change which events a pass emits.
+ALTER TABLE position_snapshots ADD COLUMN size_coin NUMERIC;
