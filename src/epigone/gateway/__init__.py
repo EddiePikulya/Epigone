@@ -81,8 +81,9 @@ class Position:
     sizes ORDERS in coin units, so a dollar notional alone can never be acted
     on; recording units gives the mark price too (`size_usd / size_coin`), which
     is why there is no separate mark field to disagree with it. Optional for the
-    same reason the margin fields are: a Position synthesized from a snapshot
-    taken before #155, or in a test, simply doesn't know it."""
+    same reason the margin fields are: a Position that was synthesized rather
+    than parsed — in a test, or hydrated from a snapshot with only the fields
+    one caller needs — simply doesn't know it."""
 
     coin: str
     side: Side
