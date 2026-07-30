@@ -74,7 +74,15 @@ class Position:
     `size_usd` is the leveraged notional; `margin` is the real money the Trader
     put up (issue #35). Hyperliquid returns both directly — `marginUsed` and
     `returnOnEquity` — but they're optional here so a synthesized Position (tests,
-    a snapshot replay) can omit them and fall back to notional/leverage."""
+    a snapshot replay) can omit them and fall back to notional/leverage.
+
+    `size_coin` is the same position measured in coin units — `szi`'s magnitude,
+    unsigned, with `side` carrying the sign (issue #155, ADR-0006). Hyperliquid
+    sizes ORDERS in coin units, so a dollar notional alone can never be acted
+    on; recording units gives the mark price too (`size_usd / size_coin`), which
+    is why there is no separate mark field to disagree with it. Optional for the
+    same reason the margin fields are: a Position synthesized from a snapshot
+    taken before #155, or in a test, simply doesn't know it."""
 
     coin: str
     side: Side
@@ -82,6 +90,7 @@ class Position:
     leverage: Decimal
     entry_price: Decimal
     unrealized_pnl: Decimal
+    size_coin: Decimal | None = None  # |szi| in coin units; None → not observed
     margin_used: Decimal | None = None  # exact marginUsed from the API; None → derive
     return_on_equity: Decimal | None = None  # returnOnEquity (PnL over margin), a ratio
 

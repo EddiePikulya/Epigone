@@ -37,7 +37,10 @@ def position(
     leverage: str = "5",
     entry_price: str = "100",
     unrealized_pnl: str = "0",
+    size_coin: str | None = None,
 ) -> Position:
+    # size_coin defaults to unset (#155): a synthesized Position stays
+    # constructible without it, exactly as the gateway type allows.
     return Position(
         coin=coin,
         side=side,
@@ -45,6 +48,7 @@ def position(
         leverage=Decimal(leverage),
         entry_price=Decimal(entry_price),
         unrealized_pnl=Decimal(unrealized_pnl),
+        size_coin=Decimal(size_coin) if size_coin is not None else None,
     )
 
 
@@ -225,6 +229,70 @@ async def test_subthreshold_size_and_entry_changes_are_silent(
     assert snapshot["unrealized_pnl"] == Decimal("120")
     assert snapshot["opened_at"] == opened  # holding time survives resizes
     assert snapshot["updated_at"] == clock.now()
+
+
+# --- coin-unit size (#155): the snapshot carries what an order is sized in ----
+
+
+async def test_a_snapshot_records_the_position_in_coin_units(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """ADR-0006 builds a CLOSE entirely from the stored snapshot, so a snapshot
+    that knows only a dollar notional can never say what was closed in the units
+    an order is placed in. The value rides every write — the baseline insert and
+    the silent-drift upsert alike — and the stream keeps nothing in memory, so
+    re-reading the row after a further pass is what "survives a restart" means."""
+    await track(pool, clock, "0xaaa", 42)
+    gateway.set_positions("0xaaa", [position(coin="ETH", size_usd="10000", size_coin="2.5")])
+
+    await baseline(pool, gateway, clock)
+
+    snapshot = await pool.fetchrow("SELECT * FROM position_snapshots")
+    assert snapshot is not None
+    assert snapshot["size_coin"] == Decimal("2.5")
+
+    # Drift below the scale threshold: silent, but the upsert must rewrite the
+    # units alongside the notional rather than leave the old pair inconsistent.
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="ETH", size_usd="10500", size_coin="2.625")])
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 0
+    reloaded = await pool.fetchrow("SELECT * FROM position_snapshots")
+    assert reloaded is not None
+    assert reloaded["size_coin"] == Decimal("2.625")
+
+
+async def test_a_position_snapshotted_before_coin_units_polls_quietly_and_backfills(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Production holds snapshots written before migration 0028, with no coin
+    size at all. Such a row must poll like any other: the diff reads side and
+    notional, so an absent coin size is not a change and cannot manufacture a
+    Position Alert for a position that did nothing. The next pass fills it in."""
+    await track(pool, clock, "0xaaa", 42)
+    await baseline(pool, gateway, clock)  # no positions yet: just the poll state
+    # A row exactly as the pre-#155 poller wrote it — every column but the units.
+    await pool.execute(
+        """
+        INSERT INTO position_snapshots (trader_address, coin, side, size_usd, leverage,
+                                        entry_price, unrealized_pnl, opened_at, updated_at)
+        VALUES ('0xaaa', 'ETH', 'long', 10000, 5, 100, 0, $1, $1)
+        """,
+        clock.now(),
+    )
+    opened = clock.now()
+
+    clock.advance(30)
+    gateway.set_positions("0xaaa", [position(coin="ETH", size_usd="10000", size_coin="2.5")])
+    result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.events == 0
+    assert await alerts(pool) == []
+    snapshot = await pool.fetchrow("SELECT * FROM position_snapshots")
+    assert snapshot is not None
+    assert snapshot["size_coin"] == Decimal("2.5")  # backfilled by the ordinary upsert
+    assert snapshot["opened_at"] == opened  # and holding time is untouched by it
 
 
 async def test_simultaneous_open_and_close_both_alert(

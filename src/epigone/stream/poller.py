@@ -394,14 +394,15 @@ async def _replace_snapshot(
         """
         INSERT INTO position_snapshots
             (trader_address, coin, side, size_usd, leverage, entry_price,
-             unrealized_pnl, opened_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             unrealized_pnl, size_coin, opened_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (trader_address, coin) DO UPDATE
             SET side = EXCLUDED.side,
                 size_usd = EXCLUDED.size_usd,
                 leverage = EXCLUDED.leverage,
                 entry_price = EXCLUDED.entry_price,
                 unrealized_pnl = EXCLUDED.unrealized_pnl,
+                size_coin = EXCLUDED.size_coin,
                 opened_at = EXCLUDED.opened_at,
                 updated_at = EXCLUDED.updated_at
         """,
@@ -412,6 +413,10 @@ async def _replace_snapshot(
         pos.leverage,
         pos.entry_price,
         pos.unrealized_pnl,
+        # The coin-unit size (#155), rewritten on every pass exactly like the
+        # notional it must stay consistent with — which is also what backfills
+        # the snapshots written before migration 0028.
+        pos.size_coin,
         opened_at,
         updated_at,
     )
