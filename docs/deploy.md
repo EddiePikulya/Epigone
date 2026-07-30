@@ -7,6 +7,10 @@ monitor) onto a single Ubuntu server. Restores the current Universe from a
 **Roles:** you run these on the **server** (via `ssh root@<IP>`) unless a step is
 marked **[on your Mac]**. Paste output back at the `✅ verify` checkpoints.
 
+Sections 1–6 are the **first install**. Every deploy after that is
+["Updating later"](#updating-later-after-a-merge-to-main) — `git pull &&
+./scripts/deploy.sh`, which dumps the database before it restarts anything.
+
 Placeholders: `<IP>` = server IP, `<MAC-REPO>` = `/Users/ediksymonian/SE/Epigone`.
 
 ---
@@ -133,10 +137,43 @@ docker compose logs stream --tail=3
 ## Updating later (after a merge to main)
 
 ```sh
-cd ~/epigone && git pull && docker compose up -d --build
+cd ~/epigone && git pull && ./scripts/deploy.sh
 ```
-`migrate()` applies any new numbered migrations automatically. That's the whole
-update flow — no hand-DDL (that's the #16/#37 payoff).
+
+That is the whole update flow — no hand-DDL (the #16/#37 payoff), and no
+remembering to back up first (the #160 payoff). `scripts/deploy.sh`:
+
+1. refuses to run if postgres isn't up — there would be nothing to dump, and a
+   deploy that proceeds unprotected is the thing it exists to prevent;
+2. dumps the database to `~/epigone-dumps/epigone-<UTC>.dump`
+   (`--format=custom`, ~34 MB, ~5s) and reads the archive back end to end
+   before accepting it. A dump that fails or comes back short stops the deploy
+   here, with the old containers still running;
+3. deletes all but the **3 most recent** dumps;
+4. `docker compose up -d --build`, where `migrate()` applies any new numbered
+   migrations at startup.
+
+**The order is the point.** `pg_dump` takes locks that let reads and writes
+through but conflict with schema changes, and migrations run at container
+startup (ADR-0003) — so the dump has to *finish* before anything comes up, not
+run alongside it. Getting a dump and a migration in the same window is how you
+get neither. The `git pull` stays outside the script for a separate reason; the
+script's header comment gives it, along with the rest of the reasoning behind
+the steps above.
+
+Optional knobs, both with safe defaults: `EPIGONE_DUMP_DIR`
+(`~/epigone-dumps`), `EPIGONE_DUMP_KEEP` (`3`; a value below 1 is refused
+rather than obeyed).
+
+**Restoring one of these dumps: `docs/runbooks/restore-from-dump.md`.** Read it
+before you need it — in particular the part about the code on disk re-applying
+the migration you just restored away from.
+
+### The dumps from before this existed
+
+Retention only touches files it wrote itself, so the pre-#160 hand-made dumps
+(`~/epigone_pre_*.sql`, ~2.1 GB) stay until the operator removes them — the
+runbook's "Housekeeping" section has the command.
 
 ## Notes
 - Postgres is bound to `127.0.0.1` (not internet-exposed); creds are dev-grade but unreachable from outside. Rotating to a strong password is a later hardening.

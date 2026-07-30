@@ -65,6 +65,9 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
 [tool.ruff.lint.per-file-ignores]
+# The deploy runs this one under the *host's* python3 (issue #160), not ours, so
+# it stays inside 3.9-era syntax: `timezone.utc` rather than 3.11's `datetime.UTC`.
+"src/epigone/dump_retention.py" = ["UP017"]
 # aiogram's BaseSession interface mandates `timeout` parameters.
 "tests/support/telegram.py" = ["ASYNC109"]
 "tests/test_alert_delivery.py" = ["ASYNC109"]
