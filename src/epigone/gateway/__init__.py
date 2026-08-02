@@ -408,6 +408,25 @@ MKTS_DEX = "mkts"
 POSITION_VENUES: tuple[str | None, ...] = (None, XYZ_DEX)
 
 
+def on_covered_venue(coin: str) -> bool:
+    """Whether this namespaced coin belongs to a venue Epigone covers.
+
+    Coins are `dex:COIN` for a builder DEX and a bare ticker for core (issue
+    #21), so the namespace IS the venue and no lookup is needed.
+
+    This exists because not every source is per-venue. The REST reads are —
+    they walk POSITION_VENUES and see exactly what they ask for — but the
+    websocket's all-dex subscription (issue #157) carries EVERY dex in one
+    message, including the ones POSITION_VENUES deliberately drops for weight
+    reasons. A consumer that mixes the two must reduce the wider observation to
+    the covered venues, or it is diffing a complete view against a partial one
+    and every uncovered coin reads as opening and closing by turns."""
+    dex, separator, _ = coin.partition(":")
+    if not separator:
+        return None in POSITION_VENUES
+    return dex in POSITION_VENUES
+
+
 async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> list[Position]:
     """A Trader's open positions across every venue Epigone covers (POSITION_VENUES:
     the core perps plus the xyz builder DEX, issue #21), merged into one list.

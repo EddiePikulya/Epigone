@@ -50,10 +50,13 @@ from decimal import Decimal
 import asyncpg
 
 # The producer that observed the event. 'poll' is the REST poll pass; 'ws' is
-# the WebSocket lane, which arrives later writing these same rows without the
-# consumer changing (ADR-0006's payoff). A consumer that must not see both
-# filters on this column.
+# the WebSocket shadow lane (issue #157), which writes these same rows through
+# this same seam without the consumer changing — ADR-0006's payoff, collected.
+# A consumer that must not see both filters on this column; today nothing
+# reads 'ws' rows at all, which is what makes the lane unable to affect
+# alerting even when it is wrong.
 POLL_SOURCE = "poll"
+WS_SOURCE = "ws"
 
 # Events are pruned past a week, and that is a safety property rather than
 # housekeeping: a consumer seven days behind is not behind, it is broken, and
