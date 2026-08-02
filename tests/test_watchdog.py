@@ -16,7 +16,7 @@ import asyncpg
 import pytest
 
 from epigone.budget import SharedWeightBudget, WeightBudget
-from epigone.gateway import ExtraAgent, GatewayError, OpenOrder, Position, Side
+from epigone.gateway import ExtraAgent, GatewayError, Position, Side
 from epigone.gateway.execution import AmbiguousExecutionError, CancelSpec
 from epigone.gateway.execution_fake import FakeExecutionGateway
 from epigone.gateway.fake import FakeHyperliquidGateway
@@ -39,27 +39,12 @@ from epigone.safety.halt import (
 )
 from epigone.safety.watchdog import Watchdog
 from tests.support.clock import FakeClock
+from tests.support.orders import open_order
 
 MASTER = "0x" + "ab" * 20
 SIGNER = "0x" + "cd" * 20
 ADMIN = 370818090
 STALE = timedelta(seconds=60)
-
-
-def _order(coin: str, oid: int) -> OpenOrder:
-    return OpenOrder(
-        coin=coin,
-        is_buy=True,
-        limit_price=Decimal("100"),
-        size=Decimal("1"),
-        order_id=oid,
-        placed_at=datetime(2026, 7, 10, 11, 0, tzinfo=UTC),
-        order_type="Limit",
-        is_trigger=False,
-        trigger_price=None,
-        is_position_tpsl=False,
-        reduce_only=False,
-    )
 
 
 def _position(coin: str) -> Position:
@@ -175,8 +160,8 @@ async def test_simulated_stall_trips_and_cancel_alls(
     # which is itself the independence criterion.
     await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
     clock.advance(120)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 11), _order("SOL", 12)])
-    read_gateway.set_open_orders(MASTER, [_order("xyz:BB", 13)], dex="xyz")
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 11), open_order("SOL", 12)])
+    read_gateway.set_open_orders(MASTER, [open_order("xyz:BB", 13)], dex="xyz")
 
     await watchdog.run_cycle()
 
@@ -257,7 +242,7 @@ async def test_ambiguous_cancel_is_never_read_as_swept(
     """THE hazard test: a halt path that misreads an ambiguous cancel as
     "nothing happened" leaves live orders behind a swept stamp."""
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 21)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 21)])
     exec_gateway.errors.append(AmbiguousExecutionError("timed out — may have executed"))
 
     with pytest.raises(AmbiguousExecutionError):
@@ -290,7 +275,7 @@ async def test_unmappable_coin_aborts_the_sweep_loudly(
     audit: ExecutionAudit,
 ) -> None:
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
-    read_gateway.set_open_orders(MASTER, [_order("DELISTED", 31)])
+    read_gateway.set_open_orders(MASTER, [open_order("DELISTED", 31)])
     with pytest.raises(GatewayError, match="DELISTED"):
         await watchdog.run_cycle()
     halt = await active_halt(pool)
@@ -322,7 +307,7 @@ async def test_watchdog_loop_survives_failing_cycles_and_maintains_the_deadman(
     from epigone.safety.main import watchdog_loop
 
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
-    read_gateway.set_open_orders(MASTER, [_order("DELISTED", 41)])
+    read_gateway.set_open_orders(MASTER, [open_order("DELISTED", 41)])
     deadman = DeadMansSwitch(
         audited,  # the shared audited gateway, exactly as main.py wires it
         audit,
@@ -470,7 +455,7 @@ async def test_sweep_covers_dexs_outside_position_venues(
     `flip` — listed on-chain but NOT in POSITION_VENUES — is enumerated and
     cancelled with the offset its listing position fixes (110000 + 1×10000)."""
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
-    read_gateway.set_open_orders(MASTER, [_order("flip:GME", 51)], dex="flip")
+    read_gateway.set_open_orders(MASTER, [open_order("flip:GME", 51)], dex="flip")
 
     await watchdog.run_cycle()
 
@@ -517,7 +502,7 @@ async def test_blind_trip_cancels_at_the_real_budget_seam(
         db_blind_after=DB_BLIND,
         capability_interval=CAPABILITY_INTERVAL,
     )
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 61)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 61)])
 
     await watchdog.run_cycle()  # blind for 0s: wait, don't trip, don't raise
     assert _cancels(exec_gateway) == []
@@ -546,7 +531,7 @@ async def test_blind_sweep_reconciles_into_a_distinct_halt_on_recovery(
     async def db_down(_pool: asyncpg.Pool) -> None:
         raise ConnectionError("postgres unreachable")
 
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 62)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 62)])
     monkeypatch.setattr(watchdog_module, "active_halt", db_down)
     await watchdog.run_cycle()  # the failure STREAK opens here (round 3 item 3)
     assert _cancels(exec_gateway) == []
@@ -602,7 +587,7 @@ async def test_unwritable_halt_row_never_suppresses_the_trip_cancel(
 
     await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
     clock.advance(120)  # a REAL stall, with only the halt WRITE failing
-    read_gateway.set_open_orders(MASTER, [_order("SOL", 63)])
+    read_gateway.set_open_orders(MASTER, [open_order("SOL", 63)])
     monkeypatch.setattr(watchdog_module, "request_halt", halt_write_down)
     await watchdog.run_cycle()
     assert _cancels(exec_gateway) == [CancelSpec(asset=2, oid=63)]
@@ -632,7 +617,7 @@ async def test_perp_dexs_outage_degrades_to_a_partial_sweep(
     sweep — core-venue orders still die (partial coverage, reported) — but
     partial coverage can never stamp swept_at."""
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 64)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 64)])
     read_gateway.perp_dex_error = GatewayError("perpDexs down")
 
     await watchdog.run_cycle()
@@ -712,7 +697,7 @@ async def test_writes_broken_window_keeps_cancelling_every_cycle(
 
     await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
     clock.advance(120)  # a REAL stall
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 71)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 71)])
     monkeypatch.setattr(watchdog_module, "request_halt", writes_broken)
 
     for cycle in range(1, 5):  # trip + three writes-still-broken cycles
@@ -765,7 +750,7 @@ async def test_alternating_read_failures_never_blind_trip(
         return await real_active_halt(p)
 
     monkeypatch.setattr(watchdog_module, "active_halt", flaky_active_halt)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 72)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 72)])
     for _ in range(6):
         clock.advance(200)  # every gap alone exceeds the 180s threshold
         await watchdog.run_cycle()
@@ -787,7 +772,7 @@ async def test_unbroken_failure_streak_still_trips(
         raise ConnectionError("still down")
 
     monkeypatch.setattr(watchdog_module, "active_halt", db_down)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 73)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 73)])
     await watchdog.run_cycle()  # streak opens here; 0s blind → wait
     assert _cancels(exec_gateway) == []
     clock.advance(100)
@@ -896,7 +881,7 @@ async def test_a_trip_reaches_the_wire_before_any_halt_state_is_written(
     monkeypatch.setattr(audit, "record_attempt", order_recording_attempt)
     await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
     clock.advance(120)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 81)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 81)])
 
     await watchdog.run_cycle()
 
@@ -928,7 +913,7 @@ async def test_a_post_reconcile_blip_does_not_retrip(
         raise ConnectionError("postgres unreachable")
 
     # A full blind incident, reconciled: outage, trip, recovery.
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 95)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 95)])
     monkeypatch.setattr(watchdog_module, "active_halt", db_down)
     await watchdog.run_cycle()  # streak opens
     clock.advance(DB_BLIND.total_seconds() + 1)
@@ -945,7 +930,7 @@ async def test_a_post_reconcile_blip_does_not_retrip(
     # Much later, ONE dropped connection. Before the fix, blind_for was
     # computed from the ORIGINAL outage onset and re-tripped immediately.
     clock.advance(3600)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 96)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 96)])
     monkeypatch.setattr(watchdog_module, "active_halt", db_down)
     await watchdog.run_cycle()
     assert len(_cancels(exec_gateway)) == cancels_after_incident  # no false sweep

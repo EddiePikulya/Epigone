@@ -45,7 +45,7 @@ import aiohttp
 from epigone.budget import SharedWeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
-from epigone.gateway.execution import AmbiguousExecutionError
+from epigone.gateway.execution import AmbiguousExecutionError, ExecutionGateway
 from epigone.gateway.execution_http import HttpExecutionGateway
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.keystore import KeystoreError, load_kek
@@ -88,6 +88,34 @@ async def watchdog_loop(
             log.exception("dead-man's switch maintenance failed; retrying next tick")
         await clock.sleep(interval_seconds)
         cycles += 1
+
+
+def safety_gateway(
+    inner: ExecutionGateway,
+    audit: ExecutionAudit,
+    *,
+    master_address: str,
+    signer_address: str,
+) -> AuditedExecutionGateway:
+    """The watchdog's write path, in one place so the tests can assert its
+    SHAPE rather than re-describe it (review of PR for issue #145):
+
+    - CANCEL-ONLY INSIDE the audit wrapper: a refused placement never reaches
+      the signer, and still leaves its error row on the trail. This is what
+      makes "a blind cold start cannot open risk" structural.
+    - BEST-EFFORT AUDIT (PR #143 review, both rounds): a Postgres outage must
+      never suppress a protective cancel. This flag is the audit leg;
+      FallbackBudget is the pacing leg; the watchdog's blind trip is the
+      decision leg (watchdog.py's module docstring states the full guarantee).
+    """
+    return AuditedExecutionGateway(
+        CancelOnlyExecutionGateway(inner),
+        audit,
+        actor=WATCHDOG_ACTOR,
+        master_address=master_address,
+        signer_address=signer_address,
+        best_effort_audit=True,
+    )
 
 
 async def main() -> None:
@@ -134,30 +162,18 @@ async def main() -> None:
     )
     async with aiohttp.ClientSession() as session:
         read_gateway = HttpHyperliquidGateway(session, clock, info_url=config.info_url)
-        exec_gateway = AuditedExecutionGateway(
-            # Cancel-only INSIDE the audit wrapper (module docstring): a
-            # refused placement never reaches the signer, and still leaves
-            # its error row on the trail.
-            CancelOnlyExecutionGateway(
-                HttpExecutionGateway(
-                    session,
-                    clock,
-                    budget,
-                    signer=signer,
-                    master_address=master_address,
-                    exchange_url=config.exchange_url,
-                )
+        exec_gateway = safety_gateway(
+            HttpExecutionGateway(
+                session,
+                clock,
+                budget,
+                signer=signer,
+                master_address=master_address,
+                exchange_url=config.exchange_url,
             ),
             audit,
-            actor=WATCHDOG_ACTOR,
             master_address=master_address,
             signer_address=signer.address,
-            # The safety path's discipline (PR #143 review, both rounds): a
-            # Postgres outage must never suppress a protective cancel. This
-            # flag is the audit leg; FallbackBudget is the pacing leg; the
-            # watchdog's blind trip is the decision leg (watchdog.py module
-            # docstring states the full guarantee precisely).
-            best_effort_audit=True,
         )
         deadman = DeadMansSwitch(
             exec_gateway,
@@ -180,12 +196,11 @@ async def main() -> None:
             db_blind_after=config.db_blind_after,
             capability_interval=config.capability_interval,
         )
-        if startup.cold_start:
+        if startup.cold_start_reason is not None:
             # The incident opens HERE, not after a threshold: the startup
             # grace already spent the blind threshold's worth of unbroken
             # unreachability, so the first cycle cancels (issue #145).
-            assert startup.reason is not None
-            watchdog.declare_cold_start(launched_at, startup.reason)
+            watchdog.declare_cold_start(launched_at, startup.cold_start_reason)
         # "Which mechanism(s) are active" starts here on the trail: the
         # watchdog is primary the moment it runs; the deadman announces its
         # own eligibility transitions as it probes.
@@ -199,7 +214,7 @@ async def main() -> None:
                     "exchange_url": config.exchange_url,
                     "executor_stale_seconds": int(config.executor_stale.total_seconds()),
                     "interval_seconds": int(config.interval.total_seconds()),
-                    "cold_start": startup.cold_start,
+                    "cold_start": startup.cold_start_reason is not None,
                 },
                 master_address=master_address,
             )

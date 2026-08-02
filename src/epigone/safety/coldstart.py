@@ -34,6 +34,15 @@ the other way:
   uses — schema changes legitimately take long and must not inherit
   incident-tuned timeouts. Until then the process simply has no database,
   which is a state the watchdog already knows how to be in.
+- THE DB-BACKED ATTEMPT IS BOUNDED TOO (review of this PR). The probe
+  answering is not a promise that the next step returns — `migrate` waits on
+  an advisory lock with no timeout, and asyncpg's transaction exit is the one
+  leg no per-op bound reaches — so a started-but-stalled attempt is abandoned
+  at the grace and the process cold-starts blind rather than hanging
+  unstarted, which was the exact failure this module exists to remove.
+  Refreshing the key cache is best-effort for the same reason in the other
+  direction: an unwritable cache degrades a FUTURE cold start and must never
+  turn a healthy start into a blind one.
 - THE LAUNCH STAMP IS RETROACTIVE. `process_heartbeats.started_at` is what
   the #52 monitor ages the never-verified capability grace period from
   (migration 0026). A cold start cannot stamp it, so the reconnect writes it
@@ -118,7 +127,10 @@ class ColdStartPool:
     def is_live(self) -> bool:
         return self._live is not None
 
-    async def _require(self) -> asyncpg.Pool:
+    async def ensure_pool(self) -> asyncpg.Pool:
+        """The live pool, opening it if an attempt is due. Public because the
+        deferred `acquire()` context below needs the same entry point the
+        query methods use."""
         if self._live is not None:
             return self._live
         now = self._clock.now()
@@ -142,18 +154,18 @@ class ColdStartPool:
         return self._live
 
     async def execute(self, query: str, *args: Any, **kwargs: Any) -> str:
-        status: str = await (await self._require()).execute(query, *args, **kwargs)
+        status: str = await (await self.ensure_pool()).execute(query, *args, **kwargs)
         return status
 
     async def fetch(self, query: str, *args: Any, **kwargs: Any) -> list[asyncpg.Record]:
-        rows: list[asyncpg.Record] = await (await self._require()).fetch(query, *args, **kwargs)
+        rows: list[asyncpg.Record] = await (await self.ensure_pool()).fetch(query, *args, **kwargs)
         return rows
 
     async def fetchrow(self, query: str, *args: Any, **kwargs: Any) -> asyncpg.Record | None:
-        return await (await self._require()).fetchrow(query, *args, **kwargs)
+        return await (await self.ensure_pool()).fetchrow(query, *args, **kwargs)
 
     async def fetchval(self, query: str, *args: Any, **kwargs: Any) -> Any:
-        return await (await self._require()).fetchval(query, *args, **kwargs)
+        return await (await self.ensure_pool()).fetchval(query, *args, **kwargs)
 
     def acquire(self, *, timeout: float | None = None) -> "_DeferredAcquire":
         # asyncpg's acquire() is sync-returning-an-async-context-manager, and
@@ -177,7 +189,7 @@ class _DeferredAcquire:
         self._inner: Any = None
 
     async def __aenter__(self) -> Any:
-        pool = await self._owner._require()
+        pool = await self._owner.ensure_pool()
         self._inner = (
             pool.acquire() if self._timeout is None else pool.acquire(timeout=self._timeout)
         )
@@ -189,13 +201,15 @@ class _DeferredAcquire:
 
 @dataclass(frozen=True)
 class Startup:
-    """What the process starts with, and whether it started blind."""
+    """What the process starts with. `cold_start_reason` is both the flag and
+    the payload — the text the blind incident is declared under, or None for a
+    DB-backed start — so no call site can hold "this was a cold start" without
+    also holding what to record about it."""
 
     pool: asyncpg.Pool
     signer: LocalAccount
     master_address: str
-    cold_start: bool
-    reason: str | None  # cold starts only: what the blind incident records
+    cold_start_reason: str | None
 
 
 async def probe_database(
@@ -255,13 +269,23 @@ async def open_startup(
     while True:
         if await probe_database(database_url):
             try:
-                return await _db_backed_startup(
+                return await _bounded_db_backed_startup(
                     database_url=database_url,
                     clock=clock,
                     kek=kek,
                     cache=cache,
                     operator_id=operator_id,
                     launched_at=launched_at,
+                    # What is LEFT of the grace, not a fresh copy of it (review
+                    # of this PR): the budget is the whole startup's, so a
+                    # probe answering late cannot double the time to the first
+                    # blind cancel. Floored at one retry interval so a database
+                    # that answers at the very end of the window still gets a
+                    # real attempt instead of an instant timeout — which is the
+                    # single term by which the documented bound can be
+                    # exceeded, and why the runbook says "plus at most one poll
+                    # interval".
+                    ceiling=max(grace - (clock.now() - launched_at), retry_every),
                 )
             except KeystoreError:
                 raise  # no usable key: fail fast, loudly, as this always has
@@ -313,12 +337,66 @@ async def open_startup(
         retry_after=retry_every,
     )
     return Startup(
+        # HONEST SCOPE for this cast (the epigone.safety.db convention for
+        # type-system escapes): ColdStartPool is NOT an asyncpg.Pool — it
+        # duck-types the six methods this layer actually calls (execute,
+        # fetch, fetchrow, fetchval, acquire, close; grep them in
+        # epigone.safety.* and epigone.budget). asyncpg is typed as Any
+        # here (mypy override), so a Protocol would check nothing; the real
+        # guard is that a state module reaching for a SEVENTH method fails
+        # in the cold-start tests, which drive a full incident cycle —
+        # heartbeat, halt row, audit rows, budget — through this object.
         pool=cast(asyncpg.Pool, pool),
         signer=cached.signer,
         master_address=cached.master_address,
-        cold_start=True,
-        reason=reason,
+        cold_start_reason=reason,
     )
+
+
+async def _bounded_db_backed_startup(
+    *,
+    database_url: str,
+    clock: Clock,
+    kek: Kek,
+    cache: WatchdogKeyCache,
+    operator_id: int,
+    launched_at: datetime,
+    ceiling: timedelta,
+) -> Startup:
+    """A DB-backed start that cannot outlive the grace window (review of this
+    PR). The probe answering is not a promise that the next step returns: a
+    backend can stall between the two, `migrate` waits on an advisory lock
+    with no timeout, and asyncpg's transaction exit is the one leg no per-op
+    bound reaches (epigone.safety.db). Without this the process would hang
+    unstarted and unprotecting — the exact failure issue #145 exists to
+    remove — so the attempt runs as a TASK and is ABANDONED at the ceiling
+    rather than awaited: `asyncio.wait_for` would block on the same wedged
+    rollback it is trying to escape. An abandoned attempt is harmless — its
+    migration is one rolled-back transaction, and everything it might still
+    write (schema bookkeeping, the launch stamp, the key cache) is
+    idempotent — and the reconnect redoes all of it.
+
+    REAL TIME, not the injected clock (the watchdog.DB_BLOCK_CEILING_SECONDS
+    convention): this bounds an actual await, and under a fake clock the
+    startup finishes instantly anyway."""
+    attempt = asyncio.create_task(
+        _db_backed_startup(
+            database_url=database_url,
+            clock=clock,
+            kek=kek,
+            cache=cache,
+            operator_id=operator_id,
+            launched_at=launched_at,
+        )
+    )
+    done, _ = await asyncio.wait({attempt}, timeout=ceiling.total_seconds())
+    if not done:
+        attempt.cancel()  # deliberately NOT awaited: it may be wedged in asyncpg
+        raise TimeoutError(
+            f"DB-backed startup did not finish within {int(ceiling.total_seconds())}s "
+            f"even though Postgres answered the probe"
+        )
+    return attempt.result()
 
 
 async def _db_backed_startup(
@@ -331,22 +409,39 @@ async def _db_backed_startup(
     launched_at: datetime,
 ) -> Startup:
     pool = await open_db_backed_pool(database_url)
-    keystore = AgentKeystore(pool, kek, clock)
-    # Fail fast on a missing signer (epigone.safety.main's first wiring note):
-    # no watchdog-lane key means this process cannot cancel anything.
-    signer = await keystore.signer(operator_id, WATCHDOG_LANE)
-    record = await keystore.active_record(operator_id, WATCHDOG_LANE)
-    assert record is not None  # signer() above proved it
-    # EVERY successful DB-backed start refreshes the cache, so the copy a
-    # future cold start reads is never older than the last healthy restart.
-    cache.write(record, bytes(signer.key), now=clock.now())
-    await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, launched_at)
+    try:
+        keystore = AgentKeystore(pool, kek, clock)
+        # Fail fast on a missing signer (epigone.safety.main's first wiring
+        # note): no watchdog-lane key means this process cannot cancel anything.
+        signer = await keystore.signer(operator_id, WATCHDOG_LANE)
+        record = await keystore.active_record(operator_id, WATCHDOG_LANE)
+        assert record is not None  # signer() above proved it
+        # EVERY successful DB-backed start refreshes the cache, so the copy a
+        # future cold start reads is never older than the last healthy restart.
+        # BEST-EFFORT, deliberately (review of this PR): an unwritable cache —
+        # a read-only mount, a full disk, wrong perms — is a degraded FUTURE
+        # cold start, and must never turn a perfectly healthy start into a
+        # blind one that cancels the book while Postgres is fine.
+        try:
+            cache.write(record, bytes(signer.key), now=clock.now())
+        except (KeystoreError, OSError):
+            log.exception(
+                "watchdog startup: could not refresh the cold-start key cache at %s — "
+                "starting anyway; a restart taken during a Postgres outage would fall "
+                "back to whatever copy is already there, or refuse to start",
+                cache.path,
+            )
+        await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, launched_at)
+    except BaseException:
+        # Nothing may leak a pool back into the grace loop: a retried attempt
+        # opens its own.
+        await _close_quietly(pool)
+        raise
     return Startup(
         pool=pool,
         signer=signer,
         master_address=record.master_address,
-        cold_start=False,
-        reason=None,
+        cold_start_reason=None,
     )
 
 
@@ -401,8 +496,15 @@ async def deferred_startup(
     start, not this moment (module docstring): the #52 monitor's
     never-verified capability grace period must not restart because a cold
     start happened."""
-    await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, launched_at)
     now = clock.now()
+    await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, launched_at)
+    # record_start upserts beaten_at along with started_at, which would leave
+    # the liveness column reading as of the LAUNCH — minutes or hours stale
+    # after a long blind window, and the #52 liveness check
+    # (HEALTHCHECK_WATCHDOG_STALE_SECONDS, default 300) would page for a
+    # process that is plainly alive. The beat is a separate fact from the
+    # stamp: this process is alive NOW, and it launched THEN.
+    await heartbeat.beat(pool, heartbeat.WATCHDOG_PROCESS, now)
     refreshed, active_agent = await _refresh_cache(pool, clock, kek, cache, operator_id)
     stale_signer = active_agent is not None and active_agent != cached_agent_address
     if stale_signer:

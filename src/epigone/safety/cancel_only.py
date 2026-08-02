@@ -67,13 +67,13 @@ class CancelOnlyExecutionGateway:
         grouping: Grouping = Grouping.NA,
         builder: BuilderFee | None = None,
     ) -> list[OrderResult]:
-        raise self._refuse("place_orders", len(orders))
+        raise self._refusal("place_orders", len(orders))
 
     async def modify_orders(self, modifies: list[ModifySpec]) -> list[OrderResult]:
-        raise self._refuse("modify_orders", len(modifies))
+        raise self._refusal("modify_orders", len(modifies))
 
     async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
-        raise self._refuse("update_leverage", 1)
+        raise self._refusal("update_leverage", 1)
 
     async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
         return await self._inner.cancel_orders(cancels)
@@ -84,7 +84,7 @@ class CancelOnlyExecutionGateway:
     async def schedule_cancel(self, at: datetime | None) -> None:
         await self._inner.schedule_cancel(at)
 
-    def _refuse(self, action: str, count: int) -> OrderPlacementForbiddenError:
+    def _refusal(self, action: str, count: int) -> OrderPlacementForbiddenError:
         message = (
             f"the safety lane is CANCEL-ONLY: refusing {action} ({count} item(s)) — "
             f"the watchdog cancels and schedules cancels, it never opens risk "

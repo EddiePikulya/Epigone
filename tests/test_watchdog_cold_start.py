@@ -22,16 +22,16 @@ this file's order:
   0026) does not restart.
 """
 
+import asyncio
 import json
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
+import os
+from datetime import timedelta
 from pathlib import Path
 
 import asyncpg
 import pytest
 
 from epigone.budget import SharedWeightBudget
-from epigone.gateway import OpenOrder
 from epigone.gateway.execution import CancelSpec
 from epigone.gateway.execution_fake import FakeExecutionGateway
 from epigone.gateway.fake import FakeHyperliquidGateway
@@ -45,12 +45,9 @@ from epigone.keystore import (
     load_kek,
 )
 from epigone.safety import heartbeat
-from epigone.safety.audit import EVENT, WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
+from epigone.safety.audit import EVENT, ExecutionAudit
 from epigone.safety.budget import FallbackBudget
-from epigone.safety.cancel_only import (
-    CancelOnlyExecutionGateway,
-    OrderPlacementForbiddenError,
-)
+from epigone.safety.cancel_only import OrderPlacementForbiddenError
 from epigone.safety.coldstart import (
     ColdStartPool,
     DatabaseUnavailableError,
@@ -61,8 +58,10 @@ from epigone.safety.coldstart import (
 )
 from epigone.safety.halt import active_halt
 from epigone.safety.keycache import WatchdogKeyCache
+from epigone.safety.main import safety_gateway
 from epigone.safety.watchdog import Watchdog
 from tests.support.clock import FakeClock
+from tests.support.orders import open_order
 
 OPERATOR = 424242
 MASTER = "0x" + "ab" * 20
@@ -120,22 +119,6 @@ def read_gateway() -> FakeHyperliquidGateway:
     return fake
 
 
-def _order(coin: str, oid: int) -> OpenOrder:
-    return OpenOrder(
-        coin=coin,
-        is_buy=True,
-        limit_price=Decimal("100"),
-        size=Decimal("1"),
-        order_id=oid,
-        placed_at=datetime(2026, 7, 10, 11, 0, tzinfo=UTC),
-        order_type="Limit",
-        is_trigger=False,
-        trigger_price=None,
-        is_position_tpsl=False,
-        reduce_only=False,
-    )
-
-
 def _cache_file(path: Path) -> tuple[str, dict[str, object]]:
     """The cache file's raw text and parsed payload. A plain sync helper: the
     async tests read it, and pathlib in an async body is a lint the repo takes
@@ -150,6 +133,15 @@ def _rewrite(path: Path, payload: dict[str, object]) -> None:
 
 def _mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
+
+
+def _make_unwritable_dir(path: Path) -> None:
+    path.mkdir(parents=True)
+    path.chmod(0o500)
+
+
+def _restore_dir(path: Path) -> None:
+    path.chmod(0o700)
 
 
 def _cancels(exec_gateway: FakeExecutionGateway) -> list[CancelSpec]:
@@ -167,18 +159,19 @@ def _blind_watchdog(
     read_gateway: FakeHyperliquidGateway,
     exec_gateway: FakeExecutionGateway,
 ) -> Watchdog:
-    """The production wiring shape (epigone.safety.main) over whatever pool
-    the startup produced: cancel-only gateway, best-effort audit, and the
-    FallbackBudget whose shared bucket sits on that same pool — so a blind
-    cycle is exercised through every seam that could touch Postgres."""
+    """The production wiring (epigone.safety.main.safety_gateway) over
+    whatever pool the startup produced, plus the FallbackBudget whose shared
+    bucket sits on that same pool — so a blind cycle is exercised through
+    every seam that could touch Postgres."""
     audit = ExecutionAudit(startup.pool, clock)
-    audited = AuditedExecutionGateway(
-        CancelOnlyExecutionGateway(exec_gateway),
+    # main's OWN wiring function, not a hand-rolled copy of it: the
+    # cancel-only guarantee below is then a property of what production
+    # builds, and deleting that wrapper fails these tests.
+    audited = safety_gateway(
+        exec_gateway,
         audit,
-        actor=WATCHDOG_ACTOR,
         master_address=startup.master_address,
         signer_address=startup.signer.address,
-        best_effort_audit=True,
     )
     watchdog = Watchdog(
         startup.pool,
@@ -193,9 +186,8 @@ def _blind_watchdog(
         db_blind_after=DB_BLIND,
         capability_interval=CAPABILITY_INTERVAL,
     )
-    if startup.cold_start:
-        assert startup.reason is not None
-        watchdog.declare_cold_start(clock.now(), startup.reason)
+    if startup.cold_start_reason is not None:
+        watchdog.declare_cold_start(clock.now(), startup.cold_start_reason)
     return watchdog
 
 
@@ -238,7 +230,7 @@ async def test_a_db_backed_start_caches_the_watchdog_key_encrypted_at_rest(
         retry_every=INTERVAL,
     )
     try:
-        assert startup.cold_start is False
+        assert startup.cold_start_reason is None
         assert startup.signer.address == signer.address
     finally:
         await startup.pool.close()
@@ -355,16 +347,16 @@ async def test_cold_start_with_postgres_unreachable_cancels_on_its_first_cycle(
 
     startup = await _cold_start(cache, clock, kek_path)
 
-    assert startup.cold_start is True
     assert startup.signer.address == signer.address  # the CACHED key, only
     assert startup.master_address == MASTER
-    assert startup.reason is not None and "COLD START" in startup.reason
+    assert startup.cold_start_reason is not None
+    assert "COLD START" in startup.cold_start_reason
     # Bounded and documented: the grace window, and nothing beyond it.
     assert clock.now() - launched_at <= GRACE
 
     exec_gateway = FakeExecutionGateway()
     watchdog = _blind_watchdog(startup, clock, read_gateway, exec_gateway)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 71)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 71)])
 
     await watchdog.run_cycle()  # the FIRST cycle — no threshold left to wait
 
@@ -389,8 +381,12 @@ async def test_a_cold_started_watchdog_cannot_place_orders(
     cache.write(watchdog_key, bytes(signer.key), now=clock.now())
     startup = await _cold_start(cache, clock, kek_path)
     exec_gateway = FakeExecutionGateway()
-    _blind_watchdog(startup, clock, read_gateway, exec_gateway)
-    gateway = CancelOnlyExecutionGateway(exec_gateway)
+    gateway = safety_gateway(
+        exec_gateway,
+        ExecutionAudit(startup.pool, clock),
+        master_address=startup.master_address,
+        signer_address=startup.signer.address,
+    )
 
     with pytest.raises(OrderPlacementForbiddenError):
         await gateway.place_orders([])
@@ -542,12 +538,11 @@ async def test_the_cold_start_blind_window_reconciles_under_its_own_reason(
         pool=cold_pool,  # type: ignore[arg-type]
         signer=signer,
         master_address=MASTER,
-        cold_start=True,
-        reason="COLD START with Postgres unreachable: the test's outage",
+        cold_start_reason="COLD START with Postgres unreachable: the test's outage",
     )
     exec_gateway = FakeExecutionGateway()
     watchdog = _blind_watchdog(startup, clock, read_gateway, exec_gateway)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 72)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 72)])
 
     await watchdog.run_cycle()  # blind: cancels, cannot record anything
     assert len(_cancels(exec_gateway)) == 1
@@ -598,11 +593,11 @@ async def test_a_running_process_blind_window_keeps_its_own_reason(
 
     signer = await keystore.signer(OPERATOR, WATCHDOG_LANE)
     startup = Startup(
-        pool=pool, signer=signer, master_address=MASTER, cold_start=False, reason=None
+        pool=pool, signer=signer, master_address=MASTER, cold_start_reason=None
     )
     exec_gateway = FakeExecutionGateway()
     watchdog = _blind_watchdog(startup, clock, read_gateway, exec_gateway)
-    read_gateway.set_open_orders(MASTER, [_order("ETH", 73)])
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 73)])
 
     async def db_down(_pool: asyncpg.Pool) -> None:
         raise ConnectionError("postgres unreachable")
@@ -652,3 +647,117 @@ async def test_the_cold_start_pool_paces_its_reconnect_attempts(
     with pytest.raises(DatabaseUnavailableError):
         await cold_pool.fetchval("SELECT 1")
     assert attempts == 2
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the directory mode this test sets")
+async def test_an_unwritable_cache_never_turns_a_healthy_start_blind(
+    database_url: str,
+    pool: asyncpg.Pool,
+    cache_path: Path,
+    kek_path: Path,
+    clock: FakeClock,
+    watchdog_key: AgentKeyRecord,
+) -> None:
+    """Review of this PR: refreshing the cache is bookkeeping for a FUTURE
+    cold start. A read-only mount or a full disk must not make a process
+    with a perfectly healthy database cancel the whole book blind."""
+    _make_unwritable_dir(cache_path.parent)  # writes refused; the DB is fine
+    try:
+        startup = await open_startup(
+            database_url=database_url,
+            clock=clock,
+            kek=load_kek(kek_path),
+            cache=WatchdogKeyCache(cache_path, load_kek(kek_path)),
+            operator_id=OPERATOR,
+            launched_at=clock.now(),
+            grace=GRACE,
+            retry_every=INTERVAL,
+        )
+    finally:
+        _restore_dir(cache_path.parent)
+    try:
+        assert startup.cold_start_reason is None  # DB-backed, as it should be
+        assert startup.signer.address is not None
+    finally:
+        await startup.pool.close()
+    with pytest.raises(KeystoreError, match="no usable watchdog key cache"):
+        WatchdogKeyCache(cache_path, load_kek(kek_path)).load(clock.now())
+
+
+async def test_the_reconnect_leaves_a_fresh_beat_beside_the_retroactive_stamp(
+    database_url: str,
+    pool: asyncpg.Pool,
+    cache: WatchdogKeyCache,
+    kek_path: Path,
+    clock: FakeClock,
+    watchdog_key: AgentKeyRecord,
+    keystore: AgentKeystore,
+) -> None:
+    """Review of this PR: record_start upserts beaten_at too, so stamping the
+    launch retroactively would leave the LIVENESS column reading as of the
+    launch — and the #52 staleness check would page for a process that is
+    plainly alive. started_at looks back; beaten_at says "now"."""
+    signer = await keystore.signer(OPERATOR, WATCHDOG_LANE)
+    cache.write(watchdog_key, bytes(signer.key), now=clock.now())
+    launched_at = clock.now()
+    clock.advance(3600)  # an hour blind: far past any staleness threshold
+
+    reconnected = await reconnect_opener(
+        database_url=database_url,
+        clock=clock,
+        kek=load_kek(kek_path),
+        cache=cache,
+        operator_id=OPERATOR,
+        launched_at=launched_at,
+        cached_agent_address=watchdog_key.agent_address,
+    )()
+    await reconnected.close()
+
+    row = await pool.fetchrow(
+        "SELECT started_at, beaten_at FROM process_heartbeats WHERE process = $1",
+        heartbeat.WATCHDOG_PROCESS,
+    )
+    assert row is not None
+    assert row["started_at"] == launched_at
+    assert row["beaten_at"] == clock.now()
+
+
+async def test_a_startup_that_stalls_after_a_good_probe_still_goes_blind(
+    database_url: str,
+    cache: WatchdogKeyCache,
+    kek_path: Path,
+    clock: FakeClock,
+    watchdog_key: AgentKeyRecord,
+    keystore: AgentKeystore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of this PR: the probe answering is not a promise that the next
+    step RETURNS — `migrate` waits on an advisory lock with no timeout, and
+    asyncpg's transaction exit is the one leg no per-op bound reaches. A
+    started-but-stalled attempt must be abandoned at the grace, not awaited
+    forever, or the process hangs unstarted and unprotecting."""
+    from epigone.safety import coldstart
+
+    signer = await keystore.signer(OPERATOR, WATCHDOG_LANE)
+    cache.write(watchdog_key, bytes(signer.key), now=clock.now())
+
+    async def stall(**kwargs: object) -> Startup:
+        await asyncio.sleep(30)  # far past the ceiling; never returns in time
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(coldstart, "_db_backed_startup", stall)
+    tick = timedelta(seconds=1)
+
+    startup = await open_startup(
+        database_url=database_url,  # REACHABLE: the probe succeeds every time
+        clock=clock,
+        kek=load_kek(kek_path),
+        cache=cache,
+        operator_id=OPERATOR,
+        launched_at=clock.now(),
+        grace=tick,
+        retry_every=tick,
+    )
+
+    assert startup.cold_start_reason is not None  # blind, not hung
+    assert startup.signer.address == signer.address

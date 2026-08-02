@@ -113,7 +113,8 @@ async def test_time_to_first_cancel_is_bounded_under_a_fully_hanging_database(
     from epigone.safety import watchdog as watchdog_module
     from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
     from epigone.safety.watchdog import Watchdog
-    from tests.test_watchdog import MASTER, SIGNER, _order
+    from tests.support.orders import open_order
+    from tests.test_watchdog import MASTER, SIGNER
 
     await SharedWeightBudget(pool, clock, reserve=0).spend(1)  # the row exists
     safety_pool = await create_safety_pool(
@@ -136,7 +137,7 @@ async def test_time_to_first_cancel_is_bounded_under_a_fully_hanging_database(
         read_gateway = FakeHyperliquidGateway()
         read_gateway.perp_universes[None] = ["BTC", "ETH"]
         read_gateway.perp_dex_listing = []
-        read_gateway.set_open_orders(MASTER, [_order("ETH", 91)])
+        read_gateway.set_open_orders(MASTER, [open_order("ETH", 91)])
         exec_gateway = FakeExecutionGateway()
         audit = ExecutionAudit(safety_pool, clock)
         watchdog = Watchdog(
