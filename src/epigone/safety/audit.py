@@ -38,7 +38,6 @@ from typing import Any, TypeVar
 import asyncpg
 
 from epigone.clock import Clock
-from epigone.safety.db import SAFETY_DB_TIMEOUT_SECONDS
 from epigone.gateway.execution import (
     ActionRejectedError,
     AmbiguousExecutionError,
@@ -55,6 +54,7 @@ from epigone.gateway.execution import (
     OrderResult,
     OrderSpec,
 )
+from epigone.safety.db import SAFETY_DB_TIMEOUT_SECONDS
 
 log = logging.getLogger(__name__)
 
