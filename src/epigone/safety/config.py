@@ -6,6 +6,12 @@ watchdog-only, env-tunable, and falls back to a safe default on a bad value
 (the monitor-config convention) so a misconfiguration never wedges the
 switch.
 
+`WATCHDOG_KEY_CACHE_FILE` is the one knob here that is not a duration: where
+the cold-start key cache lives (issue #145). It must sit on storage that
+OUTLIVES the container — the whole point is surviving a restart during a
+Postgres outage — so the compose service points it at a named volume; the
+default is a path under the operator's home for local runs.
+
 The exchange URL defaults to TESTNET and mainnet stays refused by
 construction regardless: HttpExecutionGateway raises MainnetNotEnabledError
 until A5's wiring passes allow_mainnet=True, which nothing here does. The
@@ -19,10 +25,12 @@ import logging
 import os
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 from epigone.config import parse_positive_int
 from epigone.gateway.execution_http import TESTNET_EXCHANGE_URL
 from epigone.gateway.http import TESTNET_INFO_URL
+from epigone.safety.keycache import default_cache_path
 
 log = logging.getLogger(__name__)
 
@@ -45,9 +53,18 @@ DEFAULT_EXECUTOR_STALE_SECONDS = 60
 # for the streak to open, + this threshold, + up to one more poll interval
 # plus one waiting cycle's ceilinged DB blocks (each bounded by
 # watchdog.DB_BLOCK_CEILING_SECONDS; the trip quantizes to cycle starts) —
-# hang-shaped outages included — for an ALREADY-RUNNING watchdog
-# (cold-start during an outage has no cancel path; see the runbook).
+# hang-shaped outages included. A process that STARTS into the outage has its
+# own, equally bounded path: the cold-start grace below, then its first cycle.
 DEFAULT_DB_BLIND_SECONDS = 3 * DEFAULT_EXECUTOR_STALE_SECONDS
+# How long startup keeps probing an unreachable Postgres before COLD-STARTING
+# BLIND (issue #145): loading the watchdog lane's key from the encrypted local
+# cache and declaring the incident at launch. Deliberately the same span as
+# the blind threshold, so one rule covers both shapes — Postgres unreachable
+# CONTINUOUSLY for this long is an incident, however the process got there.
+# Zero would cancel the whole book because a deploy landed during a five-second
+# blip; the probe returns the instant the database answers, so a healthy
+# restart pays nothing for the window.
+DEFAULT_COLDSTART_GRACE_SECONDS = DEFAULT_DB_BLIND_SECONDS
 # scheduleCancel horizon (the upgrade path, deadman.py): long enough that a
 # deploy restart (seconds) or one slow cycle can't spuriously fire it, short
 # enough that total host death strands resting orders for minutes, not hours.
@@ -67,15 +84,18 @@ class WatchdogConfig:
     interval: timedelta
     executor_stale: timedelta
     db_blind_after: timedelta
+    coldstart_grace: timedelta
     deadman_horizon: timedelta
     deadman_reprobe: timedelta
     capability_interval: timedelta
     exchange_url: str
     info_url: str
+    key_cache_path: Path
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
         exchange_url = _parse_exchange_url(os.environ.get("WATCHDOG_EXCHANGE_URL"))
+        cache_file = os.environ.get("WATCHDOG_KEY_CACHE_FILE")
         return cls(
             interval=timedelta(
                 seconds=parse_positive_int(
@@ -96,6 +116,13 @@ class WatchdogConfig:
                     os.environ.get("WATCHDOG_DB_BLIND_SECONDS"),
                     default=DEFAULT_DB_BLIND_SECONDS,
                     name="WATCHDOG_DB_BLIND_SECONDS",
+                )
+            ),
+            coldstart_grace=timedelta(
+                seconds=parse_positive_int(
+                    os.environ.get("WATCHDOG_COLDSTART_GRACE_SECONDS"),
+                    default=DEFAULT_COLDSTART_GRACE_SECONDS,
+                    name="WATCHDOG_COLDSTART_GRACE_SECONDS",
                 )
             ),
             deadman_horizon=timedelta(
@@ -121,6 +148,7 @@ class WatchdogConfig:
             ),
             exchange_url=exchange_url,
             info_url=_info_url_for(exchange_url),
+            key_cache_path=Path(cache_file) if cache_file else default_cache_path(),
         )
 
 

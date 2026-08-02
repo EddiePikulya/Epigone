@@ -97,14 +97,23 @@ services:
       DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
       ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID}
       KEYSTORE_KEK_FILE: /run/secrets/keystore-kek
+      # The cold-start key cache (issue #145). MUST live on the persistent
+      # volume below: its whole job is surviving a restart taken during a
+      # Postgres outage, which a container-local path would not.
+      WATCHDOG_KEY_CACHE_FILE: /var/lib/epigone/watchdog-key-cache.enc
     volumes:
       # The KEK file (outside git, outside the DB — keystore invariant),
       # mounted read-only where KEYSTORE_KEK_FILE points.
       - ${KEYSTORE_KEK_FILE:-./.keystore-kek}:/run/secrets/keystore-kek:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
+      - watchdog-state:/var/lib/epigone
+    # NO depends_on (issue #145): `condition: service_healthy` would refuse to
+    # start the watchdog for exactly as long as Postgres is unhealthy — the
+    # one window where a cold-started watchdog is the only cancel path there
+    # is. It starts regardless and decides for itself (epigone.safety.coldstart).
     restart: unless-stopped
 
 volumes:
   pgdata:
+  # The watchdog's encrypted cold-start key cache. Sealed under the KEK, so
+  # this volume alone yields nothing — same property a database dump has.
+  watchdog-state:

@@ -3,11 +3,23 @@ alone.
 
 Wiring notes, each load-bearing:
 
-- FAIL-FAST ON MISSING SIGNER: no watchdog-lane agent key in the keystore
-  means this process cannot cancel anything — a watchdog that beats its
+- FAIL-FAST ON MISSING SIGNER: no watchdog-lane agent key — in the keystore
+  when Postgres answers, in the encrypted local cache when it does not —
+  means this process cannot cancel anything, and a watchdog that beats its
   heartbeat but can't act would be worse than none (false safety), so it
   refuses to start instead. Run the ceremony with `--lane watchdog`
   (docs/runbooks/agent-key-ceremony.md) before enabling the service.
+- STARTUP DOES NOT REQUIRE POSTGRES (issue #145). epigone.safety.coldstart
+  probes the database on a bounded connect for a grace window; if it never
+  answers, the process COLD-STARTS BLIND — cached watchdog-lane key,
+  deferred migration check, an incident declared at launch so the first
+  cycle cancels — and reconciles into the trail when Postgres returns,
+  launch stamp included, with the actual launch time.
+- CANCEL-ONLY BY CONSTRUCTION: the real gateway is wrapped in
+  CancelOnlyExecutionGateway before the audit wrapper, so no path through
+  this process — the blind cold-start path least of all — can place,
+  modify, or re-lever. The watchdog's authority is subtractive; that is now
+  a property of the wiring rather than of what the code happens to call.
 - Phase A is operator-only: the account under protection is the operator's
   (ADMIN_TELEGRAM_ID names the keystore row). Multi-account is Phase B.
 - The rate budget is a FallbackBudget over a SharedWeightBudget at
@@ -33,17 +45,17 @@ import aiohttp
 from epigone.budget import SharedWeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
-from epigone.db import create_pool, migrate
 from epigone.gateway.execution import AmbiguousExecutionError
 from epigone.gateway.execution_http import HttpExecutionGateway
 from epigone.gateway.http import HttpHyperliquidGateway
-from epigone.keystore import WATCHDOG_LANE, AgentKeystore, KeystoreError, load_kek
-from epigone.safety import heartbeat
+from epigone.keystore import KeystoreError, load_kek
 from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
 from epigone.safety.budget import PRIMARY_ATTEMPT_CEILING_SECONDS, FallbackBudget
+from epigone.safety.cancel_only import CancelOnlyExecutionGateway
+from epigone.safety.coldstart import open_startup
 from epigone.safety.config import WatchdogConfig
-from epigone.safety.db import create_safety_pool
 from epigone.safety.deadman import DeadMansSwitch
+from epigone.safety.keycache import WatchdogKeyCache
 from epigone.safety.watchdog import Watchdog
 
 log = logging.getLogger(__name__)
@@ -83,30 +95,35 @@ async def main() -> None:
     settings = Settings.from_env()
     config = WatchdogConfig.from_env()
     clock = SystemClock()
-
-    # STARTUP runs on a plain, unbounded pool — migrations legitimately take
-    # long on a fresh database and must not inherit incident-tuned timeouts.
-    # RUNTIME then switches to the safety pool, where every DB touch is
-    # bounded (connect, per-query, lock waits) so a HANGING database becomes
-    # the exception the degradation design handles instead of a stuck await
-    # (epigone.safety.db, PR #143 round 3). Startup needing Postgres at all
-    # is the cold-start boundary the runbook states plainly.
-    startup_pool = await create_pool(settings.database_url)
-    try:
-        await migrate(startup_pool)
-    finally:
-        await startup_pool.close()
-    pool = await create_safety_pool(settings.database_url)
+    launched_at = clock.now()
 
     kek_path = os.environ.get("KEYSTORE_KEK_FILE")
     if not kek_path:
         raise KeystoreError("KEYSTORE_KEK_FILE must name the KEK file (outside git)")
-    keystore = AgentKeystore(pool, load_kek(Path(kek_path)), clock)
+    kek = load_kek(Path(kek_path))
     operator_id = settings.require_admin_telegram_id()
-    signer = await keystore.signer(operator_id, WATCHDOG_LANE)  # fail fast (module docstring)
-    record = await keystore.active_record(operator_id, WATCHDOG_LANE)
-    assert record is not None  # signer() above proved it
-    master_address = record.master_address
+
+    # Where startup used to hard-depend on Postgres (pool → migrations →
+    # keystore) it now DECIDES (issue #145, epigone.safety.coldstart): a
+    # DB-backed start migrates, loads the keystore's watchdog-lane key and
+    # refreshes the local cache from it; a start whose grace window expires
+    # unanswered takes the cached key instead and hands back a pool that
+    # keeps trying to become real. `record_start` is stamped inside — at
+    # launch when Postgres answers, retroactively on the reconnect when it
+    # does not (the #52 grace clock must not restart because of a cold start).
+    startup = await open_startup(
+        database_url=settings.database_url,
+        clock=clock,
+        kek=kek,
+        cache=WatchdogKeyCache(config.key_cache_path, kek),
+        operator_id=operator_id,
+        launched_at=launched_at,
+        grace=config.coldstart_grace,
+        retry_every=config.interval,
+    )
+    pool = startup.pool
+    signer = startup.signer
+    master_address = startup.master_address
 
     audit = ExecutionAudit(pool, clock)
     budget = FallbackBudget(
@@ -115,19 +132,21 @@ async def main() -> None:
         ),
         clock,
     )
-    # The never-verified capability grace period ages from this stamp
-    # (migration 0026); startup requires Postgres anyway, so it always lands.
-    await heartbeat.record_start(pool, heartbeat.WATCHDOG_PROCESS, clock.now())
     async with aiohttp.ClientSession() as session:
         read_gateway = HttpHyperliquidGateway(session, clock, info_url=config.info_url)
         exec_gateway = AuditedExecutionGateway(
-            HttpExecutionGateway(
-                session,
-                clock,
-                budget,
-                signer=signer,
-                master_address=master_address,
-                exchange_url=config.exchange_url,
+            # Cancel-only INSIDE the audit wrapper (module docstring): a
+            # refused placement never reaches the signer, and still leaves
+            # its error row on the trail.
+            CancelOnlyExecutionGateway(
+                HttpExecutionGateway(
+                    session,
+                    clock,
+                    budget,
+                    signer=signer,
+                    master_address=master_address,
+                    exchange_url=config.exchange_url,
+                )
             ),
             audit,
             actor=WATCHDOG_ACTOR,
@@ -161,21 +180,35 @@ async def main() -> None:
             db_blind_after=config.db_blind_after,
             capability_interval=config.capability_interval,
         )
+        if startup.cold_start:
+            # The incident opens HERE, not after a threshold: the startup
+            # grace already spent the blind threshold's worth of unbroken
+            # unreachability, so the first cycle cancels (issue #145).
+            assert startup.reason is not None
+            watchdog.declare_cold_start(launched_at, startup.reason)
         # "Which mechanism(s) are active" starts here on the trail: the
         # watchdog is primary the moment it runs; the deadman announces its
         # own eligibility transitions as it probes.
-        await audit.record_event(
-            actor=WATCHDOG_ACTOR,
-            action="watchdog_started",
-            risk_decision="process start",
-            detail={
-                "primary": "watchdog process (scheduleCancel is volume-gated, PR #141)",
-                "exchange_url": config.exchange_url,
-                "executor_stale_seconds": int(config.executor_stale.total_seconds()),
-                "interval_seconds": int(config.interval.total_seconds()),
-            },
-            master_address=master_address,
-        )
+        try:
+            await audit.record_event(
+                actor=WATCHDOG_ACTOR,
+                action="watchdog_started",
+                risk_decision="process start",
+                detail={
+                    "primary": "watchdog process (scheduleCancel is volume-gated, PR #141)",
+                    "exchange_url": config.exchange_url,
+                    "executor_stale_seconds": int(config.executor_stale.total_seconds()),
+                    "interval_seconds": int(config.interval.total_seconds()),
+                    "cold_start": startup.cold_start,
+                },
+                master_address=master_address,
+            )
+        except Exception:
+            # A cold start has no database to announce itself to, and the
+            # announcement must never be what stops the switch from running.
+            # The reconnect's own event and the blind-window reconcile carry
+            # the story into the trail once Postgres answers.
+            log.exception("watchdog: could not record the process-start event; continuing")
         log.info(
             "watchdog: guarding %s every %ss (executor stale after %ss, %s)",
             master_address,

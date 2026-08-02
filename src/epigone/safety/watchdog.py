@@ -75,6 +75,17 @@ dependency instead of bounding another leg:
   case except a watchdog death inside the recovery-to-reconcile window —
   the runbook's one carve-out).
 
+A COLD START DURING AN OUTAGE IS THE SAME INCIDENT, DECLARED AT LAUNCH
+(issue #145). The guarantee above used to cover an already-running process
+only, because startup needed Postgres for the pool, the migrations, and the
+keystore row holding the agent key — so a crash, a reboot, or a deploy
+*during* an outage left no cancel path at all. epigone.safety.coldstart
+removes that: the key comes from an encrypted local cache, the migration
+check is deferred to the reconnect, and the watchdog is handed an incident
+that is already open (`declare_cold_start`) so its FIRST cycle cancels. The
+kind is preserved end to end — "cold-start DB-blind sweep" — because the
+operator's follow-up differs from a running-process window.
+
 THE SWEEP NEVER TRUSTS A CANCEL'S WORD. `swept_at` is stamped only when a
 FRESH enumeration of the book answers empty — cancel results, however clean,
 don't count, and an AmbiguousExecutionError just means the next cycle
@@ -156,11 +167,19 @@ class _BlindIncident:
     — the distinction the reconciled halt's headline must preserve, so the
     operator can tell them apart). Held until a cycle can write the halt
     row — the reconcile — so the state machinery and the operator alert
-    catch up with what the wire already did."""
+    catch up with what the wire already did.
+
+    `cold_start` (issue #145) splits the db_blind case once more: the
+    process came up with Postgres already unreachable, so it has NEVER seen
+    halt state or executor liveness, and its key came from the local cache
+    rather than the keystore. Same protective behaviour, different operator
+    follow-up — the process was restarted mid-outage — so the reason it
+    reconciles under says so."""
 
     since: datetime
     reason: str
     db_blind: bool
+    cold_start: bool = False
 
 
 class Watchdog:
@@ -204,6 +223,19 @@ class Watchdog:
         self._db_failing_since: datetime | None = None
         self._blind: _BlindIncident | None = None
         self._blind_passes = 0
+
+    def declare_cold_start(self, since: datetime, reason: str) -> None:
+        """The process came up blind (issue #145): Postgres was unreachable at
+        launch, so epigone.safety.main loaded the agent key from the local
+        cache and hands the watchdog an incident that is ALREADY open. The
+        first cycle therefore cancels — there is nothing to wait for. A
+        running process waits out `db_blind_after` because a blip is not an
+        incident; here the outage has already outlived the startup grace
+        (WATCHDOG_COLDSTART_GRACE_SECONDS, the same span), so the same rule
+        has already been satisfied by the time this is called."""
+        self._declare(
+            _BlindIncident(since=since, reason=reason, db_blind=True, cold_start=True)
+        )
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
@@ -349,7 +381,7 @@ class Watchdog:
         keys the plain-reason/no-window-event shape on it rather than
         inferring it from timestamp equality."""
         assert self._blind is not None
-        kind = "DB-blind sweep" if self._blind.db_blind else "unrecorded trip"
+        kind = _incident_kind(self._blind)
         try:
             await self._unrecorded_pass(f"{kind}: {self._blind.reason}")
         except Exception:
@@ -429,7 +461,7 @@ class Watchdog:
             # halt row's commit and clearing the incident, in which case the
             # next cycle joins its own, successfully written row — the label
             # must be true for both that case and a genuinely failing write.
-            headline = "DB-blind sweep reconciled" if self._blind.db_blind else (
+            headline = f"{_incident_kind(self._blind)} reconciled" if self._blind.db_blind else (
                 "unrecorded trip reconciled (halt row write had not been confirmed)"
             )
             reason = (
@@ -453,6 +485,9 @@ class Watchdog:
                     "unrecorded_cancel_passes": self._blind_passes,
                     "halt_id": halt.id,
                     "joined_standing_halt": not created,
+                    # Issue #145: which KIND of blind window this was, as a
+                    # queryable field and not only inside the prose reason.
+                    "cold_start": self._blind.cold_start,
                 },
                 master_address=self._master,
             )
@@ -697,6 +732,18 @@ class Watchdog:
             exc_info=True,
         )
         self._next_capability_at = now + CAPABILITY_RETRY
+
+
+def _incident_kind(incident: _BlindIncident) -> str:
+    """The operator-facing name of an incident, used verbatim in the cancel
+    pass's risk decision and (with " reconciled") in the halt headline. Three
+    kinds, because the follow-up differs: an unreadable database, an
+    unreadable database that was ALREADY unreachable when this process
+    launched (issue #145 — the process restarted mid-outage), and a real
+    observed stall whose halt row could not be confirmed."""
+    if not incident.db_blind:
+        return "unrecorded trip"
+    return "cold-start DB-blind sweep" if incident.cold_start else "DB-blind sweep"
 
 
 def _position_json(position: Position) -> dict[str, str]:

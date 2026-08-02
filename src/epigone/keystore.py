@@ -122,12 +122,15 @@ def _aad(user_id: int, agent_address: str) -> bytes:
     return f"epigone-agent-key:{user_id}:{agent_address}".encode()
 
 
-def _seal(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
+def seal(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
+    """One AES-256-GCM envelope leg. Public because the watchdog's local key
+    cache (issue #145) must use THIS custody — same KEK, same AAD-binding
+    discipline — rather than grow a second, subtly different crypto path."""
     nonce = secrets.token_bytes(_NONCE_LEN)
     return nonce + AESGCM(key).encrypt(nonce, plaintext, aad)
 
 
-def _unseal(key: bytes, blob: bytes, aad: bytes) -> bytes:
+def unseal(key: bytes, blob: bytes, aad: bytes) -> bytes:
     # ValueError covers malformed blobs (e.g. truncated below a valid nonce);
     # every decrypt failure mode must surface as the domain error, and the
     # message must carry no key-derived material.
@@ -222,8 +225,8 @@ class AgentKeystore:
                 agent_address,
                 agent_name,
                 self._kek.kek_id,
-                _seal(self._kek.material, dek, aad),
-                _seal(dek, private_key, aad),
+                seal(self._kek.material, dek, aad),
+                seal(dek, private_key, aad),
                 now,
                 expires_at,
             )
@@ -288,8 +291,8 @@ class AgentKeystore:
                 f"loaded KEK is {self._kek.kek_id}"
             )
         aad = _aad(user_id, row["agent_address"])
-        dek = _unseal(self._kek.material, row["dek_wrapped"], aad)
-        private_key = _unseal(dek, row["key_ciphertext"], aad)
+        dek = unseal(self._kek.material, row["dek_wrapped"], aad)
+        private_key = unseal(dek, row["key_ciphertext"], aad)
         account: LocalAccount = Account.from_key(private_key)
         if str(account.address).lower() != row["agent_address"]:
             raise KeystoreError(

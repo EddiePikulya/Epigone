@@ -24,6 +24,14 @@ is deregistered (step 4) it is beating-but-impotent. The ~6-hourly on-chain
 capability probe will page 🚨 if you forget, but the restart is what fixes
 it, and doing it inside the overlap window means zero impotent minutes.
 
+The restart also refreshes the watchdog's **cold-start key cache** (issue
+#145): the encrypted local copy it would fall back on if it had to start
+while Postgres was unreachable. Until a DB-backed start happens, that cache
+still holds the OLD key — so a rotation followed by an outage-time restart
+would come up on the pre-rotation key. It reconciles itself (the reconnect
+refreshes the cache and logs the mismatch loudly), but the clean sequence is:
+rotate → restart → *then* deregister the old agent.
+
 ## Steps
 
 1. **Approve the new agent first, under the alternate name.** Run the
