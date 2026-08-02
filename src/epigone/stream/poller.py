@@ -41,11 +41,21 @@ time, never at delivery, so unmuting or raising a floor never dumps a backlog.
   their snapshots and poll state; following them again re-baselines silently
   instead of diffing against a stale snapshot and alerting on ancient changes.
 
-Snapshot updates and alert-row inserts share one transaction per Trader, so an
-event is detected exactly once: after a stream restart the snapshots already
-reflect everything alerted, and anything not yet committed diffs again.
-One alert row is queued per event per follower; the bot process owns delivery
-(ADR-0002: processes meet only in Postgres).
+Snapshot updates, event rows and alert-row inserts share one transaction per
+Trader, so an event is detected exactly once: after a stream restart the
+snapshots already reflect everything recorded, and anything not yet committed
+diffs again. One alert row is queued per event per follower; the bot process
+owns delivery (ADR-0002: processes meet only in Postgres).
+
+Each event is also written down durably, once, in `position_events` (issue
+#156, ADR-0006) — the seam the copy executor (#136) reads. That table is a
+record of what this pass decided, never a second opinion about it: both writes
+iterate the same in-memory list. Alerts are untouched by it. They keep their
+per-follower shape and their mute/min-size suppression, because those are
+notification preferences and an executor must see a leader's trade whether or
+not any follower's floor admits it — so the event write is unfiltered, and a
+wallet in the poll set only because a User linked it (#121) records events too,
+though nobody is alerted about it. See epigone.position_events.
 """
 
 import logging
@@ -66,6 +76,7 @@ from epigone.gateway import (
     fetch_open_positions,
 )
 from epigone.ingest.fine import mark_due_now
+from epigone.position_events import PositionEvent, record_events
 
 log = logging.getLogger(__name__)
 
@@ -98,21 +109,6 @@ class PollResult:
     failed: int
     events: int
     aborted: bool
-
-
-@dataclass(frozen=True)
-class _Event:
-    kind: str  # 'open' | 'close' | 'flip' | 'scale_in' | 'scale_out'
-    coin: str
-    side: str | None = None  # new leg
-    size_usd: Decimal | None = None  # the position notional the alert is about
-    prev_size_usd: Decimal | None = None  # size before a scale
-    leverage: Decimal | None = None
-    entry_price: Decimal | None = None
-    prev_side: str | None = None  # closed leg
-    realized_pnl: Decimal | None = None
-    pct_return: Decimal | None = None
-    opened_at: datetime | None = None
 
 
 async def run_poll_pass(
@@ -225,7 +221,8 @@ async def _apply_poll(
     pool: asyncpg.Pool, address: str, positions: list[Position], now: datetime
 ) -> int:
     """Diff one Trader's freshly fetched positions against the snapshots and
-    commit snapshots + alert rows atomically. Returns the event count."""
+    commit snapshots + event rows + alert rows atomically. Returns the event
+    count."""
     current = {p.coin: p for p in positions}
     async with pool.acquire() as conn, conn.transaction():
         baselined = await conn.fetchval(
@@ -250,7 +247,7 @@ async def _apply_poll(
                 "SELECT * FROM position_snapshots WHERE trader_address = $1", address
             )
         }
-        events: list[_Event] = []
+        events: list[PositionEvent] = []
         for coin, snapshot in previous.items():
             if coin not in current:
                 events.append(_close_event(snapshot))
@@ -282,6 +279,14 @@ async def _apply_poll(
             now,
         )
         if events:
+            # The durable record first (issue #156, ADR-0006), in this same
+            # already-open transaction as the snapshot advances above and the
+            # alert fan-out below — never a second transaction and never a
+            # write outside one. That is what makes an interrupted pass leave
+            # both or neither: the exactly-once property the alerts have always
+            # had, inherited rather than reinvented. Both writes iterate the
+            # same in-memory list, so the table and the alerts cannot diverge.
+            await record_events(conn, address, events, now)
             await _queue_alerts(conn, address, events, now)
             # A close or flip mints a round-trip; bump the wallet due-now so the
             # fine pass folds it in within minutes and Recent trades / track
@@ -299,24 +304,28 @@ async def _apply_poll(
         return len(events)
 
 
-def _open_event(pos: Position) -> _Event:
-    return _Event(
+def _open_event(pos: Position) -> PositionEvent:
+    return PositionEvent(
         kind="open",
         coin=pos.coin,
         side=pos.side.value,
         size_usd=pos.size_usd,
+        size_coin=pos.size_coin,
         leverage=pos.leverage,
         entry_price=pos.entry_price,
     )
 
 
-def _close_event(snapshot: asyncpg.Record) -> _Event:
-    return _Event(
+def _close_event(snapshot: asyncpg.Record) -> PositionEvent:
+    return PositionEvent(
         kind="close",
         coin=snapshot["coin"],
         # The closed position's last notional, so a min-size floor (issue #10)
-        # judges a close by the position it closed, not a null.
+        # judges a close by the position it closed, not a null. Its coin units
+        # travel the same way (#155, ADR-0006) and can only come from here — by
+        # the time the pass sees the close, a live fetch shows nothing at all.
         size_usd=snapshot["size_usd"],
+        size_coin=snapshot["size_coin"],
         prev_side=snapshot["side"],
         realized_pnl=snapshot["unrealized_pnl"],
         pct_return=_return_on_margin(snapshot),
@@ -324,7 +333,7 @@ def _close_event(snapshot: asyncpg.Record) -> _Event:
     )
 
 
-def _scale_event(snapshot: asyncpg.Record, pos: Position) -> _Event | None:
+def _scale_event(snapshot: asyncpg.Record, pos: Position) -> PositionEvent | None:
     """A same-coin/same-side size change worth an alert, or None if it is below
     SCALE_SIGNIFICANCE_THRESHOLD (ordinary drift — keep today's silent update).
 
@@ -336,12 +345,14 @@ def _scale_event(snapshot: asyncpg.Record, pos: Position) -> _Event | None:
         return None
     if abs(new - old) / old < SCALE_SIGNIFICANCE_THRESHOLD:
         return None
-    return _Event(
+    return PositionEvent(
         kind="scale_in" if new > old else "scale_out",
         coin=pos.coin,
         side=pos.side.value,
         size_usd=new,
+        size_coin=pos.size_coin,
         prev_size_usd=old,
+        prev_size_coin=snapshot["size_coin"],
         leverage=pos.leverage,
         entry_price=pos.entry_price,
         # The position's live return on margin (issue #35), so the alert can say
@@ -351,14 +362,15 @@ def _scale_event(snapshot: asyncpg.Record, pos: Position) -> _Event | None:
     )
 
 
-def _flip_event(snapshot: asyncpg.Record, pos: Position) -> _Event:
+def _flip_event(snapshot: asyncpg.Record, pos: Position) -> PositionEvent:
     closed = _close_event(snapshot)
     opened = _open_event(pos)
-    return _Event(
+    return PositionEvent(
         kind="flip",
         coin=pos.coin,
         side=opened.side,
         size_usd=opened.size_usd,
+        size_coin=opened.size_coin,
         leverage=opened.leverage,
         entry_price=opened.entry_price,
         prev_side=closed.prev_side,
@@ -423,7 +435,7 @@ async def _replace_snapshot(
 
 
 async def _queue_alerts(
-    conn: asyncpg.Connection, address: str, events: list[_Event], now: datetime
+    conn: asyncpg.Connection, address: str, events: list[PositionEvent], now: datetime
 ) -> None:
     """Fan out each event to this Trader's followers, honouring each Track's
     alert controls (issue #10): a muted Track gets nothing, and an effective
@@ -473,7 +485,7 @@ async def _queue_alerts(
     )
 
 
-def _below_floor(event: _Event, floor: Decimal | None) -> bool:
+def _below_floor(event: PositionEvent, floor: Decimal | None) -> bool:
     """Whether a min-size floor suppresses this event. A floor judges every
     alert kind by the position notional it carries (event.size_usd); an event
     with no notional (should not happen) is never suppressed."""
