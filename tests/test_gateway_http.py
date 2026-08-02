@@ -7,7 +7,7 @@ replays it so the real gateway code runs an actual request/response cycle.
 """
 
 import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Coroutine
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -27,6 +27,7 @@ from epigone.gateway.http import (
     parse_positions,
 )
 from tests.support.clock import FakeClock
+from tests.support.hanging import hanging_gateway
 
 WHALE = "0xAF0FDD39E5d92499B0eD9F68693DA99C0ec1e92e"
 
@@ -401,3 +402,31 @@ async def test_get_fills_since_makes_no_request_before_the_window_opens() -> Non
 
     assert fills == []
     assert received == []
+
+
+# --- A timeout is a transport failure (issue #163) ----------------------------
+# A timeout escapes an aiohttp.ClientError wrap (see epigone.gateway.http's
+# module docstring for why, and what it cost in production). Every read call
+# site must name it, so callers keep the one degradation path they already have
+# — hence a case per public read method rather than a spot check.
+
+READ_CALLS: dict[str, Callable[[HttpHyperliquidGateway], Coroutine[Any, Any, Any]]] = {
+    "get_open_positions": lambda g: g.get_open_positions(WHALE),
+    "get_open_orders": lambda g: g.get_open_orders(WHALE),
+    "get_fills": lambda g: g.get_fills(WHALE),
+    "get_fills_since": lambda g: g.get_fills_since(WHALE, datetime(2026, 7, 1, tzinfo=UTC)),
+    "get_perp_universe": lambda g: g.get_perp_universe(),
+    "get_perp_dexs": lambda g: g.get_perp_dexs(),
+    "get_extra_agents": lambda g: g.get_extra_agents(WHALE),
+    "get_leaderboard": lambda g: g.get_leaderboard(),
+}
+
+
+@pytest.mark.parametrize("call", list(READ_CALLS.values()), ids=list(READ_CALLS))
+async def test_a_timed_out_request_surfaces_as_gateway_error(
+    call: Callable[[HttpHyperliquidGateway], Coroutine[Any, Any, Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with hanging_gateway(monkeypatch) as gateway:
+        with pytest.raises(GatewayError):
+            await call(gateway)
