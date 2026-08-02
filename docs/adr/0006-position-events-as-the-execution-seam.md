@@ -339,8 +339,10 @@ document contradicting the code:
   reads a source it did not filter for — which is #158's decision to make, not
   a property the shadow phase has.
 - **Order events stayed unsolved, as §Scope requires.** #157's issue text asked
-  for resting-order changes "recorded as position events"; an operator-agreed
-  scope correction narrowed it back to positions, on this ADR's reasoning. The
+  for resting-order changes "recorded as position events"; the implementation
+  session narrowed this to positions on this ADR's reasoning, and the operator
+  confirmed the narrowing at merge review (2026-08-02), deferring order
+  persistence to a dedicated follow-up ticket rather than dropping it. The
   lane subscribes to `orderUpdates` (it costs a subscription and serves the
   liveness signal) and counts what arrives, but persists nothing — the order
   seam's schema remains a decision to be made with the cutover, not a detail to
