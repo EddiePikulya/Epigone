@@ -14,6 +14,14 @@ A 429 backs off and retries here rather than surfacing (issue #28): sleep the
 server's Retry-After when present, else an exponential window with jitter.
 Only a persistent streak escapes, as RateLimitedError, which callers treat as
 pacing — retry the item later, never abort a whole pass over it.
+
+Every OTHER transport failure — including a request that exhausts
+REQUEST_TIMEOUT — leaves this module as GatewayError, so a caller has exactly
+one degradation path to write (issue #163). A timeout is easy to miss here: it
+raises the builtin TimeoutError (what asyncio.TimeoutError aliases), which is
+NOT an aiohttp.ClientError, so it must be named in each wrap explicitly — as
+the write-side execution gateway already does. Missing it cost the stream
+process its life on one slow clearinghouseState (production, 2026-07-31).
 """
 
 import heapq
@@ -83,7 +91,7 @@ class HttpHyperliquidGateway:
     async def get_leaderboard(self) -> list[LeaderboardEntry]:
         try:
             payload = await self._request_json("GET", LEADERBOARD_URL)
-        except aiohttp.ClientError as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"leaderboard request failed: {exc}") from exc
         return parse_leaderboard(payload)
 
@@ -144,7 +152,7 @@ class HttpHyperliquidGateway:
                 self._info_url,
                 json_body={"type": request_type, "user": address.lower(), **extra},
             )
-        except aiohttp.ClientError as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"{request_type} request failed for {address}: {exc}") from exc
 
     async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
@@ -153,7 +161,7 @@ class HttpHyperliquidGateway:
             body["dex"] = dex  # a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21)
         try:
             payload = await self._request_json("POST", self._info_url, json_body=body)
-        except aiohttp.ClientError as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
         return parse_positions(payload, dex)
 
@@ -163,7 +171,7 @@ class HttpHyperliquidGateway:
             body["dex"] = dex  # per-dex like clearinghouseState (verified live 2026-07-24)
         try:
             payload = await self._request_json("POST", self._info_url, json_body=body)
-        except aiohttp.ClientError as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"frontendOpenOrders request failed for {address}: {exc}") from exc
         return parse_open_orders(payload, dex)
 
@@ -173,7 +181,7 @@ class HttpHyperliquidGateway:
             body["dex"] = dex
         try:
             payload = await self._request_json("POST", self._info_url, json_body=body)
-        except aiohttp.ClientError as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"meta request failed for dex {dex!r}: {exc}") from exc
         return parse_perp_universe(payload, dex)
 
@@ -182,22 +190,24 @@ class HttpHyperliquidGateway:
             payload = await self._request_json(
                 "POST", self._info_url, json_body={"type": "perpDexs"}
             )
-        except aiohttp.ClientError as exc:
+        except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"perpDexs request failed: {exc}") from exc
         return parse_perp_dexs(payload)
 
     async def get_extra_agents(self, address: str) -> list[ExtraAgent]:
-        try:
-            payload = await self._info_json("extraAgents", address)
-        except aiohttp.ClientError as exc:
-            raise GatewayError(f"extraAgents request failed for {address}: {exc}") from exc
-        return parse_extra_agents(payload)
+        # No wrap of its own: _info_json already raises GatewayError naming this
+        # request type, exactly as get_fills relies on. (It used to carry an
+        # outer aiohttp.ClientError catch, which nothing could ever reach — a
+        # transport failure was a GatewayError by the time it got here. Left in
+        # place it would have read as a second handler that also needed the
+        # timeout fix, issue #163.)
+        return parse_extra_agents(await self._info_json("extraAgents", address))
 
     async def _request_json(
         self, method: str, url: str, *, json_body: dict[str, Any] | None = None
     ) -> Any:
         """One request with 429 backoff-and-retry; other failures raise untouched
-        (aiohttp errors, wrapped per-endpoint by the callers)."""
+        (aiohttp errors and timeouts, wrapped per-endpoint by the callers)."""
         for attempt in range(RATE_LIMIT_MAX_TRIES):
             async with self._session.request(
                 method, url, json=json_body, timeout=REQUEST_TIMEOUT

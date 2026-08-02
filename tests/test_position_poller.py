@@ -12,20 +12,33 @@ epigone.stream.poller):
   snapshot update, so a restart neither re-alerts nor loses events
 
 Alert-control suppression (mute, min-size) lives in tests/test_alert_controls.py.
+
+One exception to the fake-gateway convention, at the bottom: the timeout tests
+(issue #163) drive the REAL gateway against a stalled server, because the
+behaviour they pin — a timeout becoming a GatewayError — is the production
+gateway's, and a fake asked to "time out" would be asserting a policy this
+pass deliberately does not own.
 """
 
+import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
+import pytest
 
 from epigone.budget import WeightBudget
 from epigone.clock import Clock
 from epigone.gateway import GatewayError, Position, RateLimitedError, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.ingest.fine import MARK_DUE_FRESHNESS
-from epigone.stream.poller import POSITIONS_WEIGHT, run_poll_pass
+from epigone.stream.poller import (
+    MAX_CONSECUTIVE_FAILURES,
+    POSITIONS_WEIGHT,
+    run_poll_pass,
+)
 from tests.support.clock import FakeClock
+from tests.support.hanging import hanging_gateway
 
 WIDE_OPEN_BUDGET = 1_000_000
 
@@ -435,6 +448,64 @@ async def test_rate_limit_streaks_do_not_abort_the_pass(
     assert result.failed == 6 and result.polled == 1
     # Each escaped RateLimitedError feeds the health monitor's signal (issue #54).
     assert await pool.fetchval("SELECT count(*) FROM rate_limit_events") == 6
+
+
+# --- A timed-out request costs one wallet, not the process (issue #163) -------
+# A request that exceeds the gateway's timeout raises the builtin TimeoutError,
+# which is not an aiohttp.ClientError — before #163 it escaped the gateway's
+# wrap, crossed this pass and killed the stream process (production,
+# 2026-07-31). These two are the module docstring's stated exception: the wrap
+# under test lives in the REAL gateway, so they drive it against a server that
+# never answers (tests.support.hanging) instead of the fake, which could only
+# replay a decision this pass already handles.
+
+
+async def test_a_timed_out_wallet_fails_alone_and_the_pass_carries_on(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await track(pool, clock, "0xaaa", 42)
+    await track(pool, clock, "0xbbb", 42)
+
+    with caplog.at_level(logging.WARNING, logger="epigone.stream.poller"):
+        async with hanging_gateway(monkeypatch, hangs={"0xaaa"}) as gateway:
+            result = await run_poll_pass(
+                pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock
+            )
+
+    # The timeout counted as one ordinary failure; the next wallet still polled
+    # and the pass returned normally rather than raising through its caller.
+    assert not result.aborted
+    assert result.failed == 1 and result.polled == 1
+    # Logged like any other transport failure, so the wallet that stalled is
+    # nameable from the logs rather than an anonymous bump in `failed`.
+    assert any("positions fetch failed for 0xaaa" in r.getMessage() for r in caplog.records)
+    # And the timeout was a failure, not an empty book: a swallowed one would
+    # have baselined 0xaaa off a position list nobody ever fetched.
+    assert (
+        await pool.fetchval(
+            "SELECT count(*) FROM position_poll_state WHERE trader_address = '0xaaa'"
+        )
+        == 0
+    )
+
+
+async def test_a_timeout_streak_counts_toward_the_abort_streak(
+    pool: asyncpg.Pool, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Hyperliquid hanging on every wallet is an outage like any other: the pass
+    # stops burning budget at the same threshold other transport failures hit.
+    addresses = [f"0x{i:03d}" for i in range(MAX_CONSECUTIVE_FAILURES + 2)]
+    for address in addresses:
+        await track(pool, clock, address, 42)
+
+    async with hanging_gateway(monkeypatch, hangs=set(addresses)) as gateway:
+        result = await run_poll_pass(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock)
+
+    assert result.aborted
+    assert result.failed == MAX_CONSECUTIVE_FAILURES
 
 
 async def test_the_pass_is_paced_by_the_weight_budget(

@@ -55,6 +55,25 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # The websocket shadow lane (issue #157): a SECOND producer of position
+  # events, writing source = 'ws' rows beside the poller's so the cutover
+  # ticket can compare the two transports. Nothing consumes those rows — REST
+  # polling stays authoritative and Position Alerts are untouched.
+  #
+  # Its own service rather than a third loop inside `stream`, and that is the
+  # safety argument rather than packaging: sharing the stream process would
+  # give a shadow lane a path to kill the pollers. Here it can crash, wedge, or
+  # be stopped (`docker compose stop ws`) and alerting never notices.
+  ws:
+    build: .
+    command: ["/app/.venv/bin/python", "-m", "epigone.ws.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Proactive health-check (issue #52): evaluates liveness/freshness signals on a
   # short cadence and DMs the admin on Telegram — problem alerts, recoveries, and
   # a daily "all good" heartbeat. Send-only (no polling), so it shares the bot

@@ -68,6 +68,14 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 # The deploy runs this one under the *host's* python3 (issue #160), not ours, so
 # it stays inside 3.9-era syntax: `timezone.utc` rather than 3.11's `datetime.UTC`.
 "src/epigone/dump_retention.py" = ["UP017"]
+# The websocket seam's `receive(timeout=…)` is the interface, not a helper
+# reaching for asyncio.timeout: a tick that expires with no message is a
+# RESULT the lane acts on (ping, liveness check, tracked-set refresh), not a
+# cancellation, and asyncio.timeout would turn it into one.
+"src/epigone/ws/__init__.py" = ["ASYNC109"]
+"src/epigone/ws/transport.py" = ["ASYNC109"]
+"tests/support/websocket.py" = ["ASYNC109"]
+"tests/test_ws_lane.py" = ["ASYNC109"]
 # aiogram's BaseSession interface mandates `timeout` parameters.
 "tests/support/telegram.py" = ["ASYNC109"]
 "tests/test_alert_delivery.py" = ["ASYNC109"]
