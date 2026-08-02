@@ -319,3 +319,35 @@ the failure mode option 1 has.
   favouring a missed copy over a doubled one.
 - Order events remain unsolved, deliberately. `order_alerts` keeps its batched
   per-follower shape until the WS lane makes a per-order seam meaningful.
+
+## Update, 2026-08-02 (issue #157): the shadow phase, and what the one-producer invariant binds
+
+The WS lane landed as this ADR anticipated — a second producer writing these
+same rows with `source = 'ws'`, and the executor untouched. Two clarifications
+the implementation forced, recorded here so a later reader does not find the
+document contradicting the code:
+
+- **"One producer per (trader, coin) at a time" binds from CUTOVER, not now.**
+  The Ordering section states that invariant and derives it from "a copy-enabled
+  wallet is streamed *or* polled, never both". The shadow lane deliberately
+  violates it: it subscribes to the whole poll set and dual-writes every
+  `(trader, coin)`, because comparing the transports is the entire point and
+  requires both descriptions of the same change. That is the case the Ordering
+  section itself allows two paragraphs later ("a dual-written (trader, coin) is
+  that comparison working, not a bug"), and it is safe only because NOTHING
+  consumes `'ws'` rows. The invariant becomes binding the moment a consumer
+  reads a source it did not filter for — which is #158's decision to make, not
+  a property the shadow phase has.
+- **Order events stayed unsolved, as §Scope requires.** #157's issue text asked
+  for resting-order changes "recorded as position events"; an operator-agreed
+  scope correction narrowed it back to positions, on this ADR's reasoning. The
+  lane subscribes to `orderUpdates` (it costs a subscription and serves the
+  liveness signal) and counts what arrives, but persists nothing — the order
+  seam's schema remains a decision to be made with the cutover, not a detail to
+  be improvised inside a shadow lane.
+
+One factual correction to the Context section while the record is open: the
+"~1-3s" latency it projects is what the transport ALLOWS, not a measurement.
+`allDexsClearinghouseState` was observed pushing absolute state on a ~5s cadence
+for an idle account; whether a change also triggers an immediate push is
+unsettled and is #158's to measure. See docs/research/ecosystem-survey.md.

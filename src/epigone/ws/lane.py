@@ -96,9 +96,16 @@ import asyncpg
 
 from epigone.budget import Budget
 from epigone.clock import Clock
-from epigone.gateway import GatewayError, HyperliquidGateway, Position, RateLimitedError
-from epigone.position_diff import SnapshotState, diff_positions, events_of
+from epigone.gateway import (
+    GatewayError,
+    HyperliquidGateway,
+    Position,
+    RateLimitedError,
+    on_covered_venue,
+)
+from epigone.position_diff import diff_positions, events_of
 from epigone.position_events import WS_SOURCE, record_events
+from epigone.position_snapshots import WS_SNAPSHOTS, apply_changes, read_snapshots, remember
 from epigone.safety.heartbeat import beat, record_start
 from epigone.stream.poller import fetch_poll_set, fetch_positions_paced
 from epigone.ws import (
@@ -129,9 +136,6 @@ WS_LANE_PROCESS = "ws_shadow"
 # entirely separate from the 1200 weight/min REST cap that epigone.budget
 # paces against, which is the whole reason this transport is worth having.
 SUBSCRIPTION_LIMIT = 1000
-CONNECTION_LIMIT = 10
-OUTBOUND_MESSAGES_PER_MINUTE = 2000
-NEW_CONNECTIONS_PER_MINUTE = 30
 
 # What one Trader costs: the all-dex positions feed plus the account-wide order
 # feed. The per-dex forms would cost one subscription per venue for the same
@@ -208,9 +212,12 @@ class OutboundAllowance:
     what to do with a no, which for a subscription change is to defer it to the
     next refresh rather than block the read loop."""
 
-    def __init__(self, clock: Clock, limit: int = OUTBOUND_BUDGET_PER_MINUTE) -> None:
+    def __init__(self, clock: Clock, limit: int | None = None) -> None:
         self._clock = clock
-        self._limit = limit
+        # Read at construction rather than bound as a default argument, so the
+        # ceiling is one editable constant rather than a value frozen into this
+        # signature at import time.
+        self._limit = OUTBOUND_BUDGET_PER_MINUTE if limit is None else limit
         self._sent: list[datetime] = []
 
     def take(self) -> bool:
@@ -455,13 +462,26 @@ async def _apply_positions_message(
     is precisely the gap-losing behaviour the resync exists to prevent. In
     practice that only catches a push racing an unsubscribe."""
     try:
-        address, positions = parse_positions_message(message["data"])
+        address, streamed = parse_positions_message(message["data"])
     except (GatewayError, KeyError, TypeError) as exc:
         log.warning("ws lane: unreadable %s message: %s", POSITIONS_CHANNEL, exc)
         return 0
     if address not in subscribed:
         log.debug("ws lane: dropping %s message for unsubscribed %s", POSITIONS_CHANNEL, address)
         return 0
+    # The all-dex subscription carries EVERY venue; the resync that anchors it
+    # is a REST read of POSITION_VENUES only. Diffing the wider observation
+    # against memory built from the narrower one would read every uncovered
+    # coin as an OPEN it never saw close — and then, on each reconnect, as a
+    # CLOSE and an OPEN again, since the resync would drop it once more. So the
+    # stream is reduced to the venues the anchor can cover.
+    #
+    # That also keeps the comparison this lane exists for honest: the poller
+    # covers POSITION_VENUES, so a websocket event on a venue it never looks at
+    # would show up in #158 as a websocket-only signal and mean nothing about
+    # the transports. Widening coverage stays a REST-side decision (the mkts
+    # drop, epigone.gateway.POSITION_VENUES), taken once, for both lanes.
+    positions = [position for position in streamed if on_covered_venue(position.coin)]
     return await _apply_positions(pool, address, positions, now, resync=False)
 
 
@@ -493,7 +513,9 @@ async def _apply_positions(
             # newly tracked wallet would produce a burst of phantom opens that
             # the comparison would read as a websocket-only signal.
             for position in positions:
-                await _remember(conn, address, position, opened_at=now, updated_at=now)
+                await remember(
+                    conn, WS_SNAPSHOTS, address, position, opened_at=now, updated_at=now
+                )
             await conn.execute(
                 """
                 INSERT INTO ws_lane_state (trader_address, baselined_at, resynced_at,
@@ -505,25 +527,9 @@ async def _apply_positions(
             )
             return 0
 
-        previous = {
-            row["coin"]: SnapshotState.from_row(row)
-            for row in await conn.fetch(
-                "SELECT * FROM ws_position_snapshots WHERE trader_address = $1", address
-            )
-        }
+        previous = await read_snapshots(conn, WS_SNAPSHOTS, address)
         changes = diff_positions(previous, positions, now)
-        for change in changes:
-            if change.position is None:
-                await conn.execute(
-                    "DELETE FROM ws_position_snapshots WHERE trader_address = $1 AND coin = $2",
-                    address,
-                    change.coin,
-                )
-            else:
-                assert change.opened_at is not None  # a remembered position always has one
-                await _remember(
-                    conn, address, change.position, opened_at=change.opened_at, updated_at=now
-                )
+        await apply_changes(conn, WS_SNAPSHOTS, address, changes, now)
         events = events_of(changes)
         if events:
             await record_events(conn, address, events, now, source=WS_SOURCE)
@@ -543,43 +549,6 @@ async def _apply_positions(
                 now,
             )
         return len(events)
-
-
-async def _remember(
-    conn: asyncpg.Connection,
-    address: str,
-    position: Position,
-    *,
-    opened_at: datetime,
-    updated_at: datetime,
-) -> None:
-    await conn.execute(
-        """
-        INSERT INTO ws_position_snapshots
-            (trader_address, coin, side, size_usd, leverage, entry_price,
-             unrealized_pnl, size_coin, opened_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (trader_address, coin) DO UPDATE
-            SET side = EXCLUDED.side,
-                size_usd = EXCLUDED.size_usd,
-                leverage = EXCLUDED.leverage,
-                entry_price = EXCLUDED.entry_price,
-                unrealized_pnl = EXCLUDED.unrealized_pnl,
-                size_coin = EXCLUDED.size_coin,
-                opened_at = EXCLUDED.opened_at,
-                updated_at = EXCLUDED.updated_at
-        """,
-        address,
-        position.coin,
-        position.side.value,
-        position.size_usd,
-        position.leverage,
-        position.entry_price,
-        position.unrealized_pnl,
-        position.size_coin,
-        opened_at,
-        updated_at,
-    )
 
 
 async def _prune_unwatched(pool: asyncpg.Pool) -> None:

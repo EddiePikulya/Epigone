@@ -24,9 +24,14 @@ subscription cap has to be budgeted against.
 
 Note what the all-dex form covers: every venue, including the ones REST polling
 deliberately dropped for weight reasons (POSITION_VENUES omits mkts). That is a
-REST-side decision about REST costs and is not reintroduced there. It does mean
-a shadow-lane event can exist for a venue the poller never looks at — expected,
-and worth knowing when the two lanes are compared (#158).
+REST-side decision about REST costs and is not reintroduced there — so the lane
+REDUCES each message to the covered venues before diffing it
+(epigone.gateway.on_covered_venue). It has to: the reconnect resync that
+anchors the stream is a REST read, which can only see those venues, and diffing
+a wider observation against a narrower anchor manufactures a phantom OPEN for
+every uncovered coin — then a CLOSE and an OPEN on each reconnect. The
+subscription stays the all-dex form regardless, because it is one subscription
+where the per-dex forms are one apiece.
 """
 
 from collections.abc import Awaitable, Callable, Mapping
@@ -35,11 +40,10 @@ from typing import Any, Protocol
 from epigone.gateway import GatewayError, Position
 from epigone.gateway.http import parse_positions
 
-# The public websocket endpoints. Product data is mainnet, exactly like the
-# REST gateway's default; the testnet URL exists for the same reason
-# TESTNET_INFO_URL does — a harness pointing at it, never the product.
+# The public websocket endpoint. Product data is mainnet, exactly like the REST
+# gateway's default; probes against testnet carry their own URL
+# (scripts/testnet_ws_probe.py) rather than tempting the product with one.
 WS_URL = "wss://api.hyperliquid.xyz/ws"
-TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 
 # Channels the lane reads. POSITIONS_CHANNEL is the one that becomes events;
 # ORDERS_CHANNEL is subscribed and measured but deliberately not persisted (the

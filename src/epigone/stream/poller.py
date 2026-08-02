@@ -70,8 +70,9 @@ from epigone.gateway import (
     fetch_open_positions,
 )
 from epigone.ingest.fine import mark_due_now
-from epigone.position_diff import SnapshotState, diff_positions, events_of
+from epigone.position_diff import diff_positions, events_of
 from epigone.position_events import PositionEvent, record_events
+from epigone.position_snapshots import POLL_SNAPSHOTS, apply_changes, read_snapshots, remember
 
 log = logging.getLogger(__name__)
 
@@ -233,7 +234,9 @@ async def _apply_poll(
         )
         if not baselined:
             for pos in positions:
-                await _insert_snapshot(conn, address, pos, now)
+                await remember(
+                    conn, POLL_SNAPSHOTS, address, pos, opened_at=now, updated_at=now
+                )
             await conn.execute(
                 """
                 INSERT INTO position_poll_state (trader_address, baselined_at, last_polled_at)
@@ -244,25 +247,9 @@ async def _apply_poll(
             )
             return 0
 
-        previous = {
-            r["coin"]: SnapshotState.from_row(r)
-            for r in await conn.fetch(
-                "SELECT * FROM position_snapshots WHERE trader_address = $1", address
-            )
-        }
+        previous = await read_snapshots(conn, POLL_SNAPSHOTS, address)
         changes = diff_positions(previous, positions, now)
-        for change in changes:
-            if change.position is None:
-                await conn.execute(
-                    "DELETE FROM position_snapshots WHERE trader_address = $1 AND coin = $2",
-                    address,
-                    change.coin,
-                )
-            else:
-                assert change.opened_at is not None  # a remembered position always has one
-                await _replace_snapshot(
-                    conn, address, change.position, opened_at=change.opened_at, updated_at=now
-                )
+        await apply_changes(conn, POLL_SNAPSHOTS, address, changes, now)
         events: list[PositionEvent] = events_of(changes)
         await conn.execute(
             "UPDATE position_poll_state SET last_polled_at = $2 WHERE trader_address = $1",
@@ -293,52 +280,6 @@ async def _apply_poll(
             if any(event.kind in ("close", "flip") for event in events):
                 await mark_due_now(conn, address, now)
         return len(events)
-
-
-async def _insert_snapshot(
-    conn: asyncpg.Connection, address: str, pos: Position, now: datetime
-) -> None:
-    await _replace_snapshot(conn, address, pos, opened_at=now, updated_at=now)
-
-
-async def _replace_snapshot(
-    conn: asyncpg.Connection,
-    address: str,
-    pos: Position,
-    *,
-    opened_at: datetime,
-    updated_at: datetime,
-) -> None:
-    await conn.execute(
-        """
-        INSERT INTO position_snapshots
-            (trader_address, coin, side, size_usd, leverage, entry_price,
-             unrealized_pnl, size_coin, opened_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (trader_address, coin) DO UPDATE
-            SET side = EXCLUDED.side,
-                size_usd = EXCLUDED.size_usd,
-                leverage = EXCLUDED.leverage,
-                entry_price = EXCLUDED.entry_price,
-                unrealized_pnl = EXCLUDED.unrealized_pnl,
-                size_coin = EXCLUDED.size_coin,
-                opened_at = EXCLUDED.opened_at,
-                updated_at = EXCLUDED.updated_at
-        """,
-        address,
-        pos.coin,
-        pos.side.value,
-        pos.size_usd,
-        pos.leverage,
-        pos.entry_price,
-        pos.unrealized_pnl,
-        # The coin-unit size (#155), rewritten on every pass exactly like the
-        # notional it must stay consistent with — which is also what backfills
-        # the snapshots written before migration 0028.
-        pos.size_coin,
-        opened_at,
-        updated_at,
-    )
 
 
 async def _queue_alerts(

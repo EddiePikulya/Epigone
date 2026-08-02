@@ -41,6 +41,7 @@ from epigone.ws import (
     ORDERS_CHANNEL,
     POSITIONS_CHANNEL,
     WebsocketClosed,
+    lane,
 )
 from epigone.ws.lane import (
     LIVENESS_TIMEOUT_SECONDS,
@@ -51,6 +52,7 @@ from epigone.ws.lane import (
     SUBSCRIPTION_LIMIT,
     WS_LANE_PROCESS,
     LaneSilent,
+    OutboundAllowance,
     run_connection,
     run_lane,
 )
@@ -302,24 +304,77 @@ async def test_a_change_during_a_disconnect_yields_exactly_one_event(
     assert [(row["kind"], row["coin"]) for row in rows] == [("open", "ETH")]
 
 
+class JournallingGateway(FakeHyperliquidGateway):
+    """Records its reads into a journal shared with the socket, so a test can
+    assert what happened BEFORE what."""
+
+    def __init__(self, journal: list[str]) -> None:
+        super().__init__()
+        self._journal = journal
+
+    async def get_open_positions(
+        self, address: str, dex: str | None = None
+    ) -> list[Position]:
+        self._journal.append(f"resync:{address}")
+        return await super().get_open_positions(address, dex=dex)
+
+
+class JournallingWebsocket(FakeWebsocket):
+    def __init__(
+        self, clock: FakeClock, script: list[dict[str, Any] | None], journal: list[str]
+    ) -> None:
+        super().__init__(clock, script)
+        self._journal = journal
+
+    async def send(self, message: Any) -> None:
+        await super().send(message)
+        if message.get("method") == "subscribe":
+            self._journal.append(f"subscribe:{message['subscription'].get('user', '')}")
+
+
 async def test_the_resync_happens_before_the_subscription(
-    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+    pool: asyncpg.Pool, clock: FakeClock
 ) -> None:
     """Order is the correctness argument, not a detail: subscribing first would
     let a push land while the REST read was in flight, and the staler answer
-    would then overwrite it and manufacture a phantom event."""
+    would then overwrite it and manufacture a phantom event. So the assertion
+    is the ORDER, not merely that both happened."""
+    journal: list[str] = []
+    gateway = JournallingGateway(journal)
     await track(pool, clock, TRADER, FOLLOWER)
     gateway.set_positions(TRADER, [position()])
 
-    socket = FakeWebsocket(clock, [liveness_message()])
+    socket = JournallingWebsocket(clock, [liveness_message()], journal)
     await run_lane_once(pool, gateway, clock, socket)
 
-    assert gateway.positions_calls, "the lane must read absolute state over REST"
+    assert journal.index(f"resync:{TRADER}") < journal.index(f"subscribe:{TRADER}")
     assert socket.subscriptions(POSITIONS_CHANNEL) == [TRADER]
     resynced_at = await pool.fetchval(
         "SELECT resynced_at FROM ws_lane_state WHERE trader_address = $1", TRADER
     )
     assert resynced_at is not None
+
+
+async def test_a_venue_the_resync_cannot_see_is_not_diffed(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The all-dex subscription carries every venue; the REST resync that
+    anchors it covers only POSITION_VENUES. Diffing the wider observation
+    against the narrower anchor would invent an OPEN for every uncovered coin,
+    and then a CLOSE and an OPEN on each reconnect — poisoning exactly the
+    dataset this lane exists to produce."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])  # REST sees the core venue only
+    streamed = [position(), position(coin="mkts:FOO", size_usd="4000", size_coin="7")]
+
+    for _ in range(2):  # baseline, then a reconnect that resyncs again
+        await run_lane_once(
+            pool,
+            gateway,
+            clock,
+            FakeWebsocket(clock, [liveness_message(), positions_message(TRADER, streamed)]),
+        )
+        assert await events(pool, WS_SOURCE) == []
 
 
 async def test_a_quiet_trader_keeps_the_heartbeat_fresh(
@@ -450,6 +505,64 @@ async def test_the_subscription_cap_bounds_the_shadowed_set() -> None:
     logged refusal rather than the server quietly rejecting subscriptions."""
     assert MAX_SUBSCRIBED_TRADERS == 499
     assert MAX_SUBSCRIBED_TRADERS * 2 + 1 <= SUBSCRIPTION_LIMIT
+
+
+async def test_a_poll_set_past_the_cap_is_truncated_not_overrun(
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Past the cap the lane shadows what it can and says so, rather than
+    letting the server start rejecting subscriptions — at which point the lane
+    would be silently partial with no signal that it was."""
+    monkeypatch.setattr(lane, "MAX_SUBSCRIBED_TRADERS", 1)
+    await track(pool, clock, TRADER, FOLLOWER)
+    await track(pool, clock, OTHER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    gateway.set_positions(OTHER, [position()])
+
+    socket = FakeWebsocket(clock, [liveness_message()])
+    await run_lane_once(pool, gateway, clock, socket)
+
+    assert socket.subscriptions(POSITIONS_CHANNEL) == [TRADER]
+    assert socket.subscription_count == 2 + 1
+
+
+async def test_the_outbound_ledger_holds_a_rolling_minute(clock: FakeClock) -> None:
+    """The per-IP outbound cap is a per-MINUTE one, so the ledger has to forget:
+    a lane that counted forever would stop subscribing after its first busy
+    minute and never resume."""
+    allowance = OutboundAllowance(clock, limit=2)
+
+    assert allowance.take() and allowance.take()
+    assert not allowance.take()
+
+    clock.advance(61)
+    assert allowance.take()
+
+
+async def test_an_exhausted_outbound_allowance_defers_rather_than_overruns(
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wallet whose subscribe could not be sent must not be recorded as
+    subscribed: the lane would then diff streamed messages it never anchored,
+    and would never retry the subscription. Deferring costs latency; pretending
+    costs correctness."""
+    monkeypatch.setattr(lane, "OUTBOUND_BUDGET_PER_MINUTE", 1)  # the liveness sub spends it
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+
+    socket = FakeWebsocket(
+        clock, [liveness_message(), positions_message(TRADER, [position(coin="ETH")])]
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    assert socket.subscriptions(POSITIONS_CHANNEL) == []
+    assert await events(pool, WS_SOURCE) == []  # nothing anchored, so nothing diffed
 
 
 async def test_order_messages_are_measured_and_never_persisted(

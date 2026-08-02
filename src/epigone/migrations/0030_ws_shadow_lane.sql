@@ -48,6 +48,11 @@ CREATE TABLE ws_position_snapshots (
 -- legitimately empty for a flat wallet — is what says "this Trader has been
 -- observed before", exactly as position_poll_state does for the poller.
 --
+-- `last_message_at` is diagnostic and nothing branches on it: it is how #158
+-- (and an operator) can ask which Traders' feeds are actually delivering,
+-- which the lane-wide heartbeat cannot answer — that one says the CONNECTION
+-- is alive, not that any given subscription is.
+--
 -- `resynced_at` is the lane's other correctness anchor. A websocket delivers
 -- what happens from the moment you subscribe, so a reconnect that resumed
 -- streaming without first re-establishing absolute state would silently lose
