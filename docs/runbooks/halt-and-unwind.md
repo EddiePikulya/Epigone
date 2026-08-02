@@ -94,13 +94,15 @@ the audit trail is where history lives, and it is append-only.)
 |---|---|---|
 | kills resting orders | ✅ cancel-all, verified by enumeration | ✅ exchange-side, all at once |
 | closes positions | ❌ (this policy) | ❌ |
-| needs alive | its own process **plus Postgres** (heartbeat + halt state ride the ADR-0002 seam) — never the executor | nothing — fires exchange-side even if the whole host and its database are gone |
+| needs alive | its own process — never the executor, and (since issue #145) **not Postgres**: it cancels blind through an outage and can even cold-start into one | nothing — fires exchange-side even if the whole host and its database are gone |
 | available today | ✅ | ❌ $1M cumulative-volume gate (verified live 2026-07-28; operator ~$58k) |
 | status | always on (`--profile execution`) | eligibility-probed every 6h, self-activates on acceptance, transitions on the audit trail |
 
 Stated precisely (PR #143 review, rounds 2–3 — no sentence here is broader
-than what the code guarantees, and the whole section covers an
-**already-running watchdog only**; see the cold-start boundary below):
+than what the code guarantees). It covers a watchdog that is **running or
+starting**: issue #145 removed the already-running caveat this section used
+to carry, so a crash, an OOM, a reboot, or a deploy *during* the outage no
+longer strands the account (see "Cold start during an outage" below):
 
 - **What a Postgres outage does NOT stop:** cancelling — because once an
   incident is declared, the cancel path does no Postgres state work before
@@ -157,20 +159,84 @@ than what the code guarantees, and the whole section covers an
   event. In every other case a blind window cannot exist only in process
   logs.
 - **What still needs Postgres:** `/kill` recording a halt (the bot tells
-  you plainly when it could not), `/resume`, the monitor's view, the
-  executor's own `is_halted` gate — and the watchdog's **cold start**:
-  startup needs the pool, migrations, and the keystore, so a watchdog
-  crash/reboot/deploy *during* the outage leaves no cancel path until
-  Postgres returns (filed separately; not covered by this page's
-  guarantees). The only layer needing NOTHING of ours is scheduleCancel —
-  exactly why it stays implemented-and-probing despite being volume-gated
-  inactive.
+  you plainly when it could not), `/resume`, the monitor's view, and the
+  executor's own `is_halted` gate. The watchdog's own **start** no longer
+  does (issue #145) — see below. The only layer needing NOTHING of ours is
+  scheduleCancel — exactly why it stays implemented-and-probing despite
+  being volume-gated inactive.
 - The executor's ORDER path keeps the opposite discipline end to end
   (write-ahead audit, shared budget with its burst cap and send gate, hard
   halt gate): evidence and pacing before money is spent; action before
   losses continue. The asymmetry is the design — which is also why the
   safety lane's degraded in-process bucket deliberately trades the shared
   burst discipline for availability during the incident window.
+
+### Cold start during an outage (issue #145)
+
+A watchdog that is *started* while Postgres is unreachable — a crash, an OOM,
+a host reboot, a deploy landing mid-incident — protects the account anyway:
+
+- **How it gets a key without the database.** Every successful DB-backed
+  start writes the **watchdog lane's** agent key to a local file
+  (`WATCHDOG_KEY_CACHE_FILE`), sealed under the same KEK as the keystore
+  (`KEYSTORE_KEK_FILE`), AAD-bound so no field of it can be edited and no
+  keystore blob transplanted in. A start that cannot reach Postgres loads
+  that copy. It is the watchdog lane only — never the executor's, never a
+  master key (ADR-0005 is untouched) — and the file must live on storage
+  that survives a container restart (the compose service mounts a named
+  volume at `/var/lib/epigone`).
+- **When it goes blind.** Startup probes Postgres on a bounded connect and
+  keeps probing for `WATCHDOG_COLDSTART_GRACE_SECONDS` (default 180 — the
+  same span as the blind threshold, so one rule covers both shapes: a
+  five-second blip during a deploy is not an incident). If the database
+  answers, startup is exactly as before. If it does not, the process
+  cold-starts blind and the incident is declared **at launch**, so the
+  FIRST cycle cancels. A start that *begins* DB-backed and then stalls (a
+  wedged advisory lock, the host black-holing right after the probe) is
+  abandoned at the same grace and goes blind too — hanging unstarted is the
+  one outcome this must never have.
+- **Worst case, outage onset to the first blind cancel, for a cold start:**
+  the grace window — plus, at most, one poll interval if the database
+  answered right at its end and the DB-backed attempt then stalled — plus
+  one cycle, plus the venue enumeration's HTTP legs (30s/request, the read
+  gateway's own bound). Nothing in that path touches Postgres.
+- **What a cold-started watchdog cannot do:** place orders. Its gateway is
+  wrapped cancel-only in code (`epigone.safety.cancel_only`), so
+  placement/modify/leverage raise instead of signing. It cancels, and it
+  pushes scheduleCancel. That is the whole authority.
+- **Deferred, not skipped.** The migration check runs on the reconnect,
+  before any other write. It runs inside the cycle's hard DB ceiling, so a
+  migration that cannot finish inside it — typically one queued behind
+  another process's advisory lock — leaves the watchdog blind and cancelling
+  every cycle until the schema settles. That is the fail-safe direction and
+  it is self-healing, but the logs are where you will see it.
+- **The process-start stamp lands on that reconnect too**, carrying the
+  ACTUAL launch time rather than the reconnect time — otherwise a cold start
+  would silently restart the #52 monitor's never-verified-capability grace
+  clock and defer the page that says this watchdog has never proved it can
+  act.
+- **What you will see in the trail** once Postgres returns: a
+  `watchdog_cold_start_reconnected` event (launch time, blind duration,
+  whether the key cache still matches the keystore), plus the usual
+  `blind_window_reconciled` event and halt row — under the headline
+  **"cold-start DB-blind sweep reconciled"**, distinct from a running
+  process's "DB-blind sweep reconciled". The distinction is the follow-up:
+  a cold-start window means the process was restarted mid-outage, so check
+  *why* it restarted.
+- **The rotation caveat.** The cache is a copy, not the source of truth. If
+  you rotate the watchdog lane while the process is down, a cold start uses
+  the older key until the reconnect refreshes the cache; the reconnect logs
+  the mismatch loudly and asks for a restart, and the on-chain capability
+  probe is what decides whether the older key can still act.
+- **A cache it cannot write does not change anything.** Refreshing the
+  cache is best-effort: if the volume is read-only or full, a healthy
+  DB-backed start still starts (loudly logged) rather than degrading into a
+  blind one that would cancel the book while Postgres is fine. What suffers
+  is the *next* cold start, which falls back to an older copy or refuses.
+- **It still refuses to start with no usable key at all** (no cache, or an
+  expired one): a watchdog that beats a heartbeat it cannot act behind is
+  false safety. Under `restart: unless-stopped` it retries, and comes up
+  the moment Postgres answers.
 
 **Sweep coverage:** the cancel-all is ACCOUNT-WIDE — the core venue plus
 every builder dex in the live `perpDexs` listing, re-fetched each sweep, so
