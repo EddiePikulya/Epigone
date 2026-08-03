@@ -151,7 +151,7 @@ async def run_order_poll_pass(
             await clock.sleep(ORDER_WALLET_SPACING_SECONDS)
         address: str = row["trader_address"]
         try:
-            orders = await _fetch_orders(gateway, budget, address)
+            orders = await fetch_orders_paced(gateway, budget, address)
         except RateLimitedError:
             # Pacing, not an outage (issue #28): the gateway already backed off
             # and retried; the wallet just polls again next pass. Never counts
@@ -188,12 +188,18 @@ async def run_order_poll_pass(
     return OrderPollResult(polled=polled, failed=failed, new_orders=new_orders, aborted=False)
 
 
-async def _fetch_orders(
+async def fetch_orders_paced(
     gateway: HyperliquidGateway, budget: Budget, address: str
 ) -> list[OpenOrder]:
     """A Trader's resting orders across POSITION_VENUES, paced by the budget:
     one ORDERS_WEIGHT spend per venue, billed off the same tuple the shared
     fetch iterates so the accounting never drifts from the calls made (#31).
+
+    Shared with the order lane's reconnect resync (issue #168), which needs
+    exactly this — a paced, all-or-raise, point-in-time read of the resting
+    book — and must bill it the same way, off the same venue tuple, or the two
+    spends would drift apart. `fetch_positions_paced` is shared with the
+    position lane for the same reason.
 
     fetch_open_orders raises on any venue failure; the wallet then retries
     next pass with its id set untouched, never diffed against a half-empty

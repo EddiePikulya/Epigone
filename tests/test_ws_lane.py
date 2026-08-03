@@ -52,7 +52,7 @@ from epigone.ws.lane import (
     SUBSCRIPTION_LIMIT,
     WS_LANE_PROCESS,
     LaneSilent,
-    OutboundAllowance,
+    outbound_allowance,
     run_connection,
     run_lane,
 )
@@ -123,13 +123,6 @@ def positions_message(address: str, positions: list[Position]) -> dict[str, Any]
 
 def liveness_message() -> dict[str, Any]:
     return {"channel": LIVENESS_CHANNEL, "data": {"mids": {"BTC": "100"}}}
-
-
-def order_message(address: str) -> dict[str, Any]:
-    return {
-        "channel": ORDERS_CHANNEL,
-        "data": [{"order": {"coin": "BTC", "oid": 1, "user": address}, "status": "open"}],
-    }
 
 
 async def track(pool: asyncpg.Pool, clock: FakeClock, address: str, *user_ids: int) -> None:
@@ -445,12 +438,13 @@ async def test_the_lane_pings_inside_the_servers_idle_timeout(
     assert socket.pings >= 1
 
 
-async def test_each_trader_costs_two_all_dex_subscriptions(
+async def test_each_trader_costs_one_all_dex_subscription(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
-    """The per-IP subscription cap is what sets the Trader ceiling, so what a
-    Trader costs is load-bearing: the all-dex position feed plus the
-    account-wide order feed, and nothing per venue."""
+    """What a Trader costs this connection: the all-dex position feed, and
+    nothing per venue. The account-wide ORDER feed used to be subscribed here
+    too — issue #168 moved it to a connection of its own, because its frames
+    carry no `user` and cannot be attributed on a shared connection."""
     await track(pool, clock, TRADER, FOLLOWER)
     await track(pool, clock, OTHER, FOLLOWER)
     gateway.set_positions(TRADER, [position()])
@@ -460,9 +454,9 @@ async def test_each_trader_costs_two_all_dex_subscriptions(
     await run_lane_once(pool, gateway, clock, socket)
 
     assert socket.subscriptions(POSITIONS_CHANNEL) == [TRADER, OTHER]
-    assert socket.subscriptions(ORDERS_CHANNEL) == [TRADER, OTHER]
+    assert socket.subscriptions(ORDERS_CHANNEL) == []
     assert socket.subscriptions(LIVENESS_CHANNEL) == [""]
-    assert socket.subscription_count == 2 * 2 + 1
+    assert socket.subscription_count == 2 + 1
     assert socket.subscription_count <= SUBSCRIPTION_LIMIT
 
 
@@ -488,7 +482,7 @@ async def test_an_untracked_trader_is_unsubscribed_and_forgotten(
             connecting(socket),
             clock,
         )
-    assert socket.subscription_count == 5
+    assert socket.subscription_count == 3
 
     await pool.execute("DELETE FROM tracks WHERE trader_address = $1", OTHER)
     second = FakeWebsocket(clock, [liveness_message()])
@@ -500,11 +494,14 @@ async def test_an_untracked_trader_is_unsubscribed_and_forgotten(
     ) == 0
 
 
-async def test_the_subscription_cap_bounds_the_shadowed_set() -> None:
-    """The ceiling is arithmetic, and it is stated so the day it binds is a
-    logged refusal rather than the server quietly rejecting subscriptions."""
-    assert MAX_SUBSCRIBED_TRADERS == 499
-    assert MAX_SUBSCRIBED_TRADERS * 2 + 1 <= SUBSCRIPTION_LIMIT
+async def test_the_unique_user_cap_bounds_the_shadowed_set() -> None:
+    """The ceiling is MEASURED, not derived, and that is the correction issue
+    #168 forced: the binding limit is an undocumented per-IP allowance of 15
+    unique users, not the 1000-subscription cap ADR-0006 computed 499 from. It
+    is stated here so the day it binds is a logged refusal rather than the
+    server quietly rejecting subscriptions — which is what it had been doing."""
+    assert MAX_SUBSCRIBED_TRADERS == 15
+    assert MAX_SUBSCRIBED_TRADERS + 1 <= SUBSCRIPTION_LIMIT  # subscriptions are not the problem
 
 
 async def test_a_poll_set_past_the_cap_is_truncated_not_overrun(
@@ -526,14 +523,14 @@ async def test_a_poll_set_past_the_cap_is_truncated_not_overrun(
     await run_lane_once(pool, gateway, clock, socket)
 
     assert socket.subscriptions(POSITIONS_CHANNEL) == [TRADER]
-    assert socket.subscription_count == 2 + 1
+    assert socket.subscription_count == 1 + 1
 
 
 async def test_the_outbound_ledger_holds_a_rolling_minute(clock: FakeClock) -> None:
     """The per-IP outbound cap is a per-MINUTE one, so the ledger has to forget:
     a lane that counted forever would stop subscribing after its first busy
     minute and never resume."""
-    allowance = OutboundAllowance(clock, limit=2)
+    allowance = outbound_allowance(clock, limit=2)
 
     assert allowance.take() and allowance.take()
     assert not allowance.take()
@@ -565,29 +562,28 @@ async def test_an_exhausted_outbound_allowance_defers_rather_than_overruns(
     assert await events(pool, WS_SOURCE) == []  # nothing anchored, so nothing diffed
 
 
-async def test_order_messages_are_measured_and_never_persisted(
+async def test_this_connection_no_longer_subscribes_the_order_feed(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
-    """orderUpdates is subscribed — it costs a subscription and serves the
-    liveness/measurement question — but the order-event seam is a design
-    decision this ticket does not make (ADR-0006 §Scope). Nothing durable."""
+    """Issue #168's correction. `orderUpdates` frames carry no `user`, so on a
+    connection serving every Trader they are anonymous and could never be
+    persisted — counting them measured nothing per Trader, and they are a large
+    share of this connection's inbound traffic. The order lane subscribes them
+    one Trader per connection instead (epigone.ws.order_lane).
+
+    A stray order frame arriving here is therefore ignored rather than acted
+    on: this connection has no way to know whose it is."""
     await track(pool, clock, TRADER, FOLLOWER)
     gateway.set_positions(TRADER, [position()])
 
-    socket = FakeWebsocket(
-        clock, [liveness_message(), order_message(TRADER), order_message(TRADER)]
-    )
-    await run_lane_once(pool, gateway, clock, socket)
+    stray = {"channel": ORDERS_CHANNEL, "data": [{"order": {"coin": "BTC"}, "status": "open"}]}
+    socket = FakeWebsocket(clock, [liveness_message(), stray])
+    ended = await run_lane_once(pool, gateway, clock, socket)
 
+    assert isinstance(ended, WebsocketClosed)  # it read the frame and carried on
+    assert socket.subscriptions(ORDERS_CHANNEL) == []
     assert await events(pool, WS_SOURCE) == []
-    tables = await pool.fetch(
-        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename LIKE '%order%'"
-    )
-    assert {row["tablename"] for row in tables} == {
-        "order_snapshots",
-        "order_poll_state",
-        "order_alerts",
-    }
+    assert await pool.fetchval("SELECT count(*) FROM order_events") == 0
 
 
 async def test_the_lane_writes_no_alerts_and_leaves_the_pollers_state_alone(

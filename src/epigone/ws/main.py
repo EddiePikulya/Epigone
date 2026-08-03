@@ -9,12 +9,15 @@ gathered task ends the process, and the pollers with it. A separate service
 closes it structurally: the lane can crash, wedge, or be stopped by the
 operator (`docker compose stop ws`) and the poll pass never notices.
 
-Budget: the resync reads are the lane's only REST spend, and they carry the
+Budget: the resync reads are the lanes' only REST spend, and they carry the
 ingest-style reserve — EXECUTION_RESERVE_WEIGHT plus STREAM_RESERVE_WEIGHT —
 so they are the FIRST thing starved when the shared bucket tightens. A
-reconnect storm can therefore slow this lane and ingest, and can never draw the
-bucket below the floor that guarantees position polling its instant claim
-(epigone.stream.main's rule, applied to a lane that ranks below both).
+reconnect storm can therefore slow these lanes and ingest, and can never draw
+the bucket below the floor that guarantees position polling its instant claim
+(epigone.stream.main's rule, applied to lanes that rank below both). The order
+lanes' resync is the heavier of the two — `frontendOpenOrders` is weight 20 per
+venue against `clearinghouseState`'s 2 — which is another reason they are
+bounded at MAX_ORDER_LANES rather than following the whole tracked set.
 """
 
 import asyncio
@@ -29,6 +32,7 @@ from epigone.db import create_pool, migrate
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.ws import WS_URL, WebsocketConnection
 from epigone.ws.lane import run_lane
+from epigone.ws.order_lane import run_order_lanes
 from epigone.ws.transport import connect
 
 log = logging.getLogger(__name__)
@@ -46,7 +50,16 @@ async def run(pool_url: str, clock: Clock, ws_url: str = WS_URL) -> None:
         async def open_connection() -> WebsocketConnection:
             return await connect(session, ws_url)
 
-        await run_lane(pool, gateway, budget, open_connection, clock)
+        # Two lanes, one process, and deliberately no coupling between them:
+        # the position lane multiplexes every Trader onto one connection, and
+        # the order lanes take one connection per Trader because `orderUpdates`
+        # frames do not say whose they are (ADR-0007). Both swallow their own
+        # failures and reconnect, so `gather` here is composition rather than
+        # supervision — neither can end the other.
+        await asyncio.gather(
+            run_lane(pool, gateway, budget, open_connection, clock),
+            run_order_lanes(pool, gateway, budget, open_connection, clock),
+        )
 
 
 async def main() -> None:
