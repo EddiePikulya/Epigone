@@ -207,6 +207,10 @@ async def _ask(ws: aiohttp.ClientWebSocketResponse, method: str, sub: dict[str, 
     return "no answer"
 
 
+def _orders_sub(address: str) -> dict[str, Any]:
+    return {"type": "orderUpdates", "user": address}
+
+
 async def probe_users() -> None:
     """How many unique users may one IP track, and is the allowance per IP or
     per connection?
@@ -218,7 +222,6 @@ async def probe_users() -> None:
     address on a second connection is free, so splitting one Trader's feeds
     across connections costs no allowance. This retires ADR-0006's "499
     Traders on one connection"."""
-    orders = lambda address: {"type": "orderUpdates", "user": address}  # noqa: E731
     async with aiohttp.ClientSession() as session:
         addresses = await _harvest_active(session, 40)
         print(f"harvested {len(addresses)} active addresses; settling 30s", flush=True)
@@ -227,22 +230,22 @@ async def probe_users() -> None:
         first = await session.ws_connect(MAINNET_WS, heartbeat=None)
         held: list[str] = []
         for address in addresses:
-            if await _ask(first, "subscribe", orders(address)) != "ok":
+            if await _ask(first, "subscribe", _orders_sub(address)) != "ok":
                 break
             held.append(address)
         print(f"one connection accepted {len(held)} unique users", flush=True)
 
         second = await session.ws_connect(MAINNET_WS, heartbeat=None)
         fresh = [address for address in addresses if address not in held]
-        verdict = await _ask(second, "subscribe", orders(fresh[0]))
+        verdict = await _ask(second, "subscribe", _orders_sub(fresh[0]))
         print(f"brand-new user on a SECOND connection -> {verdict}", flush=True)
         print(f"=> allowance is {'PER CONNECTION' if verdict == 'ok' else 'PER IP'}", flush=True)
-        again = await _ask(second, "subscribe", orders(held[0]))
+        again = await _ask(second, "subscribe", _orders_sub(held[0]))
         print(f"already-held user on the second      -> {again}", flush=True)
 
         await first.close()
         await asyncio.sleep(2)
-        freed = await _ask(second, "subscribe", orders(fresh[0]))
+        freed = await _ask(second, "subscribe", _orders_sub(fresh[0]))
         print(f"2s after closing the first, new user -> {freed}", flush=True)
         await second.close()
 

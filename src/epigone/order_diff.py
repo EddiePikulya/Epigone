@@ -21,7 +21,7 @@ the memory these decisions are applied to.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -178,21 +178,28 @@ def diff_open_orders(
     for order_id, remembered in previous.items():
         if order_id not in current:
             changes.append(
-                OrderChange(order_id=order_id, event=_gone_event(remembered), resting=None)
+                OrderChange(order_id=order_id, event=_resync_event(GONE, remembered), resting=None)
             )
     for order_id, order in current.items():
-        fresh = RestingOrder.from_open_order(order)
         known = previous.get(order_id)
+        fresh = RestingOrder.from_open_order(order)
+        if known is not None:
+            # `frontendOpenOrders` reports what REMAINS and never what the order
+            # started as, so `from_open_order` can only guess original == remaining.
+            # For an order we already know, memory holds the real figure — and it
+            # must survive EVERY resync, not just the one that observes a shrink.
+            # Letting the guess win would quietly rewrite a 10-lot order that has
+            # 7 left as a 7-lot order, and every later event about it, including
+            # its `gone`, would then understate what the Trader had actually
+            # committed.
+            fresh = replace(fresh, original_size=known.original_size)
         if known is None:
             changes.append(
-                OrderChange(order_id=order_id, event=_placed_event(fresh), resting=fresh)
+                OrderChange(order_id=order_id, event=_resync_event(PLACED, fresh), resting=fresh)
             )
         elif order.size < known.size:
-            # A partial fill during the gap. `original_size` is carried from
-            # memory rather than the REST read, which does not report it.
-            filled = RestingOrder(**{**vars(fresh), "original_size": known.original_size})
             changes.append(
-                OrderChange(order_id=order_id, event=_filled_event(filled), resting=filled)
+                OrderChange(order_id=order_id, event=_resync_event(FILLED, fresh), resting=fresh)
             )
         else:
             changes.append(OrderChange(order_id=order_id, event=None, resting=fresh))
@@ -255,18 +262,6 @@ def stream_change(remembered: RestingOrder | None, update: OrderUpdate) -> Order
 def events_of(changes: Sequence[OrderChange]) -> list[OrderEvent]:
     """Just the news, in decision order."""
     return [change.event for change in changes if change.event is not None]
-
-
-def _placed_event(order: RestingOrder) -> OrderEvent:
-    return _resync_event(PLACED, order)
-
-
-def _filled_event(order: RestingOrder) -> OrderEvent:
-    return _resync_event(FILLED, order)
-
-
-def _gone_event(order: RestingOrder) -> OrderEvent:
-    return _resync_event(GONE, order)
 
 
 def _resync_event(kind: str, order: RestingOrder) -> OrderEvent:

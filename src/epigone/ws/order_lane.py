@@ -47,15 +47,29 @@ Unique users are NOT additionally spent. The per-IP allowance of 15 counts
 distinct addresses, and an order lane subscribes an address the position lane
 already tracks; the same address on a second connection was measured free.
 
+Reconnects are paced against the per-IP allowance too — 30 new connections a
+minute is shared by every lane on the box, so an order lane's floor is
+`ORDER_RECONNECT_MIN_SECONDS` rather than the position lane's 2 seconds, which
+was sized when this process held one connection.
+
 ## The rate ceiling is a Bot rule, not a performance knob
 
 One active market-making address alone produced **1471 order updates in 60s**.
 Position events are rare; order events are not. Above
-`ORDER_UPDATE_RATE_LIMIT` on a rolling minute, this lane stops persisting that
-Trader for the life of the connection and says so once. CONTEXT.md excludes such
-an account from the Universe as a Bot — automated market-making rather than
-copyable skill — and a Trader whose plan changes twice a second has no plan to
-mirror. Recording them anyway would bury the leaders this seam exists for.
+`ORDER_UPDATE_RATE_LIMIT` on a rolling minute the lane REFUSES the Trader:
+CONTEXT.md excludes such an account from the Universe as a Bot — automated
+market-making rather than copyable skill — and a Trader whose plan changes twice
+a second has no plan to mirror. Recording them anyway would bury the leaders
+this seam exists for.
+
+A refusal **ends the connection** and earns a cooldown, and that is a
+correctness property rather than tidiness. Muting a Trader on a live connection
+would freeze `ws_order_state` at whatever was resting when the ceiling hit while
+the exchange moved on — and since `allMids` keeps the socket alive indefinitely,
+nothing would ever force the resync that repairs it. The lane would sit on a
+connection believing a stale book, which is the silent gap the resync discipline
+exists to prevent. Disconnecting means the next connection re-establishes
+absolute state and reports the divergence honestly, as `origin = 'resync'`.
 """
 
 import asyncio
@@ -92,9 +106,9 @@ from epigone.ws.lane import (
     PING_INTERVAL_SECONDS,
     RECEIVE_TICK_SECONDS,
     RECONNECT_MAX_SECONDS,
-    RECONNECT_MIN_SECONDS,
     TRACKED_REFRESH_SECONDS,
     LaneSilent,
+    forget_unwatched,
     outbound_allowance,
     send_if_allowed,
 )
@@ -108,6 +122,9 @@ log = logging.getLogger(__name__)
 # reconnect into a refused connection.
 CONNECTION_LIMIT = 10
 RESERVED_CONNECTIONS = 2
+# New connections per minute, also per IP and also shared with the position
+# lane — the allowance ORDER_RECONNECT_MIN_SECONDS is sized against.
+CONNECTION_RATE_LIMIT = 30
 MAX_ORDER_LANES = CONNECTION_LIMIT - RESERVED_CONNECTIONS
 
 # The Bot rule at the seam (module docstring). Two updates a second sustained is
@@ -115,6 +132,46 @@ MAX_ORDER_LANES = CONNECTION_LIMIT - RESERVED_CONNECTIONS
 # 12× this. Generous enough that no human leader trips it, small enough that a
 # maker cannot fill the seam.
 ORDER_UPDATE_RATE_LIMIT = 120
+
+# What happens after the ceiling is hit: the connection ENDS, and this lane
+# stands down for a while before resyncing and trying again.
+#
+# Ending it is the part that matters. Simply muting a Trader on a live
+# connection would leave `ws_order_state` frozen at whatever was resting when
+# the ceiling hit, while the exchange moved on — and because `allMids` keeps the
+# socket alive indefinitely, nothing would ever force the resync that repairs
+# it. The lane would hold a connection, believe a stale book, and report the
+# whole divergence as a burst of `gone`s whenever it eventually reconnected.
+# That is exactly the silent gap the resync discipline exists to prevent, so a
+# refusal is a disconnect and the next connection re-establishes absolute state.
+#
+# The cooldown is what keeps the refusal meaningful. Reconnecting on the usual
+# backoff would let a market maker write ORDER_UPDATE_RATE_LIMIT events per
+# cycle indefinitely; standing down for 15 minutes bounds them to ~11.5k a day
+# where the measured maker would have written 2.1M, and costs one paced resync
+# (2 REST calls) per lane per cooldown.
+REFUSED_COOLDOWN_SECONDS = 900.0
+
+# Reconnect pacing for an ORDER lane, which cannot use the position lane's
+# 2-second floor: that floor was sized when this process held ONE connection,
+# and the 30-new-connections/min allowance is PER IP. MAX_ORDER_LANES lanes
+# reconnecting independently at a 2s floor would spend ~240/min between them —
+# eight times the whole cap — and the position lane still has to fit.
+#
+# At a minute each, all eight together spend at most 8/min, roughly a quarter of
+# the allowance, leaving the position lane the room its own floor may ask for.
+# Order lanes take the smaller share deliberately: position events are what
+# Position Alerts and the cutover comparison are built on, and these rows are
+# read by nobody. The cost is that a transient failure delays one Trader's order
+# feed by a minute, which for a shadow lane is the right side to err on.
+ORDER_RECONNECT_MIN_SECONDS = 60.0
+
+
+class LaneRefused(Exception):
+    """This Trader is producing order updates faster than the seam will record
+    (ORDER_UPDATE_RATE_LIMIT) — a Bot by CONTEXT.md's definition rather than a
+    Trader with a plan worth mirroring. Ends the connection so memory cannot go
+    stale behind a socket that stays open, and earns a cooldown."""
 
 
 @dataclass
@@ -124,7 +181,6 @@ class OrderLaneStats:
     events: int = 0
     order_messages: int = 0
     liveness_messages: int = 0
-    dropped_updates: int = 0
 
 
 async def run_order_lanes(
@@ -186,7 +242,7 @@ async def reconcile_order_lanes(
     A wallet that leaves is stopped and forgotten, so a re-follow re-baselines
     silently instead of diffing against a ladder from months ago — the poller's
     re-follow rule, owed here for the same reason."""
-    await _prune_unwatched(pool)
+    await forget_unwatched(pool, "ws_order_state", "ws_order_lane_state")
     wanted = await _shadowed_traders(pool)
     for address in list(lanes):
         if address not in wanted:
@@ -238,10 +294,24 @@ async def run_order_lane(
     Nothing escapes. A shadow lane that could crash its own process would still
     be harmless to alerting — that is what the process split buys — but it would
     silently stop collecting the seam it exists for."""
-    delay = RECONNECT_MIN_SECONDS
+    delay = ORDER_RECONNECT_MIN_SECONDS
     while True:
         try:
             await run_order_connection(pool, gateway, budget, connect, clock, address)
+        except LaneRefused as exc:
+            # Not a failure: the Trader is a Bot by the seam's own rule. Stand
+            # down long enough that they cannot write a cycle's worth of events
+            # every backoff, then resync and re-judge — the rate is a property of
+            # what they are doing now, not a verdict on the account forever.
+            log.error(
+                "ws order lane %s: %s; standing down for %.0fs",
+                address,
+                exc,
+                REFUSED_COOLDOWN_SECONDS,
+            )
+            await clock.sleep(REFUSED_COOLDOWN_SECONDS)
+            delay = ORDER_RECONNECT_MIN_SECONDS
+            continue
         except Exception as exc:
             log.warning(
                 "ws order lane %s: connection ended (%s); reconnecting in %.0fs",
@@ -250,9 +320,9 @@ async def run_order_lane(
                 delay,
             )
         else:
-            delay = RECONNECT_MIN_SECONDS
+            delay = ORDER_RECONNECT_MIN_SECONDS
         await clock.sleep(delay)
-        delay = min(RECONNECT_MAX_SECONDS, max(RECONNECT_MIN_SECONDS, delay * 2))
+        delay = min(RECONNECT_MAX_SECONDS, max(ORDER_RECONNECT_MIN_SECONDS, delay * 2))
 
 
 async def run_order_connection(
@@ -276,7 +346,6 @@ async def run_order_connection(
     allowance = outbound_allowance(clock)
     stats = OrderLaneStats()
     ceiling = RollingMinute(clock, ORDER_UPDATE_RATE_LIMIT)
-    recording = True
     try:
         if not await send_if_allowed(connection, allowance, subscribe(liveness_subscription())):
             raise LaneSilent("could not subscribe to the liveness feed")
@@ -310,10 +379,7 @@ async def run_order_connection(
                 last_liveness = clock.now()
             elif channel == ORDERS_CHANNEL:
                 stats.order_messages += 1
-                if recording:
-                    recording = await _apply_orders_message(
-                        pool, address, message, ceiling, clock.now(), stats
-                    )
+                await _apply_orders_message(pool, address, message, ceiling, clock.now(), stats)
             elif channel == "error":
                 log.warning(
                     "ws order lane %s: server error frame: %s", address, message.get("data")
@@ -322,12 +388,11 @@ async def run_order_connection(
         await connection.close()
         log.info(
             "ws order lane %s: connection closed after %d events from %d order messages "
-            "(%d liveness, %d updates dropped over the rate ceiling)",
+            "(%d liveness)",
             address,
             stats.events,
             stats.order_messages,
             stats.liveness_messages,
-            stats.dropped_updates,
         )
 
 
@@ -400,9 +465,8 @@ async def _apply_orders_message(
     ceiling: RollingMinute,
     now: datetime,
     stats: OrderLaneStats,
-) -> bool:
-    """Turn one streamed frame into events. Returns whether this Trader is still
-    being recorded — False once the rate ceiling has judged them a Bot.
+) -> None:
+    """Turn one streamed frame into events, or refuse the Trader.
 
     The frame is attributed to `address` because it arrived on `address`'s own
     connection; there is nothing in it to read an owner from.
@@ -418,22 +482,17 @@ async def _apply_orders_message(
         updates = parse_orders_message(message["data"])
     except (GatewayError, KeyError, TypeError) as exc:
         log.warning("ws order lane %s: unreadable %s message: %s", address, ORDERS_CHANNEL, exc)
-        return True
+        return
     updates = [update for update in updates if on_covered_venue(update.coin)]
     if not updates:
-        return True
+        return
     if not all(ceiling.take() for _ in updates):
-        stats.dropped_updates += len(updates)
-        log.error(
-            "ws order lane %s: over %d order updates/minute — recording stopped for this "
-            "connection. This is the Bot rule at the seam (ADR-0007): an account requoting "
-            "this fast is automated market-making, not a plan worth mirroring",
-            address,
-            ORDER_UPDATE_RATE_LIMIT,
+        raise LaneRefused(
+            f"over {ORDER_UPDATE_RATE_LIMIT} order updates/minute — an account requoting "
+            "this fast is automated market-making (CONTEXT.md's Bot), not a plan worth "
+            "mirroring"
         )
-        return False
     stats.events += await _apply_updates(pool, address, updates, now)
-    return True
 
 
 async def _apply_updates(
@@ -532,16 +591,3 @@ async def _remember(conn: asyncpg.Connection, address: str, order: RestingOrder)
     )
 
 
-async def _prune_unwatched(pool: asyncpg.Pool) -> None:
-    """Forget wallets that left the poll set, so a re-follow re-baselines
-    silently. Events already written stay — they were true when observed."""
-    async with pool.acquire() as conn, conn.transaction():
-        for table in ("ws_order_state", "ws_order_lane_state"):
-            await conn.execute(
-                f"""
-                DELETE FROM {table}
-                WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
-                  AND trader_address NOT IN
-                      (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
-                """
-            )

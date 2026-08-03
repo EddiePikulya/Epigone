@@ -223,14 +223,12 @@ million a day, from one Trader.
 Two bounds, and they are different in kind:
 
 - **`ORDER_UPDATE_RATE_LIMIT = 120 updates/minute per Trader`,** measured on a
-  rolling minute. Above it the lane stops persisting that Trader for the life of
-  the connection and says so once, loudly. This is not a performance knob, it is
-  the **Bot rule at the seam**: CONTEXT.md defines a Bot as an account whose
-  profile indicates automated market-making rather than copyable skill, and
-  excludes it from the Universe. Two order updates per second sustained is that
-  account. A Trader whose plan changes 24 times a second does not have a plan to
-  mirror, and filling the seam with their requotes would bury the leaders it
-  exists to serve.
+  rolling minute. This is not a performance knob, it is the **Bot rule at the
+  seam**: CONTEXT.md defines a Bot as an account whose profile indicates
+  automated market-making rather than copyable skill, and excludes it from the
+  Universe. Two order updates per second sustained is that account. A Trader
+  whose plan changes 24 times a second does not have a plan to mirror, and
+  filling the seam with their requotes would bury the leaders it exists to serve.
 - **`ORDER_EVENT_RETENTION = 24 hours`,** pruned on write, the same
   `record_rate_limit` precedent ADR-0006 followed. Position events keep 7 days
   because a copy executor that was down for a day still wants them; a resting
@@ -238,9 +236,31 @@ Two bounds, and they are different in kind:
   would place an order against a book that has moved on. The staleness argument
   is strictly stronger here, so the window is strictly shorter.
 
-Worst case with both bounds: 8 lanes × 120/min × 24h ≈ 1.4M rows, and that is
-the pathological case where every shadowed Trader sits right at the bot
-threshold. A real leader produces a few hundred a day.
+**Breaching the ceiling ends the connection**; it does not mute the Trader on a
+live one. That distinction was got wrong first and is worth recording, because
+the wrong version looks harmless: a lane that simply stopped recording would
+hold `ws_order_state` frozen at whatever was resting when the ceiling hit while
+the exchange moved on, and — since `allMids` keeps the socket alive
+indefinitely — nothing would ever force the resync that repairs it. The lane
+would sit on one of ten connections believing a stale book, and the divergence
+would eventually surface as a burst of phantom `gone`s. That is precisely the
+silent gap §3 exists to prevent, arrived at from the other direction. So a
+refusal disconnects, and the next connection re-establishes absolute state.
+
+`REFUSED_COOLDOWN_SECONDS = 15 minutes` is what keeps the refusal meaningful:
+reconnecting on the ordinary backoff would let a maker write a full ceiling's
+worth every cycle forever. Worst case with all three bounds is 8 lanes ×
+120 events per 15 minutes × 24h ≈ **92k rows**, against the 2.1M/day/Trader the
+measured maker would have produced. A real leader produces a few hundred a day.
+
+One further allowance the first draft of this ADR missed, recorded because it
+binds the same way the others do: **30 new connections per minute, per IP**, also
+shared with the position lane. Eight order lanes reconnecting on the position
+lane's 2-second floor would spend ~240/min between them — eight times the whole
+cap. Order lanes therefore carry their own `ORDER_RECONNECT_MIN_SECONDS` of a
+minute (8/min between them, about a quarter of the allowance), and take the
+smaller share deliberately: position events feed Position Alerts and the cutover
+comparison, while these rows are read by nobody.
 
 ### 5. Nothing consumes it, and nothing can consume it by accident
 

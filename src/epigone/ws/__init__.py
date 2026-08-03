@@ -9,8 +9,11 @@ lane's tests need to stage.
 
 `WebsocketConnection` is deliberately thin: send a message, take the next one
 (or learn that none came within a timeout), close. Everything above it — what
-to subscribe to, when to resync, when to declare the connection dead — is
-lane logic in `epigone.ws.lane`, testable without a socket.
+to subscribe to, when to resync, when to declare the connection dead — is lane
+logic in `epigone.ws.lane` and `epigone.ws.order_lane`, testable without a
+socket. This module also holds `RollingMinute`, the allowance ledger both lanes
+pace themselves against: the per-IP outbound cap is shared BETWEEN them, so one
+implementation of "may I, right now" is the point rather than an accident.
 
 **Subscription vocabulary, verified live against testnet 2026-08-02.**
 `allDexsClearinghouseState` exists and is the right subscription: it carries
@@ -19,8 +22,15 @@ EVERY dex's clearinghouse state in one message — `clearinghouseStates` as
 `clearinghouseState` form costs one subscription per venue for the same
 coverage. `allDexsOrderUpdates` does NOT exist (the server rejects it as
 unparseable); `orderUpdates` takes no `dex` and is account-wide as it stands.
-So two subscriptions cover a Trader completely, which is what the per-IP
-subscription cap has to be budgeted against.
+
+**Corrected 2026-08-03 (issue #168).** This paragraph used to end "so two
+subscriptions cover a Trader completely, which is what the per-IP subscription
+cap has to be budgeted against". Both halves are wrong. The two subscriptions
+cannot share a connection: `allDexsClearinghouseState` messages name their
+`user` and `orderUpdates` messages do not, so the order feed is unattributable
+wherever more than one Trader is subscribed — it now takes a connection of its
+own per Trader (ADR-0007). And the subscription cap is not what binds: an
+undocumented per-IP allowance of **15 unique users** does, ~33× sooner.
 
 Note what the all-dex form covers: every venue, including the ones REST polling
 deliberately dropped for weight reasons (POSITION_VENUES omits mkts). That is a

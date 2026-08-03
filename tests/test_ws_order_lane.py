@@ -36,11 +36,19 @@ from epigone.gateway import OpenOrder
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.order_events import STREAM_ORIGIN
 from epigone.ws import LIVENESS_CHANNEL, ORDERS_CHANNEL, WebsocketClosed, order_lane
-from epigone.ws.lane import LIVENESS_TIMEOUT_SECONDS, RECEIVE_TICK_SECONDS, LaneSilent
+from epigone.ws.lane import (
+    LIVENESS_TIMEOUT_SECONDS,
+    RECEIVE_TICK_SECONDS,
+    RECONNECT_MIN_SECONDS,
+    LaneSilent,
+)
 from epigone.ws.order_lane import (
     CONNECTION_LIMIT,
+    CONNECTION_RATE_LIMIT,
     MAX_ORDER_LANES,
+    ORDER_RECONNECT_MIN_SECONDS,
     ORDER_UPDATE_RATE_LIMIT,
+    LaneRefused,
     reconcile_order_lanes,
     run_order_connection,
 )
@@ -149,7 +157,7 @@ async def run_once(
     """Drive one connection to its end and return why it ended. Every staged
     connection ends — that is what makes the test terminate — so the reason is
     an assertion rather than an accident."""
-    with pytest.raises((WebsocketClosed, LaneSilent)) as caught:
+    with pytest.raises((WebsocketClosed, LaneSilent, LaneRefused)) as caught:
         await run_order_connection(
             pool,
             gateway,
@@ -398,6 +406,44 @@ async def test_a_partial_fill_during_a_disconnect_is_reported(
     ]
 
 
+async def test_a_resync_never_forgets_what_an_order_started_as(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """`frontendOpenOrders` reports what REMAINS and never what the order started
+    as, so a resync of a partially filled order can only guess original ==
+    remaining. Memory holds the real figure and has to win on EVERY resync, not
+    only the one that happens to observe the shrink.
+
+    Otherwise a 3-lot order with 1 left quietly becomes a 1-lot order after one
+    idle reconnect, and every later event about it — including the `gone` that
+    ends it — understates what the Trader had actually committed."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [resting(oid=1, size="3")])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    # It partially fills over the stream: 3 committed, 1 left.
+    partial = orders_message(update(oid=1, status="filled", size="1", original_size="3"))
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message(), partial]))
+
+    # Two quiet reconnects that observe nothing new at all.
+    for _ in range(2):
+        gateway.set_open_orders(TRADER, [resting(oid=1, size="1")])
+        await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+    assert await pool.fetchval(
+        "SELECT original_size FROM ws_order_state WHERE order_id = 1"
+    ) == Decimal("3")
+
+    # And the event that ends it still says what the order was for.
+    gateway.set_open_orders(TRADER, [])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+    ended = (await events(pool))[-1]
+    assert (ended["kind"], ended["size"], ended["original_size"]) == (
+        "gone",
+        Decimal("1"),
+        Decimal("3"),
+    )
+
+
 class JournallingGateway(FakeHyperliquidGateway):
     """Records its reads into a journal shared with the socket, so a test can
     assert what happened BEFORE what."""
@@ -542,9 +588,9 @@ async def test_a_market_maker_is_refused_rather_than_recorded(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
     """One measured address produced 1471 order updates a minute. Above the
-    ceiling the lane stops recording that Trader — CONTEXT.md's Bot rule applied
-    at the seam: an account requoting this fast has no plan to mirror, and
-    recording it would bury the leaders this seam exists for."""
+    ceiling the lane refuses that Trader — CONTEXT.md's Bot rule applied at the
+    seam: an account requoting this fast has no plan to mirror, and recording it
+    would bury the leaders this seam exists for."""
     await track(pool, clock, TRADER, FOLLOWER)
     gateway.set_open_orders(TRADER, [])
     await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
@@ -553,10 +599,48 @@ async def test_a_market_maker_is_refused_rather_than_recorded(
         orders_message(update(oid=oid, status="open"))
         for oid in range(ORDER_UPDATE_RATE_LIMIT + 50)
     ]
-    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message(), *requotes]))
+    ended = await run_once(
+        pool, gateway, clock, FakeWebsocket(clock, [liveness_message(), *requotes])
+    )
 
+    assert isinstance(ended, LaneRefused)
     recorded = await pool.fetchval("SELECT count(*) FROM order_events")
     assert recorded == ORDER_UPDATE_RATE_LIMIT
+
+
+async def test_a_refusal_ends_the_connection_rather_than_muting_it(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Refusing has to DISCONNECT, and this is the test that says why. Muting the
+    Trader on a live connection would freeze the lane's memory at whatever was
+    resting when the ceiling hit while the exchange moved on — and `allMids`
+    keeps the socket alive indefinitely, so nothing would ever force the resync
+    that repairs it. The lane would sit on one of ten connections believing a
+    stale book. Here the refusal ends the connection, and the NEXT one resyncs
+    and reports the divergence honestly rather than as a phantom."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    requotes = [
+        orders_message(update(oid=oid)) for oid in range(ORDER_UPDATE_RATE_LIMIT + 40)
+    ]
+    # Frames after the refusal are staged but must never be read: the connection
+    # is finished at the ceiling, not muted through the rest of the script.
+    socket = FakeWebsocket(clock, [liveness_message(), *requotes])
+    ended = await run_once(pool, gateway, clock, socket)
+
+    assert isinstance(ended, LaneRefused)
+    assert socket.closed
+    # The book the lane believed is now known to be stale, so the next
+    # connection resyncs it: the orders it recorded are reported `gone` rather
+    # than left sitting in memory forever.
+    gateway.set_open_orders(TRADER, [])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+    assert await pool.fetchval("SELECT count(*) FROM ws_order_state") == 0
+    assert await pool.fetchval(
+        "SELECT count(*) FROM order_events WHERE kind = 'gone'"
+    ) == ORDER_UPDATE_RATE_LIMIT
 
 
 async def test_the_ceiling_is_a_rolling_minute_not_a_lifetime_budget(
@@ -736,6 +820,18 @@ async def test_a_poll_set_past_the_connection_cap_is_truncated_not_overrun(
 
     assert list(lanes) == [TRADER]  # the poll set is sorted, so this is deterministic
     lanes[TRADER].cancel()
+
+
+def test_reconnects_are_paced_against_the_per_ip_connection_rate() -> None:
+    """30 new connections a minute is a PER-IP allowance shared by every lane on
+    the box. The position lane's 2-second floor was sized when this process held
+    one connection; MAX_ORDER_LANES lanes reconnecting at that floor would spend
+    ~240/min between them. Stated as the arithmetic so it cannot drift."""
+    new_connections_per_minute = MAX_ORDER_LANES * (60 / ORDER_RECONNECT_MIN_SECONDS)
+    assert new_connections_per_minute <= CONNECTION_RATE_LIMIT / 3
+    # And the floor is genuinely slower than the position lane's, which is the
+    # whole point — that one was sized for a single connection.
+    assert ORDER_RECONNECT_MIN_SECONDS > RECONNECT_MIN_SECONDS
 
 
 def test_the_connection_allowance_bounds_the_shadowed_set() -> None:

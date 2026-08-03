@@ -148,13 +148,13 @@ WS_LANE_PROCESS = "ws_shadow"
 # paces against, which is the whole reason this transport is worth having.
 SUBSCRIPTION_LIMIT = 1000
 
-# What one Trader costs this connection: the all-dex positions feed, and only
-# that. The per-dex forms would cost one subscription per venue for the same
-# coverage. The account-wide order feed used to be subscribed here too — it is
-# not any more, because its frames carry no `user` and are therefore
-# unattributable on a connection serving many Traders; the order lane takes one
-# connection per Trader instead (ADR-0007, issue #168).
-SUBSCRIPTIONS_PER_TRADER = 1
+# What one Trader costs this connection is one subscription: the all-dex
+# positions feed, and nothing per venue. The account-wide order feed used to be
+# subscribed here too — it is not any more, because its frames carry no `user`
+# and are therefore unattributable on a connection serving many Traders; the
+# order lane takes one connection per Trader instead (ADR-0007, issue #168).
+# There is no constant for that 1: nothing divides by it now that the binding
+# limit counts users rather than subscriptions.
 
 # ⚠️ The real ceiling, and it is NOT the subscription cap. Measured 2026-08-03
 # (scripts/testnet_ws_probe.py users): there is an undocumented allowance of 15
@@ -386,7 +386,7 @@ async def _refresh_subscriptions(
     silently instead of diffing against months-old memory — the poller's
     re-follow rule (`_prune_untracked`), which this lane owes for the same
     reason."""
-    await _prune_unwatched(pool)
+    await forget_unwatched(pool, "ws_position_snapshots", "ws_lane_state")
     wanted = await fetch_poll_set(pool)
     if len(wanted) > MAX_SUBSCRIBED_TRADERS:
         log.error(
@@ -545,12 +545,20 @@ async def _apply_positions(
         return len(events)
 
 
-async def _prune_unwatched(pool: asyncpg.Pool) -> None:
-    """Forget wallets that left the poll set, so a re-follow re-baselines
-    silently rather than diffing against stale memory (the poller's re-follow
-    rule). Events already written stay — they were true when observed."""
+async def forget_unwatched(pool: asyncpg.Pool, *tables: str) -> None:
+    """Drop the named lanes' memory of wallets that left the poll set, so a
+    re-follow re-baselines silently rather than diffing against stale memory
+    (the poller's re-follow rule). Events already written stay — they were true
+    when observed.
+
+    Takes the tables rather than naming them, because both websocket lanes owe
+    exactly this and keep their memory in different tables: one rule, applied
+    twice, is what stops the two drifting on what a re-follow means.
+
+    `tables` are module constants, never anything a caller could taint — the
+    interpolation below has no other safe reading."""
     async with pool.acquire() as conn, conn.transaction():
-        for table in ("ws_position_snapshots", "ws_lane_state"):
+        for table in tables:
             await conn.execute(
                 f"""
                 DELETE FROM {table}
