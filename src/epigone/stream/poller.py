@@ -79,6 +79,7 @@ from epigone.gateway import (
     Position,
     RateLimitedError,
     fetch_account_state,
+    fetch_open_positions,
 )
 from epigone.ingest.fine import mark_due_now
 from epigone.position_diff import diff_positions, events_of
@@ -209,24 +210,38 @@ async def fetch_account_state_paced(
     into false CLOSE alerts (issue #21) — and with its recorded equity
     untouched, never a sum missing a venue's collateral, which is the same
     figure a Trader emptying that venue would produce."""
-    for _venue in POSITION_VENUES:
-        await budget.spend(POSITIONS_WEIGHT)
+    await _spend_venue_weight(budget)
     return await fetch_account_state(gateway, address)
 
 
 async def fetch_positions_paced(
     gateway: HyperliquidGateway, budget: Budget, address: str
 ) -> list[Position]:
-    """The positions half of fetch_account_state_paced, for callers that have no
-    use for the equity.
+    """A Trader's open positions across the venues we cover, paced identically —
+    the same calls, the same weight, parsed for the positions alone.
 
     Shared with the websocket lane's reconnect resync (issue #157), which needs
     exactly this — a paced, all-or-raise, point-in-time read — and must bill it
     the same way, off the same venue tuple, or the two lanes' spends would drift
-    from the calls they make. It reads through the equity-carrying fetch rather
-    than beside it so there is one paced clearinghouseState read in this
-    codebase, not two that could come to disagree about what a venue costs."""
-    return (await fetch_account_state_paced(gateway, budget, address)).positions
+    from the calls they make.
+
+    Deliberately NOT the positions half of fetch_account_state_paced (issue
+    #170). That read requires a marginSummary and raises without one, which is
+    right where a missing equity would be acted on and pointless where nothing
+    reads it: routing the resync through it would give the websocket lane a new
+    way to fail for a field it never uses. The two share their pacing, which is
+    the part that must not drift, and nothing else."""
+    await _spend_venue_weight(budget)
+    return await fetch_open_positions(gateway, address)
+
+
+async def _spend_venue_weight(budget: Budget) -> None:
+    """Reserve one clearinghouseState call's weight per covered venue, before
+    the calls. Billing off POSITION_VENUES here — in one place both paced reads
+    go through — keeps the accounting in lockstep with the calls the shared
+    fetches actually make (issue #31)."""
+    for _venue in POSITION_VENUES:
+        await budget.spend(POSITIONS_WEIGHT)
 
 
 async def _prune_untracked(pool: asyncpg.Pool) -> None:

@@ -488,9 +488,11 @@ async def fetch_account_state(gateway: HyperliquidGateway, address: str) -> Acco
     Epigone watches. Verified live 2026-08-04 rather than assumed (the #63
     never-assume-coverage lesson): a dex-scoped clearinghouseState answers with
     its OWN marginSummary, and a wallet holding nothing on that dex gets
-    accountValue "0.0" rather than a response missing the field. That total is deliberately a partial view of the wallet —
-    an uncovered dex or a spot balance is outside it — and it is the right one,
-    because it is exactly the money backing the positions Epigone diffs.
+    accountValue "0.0" rather than a response missing the field (the shape is
+    recorded in tests/fixtures/clearinghouse_state_xyz.json). That total is
+    deliberately a partial view of the wallet — an uncovered dex or a spot
+    balance is outside it — and it is the right one, because it is exactly the
+    money backing the positions Epigone diffs.
 
     Same all-or-raise rule as fetch_open_positions, and equity sharpens it: a
     venue that failed to answer contributes zero to the sum, which is

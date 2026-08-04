@@ -35,6 +35,14 @@ RECORDED: dict[str, Any] = json.loads(
     (Path(__file__).parent / "fixtures" / "clearinghouse_state_whale.json").read_text()
 )
 
+# The same endpoint asked for one builder DEX (issue #170), recorded live
+# 2026-08-04 from a wallet with an xyz book: its own marginSummary, its own
+# collateral, coins already namespaced.
+XYZ_WHALE = "0xfb941d2344b72ea9101400392b818173772d0ddf"
+RECORDED_XYZ: dict[str, Any] = json.loads(
+    (Path(__file__).parent / "fixtures" / "clearinghouse_state_xyz.json").read_text()
+)
+
 
 @asynccontextmanager
 async def replaying_gateway(
@@ -115,6 +123,21 @@ async def test_sends_the_documented_clearinghouse_state_request() -> None:
         await gateway.get_open_positions(WHALE)
 
     assert received == [{"type": "clearinghouseState", "user": WHALE.lower()}]
+
+
+async def test_a_builder_dex_answers_with_its_own_equity_and_namespaced_coins() -> None:
+    # Recorded live 2026-08-04 from a wallet holding xyz positions (the #63
+    # never-assume-coverage lesson applied to equity): a dex-scoped
+    # clearinghouseState carries its OWN marginSummary — a separate collateral
+    # pool from core, which is why fetch_account_state sums the venues rather
+    # than reading one — and its coins arrive already namespaced.
+    async with replaying_gateway(RECORDED_XYZ) as (gateway, received):
+        state = await gateway.get_account_state(XYZ_WHALE, dex="xyz")
+
+    assert received == [{"type": "clearinghouseState", "user": XYZ_WHALE, "dex": "xyz"}]
+    assert state.account_value == Decimal("192356.348271")
+    assert [p.coin for p in state.positions] == ["xyz:SKHX", "xyz:SP500"]
+    assert state.positions[1].side is Side.SHORT  # szi -331.233
 
 
 async def test_the_account_state_read_costs_one_request_and_carries_the_equity() -> None:

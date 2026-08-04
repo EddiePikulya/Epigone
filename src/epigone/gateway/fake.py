@@ -24,8 +24,10 @@ class FakeHyperliquidGateway:
         self.positions_errors_by_dex: dict[tuple[str, str | None], Exception] = {}
         self.positions_calls: list[tuple[str, str | None]] = []
         # A venue's account equity (issue #170), keyed like the positions it
-        # rides with. Unset means zero: a wallet a test never gave an equity to
-        # is one whose equity the test is not about.
+        # rides with. Unset answers zero, which is what the live endpoint says
+        # about a venue a wallet holds nothing on (verified 2026-08-04:
+        # accountValue "0.0", never an absent field) — so a test that says
+        # nothing about equity still gets a shape the real gateway produces.
         self.account_values: dict[tuple[str, str | None], Decimal] = {}
         self.open_orders: dict[tuple[str, str | None], list[OpenOrder]] = {}
         self.open_orders_errors: dict[str, Exception] = {}
