@@ -27,10 +27,13 @@ DEFAULT_FINE_CHUNK_SIZE = 500
 #
 # The math: one poll costs ORDERS_WEIGHT (20 nominal; ~8 measured, see
 # epigone.stream.orders) × 2 covered venues = 40 weight per wallet per cycle,
-# so at 100s each tracked wallet adds 24 nominal weight/min (~10 real) —
-# alongside position polling's 8/wallet/min at its 30s interval, 32/min/wallet
-# against the 900/min shared refill, i.e. the stream alone would claim the whole
-# bucket at ~28 distinct wallets.
+# so at 100s each tracked wallet adds 24 nominal weight/min (~10 real). Position
+# polling adds its own per-wallet weight on top, set by
+# epigone.stream.poller.POLL_INTERVAL_SECONDS; the two together against the
+# 900/min shared refill are what decide the wallet count at which the stream
+# alone claims the whole bucket. That combined saturation figure moves whenever
+# either cadence or the covered-venue tuple does, so read it from
+# docs/spec-defaults.md (order-poll cadence bullet) rather than from here.
 #
 # 100s is deliberately past the point where the cadence, not the wallet count,
 # sets the pass duration: the pass spaces its wallets by
