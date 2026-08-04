@@ -43,6 +43,7 @@ from epigone.gateway import (
     LeaderboardEntry,
     LeaderboardWindow,
     OpenOrder,
+    PerpAsset,
     Position,
     RateLimitedError,
     Side,
@@ -173,6 +174,30 @@ class HttpHyperliquidGateway:
             return await self._request_json("POST", self._info_url, json_body=body)
         except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
+
+    async def get_sub_accounts(self, address: str) -> list[str]:
+        payload = await self._info_json("subAccounts", address)
+        return parse_sub_accounts(payload)
+
+    async def get_perp_assets(self, dex: str | None = None) -> list[PerpAsset]:
+        body: dict[str, str] = {"type": "meta"}
+        if dex is not None:
+            body["dex"] = dex
+        try:
+            payload = await self._request_json("POST", self._info_url, json_body=body)
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            raise GatewayError(f"meta request failed for dex {dex!r}: {exc}") from exc
+        return parse_perp_assets(payload, dex)
+
+    async def get_mid_prices(self, dex: str | None = None) -> dict[str, Decimal]:
+        body: dict[str, str] = {"type": "allMids"}
+        if dex is not None:
+            body["dex"] = dex
+        try:
+            payload = await self._request_json("POST", self._info_url, json_body=body)
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            raise GatewayError(f"allMids request failed for dex {dex!r}: {exc}") from exc
+        return parse_mid_prices(payload, dex)
 
     async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
         body: dict[str, str] = {"type": "frontendOpenOrders", "user": address.lower()}
@@ -350,6 +375,62 @@ def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:
         return positions
     except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         raise GatewayError(f"unexpected clearinghouseState payload shape: {exc!r}") from exc
+
+
+def parse_sub_accounts(payload: Any) -> list[str]:
+    """A subAccounts payload as lowercased sub-account addresses.
+
+    `null` is the documented answer for a master with no subs and is NOT a
+    shape surprise — it is the common case for every account that has never
+    used the feature. Anything else unexpected fails loudly: a sweep that read
+    a malformed listing as "no subs" would skip exactly the books an emergency
+    stop exists to clear."""
+    if payload is None:
+        return []
+    if not isinstance(payload, list):
+        raise GatewayError(f"unexpected subAccounts payload shape: {payload!r}")
+    try:
+        return [str(entry["subAccountUser"]).lower() for entry in payload]
+    except (KeyError, TypeError) as exc:
+        raise GatewayError(f"unexpected subAccounts payload shape: {exc!r}") from exc
+
+
+def parse_perp_assets(payload: Any, dex: str | None = None) -> list[PerpAsset]:
+    """A meta payload's universe as PerpAssets in asset-index order (issue
+    #136) — parse_perp_universe's richer twin, keeping the `szDecimals` an
+    order must be rounded by. Same loud-failure rule: order IS the data, and
+    a missing precision would be rounded by a guess into a typed reject."""
+    try:
+        return [
+            PerpAsset(
+                name=_namespaced_coin(str(entry["name"]), dex),
+                sz_decimals=int(entry["szDecimals"]),
+            )
+            for entry in payload["universe"]
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GatewayError(f"unexpected meta payload shape: {exc!r}") from exc
+
+
+def parse_mid_prices(payload: Any, dex: str | None = None) -> dict[str, Decimal]:
+    """An allMids payload as coin → mid price, namespaced like every other
+    coin key in the system.
+
+    SPOT IS DROPPED by the same convention parse_open_orders uses: allMids
+    carries the wallet-agnostic mid for every asset the venue lists, spot
+    pairs (`@N`-indexed) included, and Epigone is perp-only. A non-numeric
+    mid fails the whole parse rather than the one coin — a price is what an
+    order is signed over, so half a price map is worse than none."""
+    if not isinstance(payload, dict):
+        raise GatewayError(f"unexpected allMids payload shape: {payload!r}")
+    try:
+        return {
+            _namespaced_coin(str(coin), dex): Decimal(str(mid))
+            for coin, mid in payload.items()
+            if not str(coin).startswith("@") and "/" not in str(coin)
+        }
+    except (TypeError, ValueError, InvalidOperation) as exc:
+        raise GatewayError(f"unexpected allMids payload shape: {exc!r}") from exc
 
 
 def parse_open_orders(payload: Any, dex: str | None = None) -> list[OpenOrder]:

@@ -131,6 +131,42 @@ services:
     # is. It starts regardless and decides for itself (epigone.safety.coldstart).
     restart: unless-stopped
 
+  # The A4 operator copy executor (issue #136, ADR-0007): mirrors copy-enabled
+  # Leaders into their own funded sub-accounts, reconciles against the exchange
+  # every loop, and reports every action and every skip to the operator's chat.
+  #
+  # Behind the same `execution` profile as the watchdog, and for the same
+  # reason: it fail-fasts without an EXECUTOR-lane agent key (`python -m
+  # epigone.keystore generate --lane executor …`, then the approval ceremony).
+  # It also expects the watchdog to be running — the executor beats the
+  # heartbeat that the dead-man's switch reads, and an executor with nothing
+  # watching it is the configuration A3 exists to prevent.
+  #
+  # TESTNET by construction until A5 (#137): EXECUTOR_EXCHANGE_URL defaults to
+  # testnet and mainnet is refused in code regardless, so the ticket's live
+  # gate does not depend on this file being right.
+  #
+  # UNLIKE the watchdog, this one DOES depend on Postgres being healthy. The
+  # asymmetry is deliberate: a blind watchdog must still cancel (subtractive,
+  # and the outage is exactly when orders go unattended), while a blind
+  # executor must not trade — it would have no halt state, no mappings, no
+  # claims, and no way to write the audit row that must precede the wire.
+  execute:
+    build: .
+    profiles: ["execution"]
+    command: ["/app/.venv/bin/python", "-m", "epigone.execute.main"]
+    environment:
+      DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+      ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID}
+      KEYSTORE_KEK_FILE: /run/secrets/keystore-kek
+      EXECUTOR_INTERVAL_SECONDS: ${EXECUTOR_INTERVAL_SECONDS:-5}
+    volumes:
+      - ${KEYSTORE_KEK_FILE:-./.keystore-kek}:/run/secrets/keystore-kek:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
   # The watchdog's encrypted cold-start key cache. Sealed under the KEK, so

@@ -160,6 +160,16 @@ CAPABILITY_RETRY = timedelta(minutes=5)
 
 
 @dataclass(frozen=True)
+class _AccountOrder:
+    """One resting order and WHICH BOOK it rests on (issue #136): `account` is
+    None for the master and a sub-account address otherwise — exactly the
+    vault flag the cancel must carry."""
+
+    account: str | None
+    order: OpenOrder
+
+
+@dataclass(frozen=True)
 class _BlindIncident:
     """An in-process trip that Postgres couldn't record: either the database
     was unreadable past the blind threshold (`db_blind=True`), or a REAL
@@ -527,21 +537,25 @@ class Watchdog:
         the halt unswept for the next cycle; enumeration is idempotent and
         cancels tolerate re-issue.
 
-        ACCOUNT-WIDE by construction (PR #143 review): every builder dex in
-        the live perpDexs listing, not just POSITION_VENUES. (Sub-accounts
-        are a different axis: agent-reachable per the #142 findings but
-        separate ACCOUNTS, outside this master's book — the runbook carries
-        that boundary until A5's risk policy forbids or includes them.)
+        ACCOUNT-WIDE ON BOTH AXES. Venues: every builder dex in the live
+        perpDexs listing, not just POSITION_VENUES (PR #143 review).
+        ACCOUNTS: the master plus every sub-account (issue #136, ADR-0007
+        decision 1) — A4 is the first thing in this codebase that can place
+        an order on a sub, and "adding a venue to trading means adding it to
+        the sweep" applies to accounts exactly as it applies to dexs. The sub
+        list comes from the EXCHANGE (`subAccounts`), not from Epigone's
+        `copy_subs` table, so the cold-start blind path — which has no
+        database at all — sweeps them under this same code.
 
         `skip_cancel` is the incident-reconcile shape (round 5): the
         incident's own pass already cancelled, so this call only enumerates
         and stamps — an order that somehow still rests leaves the halt
         unswept and the NEXT cycle's full sweep cancels it."""
         if skip_cancel:
-            dexs, complete = await self._sweep_venues()
-            orders = await self._open_orders(dexs)
+            dexs, accounts, complete = await self._sweep_scope()
+            orders = await self._open_orders(dexs, accounts)
         else:
-            dexs, complete, cancelled = await self._cancel_resting(
+            dexs, accounts, complete, cancelled = await self._cancel_resting(
                 f"halt #{halt.id} ({halt.source}): {halt.reason}"
             )
             if cancelled:
@@ -549,20 +563,20 @@ class Watchdog:
                 # listing included, so a dex appearing mid-sweep can't hide
                 # an order from the verify. An already-empty book needs no
                 # second look (its first enumeration IS the verify).
-                dexs, complete = await self._sweep_venues()
-                orders = await self._open_orders(dexs)
+                dexs, accounts, complete = await self._sweep_scope()
+                orders = await self._open_orders(dexs, accounts)
             else:
                 orders = []
         if orders or not complete:
             log.warning(
-                "halt #%d sweep incomplete: %d order(s) resting, venue coverage %s; "
+                "halt #%d sweep incomplete: %d order(s) resting, coverage %s; "
                 "retrying next cycle",
                 halt.id,
                 len(orders),
-                "complete" if complete else "PARTIAL (perpDexs unavailable)",
+                "complete" if complete else "PARTIAL (perpDexs or subAccounts unavailable)",
             )
             return
-        positions = await self._open_positions(dexs)
+        positions = await self._open_positions(dexs, accounts)
         # Durable write, hard-ceilinged like every state block (round 5): a
         # partition striking mid-transaction here must cost a bounded cycle,
         # not a hung loop that can never reach the blind machinery.
@@ -578,82 +592,121 @@ class Watchdog:
             DB_BLOCK_CEILING_SECONDS,
         )
         log.error(
-            "halt #%d swept: book empty across %d venue(s); %d open position(s) HELD "
-            "per %s (docs/runbooks/halt-and-unwind.md)",
+            "halt #%d swept: book empty across %d venue(s) × %d account(s); %d open "
+            "position(s) HELD per %s (docs/runbooks/halt-and-unwind.md)",
             halt.id,
             len(dexs) + 1,
+            len(accounts),
             len(positions),
             HOLD_POLICY,
         )
 
-    async def _cancel_resting(self, decision: str) -> tuple[list[str], bool, list[OpenOrder]]:
+    async def _cancel_resting(
+        self, decision: str
+    ) -> tuple[list[str], list[str | None], bool, list[_AccountOrder]]:
         """Enumerate account-wide and cancel whatever rests — the shared
         kernel of the normal sweep and the DB-blind sweep. No verification,
         no stamping: callers own what "done" means. Returns what it saw —
-        (venues, coverage-complete, the orders it cancelled) — so the normal
-        sweep can treat an already-empty first enumeration as its verify
-        instead of re-billing a second one."""
-        self._exec.decision = decision
-        dexs, complete = await self._sweep_venues()
-        orders = await self._open_orders(dexs)
-        if orders:
-            await self._exec.cancel_orders(await self._cancels_for(orders))
-        return dexs, complete, orders
+        (venues, accounts, coverage-complete, the orders it cancelled) — so
+        the normal sweep can treat an already-empty first enumeration as its
+        verify instead of re-billing a second one.
 
-    async def _sweep_venues(self) -> tuple[list[str], bool]:
-        """The builder-dex listing for an account-wide sweep — or, when the
-        listing endpoint is down, the covered POSITION_VENUES with
-        complete=False (round 2 item 3): a partial sweep that says so beats
-        a total abort that cancels nothing, but partial coverage can never
-        stamp swept_at."""
+        Cancels are grouped PER ACCOUNT because a cancel names a book: one
+        action per account, carrying that account's vault flag (the master's
+        is None). A sub whose cancel fails leaves the halt unswept and the
+        next cycle re-enumerates — the same idempotent retry the venue axis
+        already relies on."""
+        self._exec.decision = decision
+        dexs, accounts, complete = await self._sweep_scope()
+        orders = await self._open_orders(dexs, accounts)
+        if orders:
+            asset_ids = await self._asset_ids_for(orders)
+            for account in accounts:
+                theirs = [o.order for o in orders if o.account == account]
+                if not theirs:
+                    continue
+                await self._exec.cancel_orders(
+                    _cancels_for(theirs, asset_ids), vault_address=account
+                )
+        return dexs, accounts, complete, orders
+
+    async def _sweep_scope(self) -> tuple[list[str], list[str | None], bool]:
+        """What this sweep must cover, on both axes: (builder dexs, accounts,
+        coverage-complete).
+
+        Either enumeration can fail, and a failure on either degrades the same
+        way (round 2 item 3): fall back to what is certainly covered, say so,
+        and never stamp swept_at on partial coverage — a partial sweep that
+        announces itself beats a total abort that cancels nothing.
+
+        The account axis is issue #136's: `None` is the master (no vault
+        flag), and every sub-account follows. Read from the exchange rather
+        than from Epigone's own mapping table so the cold-start blind path,
+        which has no database, enumerates them identically."""
         await self._budget.spend(META_WEIGHT)
         try:
-            return await self._read.get_perp_dexs(), True
+            dexs, dexs_complete = await self._read.get_perp_dexs(), True
         except Exception:
-            fallback = [dex for dex in POSITION_VENUES if dex is not None]
+            dexs = [dex for dex in POSITION_VENUES if dex is not None]
+            dexs_complete = False
             log.error(
                 "perpDexs listing unavailable — sweep coverage degraded to the "
                 "covered venues %s (PARTIAL; swept_at withheld)",
-                fallback,
+                dexs,
                 exc_info=True,
             )
-            return fallback, False
+        accounts: list[str | None] = [None]
+        await self._budget.spend(META_WEIGHT)
+        try:
+            accounts += list(await self._read.get_sub_accounts(self._master))
+            accounts_complete = True
+        except Exception:
+            accounts_complete = False
+            log.error(
+                "subAccounts listing unavailable — sweeping the master ONLY; any "
+                "Copy Sub-account's resting orders are NOT covered this pass "
+                "(PARTIAL; swept_at withheld)",
+                exc_info=True,
+            )
+        return dexs, accounts, dexs_complete and accounts_complete
 
-    async def _cancels_for(self, orders: list[OpenOrder]) -> list[CancelSpec]:
+    async def _asset_ids_for(self, orders: list[_AccountOrder]) -> dict[str, int]:
         # Map exactly the dexs the enumerated orders sit on (namespaced
         # `dex:COIN` coins), plus the core universe fetch_asset_ids always
-        # reads. Billing: core meta + perpDexs (when any dex is needed) +
-        # one meta per needed dex.
-        needed = sorted({order.coin.split(":", 1)[0] for order in orders if ":" in order.coin})
+        # reads. One map serves every account: asset ids are a property of the
+        # venue, not of the book. Billing: core meta + perpDexs (when any dex
+        # is needed) + one meta per needed dex.
+        needed = sorted(
+            {o.order.coin.split(":", 1)[0] for o in orders if ":" in o.order.coin}
+        )
         spends = 1 + (1 + len(needed) if needed else 0)
         for _ in range(spends):
             await self._budget.spend(META_WEIGHT)
-        asset_ids = await fetch_asset_ids(self._read, dexs=needed)
-        cancels: list[CancelSpec] = []
-        for order in orders:
-            asset = asset_ids.get(order.coin)
-            if asset is None:
-                # Fail the whole sweep loudly rather than skip: a skipped
-                # order is a live order the trail would show as swept-over.
-                raise GatewayError(
-                    f"open order {order.order_id} is on coin {order.coin!r} with no "
-                    f"asset id in the universe — cannot cancel it; sweep aborted"
-                )
-            cancels.append(CancelSpec(asset=asset, oid=order.order_id))
-        return cancels
+        return await fetch_asset_ids(self._read, dexs=needed)
 
-    async def _open_orders(self, dexs: list[str]) -> list[OpenOrder]:
-        orders: list[OpenOrder] = []
-        for dex in [None, *dexs]:
-            await self._budget.spend(ORDERS_WEIGHT)
-            orders.extend(await self._read.get_open_orders(self._master, dex=dex))
+    async def _open_orders(
+        self, dexs: list[str], accounts: list[str | None]
+    ) -> list[_AccountOrder]:
+        orders: list[_AccountOrder] = []
+        for account in accounts:
+            address = account or self._master
+            for dex in [None, *dexs]:
+                await self._budget.spend(ORDERS_WEIGHT)
+                orders.extend(
+                    _AccountOrder(account=account, order=order)
+                    for order in await self._read.get_open_orders(address, dex=dex)
+                )
         return orders
 
-    async def _open_positions(self, dexs: list[str]) -> list[Position]:
+    async def _open_positions(
+        self, dexs: list[str], accounts: list[str | None]
+    ) -> list[Position]:
         positions: list[Position] = []
-        for dex in [None, *dexs]:
-            await self._budget.spend(POSITIONS_WEIGHT)
-            positions.extend(await self._read.get_open_positions(self._master, dex=dex))
+        for account in accounts:
+            address = account or self._master
+            for dex in [None, *dexs]:
+                await self._budget.spend(POSITIONS_WEIGHT)
+                positions.extend(await self._read.get_open_positions(address, dex=dex))
         return positions
 
     # --- the on-chain capability probe (advisory) ---
@@ -732,6 +785,22 @@ class Watchdog:
             exc_info=True,
         )
         self._next_capability_at = now + CAPABILITY_RETRY
+
+
+def _cancels_for(orders: list[OpenOrder], asset_ids: dict[str, int]) -> list[CancelSpec]:
+    """One account's cancels, by oid. An order whose coin has no asset id
+    fails the WHOLE sweep loudly rather than being skipped: a skipped order is
+    a live order the trail would show as swept-over."""
+    cancels: list[CancelSpec] = []
+    for order in orders:
+        asset = asset_ids.get(order.coin)
+        if asset is None:
+            raise GatewayError(
+                f"open order {order.order_id} is on coin {order.coin!r} with no "
+                f"asset id in the universe — cannot cancel it; sweep aborted"
+            )
+        cancels.append(CancelSpec(asset=asset, oid=order.order_id))
+    return cancels
 
 
 def _incident_kind(incident: _BlindIncident) -> str:

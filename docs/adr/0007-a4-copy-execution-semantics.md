@@ -39,7 +39,15 @@ its own clearinghouseState/PnL, so per-Leader copy stats are exchange-native.
   the cold-start blind path. A4 is the first thing that can place orders on a
   sub, so this scope lands in A4 (the "adding a venue means adding it to the
   sweep" rule from the runbook, applied to sub-accounts).
-- Max sub-account count is unprobed; probe before implementation.
+- Max sub-account count: PROBED (2026-08-04, `scripts/testnet_subaccount_cap_probe.py`,
+  gateway TESTNET FINDING 10) — **10 sub-accounts per master, flat**. The 11th
+  creation is refused `"Too many sub-accounts."`, and the ceiling did not move
+  at $1M cumVlm, so unlike the agent cap it is not volume-scaled. Under
+  one-sub-per-Leader that is a hard ceiling of 10 concurrent Leaders, minus
+  whatever non-copy subs the master already holds; subs cannot be deleted, so
+  a retired Leader's sub is REUSED rather than replaced. Far above phase A's
+  handful — it constrains nothing today, and it is the number that would
+  decide whether deferred multi-Leader subs ever need to return.
 
 ### 2. Sizing: fixed Base Notional per sub, relative mirroring
 
@@ -274,7 +282,8 @@ copying. `/uncopy` flips the flag off.
 - **End-to-end `run_cycle` regression test** (carry-forward from #143):
   drive a mid-transaction black hole through the real cycle with a wall-clock
   bound, wherever the execution loop's integration tests land.
-- **Probe before implementing:** max sub-account count (unprobed); testnet
+- **Probe before implementing:** max sub-account count — DONE, 10 per master
+  (decision 1, finding 10); testnet
   master is past the $100k createSubAccount gate, mainnet farming (~$65) is a
   mainnet-switch checklist item in #138.
 - **Testnet-only:** the live gate is unchanged — no mainnet code path

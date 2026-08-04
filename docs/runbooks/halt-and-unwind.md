@@ -238,19 +238,36 @@ a host reboot, a deploy landing mid-incident — protects the account anyway:
   false safety. Under `restart: unless-stopped` it retries, and comes up
   the moment Postgres answers.
 
-**Sweep coverage:** the cancel-all is ACCOUNT-WIDE — the core venue plus
-every builder dex in the live `perpDexs` listing, re-fetched each sweep, so
-a venue added to trading is swept with no code change. If the listing
-endpoint itself is down, coverage degrades to the covered POSITION_VENUES:
-those venues are still swept, but `swept_at` is deliberately withheld — so
-a halt alert that keeps saying "sweep PENDING" for more than a cycle or two
-means either orders that won't die or degraded venue coverage; the watchdog
-log says which. The boundary that
-remains: **sub-accounts.** The #142 probes showed an approved agent can
-create and fund sub-accounts — separate accounts whose books this master's
-sweep never sees. Until A5's risk policy either forbids sub-account use by
-the executor or adds their books to the sweep, treat any sub-account
-activity as OUTSIDE the kill switch's reach.
+**Sweep coverage:** the cancel-all is ACCOUNT-WIDE ON TWO AXES.
+
+*Venues:* the core venue plus every builder dex in the live `perpDexs`
+listing, re-fetched each sweep, so a venue added to trading is swept with no
+code change.
+
+*Accounts (issue #136, ADR-0007 decision 1):* the master plus **every
+sub-account**, enumerated from the exchange's own `subAccounts` endpoint on
+each sweep. A4 made the old boundary untenable — the copy executor places
+orders on a Copy Sub-account per Leader, so "sub-accounts are outside the
+kill switch's reach" would have meant the kill switch missed exactly the
+books with copy money in them. Each account's cancel carries that account's
+vault flag, because a cancel names a book. The list comes from the EXCHANGE
+rather than from Epigone's own `copy_subs` table for one reason: the
+cold-start blind path has no database, and it must sweep subs too.
+
+If EITHER listing endpoint is down, coverage degrades to what is certainly
+covered — the POSITION_VENUES on the venue axis, the master alone on the
+account axis — those are still swept, but `swept_at` is deliberately
+withheld. So a halt alert that keeps saying "sweep PENDING" for more than a
+cycle or two means either orders that won't die or degraded coverage; the
+watchdog log says which axis.
+
+One thing a sweep still does NOT do: close positions. A Copy Sub-account's
+positions are HELD exactly like the master's, and bracket triggers are
+resting orders, so a halt CANCELS a bracket-mode sub's stops. That is why
+`/resume` re-places them (ADR-0007 decision 9's r1a) — but between the halt
+and the resume, a bracket-mode position is UNSTOPPED. If the halt is going
+to stand for a while and a sub holds something you wanted stopped, act from
+the master wallet.
 
 The watchdog's own health is a 🚨 health-monitor check on two axes: liveness
 (`HEALTHCHECK_WATCHDOG_STALE_SECONDS`, default 300) and CAPABILITY — every

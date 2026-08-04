@@ -66,6 +66,7 @@ class CancelOnlyExecutionGateway:
         *,
         grouping: Grouping = Grouping.NA,
         builder: BuilderFee | None = None,
+        vault_address: str | None = None,
     ) -> list[OrderResult]:
         raise self._refusal("place_orders", len(orders))
 
@@ -75,8 +76,13 @@ class CancelOnlyExecutionGateway:
     async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
         raise self._refusal("update_leverage", 1)
 
-    async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
-        return await self._inner.cancel_orders(cancels)
+    async def cancel_orders(
+        self, cancels: list[CancelSpec], *, vault_address: str | None = None
+    ) -> list[CancelResult]:
+        # Sub-account cancels pass through unrestricted: reaching a wider set
+        # of books is still purely subtractive, and A4's per-sub sweep
+        # (ADR-0007 decision 1) is exactly why the parameter exists.
+        return await self._inner.cancel_orders(cancels, vault_address=vault_address)
 
     async def cancel_orders_by_cloid(self, cancels: list[CloidCancelSpec]) -> list[CancelResult]:
         return await self._inner.cancel_orders_by_cloid(cancels)

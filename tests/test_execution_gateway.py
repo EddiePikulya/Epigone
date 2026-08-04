@@ -254,5 +254,7 @@ async def test_fake_records_grouping_and_modify_payloads() -> None:
     await fake.modify_orders([ModifySpec(oid=5, order=order())])
     method, payload = fake.actions[0]
     assert method == "place_orders"
-    assert payload == ([order(), tp], Grouping.NORMAL_TPSL, None)
+    # (orders, grouping, builder, vault_address) — the sub-account the batch
+    # was placed on rides the payload too (issue #136), None for the master.
+    assert payload == ([order(), tp], Grouping.NORMAL_TPSL, None, None)
     assert fake.actions[1] == ("modify_orders", [ModifySpec(oid=5, order=order())])
