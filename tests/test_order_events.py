@@ -118,6 +118,19 @@ async def test_a_resync_derived_event_needs_no_status(pool: asyncpg.Pool) -> Non
     assert (row["kind"], row["status"], row["origin"]) == ("gone", None, RESYNC_ORIGIN)
 
 
+async def test_a_resync_derived_event_may_not_carry_a_status_either(
+    pool: asyncpg.Pool,
+) -> None:
+    """The other direction, and the one that matters more. A resync infers what
+    happened by diffing a book that has already moved; the exchange never said a
+    word about it. A status on such a row would be an invention, and it is the
+    invention a copy consumer would trust MOST — `origin` is a caveat, but a
+    status reads as the exchange speaking. So the column is not merely optional
+    here, it is forbidden."""
+    with pytest.raises(asyncpg.IntegrityConstraintViolationError):
+        await record(pool, event(kind="gone", status="canceled", origin=RESYNC_ORIGIN))
+
+
 async def test_what_the_stream_cannot_observe_is_null_rather_than_defaulted(
     pool: asyncpg.Pool,
 ) -> None:

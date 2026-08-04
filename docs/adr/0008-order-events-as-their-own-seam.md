@@ -201,10 +201,68 @@ The diff, and what each case emits:
   filling: a modify would have minted a new oid. This one inference is safe, so
   it is made.
 - **Known, still resting, unchanged** → nothing.
+- **Known, still resting, LARGER** → nothing emitted; memory takes the new size
+  silently. This should be unreachable — the only thing that changes a resting
+  order's size is a fill, which shrinks it, and a modify mints a new oid rather
+  than growing an old one. It is written down because `order_diff` has to do
+  *something* if the exchange ever does it, and the choice matters: emitting the
+  `filled` that the "smaller" branch would produce would report a fill that did
+  not happen, into a seam meant for copy execution. Recording what was observed
+  and saying nothing about it is the conservative half of that pair.
 
 The subscription's own opening behaviour then diffs to nothing, because the
 resync already recorded the gap — neither lost nor doubled, exactly as #157's
 position resync works.
+
+**The one window resync cannot close, and how it heals.** Resync-then-subscribe
+covers everything before the REST read and everything after the subscription
+takes effect. It does not cover what happens *between* them. On the position
+lane that gap is self-healing and nobody has to think about it: every
+`allDexsClearinghouseState` push carries absolute state, so the next push — ~5s
+away, even for an idle account — re-states the truth and the diff corrects
+itself. `orderUpdates` carries transitions. A cancel that lands in the window is
+mentioned once, to nobody, and never again; `ws_order_state` then believes in a
+resting order that is not there, indefinitely, while `allMids` keeps the socket
+looking healthy and no `gone` is ever emitted. That is the same hazard class
+§4 disconnects the rate ceiling over — frozen memory behind a live socket —
+reached from a third direction, and it must not be left undeclared.
+
+The fix is to bound how long any connection is trusted:
+**`ORDER_CONNECTION_MAX_SECONDS = 15 minutes`**, after which a perfectly healthy
+connection is retired and replaced. The replacement resyncs before it
+subscribes, so whatever the window swallowed surfaces then as `placed` /
+`filled` / `gone` with `origin = resync`, exactly like any other gap.
+
+Recycling was chosen over the two alternatives because it reuses the ordering
+argument already proven rather than adding a second one:
+
+- **A verify-resync taken after subscribing** would be a point-in-time REST read
+  applied on a live socket, i.e. precisely the "staler answer lands after a
+  newer push" race that made resync-before-subscribe the rule. Making it safe
+  needs the streamed frames buffered and reconciled against the read, which is
+  new machinery under the most correctness-critical part of the lane.
+- **A positive subscription acknowledgement** (`subscriptionResponse`, which the
+  probe confirms is real) would catch a refusal but not this: the subscription
+  here succeeds, and the change simply happened before it did.
+
+What this buys is a *bound*, not an elimination — staleness of at most 15
+minutes on a window that is itself sub-second and will usually catch nothing. It
+costs 0.53 new connections/min across all 8 lanes (of 30 per IP) and two paced
+REST calls per lane per period.
+
+**A refused subscription ends the connection.** The other way a lane can look
+healthy while recording nothing is being told no. A server `error` frame on an
+order-lane connection is unambiguous in a way it is not on the shared position
+connection: this connection serves one Trader and sends exactly two
+subscriptions and its own pings, so the error is about one of them. If it is the
+order feed — the concrete case being the per-IP allowance of 15 unique users
+already full when this lane asks, e.g. a 16th address racing the position lane's
+refresh — the lane would go on receiving `allMids`, stay liveness-healthy
+forever, record nothing and emit no `gone`. So the frame ends the connection.
+It earns `SUBSCRIPTION_COOLDOWN_SECONDS = 5 minutes` rather than the ordinary
+reconnect floor, because a refusal is usually structural: re-asking every minute
+would spend 8 connections a minute on an answer that only changes when a user
+slot frees.
 
 **The stream is reduced to covered venues before it is diffed.** `orderUpdates`
 is account-wide and carries every dex; the REST resync that anchors it sees
@@ -229,6 +287,8 @@ Two bounds, and they are different in kind:
   Universe. Two order updates per second sustained is that account. A Trader
   whose plan changes 24 times a second does not have a plan to mirror, and
   filling the seam with their requotes would bury the leaders it exists to serve.
+  It is not free of false positives, and that cost is declared as deviation 5
+  below rather than buried here.
 - **`ORDER_EVENT_RETENTION = 24 hours`,** pruned on write, the same
   `record_rate_limit` precedent ADR-0006 followed. Position events keep 7 days
   because a copy executor that was down for a day still wants them; a resting
@@ -298,6 +358,61 @@ Two changes, both corrections rather than features:
   Trader, and they are a large fraction of the lane's inbound traffic. A Trader
   now costs the shared connection one subscription, not two.
 
+## Deviations from #168
+
+What the ticket asked for and this design does not do, each deliberate and each
+argued above. Numbered so a review can name one.
+
+1. **No `modified` kind.** A modify is persisted as its two real halves, a
+   `canceled` and a `placed`, because that is what Hyperliquid does (§2).
+2. **"No change to the subscription budget" does not hold.** Subscriptions per
+   Trader actually *dropped* (2 → 1 on the shared connection), but the lane now
+   spends a whole **connection** per Trader. Forced by the attribution finding
+   (§1).
+3. **An out-of-scope correction to #157's position lane** — `MAX_SUBSCRIBED_TRADERS`
+   499 → 15, and `orderUpdates` off the shared connection — against the ticket's
+   "the position lane behaves exactly as before" (§6). *Signed off by the
+   operator, 2026-08-04, on the probe evidence.*
+4. **Order coverage (8 Traders) is below position coverage (15).** Both are the
+   transport's limits rather than Epigone's; raising either needs another IP
+   (§1).
+5. **The rate ceiling applies the Bot rule per minute, and will sometimes catch
+   a human.** CONTEXT.md defines a Bot by *statistical profile* and excludes it
+   once, at Universe vetting. `ORDER_UPDATE_RATE_LIMIT` applies the same word to
+   *one minute of behaviour*, at the seam, to an account vetting already let
+   through — and those two judgements do not always agree. A tracked human
+   Leader who mass-cancels a ladder of more than 120 orders in a minute (a real
+   thing a real leader does on changing their mind about a market) is refused
+   mid-burst, blacked out for 15 minutes, and the transitions inside that
+   blackout are never recorded: the post-cooldown resync collapses them into
+   `placed` / `gone`.
+
+   It is kept, for the reason §4 gives — the measured alternative is 2.1M rows a
+   day from a single address, which would bury exactly the leaders this seam
+   exists for — but with three properties that make it survivable rather than
+   silent:
+
+   - **The refusal is loud.** `OrderLaneStats.refused` marks the connection, its
+     closing line logs at WARNING naming the Trader and the blackout length, and
+     the lane logs at ERROR when it stands down. An operator can tell a refused
+     Leader from a refused market maker by reading the log, which is the whole
+     point of not swallowing it.
+   - **The post-cooldown state is honest, not merely present.** The resync that
+     follows re-establishes absolute state, so orders that really did leave are
+     reported `gone` exactly once and orders still resting are left alone —
+     no phantom `gone`, no phantom `placed`, and every inferred row carrying
+     `origin = resync` so a consumer can see it was inferred. What is lost is
+     resolution (which orders were cancelled, and when), never accuracy.
+   - **It is a verdict on a minute, not on an account.** The ceiling is a rolling
+     minute and the cooldown ends; the next connection re-judges from scratch.
+     Nothing about the Trader is remembered or marked.
+
+   The lasting fix is not a bigger number here — it is that the seam has no
+   consumer yet, and the consumer that eventually reads these rows (#158, copy
+   execution) is what can say whether a Leader's mass-cancel burst needed to be
+   recorded transition by transition, or whether the resync's summary was always
+   enough. That decision is theirs to take, on this dataset.
+
 ## Consequences
 
 - The order seam exists, with a vocabulary that distinguishes a fill from a
@@ -315,3 +430,8 @@ Two changes, both corrections rather than features:
 - `gone` is a kind consumers must handle. It is the honest cost of reconnecting
   to a feed that only reports transitions: some transitions happen while nobody
   is listening.
+- **Every order lane reconnects on a 15-minute cycle even when nothing is
+  wrong**, which is how the resync→subscribe window heals. Reconnect log lines
+  are therefore routine rather than a signal, and a reader of #158's dataset
+  should expect a small, regular pulse of `origin = resync` rows that is the
+  lane working rather than the transport failing.

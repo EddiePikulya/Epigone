@@ -27,8 +27,9 @@
 --           obvious ones, and the `*Canceled` family is open-ended, so an
 --           unrecognised status maps to kind 'other' and rides with its raw
 --           string intact. The OpenOrder.tpsl precedent: self-describing beats
---           silently wrong. NULL only for a resync-derived row, which no status
---           ever described — hence the CHECK.
+--           silently wrong. NULL for a resync-derived row and ONLY for one,
+--           since no status ever described it — hence the CHECK, which is an
+--           equivalence rather than an implication.
 --
 -- There is deliberately NO 'modified' kind. Hyperliquid's modify is an atomic
 -- cancel/replace minting a new oid (verified live, #115) and arrives as exactly
@@ -82,7 +83,12 @@ CREATE TABLE order_events (
     placed_at        TIMESTAMPTZ,            -- the order's own timestamp
     status_at        TIMESTAMPTZ,            -- the exchange's statusTimestamp
     observed_at      TIMESTAMPTZ NOT NULL,   -- when Epigone saw it
-    CHECK (origin <> 'stream' OR status IS NOT NULL)
+    -- `origin` says who spoke and `status` is what they said, so the two are
+    -- equivalent and BOTH directions are enforced. One direction alone lets the
+    -- other lie: a resync row carrying a status would claim the exchange
+    -- described a change it only ever inferred from a book that had moved, and
+    -- that is the reading a copy consumer would trust most.
+    CHECK ((origin = 'stream') = (status IS NOT NULL))
 );
 
 -- Per-consumer progress, the ADR-0006 pattern for the ADR-0006 reason: identity

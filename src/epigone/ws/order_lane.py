@@ -25,6 +25,22 @@ were right for the same reasons:
   `filled` / `gone` with `origin = 'resync'`.
 - **A Trader's first observation emits nothing.** A ladder that predates the
   first look is not something anyone could have watched being placed.
+- **No connection is trusted for longer than `ORDER_CONNECTION_MAX_SECONDS`.**
+  Resync-then-subscribe leaves exactly one window it cannot close by itself: a
+  change landing between the REST read returning and the subscription taking
+  effect is in neither, and `orderUpdates` is transition-only, so nothing later
+  re-states it. `allMids` would then keep the socket alive indefinitely on top
+  of memory that is quietly wrong — the same "frozen memory behind a live
+  socket" hazard a rate-ceiling breach disconnects over. So the lane bounds a
+  connection's LIFE, and the next connection's resync reports whatever the
+  window swallowed. Staleness is bounded rather than eliminated, which is the
+  honest thing this transport allows, and the bound is a stated constant.
+- **A refused subscription ends the connection.** A server `error` frame here
+  can only be about this connection's own two subscriptions — it serves one
+  Trader and sends nothing else — so it is a verdict, not noise. A lane that
+  logged it and carried on would sit liveness-healthy forever while recording
+  nothing and emitting no `gone`; the concrete case is a 16th unique address
+  refused by the per-IP user allowance while the position lane holds its 15.
 - **Silence is made unambiguous** by subscribing the always-emitting `allMids`
   feed and measuring liveness on that alone. A Trader resting quietly and a
   subscription that died look identical otherwise — and here that matters more
@@ -70,6 +86,21 @@ nothing would ever force the resync that repairs it. The lane would sit on a
 connection believing a stale book, which is the silent gap the resync discipline
 exists to prevent. Disconnecting means the next connection re-establishes
 absolute state and reports the divergence honestly, as `origin = 'resync'`.
+
+**What that costs, stated rather than hidden** (ADR-0008 deviation 5). CONTEXT.md
+excludes a Bot at Universe *vetting*, on a statistical profile; this ceiling
+applies the same word per *minute*, to behaviour, and the two do not always
+agree. A tracked human Leader who mass-cancels a ladder of more than
+`ORDER_UPDATE_RATE_LIMIT` orders in one minute — a real thing a real leader does
+on changing their mind about a market — is refused mid-burst and blacked out for
+the cooldown, and the transitions inside that blackout are never recorded: the
+post-cooldown resync collapses them into `placed` / `gone`. Nothing is invented
+and `origin` says which rows were inferred, so the seam stays honest; it is
+simply lossier for that Trader for that window. The refusal is therefore LOUD —
+`OrderLaneStats.refused`, a warning when the connection closes and an error when
+the lane stands down — so the operator can see it happened to a leader rather
+than to a market maker. And the verdict is re-taken after every cooldown: it is
+a judgement on a minute's behaviour, never on the account.
 """
 
 import asyncio
@@ -166,12 +197,65 @@ REFUSED_COOLDOWN_SECONDS = 900.0
 # feed by a minute, which for a shadow lane is the right side to err on.
 ORDER_RECONNECT_MIN_SECONDS = 60.0
 
+# How long a connection may be trusted before it is retired and replaced, even
+# while it is perfectly healthy.
+#
+# Resync-then-subscribe closes every gap but one: a change that lands between the
+# `frontendOpenOrders` read returning and the `orderUpdates` subscription taking
+# effect is in neither. `orderUpdates` reports TRANSITIONS, so — unlike the
+# position feed, which re-states absolute state every ~5s and therefore heals
+# itself — nothing ever mentions that order again. `allMids` keeps the socket
+# alive indefinitely, so without this the lane would hold a healthy-looking
+# connection over permanently wrong memory, emit no `gone` for an order it had
+# already missed, and only discover it on a reconnect nothing forces. That is the
+# same hazard class the rate ceiling disconnects over, arrived at from a third
+# direction.
+#
+# Recycling the connection is the fix because it reuses the argument already
+# proven rather than inventing a second one: the replacement resyncs BEFORE it
+# subscribes, so no observation is ever applied out of order — which a
+# resync-on-a-live-socket would risk, a point-in-time REST read being able to
+# land after a stream update it predates and resurrect a cancelled order.
+#
+# 15 minutes is what it costs against the two allowances it spends. MAX_ORDER_LANES
+# lanes recycling on this period spend 0.53 new connections/min of the 30 the IP
+# has, and 2 paced REST calls per lane per period. It bounds the window's
+# staleness at 15 minutes; shorter would buy little, since the window itself is
+# sub-second and rarely catches anything.
+ORDER_CONNECTION_MAX_SECONDS = 900.0
+
+# How long the lane stands down after the server refuses one of its
+# subscriptions. Longer than the reconnect floor because a refusal is usually
+# STRUCTURAL — the per-IP allowance of 15 unique users is full — and retrying
+# that every minute would spend MAX_ORDER_LANES connections a minute on an
+# answer that cannot have changed. Short enough that a slot freed by an unfollow
+# is picked up while the operator is still looking at the log line.
+SUBSCRIPTION_COOLDOWN_SECONDS = 300.0
+
 
 class LaneRefused(Exception):
     """This Trader is producing order updates faster than the seam will record
     (ORDER_UPDATE_RATE_LIMIT) — a Bot by CONTEXT.md's definition rather than a
     Trader with a plan worth mirroring. Ends the connection so memory cannot go
     stale behind a socket that stays open, and earns a cooldown."""
+
+
+class SubscriptionRefused(Exception):
+    """The server rejected something this connection asked for.
+
+    An `error` frame arriving HERE is unambiguous in a way it is not on the
+    shared position connection: this one serves a single Trader and sends
+    exactly two subscriptions and its own pings, so an error is about one of
+    them. The refusal that matters is the order feed's — the lane would keep
+    receiving `allMids`, look healthy forever, record nothing, and emit no
+    `gone` — and the concrete way it happens is the per-IP allowance of 15
+    unique users being full when this lane asks for its address."""
+
+
+class LaneRecycled(Exception):
+    """The connection reached ORDER_CONNECTION_MAX_SECONDS and is being replaced
+    on purpose. Not a failure: the replacement resyncs before it subscribes,
+    which is what heals the resync→subscribe window (see the constant)."""
 
 
 @dataclass
@@ -181,6 +265,11 @@ class OrderLaneStats:
     events: int = 0
     order_messages: int = 0
     liveness_messages: int = 0
+    # Set when the rate ceiling refused this Trader. Carried on the stats rather
+    # than left to the raised exception so the connection's closing log line can
+    # say the seam STOPPED RECORDING a tracked Trader, instead of reading like
+    # any other close — a refusal is loud by design (ADR-0008 deviation 5).
+    refused: bool = False
 
 
 async def run_order_lanes(
@@ -298,6 +387,31 @@ async def run_order_lane(
     while True:
         try:
             await run_order_connection(pool, gateway, budget, connect, clock, address)
+        except LaneRecycled as exc:
+            # A planned end, and the only one: the connection reached its bounded
+            # lifetime so that the resync→subscribe window can heal. Reconnect at
+            # once rather than paying the reconnect floor — the recycle is
+            # already paced by ORDER_CONNECTION_MAX_SECONDS, which spends far
+            # less of the per-IP connection rate than the floor was sized to
+            # protect, and sleeping here would blackout the feed for a minute
+            # every period for nothing.
+            log.info("ws order lane %s: %s; resyncing on a fresh connection", address, exc)
+            delay = ORDER_RECONNECT_MIN_SECONDS
+            continue
+        except SubscriptionRefused as exc:
+            # Not a transport failure and not something a backoff outlasts: the
+            # server declined to give this lane the feed. Standing down is what
+            # keeps it from spending a connection a minute re-asking a question
+            # whose answer only changes when a user slot frees.
+            log.error(
+                "ws order lane %s: %s; standing down for %.0fs",
+                address,
+                exc,
+                SUBSCRIPTION_COOLDOWN_SECONDS,
+            )
+            await clock.sleep(SUBSCRIPTION_COOLDOWN_SECONDS)
+            delay = ORDER_RECONNECT_MIN_SECONDS
+            continue
         except LaneRefused as exc:
             # Not a failure: the Trader is a Bot by the seam's own rule. Stand
             # down long enough that they cannot write a cycle's worth of events
@@ -341,11 +455,21 @@ async def run_order_connection(
     in flight, and applying the staler answer afterwards would resurrect an
     order the stream had just seen cancelled.
 
+    And the life is BOUNDED, at ORDER_CONNECTION_MAX_SECONDS. The window between
+    that REST read and that subscription belongs to neither of them, and a
+    transition-only feed never mentions it again; recycling the connection is
+    what makes the next resync find it. A healthy connection therefore ends on
+    purpose, which is the one thing here that is not a failure.
+
     Returns only by raising; the caller reconnects."""
     connection = await connect()
     allowance = outbound_allowance(clock)
     stats = OrderLaneStats()
     ceiling = RollingMinute(clock, ORDER_UPDATE_RATE_LIMIT)
+    # Counted from before the liveness subscribe and the resync, so the bound is
+    # on how stale this connection's memory may be — which starts ticking at the
+    # REST read, not at the first message.
+    started = clock.now()
     try:
         if not await send_if_allowed(connection, allowance, subscribe(liveness_subscription())):
             raise LaneSilent("could not subscribe to the liveness feed")
@@ -361,6 +485,11 @@ async def run_order_connection(
             raise LaneSilent(f"could not subscribe to {address}'s order feed")
         while True:
             now = clock.now()
+            if (now - started).total_seconds() >= ORDER_CONNECTION_MAX_SECONDS:
+                raise LaneRecycled(
+                    f"connection reached its {ORDER_CONNECTION_MAX_SECONDS:.0f}s lifetime; "
+                    "recycling so the resync→subscribe window heals"
+                )
             if (now - last_ping).total_seconds() >= PING_INTERVAL_SECONDS:
                 await send_if_allowed(connection, allowance, ping())
                 last_ping = now
@@ -381,19 +510,42 @@ async def run_order_connection(
                 stats.order_messages += 1
                 await _apply_orders_message(pool, address, message, ceiling, clock.now(), stats)
             elif channel == "error":
-                log.warning(
-                    "ws order lane %s: server error frame: %s", address, message.get("data")
-                )
+                # The position lane logs these and carries on, because its
+                # connection multiplexes many subscriptions and an error may
+                # concern a wallet that has just left. Here there is no such
+                # ambiguity: this connection asked for liveness and one Trader's
+                # orders and nothing else, so an error is a refusal of one of
+                # them. Carrying on would leave the lane liveness-healthy over a
+                # feed it never got — recording nothing, emitting no `gone`, and
+                # never reconnecting, because `allMids` keeps arriving.
+                raise SubscriptionRefused(f"server refused a subscription: {message.get('data')}")
     finally:
         await connection.close()
-        log.info(
-            "ws order lane %s: connection closed after %d events from %d order messages "
-            "(%d liveness)",
-            address,
-            stats.events,
-            stats.order_messages,
-            stats.liveness_messages,
-        )
+        if stats.refused:
+            # A refusal is not an ordinary close and must not read like one: the
+            # seam has STOPPED RECORDING a Trader somebody tracks, and if that
+            # Trader is a Leader rather than a market maker the operator needs
+            # to see it (ADR-0008 deviation 5).
+            log.warning(
+                "ws order lane %s: connection closed REFUSING the Trader over "
+                "%d order updates/minute — no order events will be recorded for %.0fs; "
+                "recorded %d events from %d order messages (%d liveness) first",
+                address,
+                ORDER_UPDATE_RATE_LIMIT,
+                REFUSED_COOLDOWN_SECONDS,
+                stats.events,
+                stats.order_messages,
+                stats.liveness_messages,
+            )
+        else:
+            log.info(
+                "ws order lane %s: connection closed after %d events from %d order messages "
+                "(%d liveness)",
+                address,
+                stats.events,
+                stats.order_messages,
+                stats.liveness_messages,
+            )
 
 
 async def _resync(
@@ -487,6 +639,7 @@ async def _apply_orders_message(
     if not updates:
         return
     if not all(ceiling.take() for _ in updates):
+        stats.refused = True
         raise LaneRefused(
             f"over {ORDER_UPDATE_RATE_LIMIT} order updates/minute — an account requoting "
             "this fast is automated market-making (CONTEXT.md's Bot), not a plan worth "

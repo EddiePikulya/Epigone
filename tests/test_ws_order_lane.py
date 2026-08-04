@@ -1,7 +1,7 @@
 """The websocket order lane (issue #168, ADR-0008).
 
 The position lane's tests are built around four things that would make its
-dataset a lie. This lane's are built around five, and the first is new and is
+dataset a lie. This lane's are built around six, and the first is new and is
 the reason the lane exists in this shape at all:
 
 1. **Attribution.** An `orderUpdates` frame carries no `user` — verified live
@@ -15,8 +15,15 @@ the reason the lane exists in this shape at all:
 3. **Vocabulary.** The exchange's status set is open-ended; a status nobody has
    seen must be recorded, not guessed at and not dropped.
 4. **The rate ceiling.** One measured market maker produced 1471 order updates
-   in 60s. The seam has to refuse them.
-5. **Nothing consumes it.** Position Alerts, the position lane and REST polling
+   in 60s. The seam has to refuse them — and the refusal has to leave honest
+   state behind, because it will sometimes catch a human (ADR-0008 deviation 5).
+5. **A healthy-looking lane that is recording nothing.** The failure mode this
+   transport makes easy: `orderUpdates` reports transitions only, `allMids` keeps
+   the socket alive indefinitely, so memory can be permanently wrong behind a
+   connection that never fails. Two ways in — a change lost in the
+   resync→subscribe window, and a subscription the server refused — and both
+   have to end the connection rather than persist.
+6. **Nothing consumes it.** Position Alerts, the position lane and REST polling
    behave exactly as before.
 
 Seam per the house convention: fake gateway, fake clock, staged websocket, real
@@ -24,6 +31,7 @@ Postgres.
 """
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -34,7 +42,7 @@ import pytest
 from epigone.budget import WeightBudget
 from epigone.gateway import OpenOrder
 from epigone.gateway.fake import FakeHyperliquidGateway
-from epigone.order_events import STREAM_ORIGIN
+from epigone.order_events import RESYNC_ORIGIN, STREAM_ORIGIN
 from epigone.ws import LIVENESS_CHANNEL, ORDERS_CHANNEL, WebsocketClosed, order_lane
 from epigone.ws.lane import (
     LIVENESS_TIMEOUT_SECONDS,
@@ -46,11 +54,17 @@ from epigone.ws.order_lane import (
     CONNECTION_LIMIT,
     CONNECTION_RATE_LIMIT,
     MAX_ORDER_LANES,
+    ORDER_CONNECTION_MAX_SECONDS,
     ORDER_RECONNECT_MIN_SECONDS,
     ORDER_UPDATE_RATE_LIMIT,
+    REFUSED_COOLDOWN_SECONDS,
+    SUBSCRIPTION_COOLDOWN_SECONDS,
+    LaneRecycled,
     LaneRefused,
+    SubscriptionRefused,
     reconcile_order_lanes,
     run_order_connection,
+    run_order_lane,
 )
 from tests.support.clock import FakeClock
 from tests.support.websocket import FakeWebsocket, connecting
@@ -127,6 +141,27 @@ def liveness_message() -> dict[str, Any]:
     return {"channel": LIVENESS_CHANNEL, "data": {"mids": {"BTC": "100"}}}
 
 
+def error_frame(data: str) -> dict[str, Any]:
+    """A server `error` frame, in the shape the probe recorded on 2026-08-03 —
+    a bare string that names no subscription."""
+    return {"channel": "error", "data": data}
+
+
+def alive_for(seconds: float) -> list[dict[str, Any] | None]:
+    """A script that keeps a connection healthy for `seconds` of lane time.
+
+    Only a quiet tick moves the fake clock (a message costs nothing), so the
+    seconds are bought by the `None`s; the liveness messages spaced through them
+    are what stop the silence deadline firing first, which is the failure this
+    helper exists to NOT stage."""
+    script: list[dict[str, Any] | None] = []
+    for tick in range(int(seconds / RECEIVE_TICK_SECONDS) + 1):
+        if tick % int(LIVENESS_TIMEOUT_SECONDS / 2) == 0:
+            script.append(liveness_message())
+        script.append(None)
+    return script
+
+
 async def track(pool: asyncpg.Pool, clock: FakeClock, address: str, *user_ids: int) -> None:
     await pool.execute(
         """
@@ -157,7 +192,9 @@ async def run_once(
     """Drive one connection to its end and return why it ended. Every staged
     connection ends — that is what makes the test terminate — so the reason is
     an assertion rather than an accident."""
-    with pytest.raises((WebsocketClosed, LaneSilent, LaneRefused)) as caught:
+    with pytest.raises(
+        (WebsocketClosed, LaneSilent, LaneRefused, SubscriptionRefused, LaneRecycled)
+    ) as caught:
         await run_order_connection(
             pool,
             gateway,
@@ -516,6 +553,183 @@ async def test_a_failed_resync_never_subscribes(
     assert await events(pool) == []
 
 
+# -- a healthy-looking lane that is recording nothing --------------------------
+
+
+class WindowWebsocket(FakeWebsocket):
+    """A socket that plants an order in the Trader's book at the exact instant
+    the order subscription is sent.
+
+    That instant IS the resync→subscribe window: the REST read has already
+    returned without the order, and the subscription is only now taking effect,
+    so the change falls between the two. `orderUpdates` reports transitions, so
+    no frame will ever mention this order again — which is precisely why the
+    lane cannot heal it by listening harder."""
+
+    def __init__(
+        self,
+        clock: FakeClock,
+        script: list[dict[str, Any] | None],
+        gateway: FakeHyperliquidGateway,
+        address: str,
+        appears: list[OpenOrder],
+    ) -> None:
+        super().__init__(clock, script)
+        self._gateway = gateway
+        self._address = address
+        self._appears = appears
+
+    async def send(self, message: Any) -> None:
+        await super().send(message)
+        if (
+            message.get("method") == "subscribe"
+            and message["subscription"]["type"] == ORDERS_CHANNEL
+        ):
+            self._gateway.set_open_orders(self._address, self._appears)
+
+
+async def test_a_change_lost_in_the_resync_subscribe_window_heals_on_a_recycle(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The gap resync-before-subscribe cannot close by itself, and the bound
+    that closes it.
+
+    The position lane never has to think about this: its feed re-states absolute
+    state every ~5s, so a change lost in the window is corrected by the next
+    push. This feed carries transitions only. An order placed in the window is
+    mentioned once, to nobody, and never again — and `allMids` would keep the
+    socket alive indefinitely over memory that is quietly wrong, emitting no
+    `gone`, until a reconnect that nothing forces.
+
+    So a healthy connection ends on purpose at ORDER_CONNECTION_MAX_SECONDS, and
+    the replacement's resync — which happens before it subscribes, so no
+    observation is ever applied out of order — is what finds the order."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    socket = WindowWebsocket(
+        clock,
+        alive_for(ORDER_CONNECTION_MAX_SECONDS),
+        gateway,
+        TRADER,
+        [resting(oid=1)],
+    )
+    ended = await run_once(pool, gateway, clock, socket)
+
+    # The connection was healthy throughout — liveness never lapsed, no frame
+    # was unreadable, nothing closed — and it ended anyway.
+    assert isinstance(ended, LaneRecycled)
+    assert await events(pool) == []  # nothing on this connection could have known
+
+    # The replacement resyncs, and the order the window swallowed surfaces once,
+    # honestly labelled as something the lane inferred rather than watched.
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+    assert [(row["order_id"], row["kind"], row["origin"]) for row in await events(pool)] == [
+        (1, "placed", RESYNC_ORIGIN)
+    ]
+
+
+def stopping_after(*connections: FakeWebsocket) -> Any:
+    """`connecting`, but the exhausted factory CANCELS instead of raising.
+
+    `run_order_lane` is a forever-loop by design, so a test needs something the
+    loop deliberately does not catch to get out of it — which is what makes the
+    reconnect sleeps it took on the way an assertion."""
+    remaining = list(connections)
+
+    async def connect() -> FakeWebsocket:
+        if not remaining:
+            raise asyncio.CancelledError
+        return remaining.pop(0)
+
+    return connect
+
+
+async def test_a_recycle_reconnects_at_once_rather_than_blacking_the_feed_out(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A recycle is not a failure and must not be paced like one. Paying the
+    60-second reconnect floor every 15 minutes would black the feed out for 7%
+    of its life to fix a sub-second window — and the pacing that floor protects
+    is already satisfied, because the recycle period is itself the rate limit
+    (MAX_ORDER_LANES lanes recycling every 15 minutes spend 0.53 new connections
+    a minute of the 30 an IP has)."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [])
+
+    socket = FakeWebsocket(clock, alive_for(ORDER_CONNECTION_MAX_SECONDS))
+    with pytest.raises(asyncio.CancelledError):
+        await run_order_lane(
+            pool,
+            gateway,
+            WeightBudget(WIDE_OPEN_BUDGET, clock),
+            stopping_after(socket),
+            clock,
+            TRADER,
+        )
+
+    assert clock.slept == []
+
+
+async def test_a_refused_subscription_ends_the_connection_rather_than_looking_healthy(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The other way this lane can look healthy while recording nothing.
+
+    The position lane logs an `error` frame and carries on, because its
+    connection multiplexes many subscriptions and the error may concern a wallet
+    that has just left. Here there is no such ambiguity: this connection serves
+    one Trader and asked for exactly two things. If the order feed was refused —
+    the concrete case being the per-IP allowance of 15 unique users already full
+    when this lane asks — `allMids` keeps arriving, liveness stays satisfied, and
+    the lane would sit there forever recording nothing and emitting no `gone`.
+
+    The staged script says exactly that: the market feed goes on flowing after
+    the refusal. The connection has to end anyway."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [resting(oid=1)])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    socket = FakeWebsocket(
+        clock,
+        [
+            liveness_message(),
+            error_frame("Cannot track more than 15 total users."),
+            *[liveness_message() for _ in range(5)],
+        ],
+    )
+    ended = await run_once(pool, gateway, clock, socket)
+
+    assert isinstance(ended, SubscriptionRefused)
+    assert "15 total users" in str(ended)
+    assert socket.closed
+
+
+async def test_a_refused_subscription_stands_down_instead_of_re_asking_every_minute(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A refusal is usually structural — the per-IP user allowance is full — so
+    the answer cannot change within a minute. Retrying on the reconnect floor
+    would spend MAX_ORDER_LANES connections a minute re-asking it, out of the 30
+    the whole box has."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [])
+
+    socket = FakeWebsocket(clock, [liveness_message(), error_frame("Cannot track more than 15")])
+    with pytest.raises(asyncio.CancelledError):
+        await run_order_lane(
+            pool,
+            gateway,
+            WeightBudget(WIDE_OPEN_BUDGET, clock),
+            stopping_after(socket),
+            clock,
+            TRADER,
+        )
+
+    assert clock.slept == [SUBSCRIPTION_COOLDOWN_SECONDS]
+
+
 # -- what must not reach the seam ---------------------------------------------
 
 
@@ -666,6 +880,87 @@ async def test_the_ceiling_is_a_rolling_minute_not_a_lifetime_budget(
 
     placed = await pool.fetchval("SELECT count(*) FROM order_events WHERE kind = 'placed'")
     assert placed == 2 * ORDER_UPDATE_RATE_LIMIT
+
+
+async def test_a_refused_leader_is_left_in_honest_state_after_the_cooldown(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """ADR-0008 deviation 5, and the property that makes it survivable.
+
+    CONTEXT.md excludes a Bot by statistical profile, once, at Universe vetting.
+    This ceiling applies the same word to one minute of behaviour, at the seam,
+    to an account vetting already let through — so it will sometimes catch a
+    human. A Leader who changes their mind about a market and pulls a
+    150-order ladder in one minute is refused mid-burst and blacked out.
+
+    What must survive that is ACCURACY, not resolution. Resolution is genuinely
+    lost: the cancels inside the blackout are never recorded as cancels. But
+    every order must still be accounted for exactly once, the inferred rows must
+    say they were inferred, orders that never moved must produce no event at
+    all, and no phantom may be left resting in memory."""
+    ladder = [resting(oid=oid) for oid in range(1, 151)]
+    untouched = [resting(oid=oid, coin="ETH") for oid in range(200, 210)]
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [*ladder, *untouched])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    cancels = [
+        orders_message(update(oid=oid, status="canceled", size="3")) for oid in range(1, 151)
+    ]
+    ended = await run_once(
+        pool, gateway, clock, FakeWebsocket(clock, [liveness_message(), *cancels])
+    )
+    assert isinstance(ended, LaneRefused)
+
+    # The cooldown passes; the lane comes back and reads what is actually there.
+    clock.advance(REFUSED_COOLDOWN_SECONDS)
+    gateway.set_open_orders(TRADER, untouched)
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    rows = await events(pool)
+    # Every order of the ladder, exactly once, and nothing else.
+    assert sorted(row["order_id"] for row in rows) == list(range(1, 151))
+    watched = [row for row in rows if row["kind"] == "canceled"]
+    inferred = [row for row in rows if row["kind"] == "gone"]
+    assert len(watched) == ORDER_UPDATE_RATE_LIMIT
+    assert len(inferred) == 150 - ORDER_UPDATE_RATE_LIMIT
+    # The rows the lane inferred rather than watched say so, which is what lets
+    # a consumer discount them.
+    assert {row["origin"] for row in inferred} == {RESYNC_ORIGIN}
+    assert {row["origin"] for row in watched} == {STREAM_ORIGIN}
+    # The orders the Leader never touched are still resting and produced nothing:
+    # a refusal must not report a phantom `gone` for a ladder that never moved.
+    assert await pool.fetchval(
+        "SELECT array_agg(order_id ORDER BY order_id) FROM ws_order_state"
+    ) == list(range(200, 210))
+
+
+async def test_a_refusal_is_loud_enough_to_tell_a_leader_from_a_market_maker(
+    pool: asyncpg.Pool,
+    gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The refusal costs a tracked Trader their coverage for a quarter of an
+    hour (deviation 5). If it read like an ordinary connection close, the
+    operator could never tell the case the rule is FOR — a market maker — from
+    the case it is a false positive on. So the closing line names the Trader,
+    the ceiling and the blackout, at WARNING."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_open_orders(TRADER, [])
+    await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message()]))
+
+    requotes = [orders_message(update(oid=oid)) for oid in range(ORDER_UPDATE_RATE_LIMIT + 5)]
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="epigone.ws.order_lane"):
+        await run_once(pool, gateway, clock, FakeWebsocket(clock, [liveness_message(), *requotes]))
+
+    closing = [record for record in caplog.records if "connection closed" in record.message]
+    assert [record.levelno for record in closing] == [logging.WARNING]
+    said = closing[0].getMessage()
+    assert TRADER in said
+    assert str(ORDER_UPDATE_RATE_LIMIT) in said
+    assert f"{REFUSED_COOLDOWN_SECONDS:.0f}s" in said
 
 
 # -- liveness -----------------------------------------------------------------
@@ -832,6 +1127,19 @@ def test_reconnects_are_paced_against_the_per_ip_connection_rate() -> None:
     # And the floor is genuinely slower than the position lane's, which is the
     # whole point — that one was sized for a single connection.
     assert ORDER_RECONNECT_MIN_SECONDS > RECONNECT_MIN_SECONDS
+
+
+def test_recycling_every_connection_still_fits_the_per_ip_connection_rate() -> None:
+    """The bounded connection lifetime buys a healed window by spending new
+    connections, so what it spends is worth stating rather than trusting. Every
+    lane recycling on this period, all the time, is a rounding error against the
+    per-IP allowance — which is why a recycle can reconnect immediately where a
+    failure has to pay the floor."""
+    recycles_per_minute = MAX_ORDER_LANES * (60 / ORDER_CONNECTION_MAX_SECONDS)
+    assert recycles_per_minute < 1
+    # And the lifetime is long enough that a recycle is rarer than the reconnect
+    # floor it skips, which is what makes skipping it safe.
+    assert ORDER_CONNECTION_MAX_SECONDS > ORDER_RECONNECT_MIN_SECONDS * 10
 
 
 def test_the_connection_allowance_bounds_the_shadowed_set() -> None:

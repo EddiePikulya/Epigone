@@ -19,6 +19,12 @@ Two further findings from the same probes, worth carrying:
 
 - **`allDexsOrderUpdates` does not exist** — the server rejects it as unparseable. `orderUpdates` takes no `dex` and is account-wide as it stands, so a Trader is still covered by 2 subscriptions total (`allDexsClearinghouseState` + `orderUpdates`).
 - **`allDexsClearinghouseState` pushes on a ~5s cadence even for a completely idle account** (43 pushes in 210s on an account with no positions), carrying absolute state each time — it is not a pure change feed. Whether a change ALSO triggers an immediate push was not determined: settling it needs an account that actually trades during the probe, which is #158's measurement with the funded harness. Until it is, the "sub-second latency" figure in ADR-0006 should be read as an upper bound argument (the transport allows it), not a measured property.
+- **Undocumented leaderboard**: `stats-data.hyperliquid.xyz/Mainnet/leaderboard` — used by client libraries (e.g. hyperliquid-go); our Universe seed. Risk: undocumented, could change without notice.
+- **⭐ Official S3 archives** (major find for `ingest`):
+  - `s3://hl-mainnet-node-data/node_fills_by_block` — every fill on the exchange streamed from a node (older formats: `node_fills`, `node_trades`).
+  - `s3://hyperliquid-archive` — L2 book snapshots (`market_data/[date]/[hour]/...`) and `asset_ctxs/[date].csv.lz4`, updated ~monthly, no timeliness guarantee.
+  - **Implication:** fine-metric computation (win rate, Sharpe, drawdown per account) can run as offline batch over bulk-downloaded fills for the *entire* Universe, bypassing the 1200/min API budget entirely. The rate-limited API is then only needed for incremental freshness and realtime tracking. To verify at build time: bucket access mode (requester-pays?), volume, lag.
+
 #### Websocket findings, measured 2026-08-03 (issue #168, the order seam's design inputs)
 
 Probed against mainnet, read-only: public market data plus public account state, no keys and no signed actions. Reproducible as `scripts/testnet_ws_probe.py orders` / `users`. All four findings contradict something the repo previously believed, so each is stated with the observation that settles it.
@@ -31,12 +37,6 @@ Probed against mainnet, read-only: public market data plus public account state,
 - **`orderUpdates` frames do NOT say which user they are about.** The payload is `{"channel":"orderUpdates","data":[{"order":{coin, side, limitPx, sz, oid, timestamp, origSz, cloid}, "status", "statusTimestamp"}, …]}` — no `user` field at any level, unlike `allDexsClearinghouseState`, which carries one. On a connection subscribed to several users the frames are therefore **unattributable**: the transport gives you the order and withholds whose it is. One connection per Trader is the only way to attribute an order update, which is what ADR-0008 decides on.
 - **`webData3` is not an alternative attribution route.** It exists (`webData2` does not — the server rejects it as unparseable), but its payload carries only `perpDexStates` and `userState`: no `user` field, and **no open orders at all**. So it neither names its subject nor carries the resting book.
 - **The order feed is a firehose for an active account.** One market-making address alone produced **442 frames / 1471 order updates in 60s** (~24/s), with statuses `open` 649, `canceled` 628, `badAloPxRejected` 105, `iocCancelRejected` 68, `filled` 21. Across 15 such addresses on one connection: 8066 frames in 90s. This is the *excluded-Bot* end of the population (the probe harvests the busiest addresses off the public trades feed, which is precisely how a market maker is spotted) rather than a copyable leader, but any order-persistence seam has to survive it — which is why ADR-0008 carries a rate ceiling and a 24h retention rather than position events' 7 days.
-
-- **Undocumented leaderboard**: `stats-data.hyperliquid.xyz/Mainnet/leaderboard` — used by client libraries (e.g. hyperliquid-go); our Universe seed. Risk: undocumented, could change without notice.
-- **⭐ Official S3 archives** (major find for `ingest`):
-  - `s3://hl-mainnet-node-data/node_fills_by_block` — every fill on the exchange streamed from a node (older formats: `node_fills`, `node_trades`).
-  - `s3://hyperliquid-archive` — L2 book snapshots (`market_data/[date]/[hour]/...`) and `asset_ctxs/[date].csv.lz4`, updated ~monthly, no timeliness guarantee.
-  - **Implication:** fine-metric computation (win rate, Sharpe, drawdown per account) can run as offline batch over bulk-downloaded fills for the *entire* Universe, bypassing the 1200/min API budget entirely. The rate-limited API is then only needed for incremental freshness and realtime tracking. To verify at build time: bucket access mode (requester-pays?), volume, lag.
 
 ### Third-party historical mirrors (backfill alternatives)
 - **Reservoir** (via Hydromancer): free public S3 archive — fills, 1s OHLCV, **daily position & balance snapshots**, 20-level L2 depth, all markets incl. HIP-3.
