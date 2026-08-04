@@ -45,8 +45,8 @@ async def run_drain_loop(
     """Supervise one outbox's drain forever: one broken iteration (database
     blip, unexpected error) is logged under `label` and retried next tick,
     never allowed to silently kill the task (ADR-0002's asyncio mitigation)
-    while dialog polling carries on. All three bot-process outboxes (Position
-    Alerts, Order Alerts, first-data notices) run this same loop."""
+    while dialog polling carries on. Every bot-process outbox (Position Alerts,
+    Order Alerts, Withdrawal Alerts, first-data notices) runs this same loop."""
     while True:
         try:
             await drain()

@@ -10,6 +10,7 @@ from epigone.bot.first_data_notice import run_first_data_notice_loop
 from epigone.bot.handlers import build_router
 from epigone.bot.menu import set_bot_commands
 from epigone.bot.order_alerts import run_order_delivery_loop
+from epigone.bot.withdrawal_alerts import run_withdrawal_delivery_loop
 from epigone.clock import SystemClock
 from epigone.config import Settings
 from epigone.db import create_pool, migrate
@@ -50,6 +51,10 @@ async def main() -> None:
         # Order Alerts (issue #115): the stream's order poll queues batches into
         # order_alerts; same seam, its own drain loop.
         order_delivery = asyncio.create_task(run_order_delivery_loop(pool, bot, clock))
+        # Withdrawal Alerts (issue #171): the poll pass queues one row per
+        # follower when a tracked Trader's equity falls by more than its PnL
+        # explains; same seam, its own drain loop.
+        withdrawal_delivery = asyncio.create_task(run_withdrawal_delivery_loop(pool, bot, clock))
         logging.getLogger(__name__).info("bot: starting polling and alert delivery")
         try:
             await dp.start_polling(bot)
@@ -57,6 +62,7 @@ async def main() -> None:
             delivery.cancel()
             first_data.cancel()
             order_delivery.cancel()
+            withdrawal_delivery.cancel()
 
 
 if __name__ == "__main__":

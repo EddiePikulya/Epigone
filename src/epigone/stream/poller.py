@@ -58,8 +58,15 @@ latest observation lands in `trader_equity` inside the same per-Trader
 transaction — so equity and positions are never separately true. It costs no
 request and no weight. Unlike an event, an observation is not something the
 Trader did, so only the newest is kept; the observation it replaces is
-`record_equity`'s return value, which is where the withdrawal follow-up (#171)
-will take its delta. See epigone.trader_equity.
+`record_equity`'s return value. See epigone.trader_equity.
+
+That delta is what Withdrawal Alerts read (issue #171, ADR-0007 "Out of A4
+scope"): an equity drop this pass's own PnL cannot account for is money that
+left the wallet, and every follower is told. The judgement is
+`epigone.withdrawals`, made from the same two looks at the book the position
+diff was made from and queued into `withdrawal_alerts` in this same per-Trader
+transaction — so a detection and the equity that can no longer produce it
+commit together, and the alert fires once.
 """
 
 import logging
@@ -86,6 +93,7 @@ from epigone.position_diff import diff_positions, events_of
 from epigone.position_events import PositionEvent, record_events
 from epigone.position_snapshots import POLL_SNAPSHOTS, apply_changes, read_snapshots, remember
 from epigone.trader_equity import record_equity
+from epigone.withdrawals import Withdrawal, detect_withdrawal
 
 log = logging.getLogger(__name__)
 
@@ -103,6 +111,22 @@ POLL_INTERVAL_SECONDS = 10
 # Same reasoning as the ingest passes: a sustained streak means Hyperliquid is
 # down, not that wallets are odd — stop burning budget and resume next cycle.
 MAX_CONSECUTIVE_FAILURES = 5
+
+# Everything this pass remembers about one wallet, keyed by its address: the
+# diff's memory, the baseline flag, and the latest equity observation (#170).
+# _prune_untracked drops a wallet from all three at once — see its docstring.
+# Module constants, never user input, so they are safe to inline into the SQL
+# (position_snapshots' table-name convention).
+POLL_MEMORY_TABLES = ("trader_equity", "position_snapshots", "position_poll_state")
+
+# The poll set, negated: a wallet neither tracked by anyone nor linked as some
+# User's own (#121). The positive form is fetch_poll_set's UNION; this is the
+# one place the two must agree, so widening the poll set means editing both.
+_OFF_THE_POLL_SET = """
+    trader_address NOT IN (SELECT trader_address FROM tracks)
+    AND trader_address NOT IN
+        (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
+"""
 
 
 @dataclass(frozen=True)
@@ -255,33 +279,20 @@ async def _prune_untracked(pool: asyncpg.Pool) -> None:
     The equity observation (issue #170) drops with the snapshots, for the same
     reason: it describes a moment Epigone was watching, and after a gap nobody
     watched it is not a baseline anything may be compared against. Left behind,
-    it would hand the withdrawal follow-up (#171) a months-old figure and an
-    alert for money that moved while the wallet was off the poll set."""
+    it would hand withdrawal alerts (#171) a months-old figure and an alert for
+    money that moved while the wallet was off the poll set.
+
+    The three tables are pruned by ONE predicate, written once: they are pruned
+    because they are all this pass's memory of a wallet, so a fourth table
+    joining them — or the poll set widening again, as #121 widened it — must
+    move them together or leave a table remembering a wallet the others have
+    forgotten. Queued withdrawal_alerts and position_alerts are deliberately not
+    in the list, for the reason above: an alert is not memory."""
     async with pool.acquire() as conn, conn.transaction():
-        await conn.execute(
-            """
-            DELETE FROM trader_equity
-            WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
-              AND trader_address NOT IN
-                  (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
-            """
-        )
-        await conn.execute(
-            """
-            DELETE FROM position_snapshots
-            WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
-              AND trader_address NOT IN
-                  (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
-            """
-        )
-        await conn.execute(
-            """
-            DELETE FROM position_poll_state
-            WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
-              AND trader_address NOT IN
-                  (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
-            """
-        )
+        for table in POLL_MEMORY_TABLES:
+            await conn.execute(
+                f"DELETE FROM {table} WHERE {_OFF_THE_POLL_SET}"  # noqa: S608 — module constants
+            )
 
 
 async def _apply_poll(
@@ -295,11 +306,11 @@ async def _apply_poll(
         # The equity observation lands first and unconditionally (issue #170):
         # it is what the account was worth when Epigone looked, which is as true
         # on a Trader's baselining pass as on any other, and as true of a pass
-        # that diffed no events as of one that did. Nothing here reads its
-        # return value yet; the withdrawal follow-up (#171) computes its delta
-        # from that previous observation, in this transaction, before this line
-        # replaces it.
-        await record_equity(conn, address, state.account_value, now)
+        # that diffed no events as of one that did. The observation it replaces
+        # is its return value, and the only place both figures exist at once —
+        # withdrawal detection (#171) takes its delta from it below, inside this
+        # same transaction.
+        previous_equity = await record_equity(conn, address, state.account_value, now)
         baselined = await conn.fetchval(
             "SELECT 1 FROM position_poll_state WHERE trader_address = $1", address
         )
@@ -350,6 +361,17 @@ async def _apply_poll(
             # a no-op there — no wasted refresh for a wallet no one follows.
             if any(event.kind in ("close", "flip") for event in events):
                 await mark_due_now(conn, address, now)
+        # Money leaving the account (issue #171), judged from the same two looks
+        # at the book the diff above just judged positions from — `previous` is
+        # still what the last pass saw, since apply_changes advanced the table
+        # and not this mapping. Reading one observation twice is the point: a
+        # second fetch could disagree with the first, and a withdrawal is
+        # precisely a disagreement between two figures.
+        withdrawal = detect_withdrawal(
+            previous_equity, state.account_value, previous, positions, now
+        )
+        if withdrawal is not None:
+            await _queue_withdrawal_alerts(conn, address, withdrawal, now)
         return len(events)
 
 
@@ -401,6 +423,41 @@ async def _queue_alerts(
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
         """,
         rows,
+    )
+
+
+async def _queue_withdrawal_alerts(
+    conn: asyncpg.Connection, address: str, withdrawal: Withdrawal, now: datetime
+) -> None:
+    """Tell every follower of this Trader that money left the account (issue
+    #171) — one row each, in the poll pass's own transaction, so a withdrawal
+    is queued exactly once for exactly the reason the equity it was computed
+    from is stored exactly once.
+
+    Muted Tracks are suppressed HERE, at queue time, for the reason every other
+    suppression in this pass is: a row that never existed cannot be backfilled
+    by unmuting (#10). The min-size floor is deliberately not applied — it
+    judges a position's notional and a withdrawal has none, the same reading
+    `_below_floor` gives an event that carries no size.
+
+    Fan-out reads `tracks`, so a wallet in the poll set only because a User
+    linked it as their own (#121) is priced and judged like any other and tells
+    nobody: an owner's transfers between their own accounts are not an alert."""
+    await conn.execute(
+        """
+        INSERT INTO withdrawal_alerts
+            (user_telegram_id, trader_address, amount_usd, prior_equity, equity_usd,
+             observed_at, created_at)
+        SELECT t.user_telegram_id, $1, $2, $3, $4, $5, $6
+        FROM tracks t
+        WHERE t.trader_address = $1 AND NOT t.muted
+        """,
+        address,
+        withdrawal.amount_usd,
+        withdrawal.prior_equity,
+        withdrawal.equity_usd,
+        withdrawal.observed_at,
+        now,
     )
 
 

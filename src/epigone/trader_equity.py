@@ -25,8 +25,16 @@ ADR-0007 "Out of A4 scope") are a delta between consecutive observations, and
 the previous one has to survive long enough to be subtracted from the new one.
 Rather than keep history for it, `record_equity` hands back what it overwrote,
 inside the transaction doing the overwriting — so a consumer sees both figures
-at the one moment both exist, and cannot read a "previous" value that a
-concurrent pass has already moved on from.
+at the one moment both exist, without a second read that could land after some
+other writer had moved the row on.
+
+That is a sequencing property, not a lock. The SELECT below takes no row lock,
+so two passes polling the same Trader at once could both read the same previous
+value and both compute the same delta — and the alert would fire twice. Nothing
+here prevents it; what prevents it is that there is exactly one poller (ADR-0002:
+one stream process, one pass at a time, wallets walked in sequence). A second
+concurrent producer of equity observations would need `FOR UPDATE` on this read
+before it could be trusted, and this note is the record of that debt.
 """
 
 from dataclasses import dataclass
@@ -56,8 +64,9 @@ async def record_equity(
 
     Read-then-write rather than a single upsert with a clever RETURNING clause,
     because the previous value is the point: this runs inside the caller's
-    transaction, so the read and the write are one atomic step regardless, and
-    the plain form says what it does."""
+    transaction, so the read and the write commit together regardless, and the
+    plain form says what it does. Single-writer, as the module docstring
+    records — the SELECT is unlocked, so this is a sequence, not a mutex."""
     previous = await conn.fetchrow(
         "SELECT account_value, observed_at FROM trader_equity WHERE trader_address = $1", address
     )
