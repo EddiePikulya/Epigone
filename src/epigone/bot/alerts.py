@@ -51,6 +51,7 @@ from epigone.bot.outbox import (
     DELIVERY_INTERVAL_SECONDS,
     MAX_DELIVERY_ATTEMPTS,
     drain_outbox,
+    fetch_pending_labeled,
     run_drain_loop,
 )
 from epigone.clock import Clock
@@ -105,7 +106,7 @@ async def deliver_pending(pool: asyncpg.Pool, bot: Bot, clock: Clock) -> int:
         bot,
         clock,
         table="position_alerts",
-        fetch=_fetch_pending_alerts,
+        fetch=lambda pool: fetch_pending_labeled(pool, "position_alerts"),
         deliver=deliver,
     )
 
@@ -280,27 +281,6 @@ async def _holds_coin(pool: asyncpg.Pool, user_telegram_id: int, coin: str) -> b
         )
         is not None
     )
-
-
-async def _fetch_pending_alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
-    # The display_name join lets render_alert label the Trader without a second
-    # query per row. The tracks join adds the recipient's own per-Track nickname
-    # (#86), scoped to this alert's follower, which takes precedence over the
-    # leaderboard label; NULL when they've since unfollowed.
-    rows: list[asyncpg.Record] = await pool.fetch(
-        """
-        SELECT a.*, t.display_name, tr.name AS track_name
-        FROM position_alerts a
-        JOIN traders t ON t.address = a.trader_address
-        LEFT JOIN tracks tr
-            ON tr.trader_address = a.trader_address
-            AND tr.user_telegram_id = a.user_telegram_id
-        WHERE a.delivered_at IS NULL AND a.attempts < $1
-        ORDER BY a.id
-        """,
-        MAX_DELIVERY_ATTEMPTS,
-    )
-    return rows
 
 
 def positions_button(row: asyncpg.Record) -> InlineKeyboardMarkup:

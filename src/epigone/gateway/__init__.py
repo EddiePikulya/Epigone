@@ -117,18 +117,24 @@ class Position:
 
 @dataclass(frozen=True)
 class AccountState:
-    """One venue's clearinghouseState read: what a Trader holds there, and what
-    the account backing it is worth (issue #170).
+    """What a Trader holds and what the account backing it is worth (issue #170)
+    — over ONE venue as the gateway reads it, or over every covered venue once
+    `fetch_account_state` has merged them.
 
-    `account_value` is the venue's `marginSummary.accountValue` — margin plus
-    unrealized PnL plus idle collateral, the figure Hyperliquid's own UI calls
-    account equity. It has always ridden the response the poller already fetches
-    and been thrown away at parse time; keeping it costs no call and no weight.
+    `account_value` is `marginSummary.accountValue` — margin plus unrealized PnL
+    plus idle collateral, the figure Hyperliquid's own UI calls account equity.
+    It has always ridden the response the poller already fetches and been thrown
+    away at parse time; keeping it costs no call and no weight.
 
-    ONE VENUE, and the distinction matters for equity in a way it never did for
-    positions: positions from several venues merge into a list, but equities are
-    separate collateral pools and only sum into a meaningful total once every
-    covered venue has answered — which is what fetch_account_state is for."""
+    The one-venue/all-venues distinction matters for equity in a way it never
+    did for positions, which is why the two readers are named apart rather than
+    given separate types: positions from several venues merge into a list, but
+    equities are separate collateral pools, and a `get_account_state` value is
+    one pool while a `fetch_account_state` value is the only sum that means
+    anything — every covered venue having answered. A partial sum is never a
+    value of this type in either form: the merge raises unless all venues
+    answered, because a silent venue contributes zero and reads as exactly the
+    withdrawal #171 alerts on."""
 
     positions: list[Position]
     account_value: Decimal

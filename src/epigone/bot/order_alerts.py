@@ -23,7 +23,7 @@ from aiogram import Bot
 
 from epigone.bot.alerts import positions_button
 from epigone.bot.format import order_lines, trader_label
-from epigone.bot.outbox import MAX_DELIVERY_ATTEMPTS, drain_outbox, run_drain_loop
+from epigone.bot.outbox import drain_outbox, fetch_pending_labeled, run_drain_loop
 from epigone.clock import Clock
 from epigone.gateway import OpenOrder, Position, Side
 
@@ -52,29 +52,9 @@ async def deliver_pending_order_alerts(pool: asyncpg.Pool, bot: Bot, clock: Cloc
         bot,
         clock,
         table="order_alerts",
-        fetch=_fetch_pending,
+        fetch=lambda pool: fetch_pending_labeled(pool, "order_alerts"),
         deliver=deliver,
     )
-
-
-async def _fetch_pending(pool: asyncpg.Pool) -> list[asyncpg.Record]:
-    # Same joins as Position Alert delivery: the recipient's own per-Track
-    # nickname (#86) beats the leaderboard label; NULL when they've since
-    # unfollowed.
-    rows: list[asyncpg.Record] = await pool.fetch(
-        """
-        SELECT a.*, t.display_name, tr.name AS track_name
-        FROM order_alerts a
-        JOIN traders t ON t.address = a.trader_address
-        LEFT JOIN tracks tr
-            ON tr.trader_address = a.trader_address
-            AND tr.user_telegram_id = a.user_telegram_id
-        WHERE a.delivered_at IS NULL AND a.attempts < $1
-        ORDER BY a.id
-        """,
-        MAX_DELIVERY_ATTEMPTS,
-    )
-    return rows
 
 
 async def render_order_alert(pool: asyncpg.Pool, row: asyncpg.Record) -> str:
