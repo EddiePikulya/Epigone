@@ -15,6 +15,7 @@ from epigone.gateway import (
     Position,
     Side,
     Window,
+    fetch_account_state,
     fetch_open_orders,
 )
 from epigone.gateway.fake import FakeHyperliquidGateway
@@ -187,6 +188,33 @@ async def test_fetch_open_orders_raises_when_any_venue_fails() -> None:
     fake.open_orders_errors_by_dex[(WHALE.lower(), "xyz")] = GatewayError("xyz venue down")
     with pytest.raises(GatewayError):
         await fetch_open_orders(fake, WHALE)
+
+
+async def test_fetch_account_state_sums_the_equity_of_every_covered_venue() -> None:
+    # Each venue collateralises itself: core equity and xyz equity are separate
+    # pools, and a Trader's covered-venue equity is their total (issue #170).
+    # The positions merge exactly as fetch_open_positions merges them.
+    fake = FakeHyperliquidGateway()
+    fake.set_positions(WHALE, [HYPE_LONG])
+    fake.set_account_value(WHALE, Decimal("400000"))
+    fake.set_account_value(WHALE, Decimal("25000"), dex="xyz")
+
+    state = await fetch_account_state(fake, WHALE)
+
+    assert state.account_value == Decimal("425000")
+    assert state.positions == [HYPE_LONG]
+    assert fake.positions_calls == [(WHALE.lower(), None), (WHALE.lower(), "xyz")]
+
+
+async def test_fetch_account_state_raises_when_any_venue_fails() -> None:
+    # A venue that did not answer contributes no equity, so a partial sum reads
+    # as a Trader who just withdrew that venue's balance — the #21/#31
+    # all-or-raise rule, and doubly so for the figure #171 alerts on.
+    fake = FakeHyperliquidGateway()
+    fake.set_account_value(WHALE, Decimal("400000"))
+    fake.positions_errors_by_dex[(WHALE.lower(), "xyz")] = GatewayError("xyz venue down")
+    with pytest.raises(GatewayError):
+        await fetch_account_state(fake, WHALE)
 
 
 def _fake_with_whale() -> FakeHyperliquidGateway:

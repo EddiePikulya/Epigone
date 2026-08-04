@@ -44,7 +44,14 @@ async def hanging_gateway(
         if hangs is not None and request.method == "POST":
             body = await request.json()
             if body["user"] not in hangs:
-                return web.json_response({"assetPositions": []})
+                # An idle account as the live endpoint describes one: no
+                # positions, and a marginSummary all the same (issue #170). The
+                # poll pass reads the account value out of this same response,
+                # so a body without one would be a shape Hyperliquid never
+                # sends, failing the wallets this fixture means to answer.
+                return web.json_response(
+                    {"marginSummary": {"accountValue": "0.0"}, "assetPositions": []}
+                )
         await asyncio.sleep(1)  # the client gives up long before this returns
         raise AssertionError("the client should have timed out long before this")
 

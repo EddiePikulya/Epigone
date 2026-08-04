@@ -50,6 +50,16 @@ notification preferences and an executor must see a leader's trade whether or
 not any follower's floor admits it — so the event write is unfiltered, and a
 wallet in the poll set only because a User linked it (#121) records events too,
 though nobody is alerted about it. See epigone.position_events.
+
+The pass also writes down what each Trader's account is WORTH (issue #170).
+`clearinghouseState` has always answered with the account value beside the
+positions, and the parser dropped it; now the same call yields both and the
+latest observation lands in `trader_equity` inside the same per-Trader
+transaction — so equity and positions are never separately true. It costs no
+request and no weight. Unlike an event, an observation is not something the
+Trader did, so only the newest is kept; the observation it replaces is
+`record_equity`'s return value, which is where the withdrawal follow-up (#171)
+will take its delta. See epigone.trader_equity.
 """
 
 import logging
@@ -63,16 +73,19 @@ from epigone.budget import Budget, record_rate_limit
 from epigone.clock import Clock
 from epigone.gateway import (
     POSITION_VENUES,
+    AccountState,
     GatewayError,
     HyperliquidGateway,
     Position,
     RateLimitedError,
+    fetch_account_state,
     fetch_open_positions,
 )
 from epigone.ingest.fine import mark_due_now
 from epigone.position_diff import diff_positions, events_of
 from epigone.position_events import PositionEvent, record_events
 from epigone.position_snapshots import POLL_SNAPSHOTS, apply_changes, read_snapshots, remember
+from epigone.trader_equity import record_equity
 
 log = logging.getLogger(__name__)
 
@@ -105,14 +118,16 @@ async def run_poll_pass(
 ) -> PollResult:
     """One clearinghouseState call per POSITION_VENUE for each distinct wallet in
     the poll set — tracked Traders plus Users' own linked wallets (issue #121) —
-    merged before diffing, paced by the budget. A purely-linked wallet is
-    snapshotted but queues no alerts: _queue_alerts fans out only to `tracks`."""
+    merged before diffing, paced by the budget. Those same responses carry each
+    wallet's account equity, recorded with the diff (issue #170). A purely-linked
+    wallet is snapshotted but queues no alerts: _queue_alerts fans out only to
+    `tracks` — its equity is still recorded, exactly as its events are."""
     await _prune_untracked(pool)
     addresses = await fetch_poll_set(pool)
     polled = failed = events = consecutive_failures = 0
     for address in addresses:
         try:
-            positions = await fetch_positions_paced(gateway, budget, address)
+            state = await fetch_account_state_paced(gateway, budget, address)
         except RateLimitedError:
             # Pacing, not an outage (issue #28): the gateway already backed off
             # and retried; the wallet just polls again next pass. Never counts
@@ -137,7 +152,7 @@ async def run_poll_pass(
                 return PollResult(polled=polled, failed=failed, events=events, aborted=True)
             continue
         consecutive_failures = 0
-        events += await _apply_poll(pool, address, positions, clock.now())
+        events += await _apply_poll(pool, address, state, clock.now())
         polled += 1
     if events or failed:
         log.info("poll pass done: %d polled, %d events, %d failed", polled, events, failed)
@@ -173,27 +188,60 @@ async def fetch_poll_set(pool: asyncpg.Pool) -> list[str]:
     return [row["trader_address"] for row in rows]
 
 
+async def fetch_account_state_paced(
+    gateway: HyperliquidGateway, budget: Budget, address: str
+) -> AccountState:
+    """A Trader's open positions AND covered-venue equity across the venues we
+    cover (POSITION_VENUES: core plus the xyz builder DEX), paced by the budget:
+    each clearinghouseState call costs POSITIONS_WEIGHT, so a wallet reserves
+    every venue's weight before polling. Billing one spend per venue off
+    POSITION_VENUES keeps the accounting in lockstep with the calls the shared
+    fetch actually makes.
+
+    The equity rides the calls this already made (issue #170) — the account
+    value has always been in the clearinghouseState response and was discarded
+    at parse time — so the loop below is unchanged and the exchange sees exactly
+    the traffic it saw before. That is the whole cost story: zero extra
+    requests, zero extra weight.
+
+    The shared fetch (epigone.gateway.fetch_account_state) merges the venues and
+    raises on a partial fetch; here that means the whole wallet is retried next
+    pass with its snapshots untouched, never diffed against a half-empty list
+    into false CLOSE alerts (issue #21) — and with its recorded equity
+    untouched, never a sum missing a venue's collateral, which is the same
+    figure a Trader emptying that venue would produce."""
+    await _spend_venue_weight(budget)
+    return await fetch_account_state(gateway, address)
+
+
 async def fetch_positions_paced(
     gateway: HyperliquidGateway, budget: Budget, address: str
 ) -> list[Position]:
-    """A Trader's open positions across the venues we cover (POSITION_VENUES:
-    core plus the xyz builder DEX), paced by the budget: each clearinghouseState
-    call costs POSITIONS_WEIGHT, so a wallet reserves every venue's weight before
-    polling. Billing one spend per venue off POSITION_VENUES keeps the accounting
-    in lockstep with the calls the shared fetch actually makes.
-
-    The shared fetch (epigone.gateway.fetch_open_positions) merges the venues
-    and raises on a partial fetch; here that means the whole wallet is retried
-    next pass with its snapshots untouched, never diffed against a half-empty
-    list into false CLOSE alerts (issue #21).
+    """A Trader's open positions across the venues we cover, paced identically —
+    the same calls, the same weight, parsed for the positions alone.
 
     Shared with the websocket lane's reconnect resync (issue #157), which needs
     exactly this — a paced, all-or-raise, point-in-time read — and must bill it
     the same way, off the same venue tuple, or the two lanes' spends would drift
-    from the calls they make."""
+    from the calls they make.
+
+    Deliberately NOT the positions half of fetch_account_state_paced (issue
+    #170). That read requires a marginSummary and raises without one, which is
+    right where a missing equity would be acted on and pointless where nothing
+    reads it: routing the resync through it would give the websocket lane a new
+    way to fail for a field it never uses. The two share their pacing, which is
+    the part that must not drift, and nothing else."""
+    await _spend_venue_weight(budget)
+    return await fetch_open_positions(gateway, address)
+
+
+async def _spend_venue_weight(budget: Budget) -> None:
+    """Reserve one clearinghouseState call's weight per covered venue, before
+    the calls. Billing off POSITION_VENUES here — in one place both paced reads
+    go through — keeps the accounting in lockstep with the calls the shared
+    fetches actually make (issue #31)."""
     for _venue in POSITION_VENUES:
         await budget.spend(POSITIONS_WEIGHT)
-    return await fetch_open_positions(gateway, address)
 
 
 async def _prune_untracked(pool: asyncpg.Pool) -> None:
@@ -202,8 +250,22 @@ async def _prune_untracked(pool: asyncpg.Pool) -> None:
     union: a wallet only linked as a User's own drops the instant that link is
     cleared, exactly as a Trader drops when their last follower leaves, while a
     wallet still tracked (or still linked) by anyone keeps its snapshot. Queued
-    alerts are untouched — they were real when detected and still owe delivery."""
+    alerts are untouched — they were real when detected and still owe delivery.
+
+    The equity observation (issue #170) drops with the snapshots, for the same
+    reason: it describes a moment Epigone was watching, and after a gap nobody
+    watched it is not a baseline anything may be compared against. Left behind,
+    it would hand the withdrawal follow-up (#171) a months-old figure and an
+    alert for money that moved while the wallet was off the poll set."""
     async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            DELETE FROM trader_equity
+            WHERE trader_address NOT IN (SELECT trader_address FROM tracks)
+              AND trader_address NOT IN
+                  (SELECT linked_wallet FROM users WHERE linked_wallet IS NOT NULL)
+            """
+        )
         await conn.execute(
             """
             DELETE FROM position_snapshots
@@ -223,12 +285,21 @@ async def _prune_untracked(pool: asyncpg.Pool) -> None:
 
 
 async def _apply_poll(
-    pool: asyncpg.Pool, address: str, positions: list[Position], now: datetime
+    pool: asyncpg.Pool, address: str, state: AccountState, now: datetime
 ) -> int:
     """Diff one Trader's freshly fetched positions against the snapshots and
-    commit snapshots + event rows + alert rows atomically. Returns the event
-    count."""
+    commit snapshots + event rows + alert rows + this pass's equity observation
+    atomically. Returns the event count."""
+    positions = state.positions
     async with pool.acquire() as conn, conn.transaction():
+        # The equity observation lands first and unconditionally (issue #170):
+        # it is what the account was worth when Epigone looked, which is as true
+        # on a Trader's baselining pass as on any other, and as true of a pass
+        # that diffed no events as of one that did. Nothing here reads its
+        # return value yet; the withdrawal follow-up (#171) computes its delta
+        # from that previous observation, in this transaction, before this line
+        # replaces it.
+        await record_equity(conn, address, state.account_value, now)
         baselined = await conn.fetchval(
             "SELECT 1 FROM position_poll_state WHERE trader_address = $1", address
         )

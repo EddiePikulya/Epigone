@@ -116,6 +116,25 @@ class Position:
 
 
 @dataclass(frozen=True)
+class AccountState:
+    """One venue's clearinghouseState read: what a Trader holds there, and what
+    the account backing it is worth (issue #170).
+
+    `account_value` is the venue's `marginSummary.accountValue` — margin plus
+    unrealized PnL plus idle collateral, the figure Hyperliquid's own UI calls
+    account equity. It has always ridden the response the poller already fetches
+    and been thrown away at parse time; keeping it costs no call and no weight.
+
+    ONE VENUE, and the distinction matters for equity in a way it never did for
+    positions: positions from several venues merge into a list, but equities are
+    separate collateral pools and only sum into a meaningful total once every
+    covered venue has answered — which is what fetch_account_state is for."""
+
+    positions: list[Position]
+    account_value: Decimal
+
+
+@dataclass(frozen=True)
 class OpenOrder:
     """A resting (unfilled) order on a Trader's book — their plan before it
     executes (issue #115).
@@ -271,6 +290,18 @@ class HyperliquidGateway(Protocol):
         `dex` selects a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21);
         None reads the core venue. Builder-DEX coins are namespaced `dex:COIN`
         (e.g. `xyz:META`), keeping them distinct from core positions."""
+        ...
+
+    async def get_account_state(self, address: str, dex: str | None = None) -> AccountState:
+        """ONE venue's clearinghouseState in full: the same positions
+        get_open_positions returns, plus the account equity backing them
+        (issue #170).
+
+        Same endpoint, same `dex` selector, same weight as get_open_positions —
+        this is that call with the account value kept rather than dropped, so a
+        caller wanting both must make exactly one of the two calls, never both.
+        get_open_positions remains for the many callers that only render or diff
+        positions. Raises GatewayError on failure."""
         ...
 
     async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
@@ -441,6 +472,40 @@ async def fetch_open_positions(gateway: HyperliquidGateway, address: str) -> lis
     for dex in POSITION_VENUES:
         positions.extend(await gateway.get_open_positions(address, dex=dex))
     return positions
+
+
+async def fetch_account_state(gateway: HyperliquidGateway, address: str) -> AccountState:
+    """A Trader across every venue Epigone covers: their merged positions and
+    their TOTAL covered-venue equity (issue #170).
+
+    fetch_open_positions with the account value kept — the same one call per
+    POSITION_VENUES entry, so a caller that wants equity calls this INSTEAD of
+    that helper and the exchange sees no extra traffic.
+
+    The equity is a sum because each venue collateralises itself: a HIP-3
+    builder DEX holds its own margin, so core equity and xyz equity are separate
+    pools and neither alone is what the Trader has at stake on the venues
+    Epigone watches. Verified live 2026-08-04 rather than assumed (the #63
+    never-assume-coverage lesson): a dex-scoped clearinghouseState answers with
+    its OWN marginSummary, and a wallet holding nothing on that dex gets
+    accountValue "0.0" rather than a response missing the field (the shape is
+    recorded in tests/fixtures/clearinghouse_state_xyz.json). That total is
+    deliberately a partial view of the wallet — an uncovered dex or a spot
+    balance is outside it — and it is the right one, because it is exactly the
+    money backing the positions Epigone diffs.
+
+    Same all-or-raise rule as fetch_open_positions, and equity sharpens it: a
+    venue that failed to answer contributes zero to the sum, which is
+    indistinguishable from a Trader who moved that balance out. Raising leaves
+    the previous observation standing instead of recording a drop that never
+    happened (issues #21, #31)."""
+    positions: list[Position] = []
+    account_value = Decimal(0)
+    for dex in POSITION_VENUES:
+        state = await gateway.get_account_state(address, dex=dex)
+        positions.extend(state.positions)
+        account_value += state.account_value
+    return AccountState(positions=positions, account_value=account_value)
 
 
 # The builder-DEX asset-id arithmetic (verified against the SDK's own
