@@ -30,6 +30,9 @@ ADMIN_COMMANDS = [
     BotCommand(command="allowed", description="List who has access"),
     BotCommand(command="kill", description="HALT execution: sweep orders, hold positions"),
     BotCommand(command="resume", description="Lift the execution halt (asks to confirm)"),
+    BotCommand(command="copy", description="Mirror a leader into a funded sub-account"),
+    BotCommand(command="uncopy", description="Stop copying a leader (never flattens)"),
+    BotCommand(command="copies", description="List your copy mappings"),
 ]
 
 

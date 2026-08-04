@@ -6,6 +6,7 @@ from aiogram import Bot, Dispatcher
 
 from epigone.bot.access import install_allowlist_gate
 from epigone.bot.alerts import run_delivery_loop
+from epigone.bot.copy_notices import run_copy_notice_loop
 from epigone.bot.first_data_notice import run_first_data_notice_loop
 from epigone.bot.handlers import build_router
 from epigone.bot.menu import set_bot_commands
@@ -34,6 +35,7 @@ async def main() -> None:
         dp["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
         dp["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
         dp["rename_pending"] = {}  # per-User wallet-rename prompts (bot/names.py)
+        dp["copy_pending"] = {}  # per-Operator /copy confirmations (bot/copy.py)
         # Invite-only gate (#33): the single outer-middleware seam every update
         # passes before any handler runs.
         install_allowlist_gate(dp)
@@ -55,6 +57,10 @@ async def main() -> None:
         # follower when a tracked Trader's equity falls by more than its PnL
         # explains; same seam, its own drain loop.
         withdrawal_delivery = asyncio.create_task(run_withdrawal_delivery_loop(pool, bot, clock))
+        # The copy executor's own messages (issue #136, ADR-0007 decision 11):
+        # every copy action, every skip with its reason, every pager case. Its
+        # own queue, never position_alerts — the separation holds both ways.
+        copy_notices = asyncio.create_task(run_copy_notice_loop(pool, bot, clock))
         logging.getLogger(__name__).info("bot: starting polling and alert delivery")
         try:
             await dp.start_polling(bot)
@@ -63,6 +69,7 @@ async def main() -> None:
             first_data.cancel()
             order_delivery.cancel()
             withdrawal_delivery.cancel()
+            copy_notices.cancel()
 
 
 if __name__ == "__main__":

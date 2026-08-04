@@ -145,11 +145,14 @@ def _restore_dir(path: Path) -> None:
 
 
 def _cancels(exec_gateway: FakeExecutionGateway) -> list[CancelSpec]:
+    """Every cancelled (asset, oid), flattened across accounts — the sweep
+    issues one cancel per account now (issue #136), so the fake's payload is
+    (cancels, vault_address)."""
     return [
         spec
         for name, payload in exec_gateway.actions
         if name == "cancel_orders"
-        for spec in payload  # type: ignore[union-attr]
+        for spec in payload[0]  # type: ignore[index]
     ]
 
 
@@ -365,6 +368,39 @@ async def test_cold_start_with_postgres_unreachable_cancels_on_its_first_cycle(
     clock.advance(INTERVAL.total_seconds())
     await watchdog.run_cycle()
     assert len(_cancels(exec_gateway)) == 2
+
+
+async def test_a_cold_started_watchdog_sweeps_copy_sub_accounts_too(
+    cache: WatchdogKeyCache,
+    kek_path: Path,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    watchdog_key: AgentKeyRecord,
+    keystore: AgentKeystore,
+) -> None:
+    """The hardest half of ADR-0007 decision 1's per-sub sweep: this process
+    has NO database, so it cannot read Epigone's own `copy_subs` mapping. It
+    asks the EXCHANGE which sub-accounts the master has — which is why the
+    sweep sources that list from `subAccounts` and not from our own table."""
+    signer = await keystore.signer(OPERATOR, WATCHDOG_LANE)
+    cache.write(watchdog_key, bytes(signer.key), now=clock.now())
+    startup = await _cold_start(cache, clock, kek_path)
+
+    sub = "0x" + "11" * 20
+    read_gateway.sub_accounts[MASTER] = [sub]
+    read_gateway.set_open_orders(sub, [open_order("ETH", 81)])
+    exec_gateway = FakeExecutionGateway()
+    watchdog = _blind_watchdog(startup, clock, read_gateway, exec_gateway)
+
+    await watchdog.run_cycle()
+
+    (account, specs) = [
+        (payload[1], payload[0])  # type: ignore[index]
+        for name, payload in exec_gateway.actions
+        if name == "cancel_orders"
+    ][0]
+    assert account == sub
+    assert specs == [CancelSpec(asset=1, oid=81)]
 
 
 async def test_a_cold_started_watchdog_cannot_place_orders(

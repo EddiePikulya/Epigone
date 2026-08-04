@@ -141,6 +141,24 @@ class AccountState:
 
 
 @dataclass(frozen=True)
+class PerpAsset:
+    """One perp asset's ORDER-PLACEMENT contract (issue #136): its name and
+    the size precision the venue accepts.
+
+    `get_perp_universe` returns names in asset-index order, which is all a
+    cancel needs — it names an asset by index and an order by oid. PLACING is
+    the harder direction: Hyperliquid refuses a size with more decimal places
+    than the asset's `szDecimals`, so an executor that rounds by a house
+    default instead of the venue's answer gets a typed reject at exactly the
+    moment it is trying to mirror a trade. The price rule derives from the
+    same number (perps: at most 6 − szDecimals decimal places, and at most 5
+    significant figures), so one field settles both."""
+
+    name: str  # namespaced exactly like get_perp_universe's entries
+    sz_decimals: int
+
+
+@dataclass(frozen=True)
 class OpenOrder:
     """A resting (unfilled) order on a Trader's book — their plan before it
     executes (issue #115).
@@ -308,6 +326,50 @@ class HyperliquidGateway(Protocol):
         caller wanting both must make exactly one of the two calls, never both.
         get_open_positions remains for the many callers that only render or diff
         positions. Raises GatewayError on failure."""
+        ...
+
+    async def get_sub_accounts(self, address: str) -> list[str]:
+        """A master account's sub-account addresses, lowercased (the
+        `subAccounts` info endpoint) — public, no signature.
+
+        The watchdog's sweep reads this (issue #136, ADR-0007 decision 1: the
+        sweep and /kill must reach every Copy Sub-account, because A4 is the
+        first thing that can place an order on one). Deliberately asked of the
+        EXCHANGE rather than of Epigone's own `copy_subs` table: the
+        cold-start blind path (#145) comes up with Postgres unreachable and
+        must still cancel across every sub, and this is the only source of
+        that list which does not need a database. It also cannot go stale.
+
+        A master with no subs answers []. Raises GatewayError on failure —
+        and a sweep that cannot enumerate its accounts must degrade to partial
+        coverage rather than silently sweep the master alone."""
+        ...
+
+    async def get_perp_assets(self, dex: str | None = None) -> list[PerpAsset]:
+        """ONE venue's perp assets in ASSET-INDEX ORDER — the same order and
+        the same namespacing as get_perp_universe, plus each asset's
+        `szDecimals` (issue #136).
+
+        This is the PLACING-side twin of get_perp_universe: index order gives
+        the asset id, szDecimals gives the size and price precision an order
+        must be rounded to before it is signed. Raises GatewayError on
+        failure."""
+        ...
+
+    async def get_mid_prices(self, dex: str | None = None) -> dict[str, Decimal]:
+        """Current mid price per coin on one venue (the `allMids` info
+        endpoint), keyed by the same namespaced coin names positions and
+        orders carry (issue #136).
+
+        The copy executor prices every IOC against these. An ENTRY has no
+        other source: it is for a coin we do not yet hold, so there is no
+        position whose notional-over-units would give a price, and the
+        Leader's own event is 10–20s stale by construction (the accepted v1
+        signal latency). An EXIT could in principle read the mark off our own
+        position — but its retries span ~30s, and re-pricing attempt three
+        against the mark that was live at attempt one would aim the order at a
+        market that has moved. One source, re-read per attempt. Raises
+        GatewayError on failure."""
         ...
 
     async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
@@ -522,12 +584,25 @@ BUILDER_DEX_ASSET_BASE = 110_000
 BUILDER_DEX_ASSET_STRIDE = 10_000
 
 
-async def fetch_asset_ids(
+@dataclass(frozen=True)
+class AssetSpec:
+    """Everything `/exchange` needs to know about a coin to act on it: the
+    integer asset id it is named by, and the size precision an order on it
+    must be rounded to (issue #136)."""
+
+    asset_id: int
+    sz_decimals: int
+
+
+async def fetch_asset_specs(
     gateway: HyperliquidGateway, *, dexs: Sequence[str] | None = None
-) -> dict[str, int]:
-    """Coin name → the integer asset id `/exchange` actions take — the mapping
-    a cancel-by-oid needs to name an OpenOrder's asset (issue #135; the read
-    gateway owns the coin↔asset mapping, per the execution seam's contract).
+) -> dict[str, AssetSpec]:
+    """Coin name → its AssetSpec across the core universe and `dexs`.
+
+    Owns the builder-DEX offset arithmetic for the whole codebase — the
+    cancel side (fetch_asset_ids, which projects this to ids alone) and the
+    placing side (the copy executor, which needs the precision too) walk the
+    same code so a change to the mapping cannot land on only one of them.
 
     `dexs` selects which builder DEXes to map beside the core universe:
     default is the covered POSITION_VENUES; the watchdog's ACCOUNT-WIDE sweep
@@ -542,9 +617,9 @@ async def fetch_asset_ids(
     requested dex missing from the perpDexs listing raises rather than
     guessing an offset, because a wrong asset id cancels (or leaves alive)
     the wrong order."""
-    ids: dict[str, int] = {}
-    for index, coin in enumerate(await gateway.get_perp_universe(None)):
-        ids[coin] = index
+    specs: dict[str, AssetSpec] = {}
+    for index, asset in enumerate(await gateway.get_perp_assets(None)):
+        specs[asset.name] = AssetSpec(asset_id=index, sz_decimals=asset.sz_decimals)
     wanted = [dex for dex in POSITION_VENUES if dex is not None] if dexs is None else list(dexs)
     if wanted:
         listing = await gateway.get_perp_dexs()
@@ -552,9 +627,24 @@ async def fetch_asset_ids(
             if dex not in listing:
                 raise GatewayError(f"perp dex {dex!r} missing from perpDexs listing {listing!r}")
             offset = BUILDER_DEX_ASSET_BASE + listing.index(dex) * BUILDER_DEX_ASSET_STRIDE
-            for index, coin in enumerate(await gateway.get_perp_universe(dex)):
-                ids[coin] = offset + index
-    return ids
+            for index, asset in enumerate(await gateway.get_perp_assets(dex)):
+                specs[asset.name] = AssetSpec(
+                    asset_id=offset + index, sz_decimals=asset.sz_decimals
+                )
+    return specs
+
+
+async def fetch_asset_ids(
+    gateway: HyperliquidGateway, *, dexs: Sequence[str] | None = None
+) -> dict[str, int]:
+    """Coin name → the integer asset id `/exchange` actions take — the mapping
+    a cancel-by-oid needs to name an OpenOrder's asset (issue #135; the read
+    gateway owns the coin↔asset mapping, per the execution seam's contract).
+
+    The ids-only projection of fetch_asset_specs, which carries the contract
+    and the offset arithmetic; see it for `dexs` and the all-or-raise rule."""
+    specs = await fetch_asset_specs(gateway, dexs=dexs)
+    return {coin: spec.asset_id for coin, spec in specs.items()}
 
 
 async def fetch_open_orders(gateway: HyperliquidGateway, address: str) -> list[OpenOrder]:

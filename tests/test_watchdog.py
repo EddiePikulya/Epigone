@@ -124,11 +124,20 @@ def watchdog(
 
 
 def _cancels(exec_gateway: FakeExecutionGateway) -> list[CancelSpec]:
+    """Every cancelled (asset, oid), flattened across accounts. The sweep
+    issues one cancel action PER ACCOUNT now (issue #136), so the fake's
+    payload is (cancels, vault_address); `_cancels_by_account` is the view
+    that keeps the account axis."""
+    return [spec for _account, specs in _cancels_by_account(exec_gateway) for spec in specs]
+
+
+def _cancels_by_account(
+    exec_gateway: FakeExecutionGateway,
+) -> list[tuple[str | None, list[CancelSpec]]]:
     return [
-        spec
+        (payload[1], payload[0])  # type: ignore[index]
         for name, payload in exec_gateway.actions
         if name == "cancel_orders"
-        for spec in payload  # type: ignore[union-attr]
     ]
 
 
@@ -464,6 +473,80 @@ async def test_sweep_covers_dexs_outside_position_venues(
     await watchdog.run_cycle()
     halt = await active_halt(pool)
     assert halt is not None and halt.swept_at is not None
+
+
+async def test_sweep_reaches_every_copy_sub_account(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """ADR-0007 decision 1: A4 is the first thing that can place an order on a
+    Copy Sub-account, so the sweep must reach one. Each account's cancel
+    carries that account's vault flag — the master's is None — because a
+    cancel names a book, and cancelling a sub's order against the master's
+    book would silently do nothing."""
+    sub_a, sub_b = "0x" + "11" * 20, "0x" + "22" * 20
+    read_gateway.sub_accounts[MASTER] = [sub_a, sub_b]
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 11)])
+    read_gateway.set_open_orders(sub_a, [open_order("SOL", 21)])
+    read_gateway.set_open_orders(sub_b, [open_order("xyz:BB", 31)], dex="xyz")
+
+    await watchdog.run_cycle()
+
+    assert _cancels_by_account(exec_gateway) == [
+        (None, [CancelSpec(asset=1, oid=11)]),
+        (sub_a, [CancelSpec(asset=2, oid=21)]),
+        (sub_b, [CancelSpec(asset=110_001, oid=31)]),
+    ]
+
+
+async def test_a_sub_accounts_outage_degrades_to_a_partial_sweep(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """The same degrade rule the perpDexs outage already obeys, on the account
+    axis: sweep what is certainly covered, say so, and never stamp swept_at —
+    a halt marked swept while a sub-account's book was never enumerated is
+    exactly the silent-live-order hazard the verify exists to prevent."""
+    read_gateway.sub_account_errors[MASTER] = GatewayError("subAccounts down")
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 11)])
+
+    await watchdog.run_cycle()
+
+    assert _cancels(exec_gateway) == [CancelSpec(asset=1, oid=11)]  # master swept
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is None  # …but never stamped
+
+
+async def test_the_halt_snapshot_covers_positions_held_in_a_sub(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audit: ExecutionAudit,
+) -> None:
+    # Positions are HELD, not closed — so the operator's alert has to list the
+    # ones sitting in a Copy Sub-account too, or hold-and-alert is only half a
+    # policy for exactly the accounts A4 put money in.
+    sub = "0x" + "11" * 20
+    read_gateway.sub_accounts[MASTER] = [sub]
+    read_gateway.set_positions(sub, [_position("SOL")])
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+
+    await watchdog.run_cycle()
+
+    halt = await active_halt(pool)
+    assert halt is not None and halt.positions is not None
+    assert [p["coin"] for p in halt.positions] == ["SOL"]
 
 
 # --- Postgres independence: the trip→wire path (PR #143 round 2) ---

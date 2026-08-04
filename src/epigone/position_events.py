@@ -174,23 +174,46 @@ async def record_events(
     )
 
 
-async def outstanding_events(conn: asyncpg.Connection, consumer: str) -> list[ClaimableEvent]:
+async def outstanding_events(
+    conn: asyncpg.Connection,
+    consumer: str,
+    *,
+    source: str | None = None,
+    traders: list[str] | None = None,
+) -> list[ClaimableEvent]:
     """This consumer's backlog: every event it has not claimed, oldest first.
 
     Ordering by id is the guarantee ADR-0006 states — total per (Trader, coin),
     and nothing across them, which no consumer needs. Unbounded and unindexed
     by design, both for the same reason: retention keeps the table to a few
     thousand rows. If it ever outgrows that, an index strategy and a batch
-    bound are the things to revisit, not the claims model."""
+    bound are the things to revisit, not the claims model.
+
+    `source` is the filter ADR-0007 decision 4 makes MANDATORY for the copy
+    executor rather than optional, and it lives here — in the query — because
+    that is where the ADR puts it. The WS shadow lane dual-writes every
+    (trader, coin) it observes, so an unfiltered executor would copy every
+    trade TWICE for as long as the shadow phase runs. Flipping the executor's
+    argument from 'poll' to 'ws' is a #158 cutover checklist item.
+
+    `traders` narrows the backlog to the copy-enabled Leaders. It is a filter,
+    not a skip: an event for a wallet nobody copies must never be CLAIMED,
+    because claim-means-handled applies to events that qualified, and claiming
+    them would mean a later /copy silently inherits a drained backlog. Events
+    that never qualify simply stay outstanding until retention prunes them."""
     rows = await conn.fetch(
         """
         SELECT e.*
         FROM position_events e
         LEFT JOIN position_event_claims c ON c.event_id = e.id AND c.consumer = $1
         WHERE c.event_id IS NULL
+          AND ($2::text IS NULL OR e.source = $2)
+          AND ($3::text[] IS NULL OR e.trader_address = ANY($3))
         ORDER BY e.id
         """,
         consumer,
+        source,
+        traders,
     )
     return [
         ClaimableEvent(

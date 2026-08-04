@@ -53,6 +53,7 @@ from epigone.gateway.execution import (
     OrderResting,
     OrderResult,
     OrderSpec,
+    SubAccountProvisioning,
 )
 from epigone.safety.db import SAFETY_DB_TIMEOUT_SECONDS
 
@@ -114,8 +115,17 @@ class ExecutionAudit:
         risk_decision: str,
         master_address: str | None = None,
         signer_address: str | None = None,
+        conn: asyncpg.Connection | None = None,
     ) -> AuditedAttempt:
-        row = await self._pool.fetchrow(
+        """`conn` writes the attempt inside the CALLER's open transaction, so
+        the row can commit atomically with whatever else makes the decision
+        durable. The copy executor is why it exists (ADR-0006): its
+        `position_event_claims` row and this attempt row must land together
+        or the write-ahead property is gone — a claim without an attempt is
+        an event silently dropped, an attempt without a claim is an event the
+        next loop copies again."""
+        db: asyncpg.Pool | asyncpg.Connection = conn if conn is not None else self._pool
+        row = await db.fetchrow(
             """
             INSERT INTO execution_audit
                 (occurred_at, actor, action, master_address, signer_address,
@@ -143,9 +153,15 @@ class ExecutionAudit:
         )
 
     async def record_outcome(
-        self, attempt: AuditedAttempt, *, outcome: str, detail: Any = None
+        self,
+        attempt: AuditedAttempt,
+        *,
+        outcome: str,
+        detail: Any = None,
+        conn: asyncpg.Connection | None = None,
     ) -> None:
-        await self._pool.execute(
+        db: asyncpg.Pool | asyncpg.Connection = conn if conn is not None else self._pool
+        await db.execute(
             """
             INSERT INTO execution_audit
                 (occurred_at, actor, action, master_address, signer_address,
@@ -258,27 +274,40 @@ class AuditedExecutionGateway:
         *,
         grouping: Grouping = Grouping.NA,
         builder: BuilderFee | None = None,
+        vault_address: str | None = None,
     ) -> list[OrderResult]:
+        # `vault_address` rides the REQUEST payload rather than a column of
+        # its own: it says which BOOK the action landed on, and the trail's
+        # master_address stays the account whose agent signed — the two facts
+        # a per-sub incident needs told apart (issue #136).
         request = {
             "orders": [_order_json(order) for order in orders],
             "grouping": grouping.value,
             "builder": None
             if builder is None
             else {"address": builder.address, "fee_tenth_bp": builder.fee_tenth_bp},
+            "vault_address": _lower(vault_address),
         }
         return await self._audited(
             "order",
             request,
-            lambda: self._inner.place_orders(orders, grouping=grouping, builder=builder),
+            lambda: self._inner.place_orders(
+                orders, grouping=grouping, builder=builder, vault_address=vault_address
+            ),
             _order_results_json,
         )
 
-    async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
-        request = {"cancels": [{"asset": c.asset, "oid": c.oid} for c in cancels]}
+    async def cancel_orders(
+        self, cancels: list[CancelSpec], *, vault_address: str | None = None
+    ) -> list[CancelResult]:
+        request = {
+            "cancels": [{"asset": c.asset, "oid": c.oid} for c in cancels],
+            "vault_address": _lower(vault_address),
+        }
         return await self._audited(
             "cancel",
             request,
-            lambda: self._inner.cancel_orders(cancels),
+            lambda: self._inner.cancel_orders(cancels, vault_address=vault_address),
             _cancel_results_json,
         )
 
@@ -333,36 +362,15 @@ class AuditedExecutionGateway:
         attempt = None if wire_first else await self._record_attempt(action, request)
         try:
             result = await call()
-        except ActionRejectedError as exc:
-            await self._finish_audit(
-                attempt,
-                wire_first,
-                action,
-                request,
-                outcome=REJECTED,
-                detail={"reason": exc.reason.value, "message": exc.message},
-            )
-            raise
-        except AmbiguousExecutionError as exc:
-            await self._finish_audit(
-                attempt,
-                wire_first,
-                action,
-                request,
-                outcome=AMBIGUOUS,
-                detail={"type": type(exc).__name__, "message": str(exc)},
-            )
-            raise
         except Exception as exc:
-            # ExecutionError (nothing sent) and anything unforeseen alike:
-            # the trail must never lose a failure, whatever its shape.
+            outcome, detail = classify_failure(exc)
             await self._finish_audit(
                 attempt,
                 wire_first,
                 action,
                 request,
-                outcome=ERROR,
-                detail={"type": type(exc).__name__, "message": str(exc)},
+                outcome=outcome,
+                detail=detail,
             )
             raise
         await self._finish_audit(
@@ -450,6 +458,94 @@ class AuditedExecutionGateway:
                 outcome,
                 attempt.id,
             )
+
+
+class AuditedProvisioning:
+    """The same attempt/outcome discipline for Copy Sub-account provisioning
+    (issue #136, ADR-0007 decision 12).
+
+    A separate wrapper for a separate protocol, mirroring the split in
+    `epigone.gateway.execution`: anything typed as `ExecutionGateway` still
+    provably cannot move funds, while the one path that creates and funds subs
+    is audited exactly as heavily as an order — write-ahead, because the
+    dangerous failure here is money moving with no record of who asked.
+
+    `decision` is the risk verdict recorded with the next call(s), the same
+    plain attribute AuditedExecutionGateway carries and for the same reason:
+    the authorization changes call to call while the instance must not."""
+
+    def __init__(
+        self,
+        inner: SubAccountProvisioning,
+        audit: ExecutionAudit,
+        *,
+        actor: str,
+        master_address: str,
+        signer_address: str,
+    ) -> None:
+        self._inner = inner
+        self._audit = audit
+        self._actor = actor
+        self._master_address = master_address
+        self._signer_address = signer_address
+        self.decision: str = "unspecified"
+
+    async def create_sub_account(self, name: str) -> str:
+        return await self._audited(
+            "createSubAccount", {"name": name}, lambda: self._inner.create_sub_account(name)
+        )
+
+    async def sub_account_transfer(
+        self, sub_address: str, *, is_deposit: bool, usd_micro: int
+    ) -> None:
+        await self._audited(
+            "subAccountTransfer",
+            {
+                "sub_account_user": _lower(sub_address),
+                "is_deposit": is_deposit,
+                "usd_micro": usd_micro,
+            },
+            lambda: self._inner.sub_account_transfer(
+                sub_address, is_deposit=is_deposit, usd_micro=usd_micro
+            ),
+        )
+
+    async def _audited(
+        self, action: str, request: Any, call: Callable[[], Awaitable[T]]
+    ) -> T:
+        attempt = await self._audit.record_attempt(
+            actor=self._actor,
+            action=action,
+            request=request,
+            risk_decision=self.decision,
+            master_address=self._master_address,
+            signer_address=self._signer_address,
+        )
+        try:
+            result = await call()
+        except Exception as exc:
+            outcome, detail = classify_failure(exc)
+            await self._audit.record_outcome(attempt, outcome=outcome, detail=detail)
+            raise
+        await self._audit.record_outcome(attempt, outcome=OK, detail={"result": result})
+        return result
+
+
+def classify_failure(exc: BaseException) -> tuple[str, dict[str, Any]]:
+    """A failed action as the trail records it: the outcome word plus what to
+    say about it.
+
+    ONE definition, shared by both audited wrappers, because the mapping IS
+    the ExecutionError hierarchy's load-bearing split — could anything have
+    reached the exchange? — and two copies of it could drift into disagreeing
+    about whether an action needs reconciling. Anything unforeseen classifies
+    ERROR alongside a plain ExecutionError: the trail must never lose a
+    failure, whatever its shape."""
+    if isinstance(exc, ActionRejectedError):
+        return REJECTED, {"reason": exc.reason.value, "message": exc.message}
+    if isinstance(exc, AmbiguousExecutionError):
+        return AMBIGUOUS, {"type": type(exc).__name__, "message": str(exc)}
+    return ERROR, {"type": type(exc).__name__, "message": str(exc)}
 
 
 def _json(value: Any) -> str:

@@ -1,7 +1,21 @@
 from datetime import datetime
 from decimal import Decimal
 
-from epigone.gateway import AccountState, ExtraAgent, Fill, LeaderboardEntry, OpenOrder, Position
+from epigone.gateway import (
+    AccountState,
+    ExtraAgent,
+    Fill,
+    LeaderboardEntry,
+    OpenOrder,
+    PerpAsset,
+    Position,
+)
+
+# What an unconfigured coin's size precision answers. A fake needs SOME
+# default, and 3 is the mid of the live core range (BTC 5, most majors 2–4) —
+# but it is a fiction, so any test whose subject is rounding sets
+# `sz_decimals` explicitly rather than leaning on it.
+DEFAULT_FAKE_SZ_DECIMALS = 3
 
 
 class FakeHyperliquidGateway:
@@ -43,6 +57,22 @@ class FakeHyperliquidGateway:
         self.perp_universes: dict[str | None, list[str]] = {}
         self.perp_dex_listing: list[str] = []
         self.perp_dex_error: Exception | None = None
+        # Order-placement precision, keyed by the same namespaced coin names
+        # `perp_universes` lists (issue #136). Deliberately a SIDE table over
+        # that one list of names rather than a second universe source: the
+        # fake must not be able to say a coin exists for placing and not for
+        # cancelling. Unset coins answer DEFAULT_FAKE_SZ_DECIMALS.
+        self.sz_decimals: dict[str, int] = {}
+        # Per-venue mid prices (allMids, issue #136) — what an IOC entry is
+        # priced against. Account equity rides `account_values` above.
+        self.mid_prices: dict[str | None, dict[str, Decimal]] = {}
+        self.mid_price_errors: dict[str | None, Exception] = {}
+        # Sub-accounts per master (the subAccounts readback, issue #136):
+        # what the watchdog's per-sub sweep enumerates, and the one source
+        # of that list the cold-start blind path can reach.
+        self.sub_accounts: dict[str, list[str]] = {}
+        self.sub_account_errors: dict[str, Exception] = {}
+        self.sub_account_calls: list[str] = []
         # Approved agents by master address (the extraAgents readback, issue
         # #135): what the watchdog's capability probe sees on-chain.
         # `extra_agents_calls` records each read so tests can pin the probe's
@@ -85,6 +115,26 @@ class FakeHyperliquidGateway:
 
     async def get_perp_universe(self, dex: str | None = None) -> list[str]:
         return list(self.perp_universes.get(dex, []))
+
+    async def get_sub_accounts(self, address: str) -> list[str]:
+        key = address.lower()
+        self.sub_account_calls.append(key)
+        error = self.sub_account_errors.get(key)
+        if error is not None:
+            raise error
+        return list(self.sub_accounts.get(key, []))
+
+    async def get_perp_assets(self, dex: str | None = None) -> list[PerpAsset]:
+        return [
+            PerpAsset(name=coin, sz_decimals=self.sz_decimals.get(coin, DEFAULT_FAKE_SZ_DECIMALS))
+            for coin in self.perp_universes.get(dex, [])
+        ]
+
+    async def get_mid_prices(self, dex: str | None = None) -> dict[str, Decimal]:
+        error = self.mid_price_errors.get(dex)
+        if error is not None:
+            raise error
+        return dict(self.mid_prices.get(dex, {}))
 
     async def get_perp_dexs(self) -> list[str]:
         if self.perp_dex_error is not None:

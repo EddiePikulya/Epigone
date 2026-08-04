@@ -54,7 +54,8 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
             "order_poll_state, order_snapshots, order_alerts, "
             "first_data_notices, criteria, criteria_preset_dismissals, "
             "rate_budget, rate_limit_events, allowlist, agent_keys, "
-            "process_heartbeats, execution_halts, execution_audit"
+            "process_heartbeats, execution_halts, execution_audit, "
+            "copy_subs, copy_episodes, copy_bracket_orders, copy_notices"
         )
     yield pool
     await pool.close()
@@ -102,5 +103,6 @@ def dp(pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock) ->
     dispatcher["drafts"] = {}  # per-User criteria-builder drafts (bot/criteria.py)
     dispatcher["min_size_pending"] = {}  # per-User min-size prompts (bot/controls.py)
     dispatcher["rename_pending"] = {}  # per-User wallet-rename prompts (bot/names.py)
+    dispatcher["copy_pending"] = {}  # per-Operator /copy confirmations (bot/copy.py)
     dispatcher.include_router(build_router())
     return dispatcher

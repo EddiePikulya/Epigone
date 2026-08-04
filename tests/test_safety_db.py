@@ -167,7 +167,9 @@ async def test_time_to_first_cancel_is_bounded_under_a_fully_hanging_database(
         cancels = [n for n, _ in exec_gateway.actions if n == "cancel_orders"]
         assert cancels == ["cancel_orders"]
         (_, payload) = exec_gateway.actions[-1]
-        assert [(spec.asset, spec.oid) for spec in payload] == [(1, 91)]  # type: ignore[union-attr]
+        # (cancels, vault_address) — the master's book carries no vault flag.
+        assert [(s.asset, s.oid) for s in payload[0]] == [(1, 91)]  # type: ignore[index]
+        assert payload[1] is None  # type: ignore[index]
         # ~2 beats + 2 liveness reads at ≤0.5s each, plus a handful of budget
         # spends each paying the ≤0.5s lock timeout before falling back: the
         # whole trip-to-wire path in single-digit real seconds.

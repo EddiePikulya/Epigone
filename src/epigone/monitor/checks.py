@@ -45,6 +45,7 @@ DISK = "disk"
 AGENT_KEY = "agent_key"
 WATCHDOG = "watchdog"
 HALT = "halt"
+COPY_PAGER = "copy_pager"
 
 WARNING = "warning"
 CRITICAL = "critical"
@@ -63,6 +64,25 @@ DISK_CRITICAL_PERCENT = 95
 # Fixed like the disk escalation band, not a tunable: 4× the probe's own
 # default cadence, generous against any sane WATCHDOG_CAPABILITY_CHECK_HOURS.
 CAPABILITY_VERDICT_STALE = timedelta(hours=24)
+
+# The copy executor's pager cases (issue #136, ADR-0007 decision 11): an
+# unfilled close after its retries exhaust, a liquidation, an unclassifiable
+# divergence. They are rare and each one wants a human, so ANY of them inside
+# this window is CRITICAL — and the window is deliberately long, because "the
+# book would not absorb a $200 reduce-only IOC" does not stop mattering an
+# hour later. Fixed, not tunable: an operator who wants fewer of these fixes
+# the cause, not the threshold.
+COPY_PAGER_WINDOW = timedelta(hours=6)
+
+# The audit actions that ARE pager cases. Keyed off the trail rather than off
+# `copy_notices` so a delivery failure can never also silence the page: the
+# chat message and the monitor alert fail independently.
+COPY_PAGER_ACTIONS = (
+    "copy_close_unfilled",
+    "copy_divergence_unclassifiable",
+    "copy_episode_liquidated",
+    "copy_unexpected_resting",
+)
 
 
 class DiskProbe(Protocol):
@@ -155,6 +175,12 @@ class HealthSnapshot:
     active_halt_swept_at: datetime | None = None
     # jsonb_array_length of the sweep's position snapshot; None until swept.
     active_halt_positions: int | None = None
+    # Copy-executor pager cases in the recent window (issue #136): an unfilled
+    # close after retries, or a divergence nothing could classify. Counted from
+    # the AUDIT TRAIL, so a copy_notices delivery failure cannot silence the
+    # page as well as the message.
+    recent_copy_pagers: int | None = None
+    latest_copy_pager: str | None = None
 
 
 @dataclass(frozen=True)
@@ -219,11 +245,19 @@ async def gather_snapshot(
             (SELECT swept_at FROM execution_halts WHERE resumed_at IS NULL)
                 AS active_halt_swept_at,
             (SELECT jsonb_array_length(positions) FROM execution_halts
-                WHERE resumed_at IS NULL) AS active_halt_positions
+                WHERE resumed_at IS NULL) AS active_halt_positions,
+            (SELECT count(*) FROM execution_audit
+                WHERE occurred_at >= $4 AND action = ANY($5::text[]))
+                AS recent_copy_pagers,
+            (SELECT max(risk_decision) FROM execution_audit
+                WHERE occurred_at >= $4 AND action = ANY($5::text[]))
+                AS latest_copy_pager
         """,
         _start_of_day(now),
         MAX_DELIVERY_ATTEMPTS,
         now - thresholds.rate_window,
+        now - COPY_PAGER_WINDOW,
+        list(COPY_PAGER_ACTIONS),
     )
     assert row is not None
     return HealthSnapshot(
@@ -251,6 +285,8 @@ async def gather_snapshot(
         active_halt_reason=row["active_halt_reason"],
         active_halt_swept_at=row["active_halt_swept_at"],
         active_halt_positions=row["active_halt_positions"],
+        recent_copy_pagers=row["recent_copy_pagers"],
+        latest_copy_pager=row["latest_copy_pager"],
     )
 
 
@@ -292,6 +328,7 @@ def evaluate_checks(
         _agent_key_check(snapshot, thresholds.agent_key_warn),
         _watchdog_check(snapshot, thresholds.watchdog_stale),
         _halt_check(snapshot),
+        _copy_pager_check(snapshot),
     ]
 
 
@@ -567,6 +604,45 @@ def _watchdog_check(snapshot: HealthSnapshot, stale: timedelta) -> CheckResult:
         )
     return CheckResult(
         WATCHDOG, "Watchdog", ok=True, severity=CRITICAL, detail="Watchdog beating"
+    )
+
+
+def _copy_pager_check(snapshot: HealthSnapshot) -> CheckResult:
+    """The copy executor's PAGER CASES (issue #136, ADR-0007 decisions 5 and
+    10). Two shapes qualify and both want a human rather than a retry:
+
+    - a close still UNFILLED after its bounded reduce-only retries — meaning
+      the book could not absorb a ~$200 reduce-only IOC inside the slippage
+      cap, which is pathological. It has its own audit reason precisely so it
+      can page here instead of drowning in generic partial-fill noise;
+    - a divergence the reconcile could not classify — where the rule is adopt
+      nothing, page, and re-flag until resolved;
+    - a liquidated Copy Sub-account;
+    - an entry IOC that came back RESTING, which decision 4 says cannot
+      happen — so if it does, something is wrong about what this executor
+      believes it is sending, and a resting entry is the one order shape the
+      halt sweep's timing argument does not cover.
+
+    A liquidation is the third (decision 11 lists all three). Nothing here
+    saves the money — it is already gone — but a sub that liquidated is a
+    Leader whose copy terms need revisiting, and the operator should not learn
+    that from scrolling. Nothing in this check resolves itself, so the
+    reminder cadence keeps re-paging while the window holds it."""
+    count = snapshot.recent_copy_pagers
+    if not count:
+        return CheckResult(
+            COPY_PAGER, "Copy execution", ok=True, severity=CRITICAL, detail="No copy incidents"
+        )
+    hours = int(COPY_PAGER_WINDOW.total_seconds() // 3600)
+    return CheckResult(
+        COPY_PAGER,
+        "Copy execution",
+        ok=False,
+        severity=CRITICAL,
+        detail=(
+            f"Copy execution: {count} incident(s) in the last {hours}h needing a human — "
+            f"latest: {snapshot.latest_copy_pager}"
+        ),
     )
 
 

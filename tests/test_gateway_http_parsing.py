@@ -10,14 +10,17 @@ from decimal import Decimal
 
 import pytest
 
-from epigone.gateway import GatewayError, Side, Window
+from epigone.gateway import GatewayError, PerpAsset, Side, Window
 from epigone.gateway.http import (
     parse_account_state,
     parse_extra_agents,
     parse_fills,
     parse_leaderboard,
+    parse_mid_prices,
     parse_open_orders,
+    parse_perp_assets,
     parse_positions,
+    parse_sub_accounts,
 )
 
 LEADERBOARD_PAYLOAD = {
@@ -187,6 +190,71 @@ FILLS_PAYLOAD = [
         "twapId": None,
     },
 ]
+
+
+def test_parse_sub_accounts_reads_null_as_no_subs_not_as_a_surprise() -> None:
+    # `null` is what a master that has never used the feature answers, and it
+    # is the common case — so it must be an empty list, not a parse failure
+    # that degrades the sweep to partial coverage on every healthy account.
+    assert parse_sub_accounts(None) == []
+    assert parse_sub_accounts([]) == []
+
+
+def test_parse_sub_accounts_lowercases_and_fails_loudly_on_a_surprise() -> None:
+    payload = [
+        {"name": "epicopy-1", "subAccountUser": "0xAB" + "cd" * 19},
+        {"name": "epicopy-2", "subAccountUser": "0x11" + "22" * 19},
+    ]
+    assert parse_sub_accounts(payload) == [
+        ("0xAB" + "cd" * 19).lower(),
+        "0x11" + "22" * 19,
+    ]
+    # A malformed listing read as "no subs" would skip exactly the books an
+    # emergency stop exists to clear, so it raises instead.
+    with pytest.raises(GatewayError):
+        parse_sub_accounts([{"name": "epicopy-1"}])
+    with pytest.raises(GatewayError):
+        parse_sub_accounts({"subAccounts": []})
+
+
+def test_parse_perp_assets_keeps_index_order_and_size_precision() -> None:
+    payload = {
+        "universe": [
+            {"name": "BTC", "szDecimals": 5, "maxLeverage": 40},
+            {"name": "ETH", "szDecimals": 4, "maxLeverage": 25},
+        ]
+    }
+    assert parse_perp_assets(payload) == [
+        PerpAsset(name="BTC", sz_decimals=5),
+        PerpAsset(name="ETH", sz_decimals=4),
+    ]
+    # Builder-DEX names namespace exactly like parse_perp_universe's.
+    assert parse_perp_assets({"universe": [{"name": "META", "szDecimals": 2}]}, "xyz") == [
+        PerpAsset(name="xyz:META", sz_decimals=2)
+    ]
+
+
+def test_parse_perp_assets_rejects_a_universe_without_precision() -> None:
+    # Rounding by a guess produces a typed reject at the moment we are trying
+    # to mirror a trade; failing here says why instead.
+    with pytest.raises(GatewayError):
+        parse_perp_assets({"universe": [{"name": "BTC"}]})
+
+
+def test_parse_mid_prices_maps_perp_mids_and_drops_spot() -> None:
+    payload = {"BTC": "63500.0", "ETH": "3120.5", "@107": "1.0004", "HYPE/USDC": "22.1"}
+    assert parse_mid_prices(payload) == {
+        "BTC": Decimal("63500.0"),
+        "ETH": Decimal("3120.5"),
+    }
+    assert parse_mid_prices({"META": "612.4"}, "xyz") == {"xyz:META": Decimal("612.4")}
+
+
+def test_parse_mid_prices_rejects_an_unpriceable_payload() -> None:
+    with pytest.raises(GatewayError):
+        parse_mid_prices({"BTC": "not-a-price"})
+    with pytest.raises(GatewayError):
+        parse_mid_prices(["BTC", "63500.0"])
 
 
 def test_parse_fills_maps_the_recorded_shape() -> None:

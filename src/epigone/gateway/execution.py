@@ -171,6 +171,23 @@ Open questions 1–3 (research §11) — ANSWERED on funded testnet 2026-07-28
    upgrade") during which every IOC is refused — transient, lifted within
    minutes, worth knowing before reading executor errors as bugs.
 
+10. SUB-ACCOUNT COUNT IS CAPPED AT 10 PER MASTER, FLAT (issue #136, ADR-0007
+   decision 1's "probe before implementation", scripts/testnet_subaccount_
+   cap_probe.py, 2026-08-04): creating sub-accounts one at a time on the
+   $1,001,001 cumVlm throwaway master succeeded through the 10th and the
+   11th was refused with `{"status": "err", "response": "Too many
+   sub-accounts."}`. Unlike the AGENT cap (finding 1/7, which scales with
+   traded volume), this one did not move at 10x the highest volume gate we
+   know of, so treat it as a flat ceiling until something contradicts it.
+   CONSEQUENCE FOR A4: at most 10 concurrent Copy Sub-accounts, i.e. at most
+   10 concurrent Leaders under the one-sub-per-Leader capital model — fewer
+   in practice, since every non-copy sub the master already holds spends one
+   slot, and a sub cannot be deleted (the refusal is permanent-ish, so a
+   retired Leader's sub is reused, not replaced). That is far above phase
+   A's single-operator handful, so it constrains nothing today; it is the
+   number that decides whether multi-Leader subs (deferred in decision 1)
+   ever need to come back.
+
 A4 IMPLICATION (the question #142 existed to answer): sub-accounts are NOT
 a key-compromise boundary. A compromised master-approved agent key reaches
 the master AND every sub — it trades subs via vaultAddress, shuffles funds
@@ -607,17 +624,33 @@ class ExecutionGateway(Protocol):
         *,
         grouping: Grouping = Grouping.NA,
         builder: BuilderFee | None = None,
+        vault_address: str | None = None,
     ) -> list[OrderResult]:
         """Submit a batch of orders (limit, market-as-aggressive-Ioc, reduce-
         only, TP/SL trigger legs — research §2 order surface). Returns one
         OrderResult per order, in order. TP/SL legs tied to a parent use
         grouping=NORMAL_TPSL in the same batch; POSITION_TPSL sizes legs
-        against the position."""
+        against the position.
+
+        `vault_address` places ON A SUB-ACCOUNT (or vault) of the master
+        instead of the master itself — the SDK's vault mechanism, verified to
+        cover sub-accounts on testnet (finding 6: ONE master-level agent grant
+        covers the master and every sub, so this changes WHICH BOOK the order
+        lands on, never which key signs). ADR-0007's capital model gives every
+        Leader its own Copy Sub-account, which is what needs it. Lowercase by
+        the same rule every in-action address obeys (finding 2)."""
         ...
 
-    async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
+    async def cancel_orders(
+        self, cancels: list[CancelSpec], *, vault_address: str | None = None
+    ) -> list[CancelResult]:
         """Cancel resting orders by oid. One CancelResult per cancel, in
-        order; an unknown oid comes back CancelRejected(MISSING_ORDER)."""
+        order; an unknown oid comes back CancelRejected(MISSING_ORDER).
+
+        `vault_address` cancels on a sub-account's book, exactly as
+        place_orders places on it — and it is the sweep's half of the pair:
+        A4 is the first thing that can place on a sub, so the watchdog's
+        cancel-all had to learn to reach one (ADR-0007 decision 1)."""
         ...
 
     async def cancel_orders_by_cloid(self, cancels: list[CloidCancelSpec]) -> list[CancelResult]:
@@ -641,4 +674,51 @@ class ExecutionGateway(Protocol):
         burns one of the 10 daily triggers (reset 00:00 UTC). None removes
         the schedule. The executor heartbeats this forward; it must push the
         time before it arrives or eat a trigger."""
+        ...
+
+
+class SubAccountProvisioning(Protocol):
+    """Creating and funding Copy Sub-accounts (ADR-0007 decision 12) — a
+    SEPARATE protocol from ExecutionGateway, and that separation is the whole
+    point.
+
+    ExecutionGateway's contract opens by stating that moving funds is
+    IMPOSSIBLE BY CONSTRUCTION because its surface contains only trading
+    actions. Finding 3 corrected the reason (an approved agent key CAN drive
+    `subAccountTransfer`; the privilege boundary is the user-signed signature
+    scheme, not agent-versus-master), and ADR-0007 decision 12 then chose to
+    automate the funding leg. Bolting those actions onto ExecutionGateway
+    would quietly retire a property four other modules rely on: the executor's
+    order path, the watchdog's cancel-only lane and every test that types a
+    collaborator as `ExecutionGateway` would all silently gain fund-moving
+    reach. Declaring them here instead keeps the old sentence true — anything
+    holding an `ExecutionGateway` can still only trade — while the ONE code
+    path that provisions asks for this protocol by name.
+
+    What it does NOT weaken: ADR-0005's no-external-exit invariant.
+    `subAccountTransfer` moves money between the master and its OWN subs and
+    nothing else; `withdraw3` / `usdSend` are user-signed and remain
+    unreachable from any key Epigone holds. Both actions ride the SAME signer
+    and nonce lane as the trading actions (one instance per signer per
+    process), so an implementation implements both protocols rather than
+    standing up a second gateway — two nonce sources for one signer would
+    collide.
+    """
+
+    async def create_sub_account(self, name: str) -> str:
+        """Create a sub-account of the master and return its address,
+        lowercased. Behind a $100k cumulative-volume gate (finding 6) and
+        capped at 10 per master (finding 10); both refuse as
+        ActionRejectedError with the exchange's own prose. Sub-accounts
+        cannot be deleted, so a name is spent for good."""
+        ...
+
+    async def sub_account_transfer(
+        self, sub_address: str, *, is_deposit: bool, usd_micro: int
+    ) -> None:
+        """Move USDC between the master and one of its sub-accounts:
+        `is_deposit` funds the sub, False withdraws back to the master.
+        `usd_micro` is MICRO-USD — 50_000_000 arrives as an accountValue of
+        "50.0" (finding 6, measured, not documented) — so callers convert
+        from dollars in exactly one place and never here."""
         ...

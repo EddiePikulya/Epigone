@@ -219,6 +219,89 @@ async def test_an_order_payload_signs_and_recovers_to_the_agent(replaying: Any) 
     assert h.recovered_signer(payload) == AGENT.address
 
 
+async def test_a_sub_account_order_carries_the_vault_in_body_and_signature(
+    replaying: Any,
+) -> None:
+    """The copy lane's central wire fact (issue #136, ADR-0007 decision 1):
+    an order for a Copy Sub-account names the sub in `vaultAddress`, and that
+    field is COVERED BY the signature — recovery only yields the agent when
+    the verifier is handed the same vault the signer hashed. The address is
+    lowercased on the way out (finding 2)."""
+    sub = "0xAbCdEf0123456789aBcDeF0123456789AbCdEf01"
+    h = await replaying(ok_statuses({"filled": {"oid": 9, "totalSz": "0.5", "avgPx": "1800"}}))
+    await h.gateway.place_orders(
+        [OrderSpec(asset=4, is_buy=True, size=Decimal("0.5"), limit_price=Decimal("1800"))],
+        vault_address=sub,
+    )
+    (payload,) = h.received
+    assert payload["vaultAddress"] == sub.lower()
+    assert h.recovered_signer(payload) == AGENT.address
+    # And the negative that proves the signature really covers it: verify the
+    # same payload as if it had been sent for the MASTER and the recovered
+    # address is a stranger, not the agent.
+    assert (
+        recover_agent_or_user_from_l1_action(
+            payload["action"],
+            payload["signature"],
+            None,
+            payload["nonce"],
+            payload["expiresAfter"],
+            False,
+        )
+        != AGENT.address
+    )
+
+
+async def test_a_sub_account_cancel_carries_the_vault_too(replaying: Any) -> None:
+    # The sweep's half of the pair: A4 is the first thing that can place on a
+    # sub, so /kill has to be able to cancel on one (ADR-0007 decision 1).
+    sub = "0xabcdef0123456789abcdef0123456789abcdef01"
+    h = await replaying(
+        {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"]}}}
+    )
+    await h.gateway.cancel_orders([CancelSpec(asset=4, oid=77)], vault_address=sub)
+    (payload,) = h.received
+    assert payload["vaultAddress"] == sub
+    assert h.recovered_signer(payload) == AGENT.address
+
+
+async def test_sub_account_provisioning_signs_the_documented_wire(replaying: Any) -> None:
+    """createSubAccount answers the new address in `data` (finding 3), and
+    subAccountTransfer carries a LOWERCASE subAccountUser with micro-USD
+    (finding 6) — both signed by the agent on the master's own lane, no vault
+    flag, because provisioning acts as the master."""
+    h = await replaying(
+        {
+            "status": "ok",
+            "response": {"type": "createSubAccount", "data": "0xB5836370" + "aa" * 16},
+        },
+        OK_DEFAULT,
+    )
+    address = await h.gateway.create_sub_account("epicopy-1")
+    await h.gateway.sub_account_transfer(address, is_deposit=True, usd_micro=200_000_000)
+    created, funded = h.received
+    assert created["action"] == {"type": "createSubAccount", "name": "epicopy-1"}
+    assert created["vaultAddress"] is None
+    assert address == ("0xB5836370" + "aa" * 16).lower()
+    assert funded["action"] == {
+        "type": "subAccountTransfer",
+        "subAccountUser": address,
+        "isDeposit": True,
+        "usd": 200_000_000,
+    }
+    assert h.recovered_signer(created) == AGENT.address
+    assert h.recovered_signer(funded) == AGENT.address
+
+
+async def test_a_create_sub_account_without_an_address_is_ambiguous(replaying: Any) -> None:
+    # A sub may exist under a name that can never be freed (finding 10 caps
+    # the master at 10), so an unreadable ack must not read as "nothing
+    # happened" — a blind retry would spend another slot.
+    h = await replaying({"status": "ok", "response": {"type": "createSubAccount"}})
+    with pytest.raises(AmbiguousExecutionError):
+        await h.gateway.create_sub_account("epicopy-1")
+
+
 async def test_a_tpsl_leg_with_cloid_and_builder_rides_the_documented_wire(replaying: Any) -> None:
     h = await replaying(ok_statuses({"resting": {"oid": 1}}, {"resting": {"oid": 2}}))
     entry = OrderSpec(asset=4, is_buy=True, size=Decimal("0.5"), limit_price=Decimal("1800"))

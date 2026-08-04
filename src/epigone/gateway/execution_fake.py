@@ -41,7 +41,11 @@ class FakeExecutionGateway:
         self.place_results: list[list[OrderResult]] = []
         self.cancel_results: list[list[CancelResult]] = []
         self.modify_results: list[list[OrderResult]] = []
+        # Sub-account addresses create_sub_account hands out, in order; empty
+        # falls back to a generated one (issue #136).
+        self.sub_addresses: list[str] = []
         self._next_oid = 1
+        self._next_sub = 0
 
     def _record(self, method: str, payload: object) -> None:
         self.actions.append((method, payload))
@@ -54,8 +58,9 @@ class FakeExecutionGateway:
         *,
         grouping: Grouping = Grouping.NA,
         builder: BuilderFee | None = None,
+        vault_address: str | None = None,
     ) -> list[OrderResult]:
-        self._record("place_orders", (list(orders), grouping, builder))
+        self._record("place_orders", (list(orders), grouping, builder, vault_address))
         if self.place_results:
             return self.place_results.pop(0)
         results: list[OrderResult] = []
@@ -64,11 +69,27 @@ class FakeExecutionGateway:
             self._next_oid += 1
         return results
 
-    async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
-        self._record("cancel_orders", list(cancels))
+    async def cancel_orders(
+        self, cancels: list[CancelSpec], *, vault_address: str | None = None
+    ) -> list[CancelResult]:
+        self._record("cancel_orders", (list(cancels), vault_address))
         if self.cancel_results:
             return self.cancel_results.pop(0)
         return [CancelOk() for _ in cancels]
+
+    async def create_sub_account(self, name: str) -> str:
+        """SubAccountProvisioning, faked: a deterministic address per name, so
+        a test can assert WHICH sub a later order was placed on."""
+        self._record("create_sub_account", name)
+        if self.sub_addresses:
+            return self.sub_addresses.pop(0)
+        self._next_sub += 1
+        return f"0x{self._next_sub:040x}"
+
+    async def sub_account_transfer(
+        self, sub_address: str, *, is_deposit: bool, usd_micro: int
+    ) -> None:
+        self._record("sub_account_transfer", (sub_address.lower(), is_deposit, usd_micro))
 
     async def cancel_orders_by_cloid(self, cancels: list[CloidCancelSpec]) -> list[CancelResult]:
         self._record("cancel_orders_by_cloid", list(cancels))

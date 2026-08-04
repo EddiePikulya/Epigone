@@ -11,6 +11,7 @@ from epigone.monitor.checks import (
     AGENT_KEY,
     ALERTS,
     COARSE,
+    COPY_PAGER,
     CRITICAL,
     DATABASE,
     DISK,
@@ -77,7 +78,25 @@ def test_a_healthy_system_trips_no_check() -> None:
         AGENT_KEY,
         WATCHDOG,
         HALT,
+        COPY_PAGER,
     }
+
+
+def test_a_copy_pager_case_is_critical_and_names_the_latest() -> None:
+    """ADR-0007 decision 11: the executor's pager cases ride the existing 🚨
+    monitor path rather than the ordinary copy stream. Counted from the AUDIT
+    TRAIL, so a copy_notices delivery failure cannot silence the page as well
+    as the chat message."""
+    snapshot = replace(
+        HEALTHY,
+        recent_copy_pagers=2,
+        latest_copy_pager="close unfilled after 3 reduce-only attempts",
+    )
+    result = _by_name(evaluate_checks(snapshot, THRESHOLDS), COPY_PAGER)
+    assert not result.ok
+    assert result.severity == CRITICAL
+    assert "2 incident(s)" in result.detail
+    assert "close unfilled" in result.detail
 
 
 def test_ingest_is_flagged_when_no_refresh_in_window_and_traders_are_due() -> None:

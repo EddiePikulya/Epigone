@@ -139,6 +139,7 @@ class HttpExecutionGateway:
         *,
         grouping: Grouping = Grouping.NA,
         builder: BuilderFee | None = None,
+        vault_address: str | None = None,
     ) -> list[OrderResult]:
         action: dict[str, Any] = {
             "type": "order",
@@ -147,16 +148,52 @@ class HttpExecutionGateway:
         }
         if builder is not None:
             action["builder"] = {"b": builder.address.lower(), "f": builder.fee_tenth_bp}
-        data = await self._submit(action, batch_len=len(orders))
+        data = await self._submit(
+            action, batch_len=len(orders), vault_address=vault_address
+        )
         return parse_order_statuses(data, expected=len(orders))
 
-    async def cancel_orders(self, cancels: list[CancelSpec]) -> list[CancelResult]:
+    async def cancel_orders(
+        self, cancels: list[CancelSpec], *, vault_address: str | None = None
+    ) -> list[CancelResult]:
         action = {
             "type": "cancel",
             "cancels": [{"a": cancel.asset, "o": cancel.oid} for cancel in cancels],
         }
-        data = await self._submit(action, batch_len=len(cancels))
+        data = await self._submit(
+            action, batch_len=len(cancels), vault_address=vault_address
+        )
         return parse_cancel_statuses(data, expected=len(cancels))
+
+    async def create_sub_account(self, name: str) -> str:
+        """SubAccountProvisioning: mint a sub-account of the master. The
+        response `data` IS the new address (finding 3); it is returned
+        lowercased like every other address in the system."""
+        data = await self._submit({"type": "createSubAccount", "name": name}, batch_len=1)
+        if not isinstance(data, str):
+            raise AmbiguousExecutionError(
+                f"createSubAccount({name!r}) answered {data!r} instead of an address: "
+                "the sub-account MAY exist — read `subAccounts` before retrying, or a "
+                "retry spends another of the master's 10 slots (finding 10)"
+            )
+        return data.lower()
+
+    async def sub_account_transfer(
+        self, sub_address: str, *, is_deposit: bool, usd_micro: int
+    ) -> None:
+        """SubAccountProvisioning: fund (or defund) a sub-account. The address
+        rides INSIDE the action, so it must be lowercase or signature recovery
+        yields a stranger (finding 2) — the one gotcha that costs a whole
+        debugging session if it is left to the caller."""
+        await self._submit(
+            {
+                "type": "subAccountTransfer",
+                "subAccountUser": sub_address.lower(),
+                "isDeposit": is_deposit,
+                "usd": usd_micro,
+            },
+            batch_len=1,
+        )
 
     async def cancel_orders_by_cloid(self, cancels: list[CloidCancelSpec]) -> list[CancelResult]:
         action = {
@@ -191,22 +228,34 @@ class HttpExecutionGateway:
             action["time"] = timestamp_ms(at)
         await self._submit(action, batch_len=1)
 
-    async def _submit(self, action: dict[str, Any], *, batch_len: int) -> Any:
+    async def _submit(
+        self, action: dict[str, Any], *, batch_len: int, vault_address: str | None = None
+    ) -> Any:
         """Spend the execution lane's weight, sign once, post (with same-
         payload 429 retry), and unwrap the response envelope to its `data`.
         Raises ActionRejectedError on {"status": "err"} — EXCEPT an
         invalid-nonce reject on a RETRIED submission, which is exactly what
         a processed-then-retried action would answer (the unverified 429
         assumption, ExecutionRateLimitedError's docstring) and so raises
-        AmbiguousExecutionError, never a clean rejection."""
+        AmbiguousExecutionError, never a clean rejection.
+
+        `vault_address` (a sub-account, for the copy lane) is covered BY THE
+        SIGNATURE as well as carried in the payload: the SDK hashes the vault
+        flag alongside the action and nonce, so passing it to sign_l1_action
+        and omitting it from the body — or the reverse — produces a signature
+        that recovers to a stranger. Lowercased here, once, for the same
+        canonicalization reason (finding 2). The nonce lane is unchanged:
+        nonces are per SIGNER, and one signer trades the master and every sub
+        of it (finding 6)."""
         await self._budget.spend(exchange_action_weight(batch_len))
         nonce = self._nonces.next()
-        signature = sign_l1_action(self._signer, action, None, nonce, None, self._is_mainnet)
+        vault = None if vault_address is None else vault_address.lower()
+        signature = sign_l1_action(self._signer, action, vault, nonce, None, self._is_mainnet)
         payload = {
             "action": action,
             "nonce": nonce,
             "signature": signature,
-            "vaultAddress": None,
+            "vaultAddress": vault,
             "expiresAfter": None,
         }
         body, retried = await self._post(payload)
