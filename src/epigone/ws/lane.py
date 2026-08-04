@@ -18,10 +18,17 @@ there.
 
 Why websocket at all: subscriptions run on a budget entirely separate from the
 REST weight cap, take a `user` parameter for any address, and cover every venue
-in one subscription. Two subscriptions per Trader against a per-IP allowance of
-1000 is 499 Traders, where REST position polling saturates near 18 — and it is
-the only transport on which mirroring a leader's resting orders is achievable
-at all.
+in one subscription — where REST position polling saturates near 18 wallets. It
+is also the only transport on which mirroring a leader's resting orders is
+achievable at all, which issue #168 collects on in `epigone.ws.order_lane`.
+
+**Correction, 2026-08-03 (#168).** This module used to claim 499 Traders on one
+connection, from the 1000-subscription cap. That is wrong by ~33×: there is an
+undocumented allowance of 15 unique users PER IP across all user-scoped
+subscriptions, and it is what actually binds (see MAX_SUBSCRIBED_TRADERS). The
+websocket's advantage over REST polling is real but far smaller than ADR-0006
+argued, and a tracked set past 15 wallets is now a logged refusal here rather
+than the server silently rejecting subscriptions.
 
 On latency, one honest correction to the premise. The positions feed was
 measured pushing on a ~5s cadence even for an account doing nothing at all,
@@ -65,18 +72,23 @@ receiving" and never "this lane's Traders are quiet". Another process reads it
 with the existing machinery (`epigone.safety.heartbeat.last_beat`).
 
 **3. Allowances are per-IP and shared with nothing.** 10 connections, 30 new
-connections/min, 1000 subscriptions, 2000 outbound messages/min. The lane holds
-ONE connection, spends 1 subscription on liveness and 2 per Trader, refuses to
-subscribe past the cap (loudly, rather than letting the server start rejecting),
-paces its own outbound messages under a rolling-minute ceiling, and never
-reconnects faster than the connection-rate cap allows.
+connections/min, 1000 subscriptions, 2000 outbound messages/min, and — the one
+that actually binds — 15 unique users. This lane holds ONE connection, spends 1
+subscription on liveness and 1 per Trader, refuses to subscribe past the user
+cap (loudly, rather than letting the server start rejecting), paces its own
+outbound messages under a rolling-minute ceiling, and never reconnects faster
+than the connection-rate cap allows. The order lanes take a connection each out
+of the same per-IP pool, and no extra user allowance: the same address on a
+second connection is free (measured).
 
 ## Measured against testnet/mainnet, 2026-08-02 (issue #157's two unknowns)
 
 - The 2000 messages/min allowance is **outbound-only**: a connection sustaining
   far more than that in inbound pushes, sending nothing but a keepalive, is
-  never throttled or cut. The Trader ceiling is therefore set by subscriptions,
-  not by message volume.
+  never throttled or cut. So the Trader ceiling is not set by message volume —
+  though it is not set by subscriptions either, as this section originally
+  concluded; the 15-unique-users-per-IP allowance found on 2026-08-03 binds
+  first.
 - There is **a ping/pong** (`{"method": "ping"}` → `{"channel": "pong"}`) and
   **a 60-second idle timeout**, undocumented and real: a connection with no
   traffic in EITHER direction is closed at ~60s. Inbound traffic resets it, so
@@ -89,7 +101,7 @@ Both findings are recorded in docs/research/ecosystem-survey.md.
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 import asyncpg
@@ -110,13 +122,12 @@ from epigone.safety.heartbeat import beat, record_start
 from epigone.stream.poller import fetch_poll_set, fetch_positions_paced
 from epigone.ws import (
     LIVENESS_CHANNEL,
-    ORDERS_CHANNEL,
     POSITIONS_CHANNEL,
     Connect,
+    RollingMinute,
     WebsocketClosed,
     WebsocketConnection,
     liveness_subscription,
-    orders_subscription,
     parse_positions_message,
     ping,
     positions_subscription,
@@ -137,16 +148,30 @@ WS_LANE_PROCESS = "ws_shadow"
 # paces against, which is the whole reason this transport is worth having.
 SUBSCRIPTION_LIMIT = 1000
 
-# What one Trader costs: the all-dex positions feed plus the account-wide order
-# feed. The per-dex forms would cost one subscription per venue for the same
-# coverage — prefer the all-dex forms (issue #157).
-SUBSCRIPTIONS_PER_TRADER = 2
+# What one Trader costs this connection is one subscription: the all-dex
+# positions feed, and nothing per venue. The account-wide order feed used to be
+# subscribed here too — it is not any more, because its frames carry no `user`
+# and are therefore unattributable on a connection serving many Traders; the
+# order lane takes one connection per Trader instead (ADR-0008, issue #168).
+# There is no constant for that 1: nothing divides by it now that the binding
+# limit counts users rather than subscriptions.
 
-# One subscription is spent on the always-emitting liveness feed, so the rest
-# of the allowance divides among Traders: 499 of them. Far past the 15-per-User
-# track cap at today's operator scale, and stated here so that the day it binds
-# it is a logged refusal rather than the server quietly rejecting subscriptions.
-MAX_SUBSCRIBED_TRADERS = (SUBSCRIPTION_LIMIT - 1) // SUBSCRIPTIONS_PER_TRADER
+# ⚠️ The real ceiling, and it is NOT the subscription cap. Measured 2026-08-03
+# (scripts/testnet_ws_probe.py users): there is an undocumented allowance of 15
+# UNIQUE USERS PER IP across all user-scoped subscriptions — a 16th address is
+# refused with "Cannot track more than 15 total users." It is per IP rather than
+# per connection (a brand-new address on a freshly opened second connection is
+# refused while the first holds its 15), it counts distinct addresses rather
+# than subscriptions, and closing a connection frees its slots within ~2s.
+#
+# This retires the 499 that ADR-0006's arithmetic produced from the subscription
+# cap, and it is ~33× smaller — small enough that today's tracked set can exceed
+# it (15 wallets per User × 2–3 Users). The lane's promise has always been that
+# passing the cap is a LOGGED REFUSAL rather than the server quietly rejecting
+# subscriptions; against the true number it has been doing the opposite, and
+# this is what makes the promise true. Raising it means more IPs, which is a
+# real decision and not one this constant can make.
+MAX_SUBSCRIBED_TRADERS = 15
 
 # Outbound pacing, kept a margin under the real ceiling: the lane's steady-state
 # outbound is ~2 pings/min, and only a churning tracked set sends more, so this
@@ -187,14 +212,10 @@ RECONNECT_MAX_SECONDS = 60.0
 
 @dataclass
 class LaneStats:
-    """What one connection did, for the log line when it ends. Order messages
-    are counted and not stored: the order-event seam is deliberately undesigned
-    (ADR-0006 §Scope), so this lane measures the feed without inventing a
-    schema for it."""
+    """What one connection did, for the log line when it ends."""
 
     events: int = 0
     position_messages: int = 0
-    order_messages: int = 0
     liveness_messages: int = 0
 
 
@@ -204,30 +225,11 @@ class LaneSilent(Exception):
     subscribing to an always-emitting feed."""
 
 
-class OutboundAllowance:
-    """A rolling-minute ledger for the per-IP outbound message cap.
-
-    Not a token bucket and not a pacer — it never sleeps. It answers one
-    question ("may I send another message right now?") and the caller decides
-    what to do with a no, which for a subscription change is to defer it to the
-    next refresh rather than block the read loop."""
-
-    def __init__(self, clock: Clock, limit: int | None = None) -> None:
-        self._clock = clock
-        # Read at construction rather than bound as a default argument, so the
-        # ceiling is one editable constant rather than a value frozen into this
-        # signature at import time.
-        self._limit = OUTBOUND_BUDGET_PER_MINUTE if limit is None else limit
-        self._sent: list[datetime] = []
-
-    def take(self) -> bool:
-        now = self._clock.now()
-        cutoff = now - timedelta(minutes=1)
-        self._sent = [at for at in self._sent if at > cutoff]
-        if len(self._sent) >= self._limit:
-            return False
-        self._sent.append(now)
-        return True
+def outbound_allowance(clock: Clock, limit: int | None = None) -> RollingMinute:
+    """The per-IP outbound message ledger. The ceiling is read here rather than
+    bound as a default argument, so it stays one editable constant instead of a
+    value frozen into a signature at import time."""
+    return RollingMinute(clock, OUTBOUND_BUDGET_PER_MINUTE if limit is None else limit)
 
 
 async def run_lane(
@@ -273,7 +275,7 @@ async def run_connection(
     tracked set, pinging, watching for silence, and turning position messages
     into events. Returns only by raising; the caller reconnects."""
     connection = await connect()
-    allowance = OutboundAllowance(clock)
+    allowance = outbound_allowance(clock)
     stats = LaneStats()
     # A fresh connection has subscribed to nothing and, crucially, resynced
     # nothing: `subscribed` starts empty on every reconnect, so the refresh
@@ -281,7 +283,7 @@ async def run_connection(
     # is streamed again.
     subscribed: set[str] = set()
     try:
-        if not await _send(connection, allowance, subscribe(liveness_subscription())):
+        if not await send_if_allowed(connection, allowance, subscribe(liveness_subscription())):
             raise LaneSilent("could not subscribe to the liveness feed")
         started = clock.now()
         last_liveness = started
@@ -309,7 +311,7 @@ async def run_connection(
                 last_liveness += last_refresh - now
                 now = last_refresh
             if (now - last_ping).total_seconds() >= PING_INTERVAL_SECONDS:
-                await _send(connection, allowance, ping())
+                await send_if_allowed(connection, allowance, ping())
                 last_ping = now
             if (now - last_liveness).total_seconds() >= LIVENESS_TIMEOUT_SECONDS:
                 raise LaneSilent(
@@ -332,31 +334,29 @@ async def run_connection(
                 stats.events += await _apply_positions_message(
                     pool, message, subscribed, clock.now()
                 )
-            elif channel == ORDERS_CHANNEL:
-                # Subscribed for coverage and measured, never persisted: the
-                # order-event seam is a design decision this ticket does not
-                # make (ADR-0006 §Scope, #157 scope correction).
-                stats.order_messages += 1
             elif channel == "error":
                 log.warning("ws lane: server error frame: %s", message.get("data"))
     finally:
         await connection.close()
         log.info(
             "ws lane: connection closed after %d events from %d position messages "
-            "(%d order messages, %d liveness, %d traders subscribed)",
+            "(%d liveness, %d traders subscribed)",
             stats.events,
             stats.position_messages,
-            stats.order_messages,
             stats.liveness_messages,
             len(subscribed),
         )
 
 
-async def _send(
-    connection: WebsocketConnection, allowance: OutboundAllowance, message: dict[str, Any]
+async def send_if_allowed(
+    connection: WebsocketConnection, allowance: RollingMinute, message: dict[str, Any]
 ) -> bool:
     """Send if the outbound allowance permits. False means it did not go — the
-    caller decides whether that is a deferral or a failure."""
+    caller decides whether that is a deferral or a failure.
+
+    Public because the order lanes (issue #168) send on their own connections
+    under the same per-IP outbound ceiling, and one implementation of "may I
+    speak" is the point: two would drift and the cap is shared."""
     if not allowance.take():
         log.warning(
             "ws lane: outbound allowance exhausted (%d/min); deferring %s",
@@ -373,7 +373,7 @@ async def _refresh_subscriptions(
     gateway: HyperliquidGateway,
     budget: Budget,
     connection: WebsocketConnection,
-    allowance: OutboundAllowance,
+    allowance: RollingMinute,
     clock: Clock,
     subscribed: set[str],
     stats: LaneStats,
@@ -386,30 +386,24 @@ async def _refresh_subscriptions(
     silently instead of diffing against months-old memory — the poller's
     re-follow rule (`_prune_untracked`), which this lane owes for the same
     reason."""
-    await _prune_unwatched(pool)
+    await forget_unwatched(pool, "ws_position_snapshots", "ws_lane_state")
     wanted = await fetch_poll_set(pool)
     if len(wanted) > MAX_SUBSCRIBED_TRADERS:
         log.error(
-            "ws lane: %d wallets exceeds the %d the per-IP subscription cap allows "
-            "(%d subscriptions, %d per trader); shadowing the first %d only",
+            "ws lane: %d wallets exceeds the %d unique users one IP may track "
+            "(measured 2026-08-03, ADR-0008); shadowing the first %d only — "
+            "raising this needs another IP, not another constant",
             len(wanted),
             MAX_SUBSCRIBED_TRADERS,
-            SUBSCRIPTION_LIMIT,
-            SUBSCRIPTIONS_PER_TRADER,
             MAX_SUBSCRIBED_TRADERS,
         )
         wanted = wanted[:MAX_SUBSCRIBED_TRADERS]
     for address in sorted(subscribed - set(wanted)):
-        dropped_positions = await _send(
-            connection, allowance, unsubscribe(positions_subscription(address))
-        )
-        dropped_orders = await _send(
-            connection, allowance, unsubscribe(orders_subscription(address))
-        )
-        # Only forget the wallet once BOTH its subscriptions are actually gone;
-        # a deferred unsubscribe retries on the next refresh rather than
-        # leaving the lane's idea of its subscription count wrong.
-        if dropped_positions and dropped_orders:
+        # A deferred unsubscribe leaves the wallet subscribed and retries on the
+        # next refresh, rather than leaving the lane's idea of what it holds
+        # wrong.
+        gone = unsubscribe(positions_subscription(address))
+        if await send_if_allowed(connection, allowance, gone):
             subscribed.discard(address)
     for address in wanted:
         if address in subscribed:
@@ -425,9 +419,9 @@ async def _refresh_subscriptions(
         except GatewayError:
             log.warning("ws lane: resync failed for %s; retrying next refresh", address)
             continue
-        if not await _send(connection, allowance, subscribe(positions_subscription(address))):
+        wanted_feed = subscribe(positions_subscription(address))
+        if not await send_if_allowed(connection, allowance, wanted_feed):
             continue
-        await _send(connection, allowance, subscribe(orders_subscription(address)))
         subscribed.add(address)
 
 
@@ -551,12 +545,20 @@ async def _apply_positions(
         return len(events)
 
 
-async def _prune_unwatched(pool: asyncpg.Pool) -> None:
-    """Forget wallets that left the poll set, so a re-follow re-baselines
-    silently rather than diffing against stale memory (the poller's re-follow
-    rule). Events already written stay — they were true when observed."""
+async def forget_unwatched(pool: asyncpg.Pool, *tables: str) -> None:
+    """Drop the named lanes' memory of wallets that left the poll set, so a
+    re-follow re-baselines silently rather than diffing against stale memory
+    (the poller's re-follow rule). Events already written stay — they were true
+    when observed.
+
+    Takes the tables rather than naming them, because both websocket lanes owe
+    exactly this and keep their memory in different tables: one rule, applied
+    twice, is what stops the two drifting on what a re-follow means.
+
+    `tables` are module constants, never anything a caller could taint — the
+    interpolation below has no other safe reading."""
     async with pool.acquire() as conn, conn.transaction():
-        for table in ("ws_position_snapshots", "ws_lane_state"):
+        for table in tables:
             await conn.execute(
                 f"""
                 DELETE FROM {table}

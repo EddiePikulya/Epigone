@@ -348,6 +348,27 @@ document contradicting the code:
   seam's schema remains a decision to be made with the cutover, not a detail to
   be improvised inside a shadow lane.
 
+## Update, 2026-08-03 (issue #168): the order seam landed as ADR-0008, and the capacity figures here are wrong
+
+§Scope's deferral is discharged: **ADR-0008** designs `order_events`, and it
+does follow this ADR's pattern (own table, own vocabulary, claim table, nothing
+consuming it yet). Two things it found while doing so contradict this document
+directly, and the correction belongs here rather than only there:
+
+- **"499 Traders on one connection" is wrong, by a factor of ~33.** The Context
+  section derives the Trader ceiling from the 1000-subscription cap. Measured
+  2026-08-03, there is an undocumented per-IP cap of **15 unique users** across
+  all user-scoped subscriptions, and it binds long before subscriptions do. It
+  is per IP rather than per connection, counts distinct addresses rather than
+  subscriptions, and frees slots within ~2s of a connection closing. The lane's
+  `MAX_SUBSCRIBED_TRADERS` moves to 15 in the same change.
+- **`orderUpdates` frames carry no `user`**, where `allDexsClearinghouseState`
+  does. §Scope assumed the order seam would be a matter of persisting what the
+  lane already receives; it cannot be, because on a multi-Trader connection
+  those frames cannot be attributed to a Trader at all. ADR-0008 pays for
+  attribution with one connection per shadowed Trader, which is why order
+  coverage (8) is bounded below position coverage (15).
+
 One factual correction to the Context section while the record is open: the
 "~1-3s" latency it projects is what the transport ALLOWS, not a measurement.
 `allDexsClearinghouseState` was observed pushing absolute state on a ~5s cadence

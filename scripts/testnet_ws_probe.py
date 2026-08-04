@@ -9,10 +9,17 @@ LIVENESS_TIMEOUT_SECONDS, MAX_SUBSCRIBED_TRADERS) are sized off them.
     uv run python scripts/testnet_ws_probe.py idle      # ping/pong + idle timeout
     uv run python scripts/testnet_ws_probe.py inbound   # does inbound count?
     uv run python scripts/testnet_ws_probe.py names     # which subscriptions exist
+    uv run python scripts/testnet_ws_probe.py users     # the per-IP unique-user cap
+    uv run python scripts/testnet_ws_probe.py orders    # what orderUpdates carries
+
+The last two are issue #168's, and they are the load-bearing ones for the order
+seam (ADR-0008): `users` establishes that the real ceiling on any lane is 15
+unique addresses per IP, and `orders` establishes that an order update never
+names the user it belongs to.
 
 Read-only throughout: market data and public account state, no keys, no signed
-actions. `inbound` runs against MAINNET because testnet is far too quiet to
-reach the message volumes in question — the allowances are per-IP and
+actions. `inbound`, `users` and `orders` run against MAINNET because testnet is
+far too quiet to reach the volumes in question — the allowances are per-IP and
 account-independent, so that is the right place to ask.
 """
 
@@ -150,7 +157,144 @@ async def probe_names() -> None:
         print(f"allDexsClearinghouseState pushes on an idle account: t={pushes}", flush=True)
 
 
-PROBES = {"idle": probe_idle, "inbound": probe_inbound, "names": probe_names}
+async def _harvest_active(session: aiohttp.ClientSession, wanted: int) -> list[str]:
+    """Addresses that are actually trading right now, off the public trades
+    feed (it carries both counterparties). Busiest-first, which is deliberate:
+    these are the market makers, i.e. the worst case any order-persistence seam
+    has to survive."""
+    seen: dict[str, int] = {}
+    async with session.ws_connect(MAINNET_WS, heartbeat=None) as ws:
+        for coin in ("BTC", "ETH", "SOL"):
+            await ws.send_json(
+                {"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}
+            )
+        started = time.monotonic()
+        while time.monotonic() - started < 20:
+            try:
+                message = await ws.receive(timeout=1.0)
+            except TimeoutError:
+                continue
+            if message.type is not aiohttp.WSMsgType.TEXT:
+                break
+            body = json.loads(message.data)
+            if body.get("channel") != "trades":
+                continue
+            for trade in body["data"]:
+                for user in trade.get("users", []):
+                    address = str(user).lower()
+                    seen[address] = seen.get(address, 0) + 1
+    return sorted(seen, key=lambda address: -seen[address])[:wanted]
+
+
+async def _ask(ws: aiohttp.ClientWebSocketResponse, method: str, sub: dict[str, Any]) -> str:
+    """One subscribe/unsubscribe and the server's verdict on it. Sent one at a
+    time so the answer is unambiguously about THIS subscription — an error frame
+    names no subscription, so a batch would be uncorrelatable."""
+    await ws.send_json({"method": method, "subscription": sub})
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        try:
+            message = await ws.receive(timeout=0.5)
+        except TimeoutError:
+            continue
+        if message.type is not aiohttp.WSMsgType.TEXT:
+            return f"CLOSED({ws.close_code})"
+        body = json.loads(message.data)
+        if body.get("channel") == "subscriptionResponse":
+            return "ok"
+        if body.get("channel") == "error":
+            return f"refused({body['data'][:70]})"
+    return "no answer"
+
+
+def _orders_sub(address: str) -> dict[str, Any]:
+    return {"type": "orderUpdates", "user": address}
+
+
+async def probe_users() -> None:
+    """How many unique users may one IP track, and is the allowance per IP or
+    per connection?
+
+    2026-08-03: **15 unique users, per IP** — a fresh second connection is
+    refused a brand-new address while the first holds its 15
+    ("Cannot track more than 15 total users."). Unsubscribing frees a slot at
+    once; closing a connection frees all of its slots within ~2s; and the same
+    address on a second connection is free, so splitting one Trader's feeds
+    across connections costs no allowance. This retires ADR-0006's "499
+    Traders on one connection"."""
+    async with aiohttp.ClientSession() as session:
+        addresses = await _harvest_active(session, 40)
+        print(f"harvested {len(addresses)} active addresses; settling 30s", flush=True)
+        await asyncio.sleep(30)
+
+        first = await session.ws_connect(MAINNET_WS, heartbeat=None)
+        held: list[str] = []
+        for address in addresses:
+            if await _ask(first, "subscribe", _orders_sub(address)) != "ok":
+                break
+            held.append(address)
+        print(f"one connection accepted {len(held)} unique users", flush=True)
+
+        second = await session.ws_connect(MAINNET_WS, heartbeat=None)
+        fresh = [address for address in addresses if address not in held]
+        verdict = await _ask(second, "subscribe", _orders_sub(fresh[0]))
+        print(f"brand-new user on a SECOND connection -> {verdict}", flush=True)
+        print(f"=> allowance is {'PER CONNECTION' if verdict == 'ok' else 'PER IP'}", flush=True)
+        again = await _ask(second, "subscribe", _orders_sub(held[0]))
+        print(f"already-held user on the second      -> {again}", flush=True)
+
+        await first.close()
+        await asyncio.sleep(2)
+        freed = await _ask(second, "subscribe", _orders_sub(fresh[0]))
+        print(f"2s after closing the first, new user -> {freed}", flush=True)
+        await second.close()
+
+
+async def probe_orders() -> None:
+    """What does an orderUpdates frame carry, and how much of it is there?
+
+    2026-08-03: the frame carries `{"order": {coin, side, limitPx, sz, oid,
+    timestamp, origSz, cloid}, "status", "statusTimestamp"}` and **no user
+    field at any level** — so on a connection subscribed to several users the
+    frames cannot be attributed, which is the constraint ADR-0008 is built
+    around. One market-making address alone: 442 frames / 1471 updates in 60s.
+    """
+    async with aiohttp.ClientSession() as session:
+        addresses = await _harvest_active(session, 1)
+        async with session.ws_connect(MAINNET_WS, heartbeat=None) as ws:
+            target = addresses[0]
+            verdict = await _ask(ws, "subscribe", {"type": "orderUpdates", "user": target})
+            print(f"watching {target} alone for 60s -> {verdict}", flush=True)
+            frames = updates = 0
+            statuses: dict[str, int] = {}
+            started = time.monotonic()
+            while time.monotonic() - started < 60:
+                try:
+                    message = await ws.receive(timeout=1.0)
+                except TimeoutError:
+                    continue
+                if message.type is not aiohttp.WSMsgType.TEXT:
+                    break
+                body = json.loads(message.data)
+                if body.get("channel") != "orderUpdates":
+                    continue
+                if not frames:
+                    print(f"RAW: {json.dumps(body)[:400]}", flush=True)
+                frames += 1
+                for update in body["data"]:
+                    updates += 1
+                    statuses[update["status"]] = statuses.get(update["status"], 0) + 1
+            print(f"{frames} frames, {updates} order updates in 60s", flush=True)
+            print(f"statuses: {json.dumps(statuses)}", flush=True)
+
+
+PROBES = {
+    "idle": probe_idle,
+    "inbound": probe_inbound,
+    "names": probe_names,
+    "users": probe_users,
+    "orders": probe_orders,
+}
 
 
 if __name__ == "__main__":
