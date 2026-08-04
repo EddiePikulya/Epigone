@@ -28,8 +28,8 @@ where `pnl_explained` is what those two observations say PnL did:
 The second term is the whole subtlety. Unrealized PnL that is still unrealized
 is still in the equity figure; unrealized PnL on size that has since gone was
 REALIZED, which moved it from the unrealized column into collateral and left
-the account worth exactly what it was. Scaling the previous observation's uPnL
-by the fraction of the position still open therefore covers, in one expression,
+the account worth about what it was. Scaling the previous observation's uPnL by
+the fraction of the position still open therefore handles, in one expression,
 every case the ticket enumerates: a full close and a flip retain nothing, a
 partial close retains its remainder, a scale-in retains all of it (the added
 size enters at its own entry price with no PnL of its own), and a position
@@ -48,12 +48,33 @@ and for the case that must:
     a transfer      equity −300k, positions untouched
                     → explained 0, outflow 300k
 
-**Funding and fees are unaccounted noise**, by decision. Both leave the account
-in ways neither observation names, and over a single ten-second interval both
-are orders of magnitude below the thresholds below — a $10M position pays
-single-dollar funding in ten seconds, and even a whole-account taker close pays
-fees measured in basis points against a threshold measured in quarters. They
-are absorbed, not modelled.
+**Where this is approximate, and what is done about it.** The realized PnL on
+size that left was `(fill price − entry) × size`; what is subtracted above is
+`(last observed mark − entry) × size`. The difference is the price move between
+the last look and the fill, on the size that left — PnL that genuinely happened
+and that neither observation can see, because by the second one the position is
+gone and there is nothing left to read a price from. Note the direction: a
+position closing into a falling market realized MORE loss than the last mark
+said, so the drop looks unexplained, and an unexplained drop is what this module
+calls a withdrawal. That is the false alert the ticket most wants not to exist —
+"a losing trader is not a leaving trader" — and it is worst exactly when it is
+most misleading, on a leveraged position force-closed during a violent move.
+
+So departed size buys an allowance: the outflow must exceed what an ordinary
+one-interval price move on the size that left could have realized
+(`UNSEEN_MOVE_FRACTION`), or the pass says nothing. A pass where nothing closed
+buys no allowance and is judged on the thresholds alone, which is the common
+shape of a real transfer — a Trader who closes out and then withdraws does the
+two things in different ten-second windows, and the withdrawing one has no
+departed size to pay for.
+
+Two residues remain named rather than modelled. **Funding and fees** leave the
+account in ways neither observation describes; over ten seconds a $10M position
+pays single-dollar funding and even a whole-account taker close pays basis
+points, against thresholds measured in quarters. **A position opened and closed
+entirely between two passes** leaves no trace in either observation and no
+departed size to buy an allowance with; the poll interval is the only bound on
+it, and the websocket's `ledgerUpdates` (#158) is the fix, not more arithmetic.
 
 **Direction.** Only outflows are alerted. A deposit is the same arithmetic with
 the opposite sign and is simply not news of this kind.
@@ -109,6 +130,21 @@ WITHDRAWAL_FLOOR_USD = Decimal("1000")
 # withdrawal alerts ever stop arriving.
 MAX_OBSERVATION_GAP_SECONDS = 60
 
+# How far a coin may plausibly move between two poll passes, as a fraction of
+# notional — the size of the PnL a close can have realized without either
+# observation seeing it (see "Where this is approximate" above). Size that left
+# is charged this much against the outflow before it counts as a withdrawal, so
+# a position force-closed into a fast market cannot be reported as a transfer.
+#
+# 5% over ten seconds is deliberately generous. The house precedent is
+# SCALE_SIGNIFICANCE_THRESHOLD's note that "over a 10s poll a real coin never
+# moves 25% on price alone"; a fifth of that is a move Epigone has never
+# observed in an interval and still leaves an ordinary close — a few tenths of a
+# percent — charged almost nothing. It is a bound on the ORDINARY case by
+# design: a genuine cascade beats it, and there this module goes quiet, which is
+# the direction a notification about someone else's money should fail in.
+UNSEEN_MOVE_FRACTION = Decimal("0.05")
+
 
 @dataclass(frozen=True)
 class Withdrawal:
@@ -125,11 +161,18 @@ class Withdrawal:
     equity_usd: Decimal
     observed_at: datetime
 
-    @property
-    def fraction(self) -> Decimal:
-        """The share of the prior account that left. Only ever built by
-        `detect_withdrawal`, which never admits a non-positive prior equity."""
-        return self.amount_usd / self.prior_equity
+
+@dataclass(frozen=True)
+class _PriorBook:
+    """What the previous observation's positions still account for, after this
+    one: the unrealized PnL still standing, and the notional that has gone.
+
+    Two figures from one walk of the same snapshots, because they are answers to
+    the same question — how much of each position is still there — and computing
+    them apart would let the two drift over what counts as departed."""
+
+    retained_pnl: Decimal
+    departed_notional: Decimal
 
 
 def detect_withdrawal(
@@ -162,10 +205,19 @@ def detect_withdrawal(
         # nothing has nothing to pull out of, and a negative one (bad debt) is
         # not a state to reason about a percentage from.
         return None
-    outflow = _pnl_explained(snapshots, positions) - (equity_now - prior_equity)
+    book = _read_prior_book(snapshots, positions)
+    now_pnl = sum((position.unrealized_pnl for position in positions), Decimal(0))
+    explained = now_pnl - book.retained_pnl
+    outflow = explained - (equity_now - prior_equity)
     if outflow < WITHDRAWAL_FLOOR_USD:
         return None
     if outflow / prior_equity < WITHDRAWAL_FRACTION_THRESHOLD:
+        return None
+    if outflow <= book.departed_notional * UNSEEN_MOVE_FRACTION:
+        # Size left the book this interval, and a close prices itself at a
+        # moment neither observation saw. An outflow no bigger than an ordinary
+        # price move on that size is not distinguishable from the trade that
+        # took it, so it is not reported as a transfer.
         return None
     return Withdrawal(
         amount_usd=outflow,
@@ -175,37 +227,34 @@ def detect_withdrawal(
     )
 
 
-def _pnl_explained(
+def _read_prior_book(
     snapshots: Mapping[str, SnapshotState], positions: Sequence[Position]
-) -> Decimal:
-    """How much of the change in account value these two looks at the book
-    account for: the unrealized PnL standing now, minus the part of the
-    previous observation's unrealized PnL that is still standing. See the
-    module docstring for why the second term is a fraction rather than the
-    whole."""
+) -> _PriorBook:
+    """Walk the previous observation's positions against this one, asking of
+    each how much of it is still there — the fraction that answers both what
+    unrealized PnL is still unrealized and what notional has gone."""
     current = {position.coin: position for position in positions}
-    now_pnl = sum((position.unrealized_pnl for position in positions), Decimal(0))
-    retained = sum(
-        (_retained_pnl(snapshot, current.get(coin)) for coin, snapshot in snapshots.items()),
-        Decimal(0),
-    )
-    return now_pnl - retained
+    retained_pnl = Decimal(0)
+    departed_notional = Decimal(0)
+    for coin, snapshot in snapshots.items():
+        held = _fraction_still_held(snapshot, current.get(coin))
+        retained_pnl += snapshot.unrealized_pnl * held
+        departed_notional += snapshot.size_usd * (Decimal(1) - held)
+    return _PriorBook(retained_pnl=retained_pnl, departed_notional=departed_notional)
 
 
-def _retained_pnl(snapshot: SnapshotState, position: Position | None) -> Decimal:
-    """The part of one coin's previously observed unrealized PnL that is still
-    unrealized — the rest was realized by the size that left, which is why it
-    no longer shows up as a change in account value.
+def _fraction_still_held(snapshot: SnapshotState, position: Position | None) -> Decimal:
+    """How much of one coin's previously observed position is still open, 0 to 1.
 
-    Gone entirely, or flipped to the other side, retains nothing: the whole
-    prior leg closed. A bigger position retains all of it, since size added
-    enters at its own price carrying no PnL. A smaller one retains the fraction
-    still open, measured in COIN UNITS (#155, ADR-0006) — notional would fold
-    the price move into the size change and call a mark-down a partial close.
-    A snapshot written before migration 0028 has no coin units to measure
-    against, and there notional is the only ratio available; the error it
-    carries is bounded by the price move over one poll interval, well inside
-    the thresholds."""
+    Gone entirely, or flipped to the other side, holds nothing: the whole prior
+    leg closed. A bigger position holds all of it — size added enters at its own
+    price carrying no PnL of its own, and nothing departed. A smaller one holds
+    the fraction still open, measured in COIN UNITS (#155, ADR-0006), because
+    notional would fold the price move into the size change and read a mark-down
+    as a partial close. A snapshot written before migration 0028 has no coin
+    units to measure against and notional is then the only ratio available; the
+    error it carries is one interval's price move, the same residual the
+    departed-size allowance exists to cover."""
     if position is None or snapshot.side != position.side.value:
         return Decimal(0)
     if snapshot.size_coin is not None and position.size_coin is not None:
@@ -213,5 +262,5 @@ def _retained_pnl(snapshot: SnapshotState, position: Position | None) -> Decimal
     else:
         before, after = snapshot.size_usd, position.size_usd
     if before <= 0:
-        return snapshot.unrealized_pnl
-    return snapshot.unrealized_pnl * min(Decimal(1), after / before)
+        return Decimal(1)
+    return min(Decimal(1), after / before)

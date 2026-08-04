@@ -21,7 +21,7 @@ from aiogram import Bot
 
 from epigone.bot.alerts import positions_button
 from epigone.bot.format import trader_label, usd_compact
-from epigone.bot.outbox import MAX_DELIVERY_ATTEMPTS, drain_outbox, run_drain_loop
+from epigone.bot.outbox import drain_outbox, fetch_pending_labeled, run_drain_loop
 from epigone.clock import Clock
 
 
@@ -47,30 +47,9 @@ async def deliver_pending_withdrawal_alerts(pool: asyncpg.Pool, bot: Bot, clock:
         bot,
         clock,
         table="withdrawal_alerts",
-        fetch=_fetch_pending,
+        fetch=lambda pool: fetch_pending_labeled(pool, "withdrawal_alerts"),
         deliver=deliver,
     )
-
-
-async def _fetch_pending(pool: asyncpg.Pool) -> list[asyncpg.Record]:
-    # The same joins as its sibling queues: the recipient's own per-Track
-    # nickname (#86) beats the leaderboard label, and is NULL once they have
-    # unfollowed — an alert queued before an unfollow still owes delivery, and
-    # reads as the bare address.
-    rows: list[asyncpg.Record] = await pool.fetch(
-        """
-        SELECT a.*, t.display_name, tr.name AS track_name
-        FROM withdrawal_alerts a
-        JOIN traders t ON t.address = a.trader_address
-        LEFT JOIN tracks tr
-            ON tr.trader_address = a.trader_address
-            AND tr.user_telegram_id = a.user_telegram_id
-        WHERE a.delivered_at IS NULL AND a.attempts < $1
-        ORDER BY a.id
-        """,
-        MAX_DELIVERY_ATTEMPTS,
-    )
-    return rows
 
 
 def render_withdrawal_alert(row: asyncpg.Record) -> str:

@@ -1,6 +1,13 @@
 -- Migration 0035: the Withdrawal Alert queue (issue #171, ADR-0007 "Out of A4
--- scope"). Numbered 0035 because 0033-0034 are reserved for the copy executor
--- (#136), in flight beside this.
+-- scope").
+--
+-- Numbered 0035, not 0033: the copy executor (#136) is in flight in a parallel
+-- branch and holds 0033-0034 (operator instruction, 2026-08-04). ADR-0003 has
+-- no reservation mechanism, so this is a deliberate hole rather than a rule the
+-- runner enforces — checked against `epigone.db.migrate` before taking it: the
+-- runner skips by the set of applied versions, never by a high-water mark, so
+-- 0033-0034 still apply in order whenever they land, and the hole is permanent
+-- but harmless if they never do.
 --
 -- The 38%-emptied-accounts finding as a push notification rather than a
 -- copy-time gate: when a tracked Trader's equity falls between two poll passes
@@ -58,7 +65,13 @@ CREATE TABLE withdrawal_alerts (
     observed_at      TIMESTAMPTZ NOT NULL,
     created_at       TIMESTAMPTZ NOT NULL,
     delivered_at     TIMESTAMPTZ,
-    attempts         INTEGER NOT NULL DEFAULT 0
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    -- The renderer divides one by the other to lead with "% of equity", and it
+    -- runs in the OTHER process (ADR-0002) — so the invariant that makes that
+    -- division safe is written here, where both sides can see it, rather than
+    -- living only in the detection that happens to be the sole writer today.
+    CHECK (prior_equity > 0),
+    CHECK (amount_usd > 0)
 );
 
 -- The bot's delivery scan: undelivered rows only, oldest first.

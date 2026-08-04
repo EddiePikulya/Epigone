@@ -55,6 +55,37 @@ async def run_drain_loop(
         await clock.sleep(DELIVERY_INTERVAL_SECONDS)
 
 
+async def fetch_pending_labeled(pool: asyncpg.Pool, table: str) -> list[asyncpg.Record]:
+    """The undelivered rows of one per-follower alert queue, oldest first, each
+    carrying the two names its renderer needs to label the wallet.
+
+    Position, Order and Withdrawal Alerts all queue `(user_telegram_id,
+    trader_address, …)` rows and all label them the same way: the recipient's
+    own per-Track nickname (#86) when they gave the wallet one, else the
+    leaderboard display name (#4), else the bare address. The `tracks` join is
+    scoped to this row's follower and is LEFT because an alert queued before an
+    unfollow still owes delivery — it simply reads as the address.
+
+    One copy, because three verbatim copies of a query is how the three drift:
+    a fix to the labelling rule that lands in two of them is a bug nothing
+    fails on. `table` is a module constant at every call site, never user
+    input, so it is safe to inline (position_snapshots' convention)."""
+    rows: list[asyncpg.Record] = await pool.fetch(
+        f"""
+        SELECT a.*, t.display_name, tr.name AS track_name
+        FROM {table} a
+        JOIN traders t ON t.address = a.trader_address
+        LEFT JOIN tracks tr
+            ON tr.trader_address = a.trader_address
+            AND tr.user_telegram_id = a.user_telegram_id
+        WHERE a.delivered_at IS NULL AND a.attempts < $1
+        ORDER BY a.id
+        """,  # noqa: S608 — see above
+        MAX_DELIVERY_ATTEMPTS,
+    )
+    return rows
+
+
 async def drain_outbox(
     pool: asyncpg.Pool,
     bot: Bot,

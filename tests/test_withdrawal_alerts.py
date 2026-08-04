@@ -183,6 +183,105 @@ async def test_a_partial_close_of_a_losing_position_alerts_nobody(
     assert await alerts(pool) == []
 
 
+async def test_a_leveraged_position_closed_into_a_falling_market_alerts_nobody(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # The residual the arithmetic cannot see: a close prices itself at a moment
+    # between two passes, so it can realize far more loss than the last observed
+    # mark showed. Here $8M of notional is closed after a 1.25% adverse move,
+    # realizing $150k against the $50k on the books — the account falls $100k,
+    # a clean 25% of it, with nothing having left the wallet. The departed size
+    # buys an allowance big enough to cover an ordinary move on itself, so the
+    # blown-up trader is not reported as a leaving one.
+    await track(pool, clock, WHALE, 1)
+    await observe(
+        pool,
+        gateway,
+        clock,
+        equity="400000",
+        positions=[position(size_usd="8000000", size_coin="80", unrealized_pnl="-50000")],
+    )
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await observe(pool, gateway, clock, equity="300000", positions=[])
+
+    assert await alerts(pool) == []
+
+
+async def test_a_flip_and_a_withdrawal_in_one_pass_attribute_separately(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # A flip closes the whole prior leg and opens the other side, so the prior
+    # leg's unrealized PnL is realized in full — and the $120k that left on top
+    # of it is the news. The departed notional here is small enough that an
+    # ordinary move on it cannot account for the drop.
+    await track(pool, clock, WHALE, 1)
+    await observe(
+        pool,
+        gateway,
+        clock,
+        equity="200000",
+        positions=[position(size_usd="100000", size_coin="10", unrealized_pnl="20000")],
+    )
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await observe(
+        pool,
+        gateway,
+        clock,
+        equity="80000",
+        positions=[position(size_usd="100000", size_coin="10", side=Side.SHORT)],
+    )
+
+    (row,) = await alerts(pool)
+    assert row["amount_usd"] == Decimal("120000")
+
+
+async def test_a_scale_in_holds_all_of_its_prior_pnl(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # Size added enters at its own price carrying no PnL of its own, so
+    # doubling a winning position leaves every dollar of the old leg's
+    # unrealized PnL exactly where it was. Scaling the prior PnL by the size
+    # ratio instead of capping it would credit the new leg with $40k it never
+    # made, and name only $60k of the $100k that actually left.
+    await track(pool, clock, WHALE, 1)
+    await observe(
+        pool,
+        gateway,
+        clock,
+        equity="200000",
+        positions=[position(size_usd="100000", size_coin="10", unrealized_pnl="40000")],
+    )
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await observe(
+        pool,
+        gateway,
+        clock,
+        equity="100000",
+        positions=[position(size_usd="200000", size_coin="20", unrealized_pnl="40000")],
+    )
+
+    (row,) = await alerts(pool)
+    assert row["amount_usd"] == Decimal("100000")
+
+
+async def test_an_account_worth_nothing_alerts_nobody(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    # There is no share of an empty account, and bad debt is not a state to
+    # reason about a percentage from — the gate exists so the arithmetic never
+    # divides by that zero.
+    await track(pool, clock, WHALE, 1)
+    await observe(pool, gateway, clock, equity="0", positions=[])
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await observe(pool, gateway, clock, equity="-5000", positions=[])
+
+    assert await alerts(pool) == []
+
+
 async def test_a_muted_track_is_suppressed_at_queue_time(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
