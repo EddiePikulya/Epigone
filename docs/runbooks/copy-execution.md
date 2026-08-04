@@ -92,10 +92,30 @@ stale leaves a position no future event will ever close.
 **A stale flip half-executes.** Close leg fires, open leg skipped, you end
 flat. Both halves are audited. Same asymmetry.
 
-**A Leader under $10,000 of live equity is not copied into.** Entries only —
-exits are never gated. This is a signal-quality gate, not a sizing input: 38%
-of quality-screened wallets had emptied their accounts while their stored
-metrics still looked alive.
+**A Leader under $10,000 of live equity is not copied into.** Opens and a
+flip's open leg only — not scale-ins, and never exits (ADR-0007 amendment
+D-2). This is a signal-quality gate, not a sizing input: it asks "is this
+still the trader whose stats earned the copy?", which is a question about
+starting to follow someone. 38% of quality-screened wallets had emptied their
+accounts while their stored metrics still looked alive.
+
+**A bracket you cancel comes back.** Restoration is a per-cycle INVARIANT
+(amendment D-1): every live position in a `bracket` sub has its triggers, and
+the executor restores them within a minute whatever removed them — a halt
+sweep, a restart, or you cancelling them in the Hyperliquid UI. If you want a
+position unstopped, the route is `default` mode or `/uncopy`, not cancelling
+the trigger. Every restoration reports in the chat.
+
+**Re-copying tops the sub up to its allocation.** `/uncopy` never flattens, so
+the sub comes back holding whatever last time left in it. The allocation is a
+TARGET BALANCE — it is the exchange-enforced exposure cap — so a re-copy moves
+only the difference. An over-funded sub is left alone: taking money out is not
+something provisioning decides.
+
+**An exit too small for the exchange is skipped, not retried.** Under the $10
+minimum order value there is no order to send, so the residue stays and
+reconciliation keeps reporting it rather than three guaranteed rejects
+appearing as a market problem.
 
 **A position we did not open is never touched.** If you hold something in a
 copy sub yourself, the Leader's events on that coin skip with "coin occupied".

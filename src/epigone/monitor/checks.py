@@ -81,6 +81,7 @@ COPY_PAGER_ACTIONS = (
     "copy_close_unfilled",
     "copy_divergence_unclassifiable",
     "copy_episode_liquidated",
+    "copy_unexpected_resting",
 )
 
 
@@ -616,7 +617,11 @@ def _copy_pager_check(snapshot: HealthSnapshot) -> CheckResult:
       can page here instead of drowning in generic partial-fill noise;
     - a divergence the reconcile could not classify — where the rule is adopt
       nothing, page, and re-flag until resolved;
-    - a liquidated Copy Sub-account.
+    - a liquidated Copy Sub-account;
+    - an entry IOC that came back RESTING, which decision 4 says cannot
+      happen — so if it does, something is wrong about what this executor
+      believes it is sending, and a resting entry is the one order shape the
+      halt sweep's timing argument does not cover.
 
     A liquidation is the third (decision 11 lists all three). Nothing here
     saves the money — it is already gone — but a sub that liquidated is a

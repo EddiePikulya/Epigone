@@ -127,13 +127,45 @@ async def test_the_v0_ceilings_refuse_before_the_operator_is_asked_to_approve(
     assert await pool.fetchval("SELECT count(*) FROM copy_subs") == 0
 
 
+async def test_a_one_legged_bracket_is_accepted(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    """Decision 6 calls them "its own OPTIONAL TP% and SL%", and migration
+    0033 accepts either leg alone — so the parser must too, or it would be the
+    only place in the system saying otherwise. `-` omits a leg positionally,
+    keeping the documented `<tp%> <sl%>` order readable."""
+    await seed_trader(pool, clock)
+    await feed_text(admin_dp, bot, f"/copy {LEADER} 1000 200 bracket - 5", user_id=ADMIN)
+    prompt = session.sent_messages()[-1].text or ""
+    assert "SL 5%" in prompt and "TP" not in prompt
+
+    await feed_callback(admin_dp, bot, COPY_CONFIRM_PREFIX + "go", user_id=ADMIN)
+    row = await pool.fetchrow("SELECT * FROM copy_subs")
+    assert row is not None
+    assert row["take_profit_pct"] is None
+    assert row["stop_loss_pct"] == Decimal("5")
+
+
+async def test_a_bracket_with_neither_leg_is_refused_as_default_in_disguise(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    await feed_text(admin_dp, bot, f"/copy {LEADER} 1000 200 bracket - -", user_id=ADMIN)
+    assert "just default mode" in (session.sent_messages()[-1].text or "")
+    assert await pool.fetchval("SELECT count(*) FROM copy_subs") == 0
+
+
 @pytest.mark.parametrize(
     "args",
     [
         "0xnope 1000 200 default",  # not an address
         f"{LEADER} 1000 200 turbo",  # unknown mode
         f"{LEADER} -5 200 default",  # non-positive money
-        f"{LEADER} 1000 200 bracket",  # bracket needs both percentages
+        f"{LEADER} 1000 200 bracket",  # bracket takes two positions, - to omit
+        f"{LEADER} 1000 200 bracket 10 nope",  # not a number and not -
         f"{LEADER} 1000 200 default 10 5",  # default takes none
     ],
 )

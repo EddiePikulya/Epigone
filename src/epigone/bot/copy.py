@@ -65,7 +65,9 @@ USAGE = (
     "changes it)\n"
     "  mode        — default (exit when the leader exits) or bracket "
     "(our own TP/SL, which ENDS the copy episode when it fires)\n\n"
-    "Example: /copy 0xabc… 1000 200 bracket 10 5"
+    "Example: /copy 0xabc… 1000 200 bracket 10 5\n"
+    "One-legged brackets are fine — use - for the leg you don't want:\n"
+    "  /copy 0xabc… 1000 200 bracket - 5   (stop only)"
 )
 NOT_COPYING_TEXT = "Not copying that wallet."
 CANCELLED_TEXT = "Cancelled — nothing was funded and nothing is being copied."
@@ -140,9 +142,16 @@ def _prompt(parsed: CopyRequest) -> str:
         f"size is. Their scales and trims are mirrored as percentages.",
     ]
     if parsed.mode == BRACKET_MODE:
+        legs = " / ".join(
+            part
+            for part in (
+                None if parsed.take_profit_pct is None else f"TP {parsed.take_profit_pct}%",
+                None if parsed.stop_loss_pct is None else f"SL {parsed.stop_loss_pct}%",
+            )
+            if part is not None
+        )
         lines.append(
-            f"• Bracket mode: TP {parsed.take_profit_pct}% / SL "
-            f"{parsed.stop_loss_pct}% on OUR fill price. If a bracket fires, that "
+            f"• Bracket mode: {legs} on OUR fill price. If a bracket fires, that "
             f"copy episode is over — the leader's later scales and their eventual "
             f"close are skipped until they close and re-open."
         )
@@ -327,13 +336,23 @@ def _parse(raw: str) -> CopyRequest | str:
             leader=leader.lower(), allocation=allocation_usd, base=base_usd, mode=mode
         )
     if len(parts) != 6:
-        return "Bracket mode needs both a TP and an SL percentage."
-    try:
-        tp, sl = Decimal(parts[4]), Decimal(parts[5])
-    except InvalidOperation:
-        return "TP and SL must be numbers (percent)."
-    if tp <= 0 or not (0 < sl < 100):
-        return "TP must be positive and SL between 0 and 100 percent."
+        return "Bracket mode takes a TP and an SL percentage (use - to omit one)."
+    # ONE-LEGGED BRACKETS ARE LEGAL. Decision 6 calls them "its own OPTIONAL
+    # TP% and SL%", and migration 0033 accepts either leg alone — a parser
+    # that demanded both would be the only place in the system saying
+    # otherwise. `-` omits a leg positionally, so the documented
+    # `<tp%> <sl%>` order still reads left to right.
+    tp = _optional_pct(parts[4])
+    sl = _optional_pct(parts[5])
+    if tp is _BAD or sl is _BAD:
+        return "TP and SL must be numbers (percent), or - to omit that leg."
+    assert not isinstance(tp, _Bad) and not isinstance(sl, _Bad)
+    if tp is None and sl is None:
+        return "Bracket mode with neither leg is just default mode — use that instead."
+    if tp is not None and tp <= 0:
+        return "TP must be a positive percent."
+    if sl is not None and not (0 < sl < 100):
+        return "SL must be between 0 and 100 percent."
     return CopyRequest(
         leader=leader.lower(),
         allocation=allocation_usd,
@@ -342,6 +361,22 @@ def _parse(raw: str) -> CopyRequest | str:
         take_profit_pct=tp,
         stop_loss_pct=sl,
     )
+
+
+class _Bad:
+    """Sentinel: that argument was neither a number nor the `-` omission."""
+
+
+_BAD = _Bad()
+
+
+def _optional_pct(raw: str) -> "Decimal | None | _Bad":
+    if raw == "-":
+        return None
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return _BAD
 
 
 def _sub_name(leader: str) -> str:

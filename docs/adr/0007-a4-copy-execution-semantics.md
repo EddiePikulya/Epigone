@@ -200,6 +200,10 @@ it → skipped as stale; post-resume events → copied normally.
   as `bracket_replaced_after_resume`. Rationale: resume is consent to trade
   WITH THE SUB'S CONFIGURED POLICY; silently degrading `bracket` to
   `default` is a decision nobody made.
+  - **SUPERSEDED by amendment D-1 (2026-08-04)** — see the amendments
+    section. r1a's *effect* is unchanged; what changed is that restoration is
+    a per-cycle invariant rather than a resume-only action, and the audit
+    reason is renamed accordingly.
 
 ### 10. Reconciliation: exchange is truth; classify, audit, never auto-fix
 
@@ -288,3 +292,72 @@ copying. `/uncopy` flips the flag off.
   mainnet-switch checklist item in #138.
 - **Testnet-only:** the live gate is unchanged — no mainnet code path
   reachable before #137 (A5) merges; the switch is hand-run.
+
+## Amendments
+
+Decisions settled after the original grill, during implementation review of
+#136 (PR #176). Each supersedes the numbered decision it names; the decision
+text above is left standing so the reasoning that produced it stays readable.
+
+### D-1 (2026-08-04). Bracket restoration is a per-cycle INVARIANT, not a
+### resume-only action — supersedes decision 9's (r1a)
+
+**Decision.** The executor holds "every live position in a bracket-mode sub
+has its TP/SL resting on the book" as a property it restores on a slow
+cadence, whatever removed them. It does not detect the /resume transition.
+
+**Why the operator chose it over r1a as written.** r1a names one cause — the
+halt sweep — but it is not the only one. A restart loses in-process
+transition state entirely, so an executor that came up after a crash would
+never restore anything; a partially-filled bracket, an exchange-side
+cancellation, and the operator's own cancel in the Hyperliquid UI all leave
+the same unstopped position with no resume to hang the fix on. One invariant
+covers every cause including the halt, and it is the only version that
+survives a restart. The cost is a periodic `frontendOpenOrders` read per
+bracket-mode sub, which is why the cadence is slower than the loop.
+
+**What it does not change.** A bracket placed at fill time is still placed at
+fill time (decision 6) — the invariant is for restoration, not for the
+initial placement, and waiting a cycle to stop a fresh position would be
+exactly the window a stop exists to cover.
+
+**Consequences, all binding:**
+
+- **The audit reason is RENAMED to `bracket_restored`.**
+  `bracket_replaced_after_resume` would be false for most of its firings once
+  a resume is the minority cause, and a trail that misnames why it acted is
+  worse than one that says less.
+- **Every restoration notices to Telegram**, like every other copy action
+  (decision 11). The operator must be able to see a bracket coming back —
+  particularly the ones that come back after something they did.
+- **The operator's route to an unstopped position is `default` mode or
+  `/uncopy`**, not "cancel the trigger and hope". Cancelling a bracket leg in
+  the exchange UI is now a temporary state: the executor restores it within
+  the cadence. That is the intended behaviour — a sub configured `bracket`
+  stays bracketed — and it is recorded here because it is genuinely
+  surprising if you expect the UI to be authoritative.
+- **A halted cycle restores nothing** and says so. Brackets are the one order
+  shape this executor leaves RESTING, so they carry the same late halt
+  re-check the order legs do; between a halt and its resume a bracket-mode
+  position is unstopped, which the halt-and-unwind runbook now states.
+
+### D-2 (2026-08-04). The liveness floor is decision 7's letter: open and
+### flip's open leg ONLY — narrows the implementation, not the decision
+
+**Decision.** The $10,000 live-equity gate fires on `open` and on a flip's
+open leg. It does NOT fire on `scale_in`.
+
+**Why.** Decision 7 already says "on ENTRY events only (open, flip's open
+leg)"; the first implementation read "entry" as "anything risk-increasing"
+and gated scale-ins too. That is a different gate with a different meaning.
+The floor asks "is this still the trader whose stats earned the copy?" —
+a question about STARTING to follow someone. A scale-in is the continuation
+of a position we already opened on a Leader we already judged, and refusing
+to follow it leaves us holding a half-mirrored position rather than no
+position, which is the worse of the two states. It also spends a weight-2
+fetch on the most common event kind.
+
+**What it does not change.** Decision 8 is untouched: a scale-in is
+risk-increasing, so it stays staleness-guarded. The asymmetry the ADR runs on
+is intact — this narrows one gate to its stated scope, it does not open
+exits to gating.

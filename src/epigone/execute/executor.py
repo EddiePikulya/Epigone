@@ -62,6 +62,7 @@ from epigone.execute.policy import (
     EXIT_RETRY_ATTEMPTS,
     EXIT_RETRY_DELAY_SECONDS,
     LEADER_EQUITY_FLOOR,
+    MIN_ORDER_NOTIONAL,
     RiskPolicyV0,
 )
 from epigone.execute.pricing import (
@@ -77,6 +78,7 @@ from epigone.execute.subs import CopySub
 from epigone.gateway import (
     POSITION_VENUES,
     AssetSpec,
+    GatewayError,
     HyperliquidGateway,
     OpenOrder,
     Position,
@@ -229,7 +231,19 @@ class CopyExecutor:
         master holds at most ten), while funding is retryable. So the address
         is written down the instant it exists, before the transfer is
         attempted — a crash or a failed transfer then resumes at the funding
-        leg instead of minting a second sub and stranding the first."""
+        leg instead of minting a second sub and stranding the first.
+
+        FUNDING IS A TOP-UP, NOT A TRANSFER OF THE FULL ALLOCATION. `/uncopy`
+        never flattens, so a re-copied Leader's sub comes back holding
+        whatever last time left in it — which may be more than the allocation
+        (it won) or almost nothing (it lost). The allocation is a TARGET
+        BALANCE, because that balance IS the exchange-enforced exposure cap
+        (decision 1); transferring the full figure again would stack a second
+        allocation on top of the first, and transferring nothing would let a
+        drained sub trade on a cap the operator never agreed to. So the sub's
+        live equity is read and only the difference moves. An over-funded sub
+        is left alone rather than drained back: taking money OUT is not
+        something provisioning should decide."""
         for sub in subs:
             if sub.is_provisioned:
                 continue
@@ -247,19 +261,36 @@ class CopyExecutor:
             address = sub.sub_address
             try:
                 if address is None:
+                    # THE HALT GATE, as late as it can be before an
+                    # IRREVERSIBLE action: a halted cycle must not mint a
+                    # sub-account or move funding money. The cycle-top check
+                    # is seconds-to-tens-of-seconds stale by now, because the
+                    # per-sub reconciles ran in between.
+                    if await self._halted_before_provisioning(sub, "create", now):
+                        return
                     address = await self._provisioning.create_sub_account(sub.sub_name)
                     await subs_store.record_sub_address(self._pool, sub.id, address)
-                await self._provisioning.sub_account_transfer(
-                    address,
-                    is_deposit=True,
-                    usd_micro=int(sub.allocation_usd * USD_MICRO),
-                )
+                topup = await self._funding_gap(sub, address)
+                if topup > 0:
+                    if await self._halted_before_provisioning(sub, "fund", now):
+                        return
+                    await self._provisioning.sub_account_transfer(
+                        address, is_deposit=True, usd_micro=int(topup * USD_MICRO)
+                    )
             except ExecutionError:
                 # The gateway already left its own attempt/outcome rows. The
                 # mapping stays unfunded and the next cycle resumes from
                 # whichever leg is still outstanding.
                 log.exception(
                     "copy sub provisioning failed for %s; retrying next cycle", sub.sub_name
+                )
+                continue
+            except GatewayError:
+                # The equity read failed, so the top-up amount is unknown.
+                # Funding a guess would be the one unrecoverable mistake here.
+                log.warning(
+                    "copy sub %s: balance unreadable, funding deferred", sub.sub_name,
+                    exc_info=True,
                 )
                 continue
             async with self._pool.acquire() as conn, conn.transaction():
@@ -270,13 +301,57 @@ class CopyExecutor:
                     kind=PROVISIONING,
                     body=(
                         f"✅ Copy sub ready for {_short(sub.leader_address)}\n"
-                        f"sub {_short(address)} · funded ${sub.allocation_usd} · "
-                        f"base ${sub.base_notional_usd} · mode {sub.copy_mode}"
+                        f"sub {_short(address)} · "
+                        + (
+                            f"topped up ${topup} to a ${sub.allocation_usd} balance"
+                            if topup > 0
+                            else f"already holds its ${sub.allocation_usd} allocation"
+                        )
+                        + f" · base ${sub.base_notional_usd} · mode {sub.copy_mode}"
                     ),
                     now=now,
                 )
             log.info("copy sub %s provisioned at %s", sub.sub_name, address)
             return
+
+    async def _funding_gap(self, sub: CopySub, address: str) -> Decimal:
+        """How much this sub is short of its target balance. Zero when it
+        already holds the allocation or more (module docstring: an over-funded
+        sub is left alone, never drained back)."""
+        await self._budget.spend(POSITIONS_WEIGHT)
+        held = (await self._read.get_account_state(address)).account_value
+        return max(sub.allocation_usd - held, Decimal(0))
+
+    async def _halted_before_provisioning(
+        self, sub: CopySub, leg: str, now: datetime
+    ) -> bool:
+        """The same discipline the order legs have, applied to the two actions
+        that move money rather than place orders. A halt means Epigone acts on
+        nothing — and unlike an IOC, a funding transfer cannot be un-sent."""
+        if not await is_halted(self._pool):
+            return False
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._audit.record_event(
+                actor=EXECUTOR_ACTOR,
+                action="copy_halted",
+                risk_decision=(
+                    f"provisioning {leg} for {sub.sub_name} NOT sent — execution is halted"
+                ),
+                detail={"sub_id": sub.id, "leg": leg},
+                master_address=self._master,
+                conn=conn,
+            )
+            await notify(
+                conn,
+                operator_id=self._operator_id,
+                kind=SKIP,
+                body=(
+                    f"🛑 Copy sub for {_short(sub.leader_address)} was NOT "
+                    f"{'created' if leg == 'create' else 'funded'} — execution is halted."
+                ),
+                now=now,
+            )
+        return True
 
     async def _decline_provisioning(self, sub: CopySub, decision: str, now: datetime) -> None:
         async with self._pool.acquire() as conn, conn.transaction():
@@ -388,7 +463,25 @@ class CopyExecutor:
                 now=now,
             )
             return
-        if await self._was_liquidated(sub, episode):
+        liquidated = await self._was_liquidated(sub, episode)
+        if liquidated is None:
+            # Unreadable, so unclassifiable (decision 10's last row): adopt
+            # nothing, page, and re-flag every cycle until the read succeeds
+            # and one of the confident branches above takes it.
+            await self._page(
+                sub,
+                action="copy_divergence_unclassifiable",
+                reason=(
+                    f"{episode.coin}: the position is gone and the fills are "
+                    f"unreadable, so nothing can say whether it was liquidated — "
+                    f"adopting nothing, the episode stays open"
+                ),
+                detail={"episode_id": episode.id, "coin": episode.coin},
+                now=now,
+                notify_once=episode.id,
+            )
+            return
+        if liquidated:
             await self._end_episode(
                 sub,
                 episode,
@@ -424,7 +517,7 @@ class CopyExecutor:
         resting = {order.order_id for order in await self._open_orders(sub)}
         return any(bracket.order_id in resting for bracket in brackets)
 
-    async def _was_liquidated(self, sub: CopySub, episode: ep.CopyEpisode) -> bool:
+    async def _was_liquidated(self, sub: CopySub, episode: ep.CopyEpisode) -> bool | None:
         """Ask the FILLS, not the equity.
 
         ADR-0007's table names this case "position gone + equity cratered",
@@ -433,14 +526,20 @@ class CopyExecutor:
         10%, which no honest threshold separates from a losing exit. The fill
         stream states it outright: Hyperliquid tags a liquidation in the
         fill's own `dir`. Strictly more precise, at the cost of one read that
-        only happens on an unexplained disappearance."""
+        only happens on an unexplained disappearance.
+
+        THREE ANSWERS, not two. `None` means the fills could not be read, and
+        it must not collapse into False: that would label a possible
+        liquidation "the operator closed it", adopt the state, and page
+        nobody. Decision 10 has a row for exactly this — unclassifiable: adopt
+        nothing, page, re-flag until resolved."""
         for _ in range(2):  # userFills + userTwapSliceFills (FILL_ENDPOINTS)
             await self._budget.spend(FILLS_WEIGHT)
         try:
             fills = await self._read.get_fills_since(sub.require_address(), episode.opened_at)
         except Exception:
             log.warning("copy executor: fills unreadable for %s", sub.sub_name, exc_info=True)
-            return False
+            return None
         return any(
             fill.coin == episode.coin and "Liquidat" in fill.direction for fill in fills
         )
@@ -620,6 +719,28 @@ class CopyExecutor:
             tags.append(f"{tpsl.value.upper()} {pct}% @ {trigger_at}")
         if not legs:
             return
+        # THE HALT GATE, as late as it can be. Every other copy order is an
+        # IOC and cannot outlive the sweep's enumeration; a bracket trigger
+        # RESTS, so a bracket landing after a halt is exactly the #143
+        # residual race, for the one order type that can reach it. A halt seen
+        # after signing stays a reconciliation obligation — the next cycle's
+        # bracket check re-reads the book, and the watchdog's per-sub sweep
+        # cancels what it finds.
+        if await is_halted(self._pool):
+            log.warning(
+                "copy executor: halted before placing brackets on %s — not sent",
+                episode.coin,
+            )
+            await self._notify(
+                kind=SKIP,
+                body=(
+                    f"🛑 Bracket for {episode.coin} ({_short(sub.leader_address)}) NOT "
+                    f"placed — execution is halted. That position is UNSTOPPED until "
+                    f"/resume."
+                ),
+                now=now,
+            )
+            return
         self._exec.decision = (
             f"bracket {'re-placed' if replaced else 'placed'} for episode {episode.id} "
             f"({sub.copy_mode} mode, anchored to the exchange's entry "
@@ -653,7 +774,14 @@ class CopyExecutor:
         if replaced:
             await self._audit.record_event(
                 actor=EXECUTOR_ACTOR,
-                action="bracket_replaced_after_resume",
+                # NOT `bracket_replaced_after_resume` (ADR-0007 decision 9's
+                # original name): the operator settled the per-cycle invariant
+                # over r1a's resume-only rule (amendment D-1), and a resume is
+                # now the MINORITY of this event's firings — a restart, a
+                # partial fill, or the operator's own cancel all reach it. A
+                # name that says "after resume" would be a lie in the trail
+                # most of the time.
+                action="bracket_restored",
                 risk_decision=self._exec.decision,
                 detail={"episode_id": episode.id, "coin": episode.coin, "legs": tags},
                 master_address=self._master,
@@ -843,9 +971,19 @@ class CopyExecutor:
                     f"the operator's own position, left alone",
                     {"coin": coin, "leg": leg},
                 )
-        floor_skip = await self._liveness_skip(event, coin, leg)
-        if floor_skip is not None:
-            return floor_skip
+        if leg in ("open", "flip_open"):
+            # Decision 7's letter, and the operator confirmed it (amendment
+            # D-2): "on ENTRY events only (open, flip's open leg)". A scale-in
+            # is not one of them — the position is already open on a Leader we
+            # already judged, and the gate exists to ask "is this still the
+            # trader whose stats earned the copy?", which is a question about
+            # STARTING a position, not about following one we are already in.
+            # Gating a scale-in would also spend a weight-2 fetch on the most
+            # common event kind. Staleness (decision 8) is unchanged: a
+            # scale-in stays guarded, because it increases risk.
+            floor_skip = await self._liveness_skip(event, coin, leg)
+            if floor_skip is not None:
+                return floor_skip
         return None
 
     async def _liveness_skip(
@@ -922,6 +1060,7 @@ class CopyExecutor:
                 ),
                 now=now,
                 kind=PAGER,
+                action_override="copy_unexpected_resting",
             )
             return
         filled, price = result.total_size, result.avg_price
@@ -1021,6 +1160,18 @@ class CopyExecutor:
                     event, sub, _Skip(f"not mirrorable: {exc}", {"coin": coin, "leg": leg}), now
                 )
             return True
+        sliver = await self._sub_minimum_skip(target, position, coin, leg)
+        if sliver is not None:
+            # Not a risk decline — exits are never declined (decision 5's
+            # asymmetry stands). This order simply cannot be sent: the
+            # exchange refuses anything under its minimum value, so the three
+            # reduce-only retries below would be three guaranteed rejects and
+            # a "0 of X closed" report that reads like a market problem. The
+            # residue stays ours and reconciliation keeps reporting it, which
+            # is decision 10's self-damping doing its job.
+            if claim:
+                return await self._claim_and_skip(event, sub, sliver, now)
+            return True
         verdict = self._policy.judge_exit()
         attempt = await self._claim_and_attempt(
             event,
@@ -1044,6 +1195,27 @@ class CopyExecutor:
         )
         await self._settle_exit(sub, episode, leg, target, filled, remaining, attempt, coin)
         return True
+
+    async def _sub_minimum_skip(
+        self, target: Decimal, position: Position, coin: str, leg: str
+    ) -> _Skip | None:
+        """Whether this exit is too small for the exchange to accept.
+
+        Priced off OUR OWN position (`size_usd / size_coin`) rather than a
+        fresh mid: it is the same instant the size came from, it costs no
+        call, and a sliver is a sliver at any nearby price."""
+        if position.size_coin is None or position.size_coin <= 0:
+            return None
+        mark = position.size_usd / position.size_coin
+        notional = target * mark
+        if notional >= MIN_ORDER_NOTIONAL:
+            return None
+        return _Skip(
+            f"exit sliver: {target} {coin} is about ${notional:.2f}, under the "
+            f"exchange's ${MIN_ORDER_NOTIONAL} minimum order value — not sent, and "
+            f"the residue stays until a larger move or reconciliation resolves it",
+            {"coin": coin, "leg": leg, "size": str(target), "notional": str(notional)},
+        )
 
     async def _reduce(
         self,

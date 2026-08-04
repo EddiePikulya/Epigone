@@ -117,7 +117,9 @@ async def build_harness(
     read.mid_prices[None] = {"BTC": Decimal("63500"), "ETH": Decimal("2000")}
     read.mid_prices["xyz"] = {"xyz:META": Decimal("600")}
     read.account_values[(LEADER, None)] = Decimal("250000")
-    read.account_values[(SUB, None)] = Decimal("1000")
+    # The sub holds NOTHING by default — the honest state for an account no
+    # test funded, and the one that makes provisioning transfer the whole
+    # allocation. Tests about the top-up set a balance explicitly.
 
     audit = ExecutionAudit(pool, clock)
     exec_fake = FakeExecutionGateway()

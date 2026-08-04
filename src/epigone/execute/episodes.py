@@ -38,7 +38,6 @@ ENDED_LEADER_FLIP = "leader_flip"
 ENDED_BRACKET = "bracket"
 ENDED_OPERATOR = "operator_closed"
 ENDED_LIQUIDATED = "liquidated"
-ENDED_UNCOPIED = "uncopied"
 
 
 @dataclass(frozen=True)

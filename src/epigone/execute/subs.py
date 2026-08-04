@@ -142,14 +142,19 @@ async def reenable_sub(
     """Turn an existing mapping back on with fresh terms, reusing its
     sub-account. Returns None when there is nothing to re-enable.
 
-    The allocation is NOT re-transferred here: whatever the sub still holds
-    from last time stays, and the executor tops it up to the requested
-    allocation as part of provisioning — the exchange's balance is the
-    authority on what has actually been funded, never this row."""
+    `provisioned_at` is CLEARED, which is what re-opens the funding leg:
+    /uncopy never flattens, so the sub comes back holding whatever last time
+    left in it — possibly almost nothing. The executor then tops it up to the
+    requested allocation on its next loop, because that balance IS the
+    exchange-enforced exposure cap and a drained sub would otherwise trade on
+    a cap the operator never agreed to. The sub-account itself is untouched:
+    subs cannot be deleted and a master holds at most ten (finding 10), so
+    re-copying MUST reuse it."""
     row = await conn.fetchrow(
         """
         UPDATE copy_subs
         SET enabled = TRUE,
+            provisioned_at = NULL,
             allocation_usd = $3,
             base_notional_usd = $4,
             copy_mode = $5,

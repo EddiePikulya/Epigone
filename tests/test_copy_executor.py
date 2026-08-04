@@ -1069,7 +1069,7 @@ async def test_brackets_are_restored_after_a_halt_sweep_cancelled_them(
     assert h.placed()  # re-placed
     assert any("Bracket re-placed" in body for body in await h.notices())
     assert any(
-        action == "bracket_replaced_after_resume" for action, _ in await h.audit_actions()
+        action == "bracket_restored" for action, _ in await h.audit_actions()
     )
 
 
@@ -1110,6 +1110,53 @@ async def test_a_fired_bracket_ends_the_episode_and_later_events_are_skipped(
     assert await outstanding(pool) == []  # …but it IS claimed
 
 
+async def test_a_halted_cycle_places_no_brackets_and_says_the_position_is_unstopped(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Brackets are the ONE order shape this executor leaves RESTING, so they
+    are the one that can outlive the halt sweep's enumeration — the #143
+    residual race, for real. The gate is re-checked immediately before
+    signing, and the operator is told the position is unstopped."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(
+        pool, clock, mode="bracket", take_profit_pct="10", stop_loss_pct="5"
+    )
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_open_orders(SUB, [])
+
+    # Halted AFTER the cycle-top check would have run — i.e. the reconcile
+    # happens, then /kill lands, then the bracket path is reached.
+    original = h.executor._maintain_brackets
+
+    async def halt_then_maintain(*args: object, **kwargs: object) -> None:
+        await request_halt(
+            pool,
+            clock,
+            ExecutionAudit(pool, clock),
+            source=KILL_SOURCE,
+            reason="operator /kill",
+            requested_by=OPERATOR,
+        )
+        await original(*args, **kwargs)  # type: ignore[arg-type]
+
+    h.executor._maintain_brackets = halt_then_maintain  # type: ignore[method-assign]
+
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert any("UNSTOPPED until /resume" in body for body in await h.notices())
+
+
 # --- provisioning (decision 12) -----------------------------------------------
 
 
@@ -1134,6 +1181,93 @@ async def test_a_pending_mapping_is_created_and_funded_by_the_executor(
     stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
     assert stored is not None
     assert stored["sub_address"] == SUB and stored["provisioned_at"] is not None
+
+
+async def test_a_halted_cycle_neither_mints_nor_funds_a_sub_account(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Unlike an IOC, a funding transfer cannot be un-sent and a sub-account
+    cannot be un-minted — so both legs carry the same late halt re-check the
+    order legs do."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock, provisioned=False)
+    h.exec_fake.sub_addresses.append(SUB)
+    await request_halt(
+        pool,
+        clock,
+        ExecutionAudit(pool, clock),
+        source=KILL_SOURCE,
+        reason="operator /kill",
+        requested_by=OPERATOR,
+    )
+    # run_cycle stops at its own halt check, so drive provisioning directly —
+    # this pins the LATE check, not the cycle-top one.
+    await h.executor._provision(
+        await subs_store.enabled_subs(pool, OPERATOR), clock.now()
+    )
+
+    assert h.exec_fake.actions == []
+    assert any("NOT created — execution is halted" in body for body in await h.notices())
+
+
+async def test_a_recopied_sub_is_topped_up_to_its_allocation(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """/uncopy never flattens, so a re-copied Leader's sub comes back holding
+    whatever last time left in it. The allocation is a TARGET BALANCE — it is
+    the exchange-enforced exposure cap — so only the difference moves: a
+    drained sub must not trade on a cap the operator never agreed to, and a
+    surviving balance must not be doubled."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, allocation="1000")
+    await subs_store.disable_sub(pool, operator_id=OPERATOR, leader_address=LEADER)
+    # It lost most of the allocation while we were copying it.
+    gateway.account_values[(SUB, None)] = Decimal("150")
+    reenabled = await subs_store.reenable_sub(
+        pool,
+        operator_id=OPERATOR,
+        leader_address=LEADER,
+        allocation_usd=Decimal("1000"),
+        base_notional_usd=Decimal("200"),
+        copy_mode="default",
+        take_profit_pct=None,
+        stop_loss_pct=None,
+    )
+    assert reenabled is not None and reenabled.provisioned_at is None  # funding reopened
+
+    await h.executor.run_cycle()
+
+    transfers = [p for m, p in h.exec_fake.actions if m == "sub_account_transfer"]
+    assert transfers == [(SUB, True, 850_000_000)]  # $850, not $1000
+    assert [m for m, _ in h.exec_fake.actions if m == "create_sub_account"] == []
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None and stored["provisioned_at"] is not None
+
+
+async def test_a_sub_already_holding_its_allocation_is_not_funded_again(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    # It won while we were away. Topping up nothing is right; draining the
+    # excess back is not provisioning's decision to make.
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock, allocation="1000")
+    await subs_store.disable_sub(pool, operator_id=OPERATOR, leader_address=LEADER)
+    gateway.account_values[(SUB, None)] = Decimal("1400")
+    await subs_store.reenable_sub(
+        pool,
+        operator_id=OPERATOR,
+        leader_address=LEADER,
+        allocation_usd=Decimal("1000"),
+        base_notional_usd=Decimal("200"),
+        copy_mode="default",
+        take_profit_pct=None,
+        stop_loss_pct=None,
+    )
+
+    await h.executor.run_cycle()
+
+    assert [m for m, _ in h.exec_fake.actions if m == "sub_account_transfer"] == []
+    assert any("already holds its $1000 allocation" in b for b in await h.notices())
 
 
 async def test_a_failed_funding_transfer_never_mints_a_second_sub_account(
@@ -1179,6 +1313,148 @@ async def test_provisioning_past_the_v0_ceilings_is_declined_before_money_moves(
     assert h.exec_fake.actions == []  # nothing signed, nothing funded
     assert any("was NOT set up" in body for body in await h.notices())
     assert await subs_store.enabled_subs(pool, OPERATOR) == []
+
+
+async def test_an_exit_sliver_under_the_exchange_minimum_is_skipped_not_retried(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Below the exchange's $10 minimum order value, three reduce-only retries
+    are three guaranteed rejects and a "0 of X closed" report that reads like
+    a market problem. Skip it with its own reason; the residue stays ours and
+    reconciliation keeps reporting it (decision 10's self-damping)."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.02"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    # 0.02 ETH at $2000 is $40 held; a 10% trim is $4 — under the minimum.
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.02", size_usd="40")])
+
+    await emit(pool, scaled("scale_out", "10", "9"), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []  # not one guaranteed-reject order
+    assert await outstanding(pool) == []  # claimed: handled
+    assert any("exit sliver" in body for body in await h.notices())
+
+
+async def test_unreadable_fills_page_as_unclassifiable_not_operator_closed(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A vanished position whose fills cannot be read might have been
+    liquidated. Labelling it "the operator closed it" would adopt the state
+    and page nobody — decision 10 has a row for exactly this: adopt nothing,
+    page, re-flag until resolved."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    episode = await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [])
+    gateway.fills_errors[SUB] = RuntimeError("fills endpoint down")
+
+    await h.executor.run_cycle()
+
+    row = await pool.fetchrow("SELECT * FROM copy_episodes WHERE id = $1", episode.id)
+    assert row is not None and row["ended_at"] is None  # adopted NOTHING
+    assert any(
+        action == "copy_divergence_unclassifiable" for action, _ in await h.audit_actions()
+    )
+    kinds = await pool.fetch("SELECT kind FROM copy_notices ORDER BY id")
+    assert any(k["kind"] == "pager" for k in kinds)
+
+
+async def test_a_scale_in_is_copied_without_a_leader_equity_fetch(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """ADR-0007 amendment D-2: the liveness floor is decision 7's letter —
+    open and flip's open leg ONLY. A scale-in continues a position we already
+    opened on a Leader we already judged, and refusing it would leave us
+    half-mirrored rather than flat."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    # The leader is BELOW the floor and their equity is unreadable besides:
+    # neither may matter to a scale-in.
+    gateway.account_values[(LEADER, None)] = Decimal("1")
+    before = len([c for c in gateway.positions_calls if c[0] == LEADER])
+
+    await emit(pool, scaled("scale_in", "10", "15"), clock.now())
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1  # copied
+    after = len([c for c in gateway.positions_calls if c[0] == LEADER])
+    assert after == before  # …and the leader was never read
+
+
+async def test_a_stale_flip_half_executes_to_flat(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Decision 8's stated consequence, pinned on its own: the close leg is
+    risk-REDUCING so it fires at any age, the open leg is risk-increasing so
+    the 5-minute guard skips it, and we end FLAT with both halves audited."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=12, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(
+        pool,
+        PositionEvent(
+            kind="flip",
+            coin="ETH",
+            side="short",
+            prev_side="long",
+            size_usd=Decimal("10000"),
+            size_coin=Decimal("5"),
+            entry_price=Decimal("2000"),
+        ),
+        clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1),
+    )
+    await h.executor.run_cycle()
+
+    (close_leg,) = h.placed()  # the close leg only
+    assert close_leg[0][0].reduce_only is True
+    notices = await h.notices()
+    assert any("Copied flip close" in body for body in notices)
+    assert any("stale entry" in body for body in notices)
+    assert await outstanding(pool) == []
 
 
 # --- the heartbeat ------------------------------------------------------------

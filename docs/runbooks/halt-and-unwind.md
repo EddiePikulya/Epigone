@@ -263,11 +263,19 @@ watchdog log says which axis.
 
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are
-resting orders, so a halt CANCELS a bracket-mode sub's stops. That is why
-`/resume` re-places them (ADR-0007 decision 9's r1a) — but between the halt
-and the resume, a bracket-mode position is UNSTOPPED. If the halt is going
-to stand for a while and a sub holds something you wanted stopped, act from
-the master wallet.
+resting orders, so a halt CANCELS a bracket-mode sub's stops. The executor
+restores them — as a per-cycle invariant, not only on resume (ADR-0007
+amendment D-1) — but it restores NOTHING while the halt stands, because
+brackets are the one order shape it leaves resting and a halt means it signs
+nothing. So between the halt and the resume, a bracket-mode position is
+UNSTOPPED, and the executor says so in the chat when it declines to place
+one. If the halt is going to stand for a while and a sub holds something you
+wanted stopped, act from the master wallet.
+
+A halt also blocks PROVISIONING: `/copy` mappings waiting for their
+sub-account are neither created nor funded while it stands. Unlike an IOC,
+a funding transfer cannot be un-sent and a sub-account cannot be un-minted,
+so both legs carry the same late halt re-check the order legs do.
 
 The watchdog's own health is a 🚨 health-monitor check on two axes: liveness
 (`HEALTHCHECK_WATCHDOG_STALE_SECONDS`, default 300) and CAPABILITY — every
