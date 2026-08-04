@@ -13,7 +13,7 @@ LIVENESS_TIMEOUT_SECONDS, MAX_SUBSCRIBED_TRADERS) are sized off them.
     uv run python scripts/testnet_ws_probe.py orders    # what orderUpdates carries
 
 The last two are issue #168's, and they are the load-bearing ones for the order
-seam (ADR-0007): `users` establishes that the real ceiling on any lane is 15
+seam (ADR-0008): `users` establishes that the real ceiling on any lane is 15
 unique addresses per IP, and `orders` establishes that an order update never
 names the user it belongs to.
 
@@ -256,7 +256,7 @@ async def probe_orders() -> None:
     2026-08-03: the frame carries `{"order": {coin, side, limitPx, sz, oid,
     timestamp, origSz, cloid}, "status", "statusTimestamp"}` and **no user
     field at any level** — so on a connection subscribed to several users the
-    frames cannot be attributed, which is the constraint ADR-0007 is built
+    frames cannot be attributed, which is the constraint ADR-0008 is built
     around. One market-making address alone: 442 frames / 1471 updates in 60s.
     """
     async with aiohttp.ClientSession() as session:

@@ -1,4 +1,4 @@
-# ADR 0007: Order events as their own seam, attributed by connection
+# ADR 0008: Order events as their own seam, attributed by connection
 
 Date: 2026-08-03
 Status: accepted

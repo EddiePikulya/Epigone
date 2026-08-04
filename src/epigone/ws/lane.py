@@ -152,7 +152,7 @@ SUBSCRIPTION_LIMIT = 1000
 # positions feed, and nothing per venue. The account-wide order feed used to be
 # subscribed here too — it is not any more, because its frames carry no `user`
 # and are therefore unattributable on a connection serving many Traders; the
-# order lane takes one connection per Trader instead (ADR-0007, issue #168).
+# order lane takes one connection per Trader instead (ADR-0008, issue #168).
 # There is no constant for that 1: nothing divides by it now that the binding
 # limit counts users rather than subscriptions.
 
@@ -391,7 +391,7 @@ async def _refresh_subscriptions(
     if len(wanted) > MAX_SUBSCRIBED_TRADERS:
         log.error(
             "ws lane: %d wallets exceeds the %d unique users one IP may track "
-            "(measured 2026-08-03, ADR-0007); shadowing the first %d only — "
+            "(measured 2026-08-03, ADR-0008); shadowing the first %d only — "
             "raising this needs another IP, not another constant",
             len(wanted),
             MAX_SUBSCRIBED_TRADERS,

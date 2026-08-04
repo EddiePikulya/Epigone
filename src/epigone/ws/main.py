@@ -53,7 +53,7 @@ async def run(pool_url: str, clock: Clock, ws_url: str = WS_URL) -> None:
         # Two lanes, one process, and deliberately no coupling between them:
         # the position lane multiplexes every Trader onto one connection, and
         # the order lanes take one connection per Trader because `orderUpdates`
-        # frames do not say whose they are (ADR-0007). Both swallow their own
+        # frames do not say whose they are (ADR-0008). Both swallow their own
         # failures and reconnect, so `gather` here is composition rather than
         # supervision — neither can end the other.
         await asyncio.gather(

@@ -1,4 +1,4 @@
-"""The durable order-event seam (issue #168, ADR-0007).
+"""The durable order-event seam (issue #168, ADR-0008).
 
 An Order Event is what happened to one of a Trader's resting orders — placed,
 filled, cancelled, rejected, triggered. An order is a Trader's *plan*; a

@@ -348,9 +348,9 @@ document contradicting the code:
   seam's schema remains a decision to be made with the cutover, not a detail to
   be improvised inside a shadow lane.
 
-## Update, 2026-08-03 (issue #168): the order seam landed as ADR-0007, and the capacity figures here are wrong
+## Update, 2026-08-03 (issue #168): the order seam landed as ADR-0008, and the capacity figures here are wrong
 
-§Scope's deferral is discharged: **ADR-0007** designs `order_events`, and it
+§Scope's deferral is discharged: **ADR-0008** designs `order_events`, and it
 does follow this ADR's pattern (own table, own vocabulary, claim table, nothing
 consuming it yet). Two things it found while doing so contradict this document
 directly, and the correction belongs here rather than only there:
@@ -365,7 +365,7 @@ directly, and the correction belongs here rather than only there:
 - **`orderUpdates` frames carry no `user`**, where `allDexsClearinghouseState`
   does. §Scope assumed the order seam would be a matter of persisting what the
   lane already receives; it cannot be, because on a multi-Trader connection
-  those frames cannot be attributed to a Trader at all. ADR-0007 pays for
+  those frames cannot be attributed to a Trader at all. ADR-0008 pays for
   attribution with one connection per shadowed Trader, which is why order
   coverage (8) is bounded below position coverage (15).
 

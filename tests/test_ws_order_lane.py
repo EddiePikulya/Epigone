@@ -1,4 +1,4 @@
-"""The websocket order lane (issue #168, ADR-0007).
+"""The websocket order lane (issue #168, ADR-0008).
 
 The position lane's tests are built around four things that would make its
 dataset a lie. This lane's are built around five, and the first is new and is

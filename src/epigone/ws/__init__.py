@@ -29,7 +29,7 @@ cap has to be budgeted against". Both halves are wrong. The two subscriptions
 cannot share a connection: `allDexsClearinghouseState` messages name their
 `user` and `orderUpdates` messages do not, so the order feed is unattributable
 wherever more than one Trader is subscribed — it now takes a connection of its
-own per Trader (ADR-0007). And the subscription cap is not what binds: an
+own per Trader (ADR-0008). And the subscription cap is not what binds: an
 undocumented per-IP allowance of **15 unique users** does, ~33× sooner.
 
 Note what the all-dex form covers: every venue, including the ones REST polling
@@ -62,7 +62,7 @@ WS_URL = "wss://api.hyperliquid.xyz/ws"
 # Channels the lanes read. POSITIONS_CHANNEL becomes position events on the
 # shared connection; ORDERS_CHANNEL becomes order events on a connection of its
 # own, one per Trader, because its frames do not say whose orders they are
-# (ADR-0007); LIVENESS_CHANNEL is the always-emitting market feed that makes
+# (ADR-0008); LIVENESS_CHANNEL is the always-emitting market feed that makes
 # silence mean something, and every connection subscribes it (see lane.py).
 POSITIONS_CHANNEL = "allDexsClearinghouseState"
 ORDERS_CHANNEL = "orderUpdates"
@@ -153,7 +153,7 @@ class OrderUpdate:
 
     Note what is NOT here, because it is not on the wire (measured 2026-08-03):
     no `user` — which is why attribution has to come from the connection an
-    update arrived on (ADR-0007) — and no `orderType` / `isTrigger` /
+    update arrived on (ADR-0008) — and no `orderType` / `isTrigger` /
     `triggerPx` / `reduceOnly` / `isPositionTpsl`, so a streamed placement
     cannot say whether it is a stop, a take-profit or a plain resting limit.
     Only the REST resync can read those.

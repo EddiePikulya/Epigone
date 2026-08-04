@@ -1,4 +1,4 @@
--- Migration 0031: the durable order-event seam (issue #168, ADR-0007).
+-- Migration 0031: the durable order-event seam (issue #168, ADR-0008).
 --
 -- ADR-0006 §Scope deferred this deliberately: `order_alerts` is one batched
 -- row per follower per wallet per cycle (issue #115's noise rule) with the

@@ -1,5 +1,5 @@
 """The websocket order lane: the durable seam for resting-order changes
-(issue #168, ADR-0007).
+(issue #168, ADR-0008).
 
 The position lane multiplexes every shadowed Trader onto one connection,
 because `allDexsClearinghouseState` messages name the user they are about.
