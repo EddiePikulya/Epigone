@@ -12,6 +12,7 @@ import pytest
 
 from epigone.gateway import GatewayError, Side, Window
 from epigone.gateway.http import (
+    parse_account_state,
     parse_extra_agents,
     parse_fills,
     parse_leaderboard,
@@ -80,7 +81,13 @@ def _position_payload(**overrides: object) -> dict[str, object]:
         "marginUsed": "96.325",
         **overrides,
     }
-    return {"assetPositions": [{"type": "oneWay", "position": position}]}
+    # marginSummary rides every clearinghouseState response beside the
+    # positions (issue #170) — the recorded fixture's own shape, trimmed to the
+    # field Epigone reads.
+    return {
+        "marginSummary": {"accountValue": "5000.0", "totalNtlPos": "3853.0"},
+        "assetPositions": [{"type": "oneWay", "position": position}],
+    }
 
 
 def test_parse_positions_falls_back_to_notional_over_leverage_without_margin() -> None:
@@ -112,6 +119,34 @@ def test_parse_positions_carries_the_coin_unit_size_beside_the_notional() -> Non
     (short_pos,) = parse_positions(_position_payload(szi="-0.1"))
     assert short_pos.side is Side.SHORT
     assert short_pos.size_coin == Decimal("0.1")
+
+
+def test_parse_account_state_carries_the_equity_beside_the_positions() -> None:
+    # The account value has always ridden the response the poller already
+    # fetches and been discarded at parse time (issue #170). Same payload, same
+    # call: one read now yields both.
+    state = parse_account_state(_position_payload())
+    assert state.account_value == Decimal("5000.0")
+    assert [p.coin for p in state.positions] == ["BTC"]
+
+
+def test_parse_account_state_reads_a_builder_dex_venue_the_same_way() -> None:
+    # A builder DEX answers clearinghouseState with its own marginSummary — the
+    # equity collateralising THAT venue — and namespaced coins (issue #21).
+    state = parse_account_state(_position_payload(coin="META"), "xyz")
+    assert state.account_value == Decimal("5000.0")
+    assert [p.coin for p in state.positions] == ["xyz:META"]
+
+
+def test_parse_account_state_rejects_a_payload_with_no_equity() -> None:
+    # A response missing marginSummary is a shape Epigone does not recognise,
+    # not a wallet worth zero: an invented 0 would read as an account emptied to
+    # nothing, which is precisely the signal the withdrawal follow-up watches
+    # for. Same all-or-raise rule the positions parse has always had.
+    payload = _position_payload()
+    del payload["marginSummary"]
+    with pytest.raises(GatewayError):
+        parse_account_state(payload)
 
 
 # One perp close (recorded verbatim from userFills on 2026-07-10) and one

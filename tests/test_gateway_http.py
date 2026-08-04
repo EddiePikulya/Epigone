@@ -117,6 +117,18 @@ async def test_sends_the_documented_clearinghouse_state_request() -> None:
     assert received == [{"type": "clearinghouseState", "user": WHALE.lower()}]
 
 
+async def test_the_account_state_read_costs_one_request_and_carries_the_equity() -> None:
+    # Equity capture (issue #170) adds no exchange traffic: it is the poller's
+    # existing clearinghouseState call, with the account value kept instead of
+    # discarded. One request in, positions AND equity out.
+    async with replaying_gateway(RECORDED) as (gateway, received):
+        state = await gateway.get_account_state(WHALE)
+
+    assert received == [{"type": "clearinghouseState", "user": WHALE.lower()}]
+    assert state.account_value == Decimal("1379146.572229")  # marginSummary.accountValue
+    assert [p.coin for p in state.positions] == ["ETH", "SOL", "AAVE", "NEAR", "JTO", "HYPE"]
+
+
 async def test_a_dex_poll_adds_the_dex_field_to_the_request() -> None:
     async with replaying_gateway({"assetPositions": []}) as (gateway, received):
         await gateway.get_open_positions(WHALE, dex="xyz")
@@ -412,6 +424,7 @@ async def test_get_fills_since_makes_no_request_before_the_window_opens() -> Non
 
 READ_CALLS: dict[str, Callable[[HttpHyperliquidGateway], Coroutine[Any, Any, Any]]] = {
     "get_open_positions": lambda g: g.get_open_positions(WHALE),
+    "get_account_state": lambda g: g.get_account_state(WHALE),
     "get_open_orders": lambda g: g.get_open_orders(WHALE),
     "get_fills": lambda g: g.get_fills(WHALE),
     "get_fills_since": lambda g: g.get_fills_since(WHALE, datetime(2026, 7, 1, tzinfo=UTC)),

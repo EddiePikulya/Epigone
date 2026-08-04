@@ -36,6 +36,7 @@ import aiohttp
 
 from epigone.clock import Clock
 from epigone.gateway import (
+    AccountState,
     ExtraAgent,
     Fill,
     GatewayError,
@@ -156,14 +157,22 @@ class HttpHyperliquidGateway:
             raise GatewayError(f"{request_type} request failed for {address}: {exc}") from exc
 
     async def get_open_positions(self, address: str, dex: str | None = None) -> list[Position]:
+        return parse_positions(await self._clearinghouse_state(address, dex), dex)
+
+    async def get_account_state(self, address: str, dex: str | None = None) -> AccountState:
+        # The same one request get_open_positions makes, parsed for everything it
+        # carries (issue #170) — never a second call, which is what makes equity
+        # capture free of exchange weight.
+        return parse_account_state(await self._clearinghouse_state(address, dex), dex)
+
+    async def _clearinghouse_state(self, address: str, dex: str | None) -> Any:
         body: dict[str, str] = {"type": "clearinghouseState", "user": address.lower()}
         if dex is not None:
             body["dex"] = dex  # a HIP-3 builder-deployed perp DEX (e.g. "xyz", issue #21)
         try:
-            payload = await self._request_json("POST", self._info_url, json_body=body)
+            return await self._request_json("POST", self._info_url, json_body=body)
         except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"clearinghouseState request failed for {address}: {exc}") from exc
-        return parse_positions(payload, dex)
 
     async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
         body: dict[str, str] = {"type": "frontendOpenOrders", "user": address.lower()}
@@ -292,6 +301,24 @@ def parse_twap_fills(payload: Any) -> list[Fill]:
     except (KeyError, TypeError) as exc:
         raise GatewayError(f"unexpected userTwapSliceFills payload shape: {exc!r}") from exc
     return parse_fills(nested)
+
+
+def parse_account_state(payload: Any, dex: str | None = None) -> AccountState:
+    """One venue's clearinghouseState in full: its positions and the equity
+    backing them (issue #170).
+
+    `marginSummary.accountValue` is read with the same all-or-raise strictness
+    as the positions: a response without it is an unrecognised shape, not an
+    account worth nothing. Defaulting to 0 would be indistinguishable from a
+    wallet emptied to zero — the exact reading the withdrawal follow-up (#171)
+    is built to act on."""
+    positions = parse_positions(payload, dex)
+    try:
+        return AccountState(
+            positions=positions, account_value=Decimal(payload["marginSummary"]["accountValue"])
+        )
+    except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+        raise GatewayError(f"unexpected clearinghouseState payload shape: {exc!r}") from exc
 
 
 def parse_positions(payload: Any, dex: str | None = None) -> list[Position]:

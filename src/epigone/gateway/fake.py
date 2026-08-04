@@ -1,6 +1,7 @@
 from datetime import datetime
+from decimal import Decimal
 
-from epigone.gateway import ExtraAgent, Fill, LeaderboardEntry, OpenOrder, Position
+from epigone.gateway import AccountState, ExtraAgent, Fill, LeaderboardEntry, OpenOrder, Position
 
 
 class FakeHyperliquidGateway:
@@ -22,6 +23,10 @@ class FakeHyperliquidGateway:
         # Fail one venue while another succeeds, keyed by (address, dex).
         self.positions_errors_by_dex: dict[tuple[str, str | None], Exception] = {}
         self.positions_calls: list[tuple[str, str | None]] = []
+        # A venue's account equity (issue #170), keyed like the positions it
+        # rides with. Unset means zero: a wallet a test never gave an equity to
+        # is one whose equity the test is not about.
+        self.account_values: dict[tuple[str, str | None], Decimal] = {}
         self.open_orders: dict[tuple[str, str | None], list[OpenOrder]] = {}
         self.open_orders_errors: dict[str, Exception] = {}
         self.open_orders_errors_by_dex: dict[tuple[str, str | None], Exception] = {}
@@ -55,6 +60,18 @@ class FakeHyperliquidGateway:
         if error is not None:
             raise error
         return self.positions.get((key, dex), [])
+
+    async def get_account_state(self, address: str, dex: str | None = None) -> AccountState:
+        # Routed through get_open_positions so the recorded call, the error
+        # injection and any subclass override apply to both reads — the live
+        # gateway serves them from one clearinghouseState response, and a fake
+        # where one read fails and the other doesn't would be modelling a
+        # transport that does not exist.
+        positions = await self.get_open_positions(address, dex)
+        return AccountState(
+            positions=positions,
+            account_value=self.account_values.get((address.lower(), dex), Decimal(0)),
+        )
 
     async def get_open_orders(self, address: str, dex: str | None = None) -> list[OpenOrder]:
         key = address.lower()
@@ -108,6 +125,14 @@ class FakeHyperliquidGateway:
         self, address: str, positions: list[Position], dex: str | None = None
     ) -> None:
         self.positions[(address.lower(), dex)] = positions
+
+    def set_account_value(
+        self, address: str, account_value: Decimal, dex: str | None = None
+    ) -> None:
+        """Provide ONE venue's account equity (issue #170), as the real gateway
+        reads it: per-dex, beside that venue's positions. A test modelling a
+        Trader's total covered-venue equity sets each venue it wants non-zero."""
+        self.account_values[(address.lower(), dex)] = account_value
 
     def set_open_orders(
         self, address: str, orders: list[OpenOrder], dex: str | None = None
