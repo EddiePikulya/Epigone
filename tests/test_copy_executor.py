@@ -1274,7 +1274,10 @@ async def test_a_sub_already_holding_its_allocation_is_not_funded_again(
     await h.executor.run_cycle()
 
     assert [m for m, _ in h.exec_fake.actions if m == "sub_account_transfer"] == []
-    assert any("already holds its $1000 allocation" in b for b in await h.notices())
+    # The BALANCE, not the allocation: "already holds its $1000 allocation"
+    # would understate a sub sitting on $1400 — and an adopted orphan is
+    # exactly where the operator needs the real figure.
+    assert any("already holds $1400 against its $1000 allocation" in b for b in await h.notices())
 
 
 async def test_a_failed_funding_transfer_never_mints_a_second_sub_account(
@@ -1593,21 +1596,26 @@ async def test_a_refusal_that_is_not_the_cap_never_adopts(
     assert stored["sub_address"] is None and stored["enabled"]
 
 
-async def test_a_halt_landing_after_an_adoption_still_stops_the_funding(
+async def test_a_halt_landing_between_the_adoption_and_the_rename_signs_nothing(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:
-    """Adoption ends in the same place creation does — money about to move —
-    so it meets the same late halt re-check. The halt is requested DURING the
-    pass, after the sub has been adopted, which is the window the check exists
-    for: nothing is transferred, and the mapping resumes at the funding leg
-    next cycle rather than adopting a second sub."""
+    """THE WINDOW THIS GATE EXISTS FOR. The "create" halt check is already
+    seconds to tens of seconds old by the time a sub is adopted — the listing
+    read and one position read per candidate happen in between — and the
+    rename is a SIGNATURE. So the halt is requested here after the adoption
+    commits and before the rename is called: no subAccountModify is signed, no
+    transfer follows, and the adoption STAYS (a row in our own database is not
+    something the exchange saw), so the next cycle resumes at the funding leg
+    instead of taking over a second sub."""
     h = await build_harness(pool, clock, gateway)
     sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
     held = capped_master(gateway)
     h.exec_fake.errors.append(cap_refusal())
     audit = ExecutionAudit(pool, clock)
+    adopt = h.executor._adopt_orphan_sub
 
-    async def halt_then_rename(*args: object, **kwargs: object) -> None:
+    async def adopt_then_halt(*args: object, **kwargs: object) -> str | None:
+        address = await adopt(*args, **kwargs)  # type: ignore[arg-type]
         await request_halt(
             pool,
             clock,
@@ -1616,13 +1624,16 @@ async def test_a_halt_landing_after_an_adoption_still_stops_the_funding(
             reason="operator /kill",
             requested_by=OPERATOR,
         )
+        return address
 
-    h.exec_fake.rename_sub_account = halt_then_rename  # type: ignore[method-assign]
+    h.executor._adopt_orphan_sub = adopt_then_halt  # type: ignore[method-assign]
 
     await h.executor.run_cycle()
 
-    assert [m for m, _ in h.exec_fake.actions if m == "sub_account_transfer"] == []
-    assert any("NOT funded — execution is halted" in body for body in await h.notices())
+    signed = [m for m, _ in h.exec_fake.actions]
+    assert "rename_sub_account" not in signed  # the gap this fix closed
+    assert "sub_account_transfer" not in signed
+    assert any("NOT renamed — execution is halted" in body for body in await h.notices())
     stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
     assert stored is not None
     assert stored["sub_address"] == held[0] and stored["provisioned_at"] is None

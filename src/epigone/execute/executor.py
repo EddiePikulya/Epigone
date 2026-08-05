@@ -125,6 +125,12 @@ ORDERS_WEIGHT = 20  # frontendOpenOrders, per venue
 MIDS_WEIGHT = 2  # allMids, per venue
 META_WEIGHT = 20  # meta / perpDexs
 SUBS_WEIGHT = 20  # subAccounts — the rate the watchdog bills this listing at
+
+# What the operator is told did not happen, per provisioning leg. Each leg is
+# one signature (`_halted_before_provisioning`), and the sentence names the
+# action rather than the leg because "NOT renamed" is what the chat needs to
+# read — the leg name is for the audit row beside it.
+_HALTED_LEG = {"create": "created", "rename": "renamed", "fund": "funded"}
 FILLS_WEIGHT = 20  # userFills, per endpoint
 
 # Micro-USD is subAccountTransfer's unit (finding 6, measured).
@@ -138,6 +144,18 @@ class SubState:
 
     account_value: Decimal
     positions: dict[str, Position]
+
+
+@dataclass(frozen=True)
+class _Funding:
+    """What one provisioning read learned about a sub's money: what it holds
+    now, and how far that is below the allocation it is targeting. Both,
+    because the transfer needs the gap and the operator's notice needs the
+    balance — and re-reading equity to say the second would bill a second
+    weight for a number already in hand."""
+
+    held: Decimal
+    topup: Decimal
 
 
 @dataclass(frozen=True)
@@ -303,15 +321,27 @@ class CopyExecutor:
                             # which case the next cycle asks again.
                             continue
                         adopted = True
+                        # A SECOND LATE GATE, and the reason it is not
+                        # redundant: the "create" check above is now SECONDS
+                        # to tens of seconds old — between them sit a
+                        # budget-throttled listing read and a position read
+                        # per candidate — and the rename is a signature. The
+                        # adoption itself is KEPT: a row in our own database
+                        # is not something the exchange saw, so the next
+                        # cycle resumes at the funding leg rather than
+                        # adopting a second sub. Only the name is lost, which
+                        # is the cosmetic half by construction.
+                        if await self._halted_before_provisioning(sub, "rename", now):
+                            return
                         renamed = await self._rename_adopted_sub(sub, address)
                     else:
                         await subs_store.record_sub_address(self._pool, sub.id, address)
-                topup = await self._funding_gap(sub, address)
-                if topup > 0:
+                funding = await self._funding_gap(sub, address)
+                if funding.topup > 0:
                     if await self._halted_before_provisioning(sub, "fund", now):
                         return
                     await self._provisioning.sub_account_transfer(
-                        address, is_deposit=True, usd_micro=int(topup * USD_MICRO)
+                        address, is_deposit=True, usd_micro=int(funding.topup * USD_MICRO)
                     )
             except ExecutionError:
                 # The gateway already left its own attempt/outcome rows. The
@@ -349,9 +379,14 @@ class CopyExecutor:
                             else ""
                         )
                         + (
-                            f"topped up ${topup} to a ${sub.allocation_usd} balance"
-                            if topup > 0
-                            else f"already holds its ${sub.allocation_usd} allocation"
+                            f"topped up ${funding.topup} to a ${sub.allocation_usd} balance"
+                            if funding.topup > 0
+                            # The BALANCE, not the allocation: a sub that
+                            # arrived with more than the allocation is not
+                            # "holding its allocation", and an adopted orphan
+                            # is exactly where that happens.
+                            else f"already holds ${funding.held} against its "
+                            f"${sub.allocation_usd} allocation"
                         )
                         + f" · base ${sub.base_notional_usd} · mode {sub.copy_mode}"
                         + (
@@ -560,20 +595,34 @@ class CopyExecutor:
             return False
         return True
 
-    async def _funding_gap(self, sub: CopySub, address: str) -> Decimal:
+    async def _funding_gap(self, sub: CopySub, address: str) -> _Funding:
         """How much this sub is short of its target balance. Zero when it
         already holds the allocation or more (module docstring: an over-funded
-        sub is left alone, never drained back)."""
+        sub is left alone, never drained back).
+
+        The balance comes back beside the gap because the operator's notice
+        needs it: "already holds its allocation" is a lie about an ADOPTED
+        orphan that arrived holding more than the allocation, and the number
+        that tells them what they actually have is one this read already
+        fetched."""
         await self._budget.spend(POSITIONS_WEIGHT)
         held = (await self._read.get_account_state(address)).account_value
-        return max(sub.allocation_usd - held, Decimal(0))
+        return _Funding(held=held, topup=max(sub.allocation_usd - held, Decimal(0)))
 
     async def _halted_before_provisioning(
         self, sub: CopySub, leg: str, now: datetime
     ) -> bool:
-        """The same discipline the order legs have, applied to the two actions
-        that move money rather than place orders. A halt means Epigone acts on
-        nothing — and unlike an IOC, a funding transfer cannot be un-sent."""
+        """The same discipline the order legs have, applied to the actions that
+        move money and mint accounts rather than place orders. A halt means
+        Epigone SIGNS nothing — and unlike an IOC, a funding transfer cannot
+        be un-sent.
+
+        Every leg that reaches the wire carries its OWN check rather than
+        sharing one, because the gaps between them are real time: adoption's
+        listing read and its per-candidate position reads sit between `create`
+        and `rename`, and the equity read sits between `rename` and `fund`. A
+        gate that fired once at the top would be tens of seconds stale by the
+        last signature."""
         if not await is_halted(self._pool):
             return False
         async with self._pool.acquire() as conn, conn.transaction():
@@ -593,7 +642,7 @@ class CopyExecutor:
                 kind=SKIP,
                 body=(
                     f"🛑 Copy sub for {_short(sub.leader_address)} was NOT "
-                    f"{'created' if leg == 'create' else 'funded'} — execution is halted."
+                    f"{_HALTED_LEG[leg]} — execution is halted."
                 ),
                 now=now,
             )

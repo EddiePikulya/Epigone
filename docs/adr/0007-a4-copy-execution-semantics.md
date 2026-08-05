@@ -430,8 +430,14 @@ is cosmetic — nothing in Epigone keys off the exchange-side name — so a
 refusal is reported in the ready notice and the provisioning run carries on.
 Renaming frees no slot; the sub is still permanent.
 
-**What it does not change.** The halt gate is unchanged and covers adoption:
-the path signs a rename and a transfer and hands a live sub to a Leader, so it
-sits behind the same late re-check minting one does. One sub per pass still
+**What it does not change.** The late halt re-check still guards every
+signature — and adoption ADDS one, because it adds a signature. Provisioning
+now gates three legs (`create`, `rename`, `fund`) rather than two, since the
+listing read and the per-candidate position reads put seconds to tens of
+seconds between the create check and the rename; a `/kill` landing in that
+window must not get a `subAccountModify`. A halt there skips the rename and
+KEEPS the adoption — a row in Epigone's own database is not something the
+exchange saw, so the next cycle resumes at the funding leg instead of taking
+over a second sub, and only the cosmetic name is lost. One sub per pass still
 holds. And the cap is still a cap — adoption re-uses slots, it does not create
 them, so ten remains the ceiling on concurrent Leaders (decision 1).
