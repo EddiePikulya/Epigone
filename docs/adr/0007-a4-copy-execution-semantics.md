@@ -54,6 +54,12 @@ its own clearinghouseState/PnL, so per-Leader copy stats are exchange-native.
 
 ### 2. Sizing: fixed Base Notional per sub, relative mirroring
 
+> **SUPERSEDED by amendment D-4 (2026-08-05, issue #137)** — Base Notional
+> becomes Base Stake and the Leader's leverage becomes a sizing input. The
+> text below is left standing so the reasoning that produced it stays
+> readable, and D-4 says which half of it survived.
+
+
 Option (a) of the grill: each Copy Sub-account has a Base Notional (e.g. $200).
 A Leader's open is copied at Base Notional regardless of the Leader's absolute
 size — the Leader's size NEVER determines copy size; only relative changes do.
@@ -441,3 +447,138 @@ exchange saw, so the next cycle resumes at the funding leg instead of taking
 over a second sub, and only the cosmetic name is lost. One sub per pass still
 holds. And the cap is still a cap — adoption re-uses slots, it does not create
 them, so ten remains the ceiling on concurrent Leaders (decision 1).
+
+### D-4 (2026-08-05, issue #137). Sizing is BASE STAKE × MIRRORED LEVERAGE —
+### supersedes decision 2's fixed Base Notional
+
+**Decision.** The dollars configured per Copy Sub-account are the Operator's
+**margin**, isolated per position, not the position's size. A copied open's
+position is **Base Stake × the mirrored leverage**, where the mirrored leverage
+is `min(the sub's mode answers, the operator's backstop, the asset's own
+maximum)`. The sub's mode is `mirror` (the Leader's own leverage on that
+position) or `fixed N`. Backstop default 20x. Relative mirroring of scale
+events is unchanged: a 50% scale-in still scales the copy by 50% of what we
+actually hold.
+
+**Why the operator reopened decision 2.** Fixed Base Notional dissolved the
+"5% of their account vs 40% of ours" conflict by refusing to let the Leader
+influence size at all — and in doing so it threw away the one thing about a
+Leader's position that is genuinely information rather than an artifact of
+their bankroll. A Leader's SIZE says how rich they are; their LEVERAGE says how
+convinced they are. Base Notional copied a 20x conviction trade and a 2x parking
+position at the same $200, which is not mirroring a strategy, it is mirroring a
+ticker. Base Stake keeps the property that made fixed sizing right — the money
+at risk is the Operator's own constant, decided by the Operator — and lets the
+Leader's conviction scale the exposure on top of it.
+
+**Isolated margin is what makes the sentence true.** "The stake is the worst
+case" is a claim about a mechanism, not a wish: under cross margin a losing
+position reaches the whole sub's balance. So the executor sets
+`updateLeverage(isolated)` per (sub, coin) before the first order of an
+episode. That is a SIGNING action and takes the full discipline every other
+signature takes — the audit wrapper, and a late halt re-check immediately
+before the wire. It is set on EVERY open rather than cached: leverage is
+exchange-side state that `/copy`, the operator's own UI, and an adopted sub can
+all change, and a cache of what we last set would be wrong exactly when it
+matters. A refusal ENDS the entry, because a position opened at whatever
+leverage the account happened to carry is not the position the policy judged.
+
+**The cap is not optional.** Notional, liquidation distance, funding cost and
+fee drag all scale with stake × leverage, so an uncapped mirror hands the
+Leader a dial that multiplies the Operator's exposure without touching the
+Operator's configuration. The backstop is the operator's; the asset maximum is
+the venue's; the lower wins. A `mirror` open whose event carries no Leader
+leverage is SKIPPED, not defaulted — 1x would silently shrink the copy tenfold
+and the backstop would silently maximise it, and neither is a decision anyone
+made.
+
+**What it does not change.** Decision 7's liveness floor still gates entries on
+Leader equity, and still is not a sizing input — the Leader now contributes
+leverage to sizing, never equity. Decision 5's fill asymmetry, decision 3's
+flip pipeline, decision 10's self-damping (relative operations against the size
+the exchange reports) and decision 4's IOC-only rule are untouched. The
+per-position exposure ceiling is still exchange-enforced: a stake the sub's
+margin cannot absorb simply rejects.
+
+**Consequences, all binding:**
+
+- **`copy_subs.base_notional_usd` is RENAMED to `base_stake_usd`** (migration
+  0036), not added beside its predecessor. The two cannot coexist honestly: a
+  row carrying both is a row where nothing says which number sized the last
+  order, and a silently reinterpreted $200 is a 20× larger position.
+- **`/copy` grows a leverage argument** — `/copy <leader> <allocation> <stake>
+  <leverage> <mode> [tp% sl%]` — and its prompt states the stake as margin and
+  spells out the position it buys.
+- **Fractional leverage rounds DOWN**, the same conservative direction every
+  size rounds. `updateLeverage` takes an integer on the wire, so `/copy` and
+  `/limits` both refuse a fractional one rather than truncating it silently.
+- **The episode records the leverage it opened at** (`copy_episodes.leverage`),
+  as bookkeeping — the exchange's own figure on the live position remains the
+  authority, exactly as it does for `size_coin`.
+
+### D-5 (2026-08-05, issue #137). Per-order risk is a POLICY MODULE with
+### operator-tunable global limits — the A5 half of decision 2's "no aggregate
+### cap needed in v0"
+
+**Decision.** Four gates, judged before signing, each recorded verbatim in
+`execution_audit.risk_decision`:
+
+1. **Liquidity Floor** — a coin is copyable iff its live market clears 24h
+   notional volume ≥ $100k AND open-interest notional ≥ $100k (defaults;
+   operator-tunable down to 0 = off). Deliberately NOT a curated allowlist:
+   which coins to trade is the Leader's decision, and Epigone's only veto is
+   market health. Judged ONCE per Copy Episode, at the open that starts it.
+2. **Stake caps** — max stake per coin per sub and max aggregate stake per sub,
+   in MARGIN dollars, measured against what the EXCHANGE says is committed. An
+   order over a cap is CLAMPED to the headroom left and audited
+   `allowed-clamped` with both figures; a clamp whose position falls under the
+   venue's $10 minimum order value becomes a denial.
+3. **Mirrored leverage**, per D-4.
+4. **Exits are unconditionally exempt from all of it.** Only the halt outranks
+   an exit. Denial prose says "did not enter", never "did not exit".
+
+**Why the floor speaks once, at the open.** A live episode must never be
+INTERRUPTED by it (a scale-in on a coin that has since gone thin still copies —
+refusing leaves us half-mirrored on a thesis still running) and never TRAPPED
+by it (an exit always signs — a copy stuck in a thin market is precisely the
+position we most need out of). A flip ENDS the episode, so a flip's opening leg
+is a fresh entry and the floor speaks again: a sub-floor coin makes the copy go
+flat and sit out, which is the correct answer rather than an edge case.
+
+**Where the numbers live, and why it is split.** Per-sub knobs (Base Stake,
+leverage mode) are properties of one Leader's mapping, so they sit on
+`copy_subs` and are set with `/copy`. The global knobs — floor volume, floor
+OI, per-coin stake cap, per-sub aggregate stake cap, backstop leverage — are
+Epigone's own stance, so they are ONE `risk_limits` row set with `/limits`,
+re-read by the executor every cycle (no restart), with every change audited old
+→ new. A limit that needs a redeploy is a limit nobody changes during the
+incident that needed it.
+
+**Stated naive choice, recorded as the known gap.** The stake caps are
+per-sub and have NO cross-sub coordination. Two Leaders in two subs holding the
+same BTC short look independent to this policy and are not — the 2026-07-29
+wallet research found exactly that shape among shortlisted wallets. A
+correlation-aware aggregate is the version that would bound true exposure; v0
+ships the naive form because each sub's allocation is separately funded and
+exchange-enforced, which bounds the error at one operator's scale. Recorded in
+migration 0036 beside the columns.
+
+**Also recorded, not built:** `l2Book` depth checking (the floor reads volume
+and open interest, not the book itself), and the rule that **the floor defaults
+must be revisited whenever the stake caps are raised** — a $100k floor bounds
+slippage for a $4,000 position and does not for a $40,000 one.
+
+**Deferred with its enabler shipped:** the daily-loss pause. Small stakes plus
+operator alerting cover the interim; what ships now is per-cycle **sub-equity
+history** (`copy_sub_equity`), recorded from the equity the reconcile already
+reads and used to discard — because the honest way to pick a daily-loss
+threshold is to look at what a sub's equity actually does across a day of
+copying.
+
+**The live gate is now a flag, not an absence.** `EXECUTOR_ALLOW_MAINNET`
+wires the capability `HttpExecutionGateway` has always demanded. Mainnet takes
+TWO deliberate acts — the flag AND the mainnet URL — plus a funded account, and
+the default is neither. The WATCHDOG opens on the same variable by name: it is
+the executor's dead-man's switch and `/kill`'s only sweeping hand, so a live
+executor beside a testnet-refused watchdog must not be reachable by setting one
+variable.

@@ -170,6 +170,10 @@ async def main() -> None:
                 signer=signer,
                 master_address=master_address,
                 exchange_url=config.exchange_url,
+                # The executor's own flag (issue #137, safety.config's module
+                # docstring): the sweep must reach whatever book the executor
+                # can trade on.
+                allow_mainnet=config.allow_mainnet,
             ),
             audit,
             master_address=master_address,

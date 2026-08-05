@@ -27,6 +27,8 @@ from decimal import Decimal
 
 import asyncpg
 
+from epigone.execute.policy import LEVERAGE_MODES
+
 DEFAULT_MODE = "default"
 BRACKET_MODE = "bracket"
 COPY_MODES = (DEFAULT_MODE, BRACKET_MODE)
@@ -42,7 +44,14 @@ class CopySub:
     sub_name: str
     sub_address: str | None
     allocation_usd: Decimal
-    base_notional_usd: Decimal
+    # The Operator's own MARGIN behind each copied open, isolated per position
+    # (ADR-0007 amendment D-4). The position it buys is this times the mirrored
+    # leverage; this figure alone is the worst case.
+    base_stake_usd: Decimal
+    # 'mirror' (the Leader's own leverage on the position) or 'fixed'. Either
+    # is an ASK — the global backstop and the asset's own maximum still cap it.
+    leverage_mode: str
+    fixed_leverage: int | None
     copy_mode: str
     take_profit_pct: Decimal | None
     stop_loss_pct: Decimal | None
@@ -67,6 +76,15 @@ class CopySub:
     def brackets(self) -> bool:
         return self.copy_mode == BRACKET_MODE
 
+    @property
+    def leverage_summary(self) -> str:
+        """How this sub picks its leverage, as one phrase for a chat message."""
+        return (
+            f"fixed {self.fixed_leverage}x"
+            if self.fixed_leverage is not None
+            else "mirroring the leader"
+        )
+
     def require_address(self) -> str:
         """The sub's address, for the paths that only run once provisioned.
         An assertion rather than a None-check at every call site: reaching the
@@ -90,7 +108,9 @@ async def register_sub(
     leader_address: str,
     sub_name: str,
     allocation_usd: Decimal,
-    base_notional_usd: Decimal,
+    base_stake_usd: Decimal,
+    leverage_mode: str,
+    fixed_leverage: int | None,
     copy_mode: str,
     take_profit_pct: Decimal | None,
     stop_loss_pct: Decimal | None,
@@ -101,20 +121,25 @@ async def register_sub(
     which has no key to create one with (module docstring)."""
     if copy_mode not in COPY_MODES:
         raise ValueError(f"copy_mode must be one of {COPY_MODES}, got {copy_mode!r}")
+    if leverage_mode not in LEVERAGE_MODES:
+        raise ValueError(f"leverage_mode must be one of {LEVERAGE_MODES}, got {leverage_mode!r}")
     try:
         row = await conn.fetchrow(
             """
             INSERT INTO copy_subs
-                (operator_id, leader_address, sub_name, allocation_usd, base_notional_usd,
+                (operator_id, leader_address, sub_name, allocation_usd, base_stake_usd,
+                 leverage_mode, fixed_leverage,
                  copy_mode, take_profit_pct, stop_loss_pct, enabled, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TRUE, $9)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11)
             RETURNING *
             """,
             operator_id,
             leader_address.lower(),
             sub_name,
             allocation_usd,
-            base_notional_usd,
+            base_stake_usd,
+            leverage_mode,
+            fixed_leverage,
             copy_mode,
             take_profit_pct,
             stop_loss_pct,
@@ -134,7 +159,9 @@ async def reenable_sub(
     operator_id: int,
     leader_address: str,
     allocation_usd: Decimal,
-    base_notional_usd: Decimal,
+    base_stake_usd: Decimal,
+    leverage_mode: str,
+    fixed_leverage: int | None,
     copy_mode: str,
     take_profit_pct: Decimal | None,
     stop_loss_pct: Decimal | None,
@@ -156,17 +183,21 @@ async def reenable_sub(
         SET enabled = TRUE,
             provisioned_at = NULL,
             allocation_usd = $3,
-            base_notional_usd = $4,
-            copy_mode = $5,
-            take_profit_pct = $6,
-            stop_loss_pct = $7
+            base_stake_usd = $4,
+            leverage_mode = $5,
+            fixed_leverage = $6,
+            copy_mode = $7,
+            take_profit_pct = $8,
+            stop_loss_pct = $9
         WHERE operator_id = $1 AND leader_address = $2
         RETURNING *
         """,
         operator_id,
         leader_address.lower(),
         allocation_usd,
-        base_notional_usd,
+        base_stake_usd,
+        leverage_mode,
+        fixed_leverage,
         copy_mode,
         take_profit_pct,
         stop_loss_pct,
@@ -268,6 +299,35 @@ async def mark_funded(
     )
 
 
+async def record_sub_equity(
+    conn: asyncpg.Pool | asyncpg.Connection, sub_id: int, account_value: Decimal, now: datetime
+) -> None:
+    """Write down what this sub was worth on this pass (issue #137 §6).
+
+    HISTORY, not a latest-value row, which is the whole difference from
+    `trader_equity` (0032): that table answers "what is this wallet worth now"
+    and nothing needed more; this one exists to be a CURVE. The daily-loss
+    pause is deferred precisely because nobody knows what threshold to set,
+    and the only honest way to pick one is to look at what a sub's equity
+    actually does across a day of copying.
+
+    The equity is already in hand — the reconcile reads each sub's
+    clearinghouseState every cycle and drops the account value — so this costs
+    no request and no exchange weight. It is written outside the reconcile's
+    per-episode work on purpose: a sub with no live episodes still has a
+    curve, and a sub whose episode reconcile failed still had a readable
+    equity."""
+    await conn.execute(
+        """
+        INSERT INTO copy_sub_equity (sub_id, account_value, observed_at)
+        VALUES ($1, $2, $3)
+        """,
+        sub_id,
+        account_value,
+        now,
+    )
+
+
 def _sub(row: asyncpg.Record) -> CopySub:
     return CopySub(
         id=row["id"],
@@ -276,7 +336,9 @@ def _sub(row: asyncpg.Record) -> CopySub:
         sub_name=row["sub_name"],
         sub_address=row["sub_address"],
         allocation_usd=row["allocation_usd"],
-        base_notional_usd=row["base_notional_usd"],
+        base_stake_usd=row["base_stake_usd"],
+        leverage_mode=row["leverage_mode"],
+        fixed_leverage=row["fixed_leverage"],
         copy_mode=row["copy_mode"],
         take_profit_pct=row["take_profit_pct"],
         stop_loss_pct=row["stop_loss_pct"],

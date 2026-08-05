@@ -124,6 +124,34 @@ def parse_positive_int(raw: str | None, *, default: int, name: str) -> int:
     return value
 
 
+# What EXECUTOR_ALLOW_MAINNET must say to open the live gate (issue #137). An
+# explicit vocabulary rather than "anything truthy": a stray value should read
+# as a misconfiguration and stay testnet, and `EXECUTOR_ALLOW_MAINNET=0` must
+# never be the thing that enabled real money.
+MAINNET_WORDS = frozenset({"1", "true", "yes", "on"})
+
+
+def parse_allow_mainnet(raw: str | None) -> bool:
+    """Whether this process may construct a MAINNET execution gateway.
+
+    Lives here, in the shared config module, because two processes ask the
+    same question of the same variable: the executor, which trades, and the
+    watchdog, which must be able to sweep whatever the executor can trade on.
+    One parser means the two can never disagree about what the operator wrote
+    (epigone.safety.config's module docstring records why they must not)."""
+    if raw is None:
+        return False
+    if raw.strip().lower() in MAINNET_WORDS:
+        return True
+    if raw.strip():
+        log.warning(
+            "EXECUTOR_ALLOW_MAINNET=%r is not one of %s — mainnet stays refused",
+            raw,
+            sorted(MAINNET_WORDS),
+        )
+    return False
+
+
 def _parse_seed_interval_minutes(raw: str | None) -> int:
     return parse_positive_int(
         raw, default=DEFAULT_SEED_INTERVAL_MINUTES, name="SEED_INTERVAL_MINUTES"

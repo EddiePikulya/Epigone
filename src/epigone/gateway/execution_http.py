@@ -227,14 +227,21 @@ class HttpExecutionGateway:
         data = await self._submit(action, batch_len=len(modifies))
         return parse_order_statuses(data, expected=len(modifies))
 
-    async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
+    async def update_leverage(
+        self,
+        asset: int,
+        leverage: int,
+        *,
+        is_cross: bool = True,
+        vault_address: str | None = None,
+    ) -> None:
         action = {
             "type": "updateLeverage",
             "asset": asset,
             "isCross": is_cross,
             "leverage": leverage,
         }
-        await self._submit(action, batch_len=1)
+        await self._submit(action, batch_len=1, vault_address=vault_address)
 
     async def schedule_cancel(self, at: datetime | None) -> None:
         action: dict[str, Any] = {"type": "scheduleCancel"}

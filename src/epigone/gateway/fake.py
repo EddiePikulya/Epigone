@@ -6,6 +6,7 @@ from epigone.gateway import (
     ExtraAgent,
     Fill,
     LeaderboardEntry,
+    MarketStats,
     OpenOrder,
     PerpAsset,
     Position,
@@ -16,6 +17,16 @@ from epigone.gateway import (
 # but it is a fiction, so any test whose subject is rounding sets
 # `sz_decimals` explicitly rather than leaning on it.
 DEFAULT_FAKE_SZ_DECIMALS = 3
+
+# What an unconfigured coin's market health answers (issue #137): a market
+# comfortably clear of any sane Liquidity Floor, and the venue's real BTC
+# leverage ceiling. Same convention and the same warning as the precision
+# default above — it exists so a test about copying does not have to describe
+# a market, and any test whose subject IS the floor or the leverage cap
+# configures `market_stats` explicitly.
+DEFAULT_FAKE_DAY_VOLUME = Decimal("50000000")
+DEFAULT_FAKE_OPEN_INTEREST = Decimal("1000000")
+DEFAULT_FAKE_MAX_LEVERAGE = 40
 
 
 class FakeHyperliquidGateway:
@@ -67,6 +78,15 @@ class FakeHyperliquidGateway:
         # priced against. Account equity rides `account_values` above.
         self.mid_prices: dict[str | None, dict[str, Decimal]] = {}
         self.mid_price_errors: dict[str | None, Exception] = {}
+        # Per-coin market health (metaAndAssetCtxs, issue #137) — what the
+        # Liquidity Floor is judged against. Keyed by namespaced coin like
+        # `sz_decimals` is, and for the same reason: the fake must not be able
+        # to say a coin exists for ordering and not for judging. Unset coins
+        # answer the healthy default above; `market_stats_errors` fails one
+        # venue's read the way `mid_price_errors` fails one venue's prices.
+        self.market_stats: dict[str, MarketStats] = {}
+        self.market_stats_errors: dict[str | None, Exception] = {}
+        self.market_stats_calls: list[str | None] = []
         # Sub-accounts per master (the subAccounts readback, issue #136):
         # what the watchdog's per-sub sweep enumerates, and the one source
         # of that list the cold-start blind path can reach.
@@ -129,6 +149,26 @@ class FakeHyperliquidGateway:
             PerpAsset(name=coin, sz_decimals=self.sz_decimals.get(coin, DEFAULT_FAKE_SZ_DECIMALS))
             for coin in self.perp_universes.get(dex, [])
         ]
+
+    async def get_market_stats(self, dex: str | None = None) -> dict[str, MarketStats]:
+        self.market_stats_calls.append(dex)
+        error = self.market_stats_errors.get(dex)
+        if error is not None:
+            raise error
+        mids = self.mid_prices.get(dex, {})
+        return {
+            coin: self.market_stats.get(
+                coin,
+                MarketStats(
+                    coin=coin,
+                    day_notional_volume=DEFAULT_FAKE_DAY_VOLUME,
+                    open_interest=DEFAULT_FAKE_OPEN_INTEREST,
+                    mark_price=mids.get(coin, Decimal(1)),
+                    max_leverage=DEFAULT_FAKE_MAX_LEVERAGE,
+                ),
+            )
+            for coin in self.perp_universes.get(dex, [])
+        }
 
     async def get_mid_prices(self, dex: str | None = None) -> dict[str, Decimal]:
         error = self.mid_price_errors.get(dex)

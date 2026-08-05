@@ -42,6 +42,7 @@ from epigone.gateway import (
     GatewayError,
     LeaderboardEntry,
     LeaderboardWindow,
+    MarketStats,
     OpenOrder,
     PerpAsset,
     Position,
@@ -188,6 +189,16 @@ class HttpHyperliquidGateway:
         except (TimeoutError, aiohttp.ClientError) as exc:
             raise GatewayError(f"meta request failed for dex {dex!r}: {exc}") from exc
         return parse_perp_assets(payload, dex)
+
+    async def get_market_stats(self, dex: str | None = None) -> dict[str, MarketStats]:
+        body: dict[str, str] = {"type": "metaAndAssetCtxs"}
+        if dex is not None:
+            body["dex"] = dex
+        try:
+            payload = await self._request_json("POST", self._info_url, json_body=body)
+        except (TimeoutError, aiohttp.ClientError) as exc:
+            raise GatewayError(f"metaAndAssetCtxs request failed for dex {dex!r}: {exc}") from exc
+        return parse_market_stats(payload, dex)
 
     async def get_mid_prices(self, dex: str | None = None) -> dict[str, Decimal]:
         body: dict[str, str] = {"type": "allMids"}
@@ -410,6 +421,48 @@ def parse_perp_assets(payload: Any, dex: str | None = None) -> list[PerpAsset]:
         ]
     except (KeyError, TypeError, ValueError) as exc:
         raise GatewayError(f"unexpected meta payload shape: {exc!r}") from exc
+
+
+def parse_market_stats(payload: Any, dex: str | None = None) -> dict[str, MarketStats]:
+    """A metaAndAssetCtxs payload as coin → MarketStats (issue #137).
+
+    The response is a two-element array: the same `meta` object `get_perp_assets
+    reads, then the per-asset contexts POSITIONALLY aligned with its universe.
+    That alignment is the whole parse, so a length mismatch fails loudly rather
+    than zipping short — judging one market against another market's volume is
+    a worse answer than no answer, and the caller's "cannot judge" path already
+    knows what to do with a raise.
+
+    A missing or non-numeric field fails the WHOLE parse for the same reason
+    parse_mid_prices does: half a health map reads as "these coins are thin",
+    which is exactly the wrong conclusion to draw from a shape change."""
+    try:
+        meta, contexts = payload
+        universe = meta["universe"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GatewayError(f"unexpected metaAndAssetCtxs payload shape: {exc!r}") from exc
+    if not isinstance(contexts, list) or len(universe) != len(contexts):
+        raise GatewayError(
+            f"metaAndAssetCtxs universe/contexts length mismatch for dex {dex!r}: "
+            f"{len(universe)} assets, {len(contexts) if isinstance(contexts, list) else '?'} ctxs"
+        )
+    try:
+        stats: dict[str, MarketStats] = {}
+        for asset, context in zip(universe, contexts, strict=True):
+            coin = _namespaced_coin(str(asset["name"]), dex)
+            stats[coin] = MarketStats(
+                coin=coin,
+                day_notional_volume=Decimal(str(context["dayNtlVlm"])),
+                open_interest=Decimal(str(context["openInterest"])),
+                # `markPx` is the venue's own mark — the price open interest is
+                # valued at here, deliberately not the mid the executor prices
+                # ORDERS against: this is a health figure, not an order price.
+                mark_price=Decimal(str(context["markPx"])),
+                max_leverage=int(asset["maxLeverage"]),
+            )
+        return stats
+    except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+        raise GatewayError(f"unexpected metaAndAssetCtxs payload shape: {exc!r}") from exc
 
 
 def parse_mid_prices(payload: Any, dex: str | None = None) -> dict[str, Decimal]:

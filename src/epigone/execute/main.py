@@ -27,9 +27,12 @@ Wiring notes, each load-bearing:
   decision 12's second gate).
 - A broken cycle is logged and retried; only the loop dying is fatal, and the
   #52 monitor sees that as a stale executor heartbeat within a minute.
-- Mainnet is refused by construction in HttpExecutionGateway (the A5 gate);
-  this process never passes allow_mainnet, so the ticket's live gate holds
-  without a runtime check anywhere.
+- Mainnet is refused by construction in HttpExecutionGateway unless this
+  process passes the capability, and `EXECUTOR_ALLOW_MAINNET` is the only
+  thing that makes it do so (issue #137's live wiring). Default off; the
+  mainnet URL alone is still refused. The start-up audit row records which
+  network this process came up on, so the trail answers "when did it go live"
+  without anyone having to remember.
 """
 
 import asyncio
@@ -45,7 +48,7 @@ from epigone.config import Settings
 from epigone.db import create_pool, migrate
 from epigone.execute.config import ExecutorConfig
 from epigone.execute.executor import CopyExecutor
-from epigone.execute.policy import RiskPolicyV0
+from epigone.execute.policy import RiskPolicy
 from epigone.gateway.execution_http import HttpExecutionGateway
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.keystore import EXECUTOR_LANE, AgentKeystore, KeystoreError, load_kek
@@ -118,6 +121,7 @@ async def main() -> None:
             signer=signer,
             master_address=master_address,
             exchange_url=config.exchange_url,
+            allow_mainnet=config.allow_mainnet,
         )
         exec_gateway = AuditedExecutionGateway(
             http_exec,
@@ -141,7 +145,7 @@ async def main() -> None:
             provisioning,
             audit,
             budget,
-            RiskPolicyV0(),
+            RiskPolicy(),
             operator_id=operator_id,
             master_address=master_address,
             signer_address=signer.address,
@@ -155,15 +159,17 @@ async def main() -> None:
                 "exchange_url": config.exchange_url,
                 "interval_seconds": int(config.interval.total_seconds()),
                 "operator_id": operator_id,
-                "risk_policy": "v0 hardcoded (A5/#137 replaces it)",
+                "risk_policy": "A5 (#137): liquidity floor, stake caps, mirrored leverage",
+                "network": "MAINNET" if config.is_mainnet else "testnet",
             },
             master_address=master_address,
         )
         log.info(
-            "copy executor: trading %s every %ss (%s)",
+            "copy executor: trading %s every %ss (%s, %s)",
             master_address,
             int(config.interval.total_seconds()),
             config.exchange_url,
+            "MAINNET — REAL MONEY" if config.is_mainnet else "testnet",
         )
         await executor_loop(executor, clock, config.interval.total_seconds())
 

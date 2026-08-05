@@ -3,12 +3,15 @@
 Three separate jobs, all pure functions so the executor's tests can pin the
 arithmetic without a database or a wire.
 
-**Sizing (decision 2).** A copied OPEN is Base Notional at the current mark,
-in coin units — the Leader's absolute size never enters it. A scale is
-RELATIVE: a 50% scale-in grows the copy 50%, a 30% trim sells 30% — and,
-crucially, of what we ACTUALLY HOLD (decision 10's self-damping principle),
-never of a bookkept expectation. The Leader's own event supplies only the
-FRACTION, computed from their before/after sizes.
+**Sizing (decision 2, as amended by D-4).** A copied OPEN is Base Stake times
+the mirrored leverage, at the current mark, in coin units — the Leader's
+absolute size still never enters it, only their leverage does. The configured
+dollars are MARGIN, isolated per position, so they are the worst case; the
+POSITION is that margin levered up. A scale is RELATIVE: a 50% scale-in grows
+the copy 50%, a 30% trim sells 30% — and, crucially, of what we ACTUALLY HOLD
+(decision 10's self-damping principle), never of a bookkept expectation. The
+Leader's own event supplies only the FRACTION, computed from their
+before/after sizes.
 
 **Precision.** Hyperliquid refuses a size with more decimals than the asset's
 `szDecimals`, and a perp price with more than 5 significant figures or more
@@ -64,15 +67,38 @@ def round_size(size_coin: Decimal, sz_decimals: int) -> Decimal:
     return rounded
 
 
-def open_size(notional_usd: Decimal, mark: Decimal, sz_decimals: int) -> Decimal:
-    """Base Notional at the mark, in coin units (decision 2). The Leader's own
-    size is not an input — that is the whole point of fixed sizing: the
-    5%-of-their-account vs 40%-of-ours conflict dissolves by construction, and
-    the model is robust to the stale leader-equity data that made 38% of
-    screened wallets look alive after they had emptied out."""
+def open_position_notional(stake_usd: Decimal, leverage: Decimal) -> Decimal:
+    """The dollar POSITION a stake buys at a leverage (amendment D-4).
+
+    One line, and it is its own function because it is the whole amendment:
+    the configured dollars used to BE the position and are now the margin
+    behind it. Every reader that needs "how big is this order in dollars" —
+    the exchange-minimum check, the operator's notice, the clamp arithmetic —
+    goes through here, so the two numbers can never be confused in one place
+    and not another."""
+    if stake_usd <= 0:
+        raise UnpriceableError(f"stake {stake_usd} is not positive")
+    if leverage <= 0:
+        raise UnpriceableError(f"leverage {leverage} is not positive")
+    return stake_usd * leverage
+
+
+def open_size(
+    stake_usd: Decimal, leverage: Decimal, mark: Decimal, sz_decimals: int
+) -> Decimal:
+    """Base Stake × mirrored leverage at the mark, in coin units (decision 2
+    as amended by D-4).
+
+    The Leader's absolute size is still not an input — that is the whole point
+    of fixed sizing: the 5%-of-their-account vs 40%-of-ours conflict dissolves
+    by construction, and the model is robust to the stale leader-equity data
+    that made 38% of screened wallets look alive after they had emptied out.
+    What the Leader now DOES supply is their conviction, as leverage: a $100
+    stake behind a 10x Leader is a $1,000 position, and the $100 is still the
+    most that position can lose, because its margin is isolated."""
     if mark <= 0:
         raise UnpriceableError(f"mark price {mark} is not positive")
-    return round_size(notional_usd / mark, sz_decimals)
+    return round_size(open_position_notional(stake_usd, leverage) / mark, sz_decimals)
 
 
 def scale_fraction(prev_size: Decimal | None, new_size: Decimal | None) -> Decimal:

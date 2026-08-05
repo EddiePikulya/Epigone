@@ -33,6 +33,7 @@ ADMIN_COMMANDS = [
     BotCommand(command="copy", description="Mirror a leader into a funded sub-account"),
     BotCommand(command="uncopy", description="Stop copying a leader (never flattens)"),
     BotCommand(command="copies", description="List your copy mappings"),
+    BotCommand(command="limits", description="Show or set the global risk limits"),
 ]
 
 

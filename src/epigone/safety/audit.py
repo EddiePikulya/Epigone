@@ -331,12 +331,29 @@ class AuditedExecutionGateway:
             _order_results_json,
         )
 
-    async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
-        request = {"asset": asset, "leverage": leverage, "is_cross": is_cross}
+    async def update_leverage(
+        self,
+        asset: int,
+        leverage: int,
+        *,
+        is_cross: bool = True,
+        vault_address: str | None = None,
+    ) -> None:
+        # `vault_address` rides the request payload for the same reason
+        # place_orders' does: it says which BOOK the action landed on, while
+        # master_address stays the account whose agent signed.
+        request = {
+            "asset": asset,
+            "leverage": leverage,
+            "is_cross": is_cross,
+            "vault_address": _lower(vault_address),
+        }
         await self._audited(
             "updateLeverage",
             request,
-            lambda: self._inner.update_leverage(asset, leverage, is_cross=is_cross),
+            lambda: self._inner.update_leverage(
+                asset, leverage, is_cross=is_cross, vault_address=vault_address
+            ),
             lambda _: None,
         )
 
