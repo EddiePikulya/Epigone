@@ -185,7 +185,7 @@ async def load(conn: asyncpg.Pool | asyncpg.Connection) -> RiskLimits:
 
 
 async def set_knob(
-    conn: asyncpg.Pool | asyncpg.Connection,
+    conn: asyncpg.Connection,
     *,
     name: str,
     raw: str,
@@ -195,12 +195,23 @@ async def set_knob(
     """Move one knob, returning (before, after) so the caller can audit the
     change as old -> new.
 
-    UPSERT rather than UPDATE: the singleton row is seeded by the migration,
-    but a policy whose row went missing must be repairable from the command
-    that configures it rather than from psql. The column name is interpolated
-    from the KNOB REGISTRY, never from the operator's text — `knob()` raises on
-    anything not in it, so no caller can reach this with an arbitrary
-    identifier."""
+    TAKES A CONNECTION, NEVER A POOL, for the reason `position_events`'
+    producers do: the caller writes the audit row in the same transaction as
+    this write, so a limit can never move without the trail that says who moved
+    it — nor a trail claim a change that rolled back.
+
+    ONE COLUMN IS WRITTEN, not five. The UPDATE names only the knob that
+    moved, so this is not a read-modify-write of the whole row: `before` is
+    read for the trail's old value, and nothing else in the row is re-stated on
+    the way past. The column name is interpolated from the KNOB REGISTRY, never
+    from the operator's text — `knob()` raises on anything not in it, so no
+    caller can reach this with an arbitrary identifier.
+
+    The INSERT is the fallback for a row that went missing, so a policy in that
+    state is repairable from the command that configures it rather than from
+    psql. It states the whole record because there is no record to merge into,
+    and the values it states are the DEFAULTS with this knob applied — never a
+    guess."""
     entry = knob(name)
     value = entry.parse(raw)
     before = await load(conn)
@@ -210,25 +221,33 @@ async def set_knob(
     # entry, not by the call site — `Knob.parse` is the one place that knows.
     changed: dict[str, Any] = {entry.column: value}
     after = replace(before, updated_at=now, updated_by=operator_id, **changed)
-    await conn.execute(
+    updated = await conn.fetchval(
         f"""
-        INSERT INTO risk_limits
-            (id, floor_day_notional_usd, floor_open_interest_usd, max_coin_stake_usd,
-             max_sub_stake_usd, backstop_leverage, updated_at, updated_by)
-        VALUES (1, $1, $2, $3, $4, $5, $6, $7)
-        ON CONFLICT (id) DO UPDATE
-            SET {entry.column} = EXCLUDED.{entry.column},
-                updated_at = EXCLUDED.updated_at,
-                updated_by = EXCLUDED.updated_by
+        UPDATE risk_limits
+        SET {entry.column} = $1, updated_at = $2, updated_by = $3
+        WHERE id = 1
+        RETURNING id
         """,
-        after.floor_day_notional_usd,
-        after.floor_open_interest_usd,
-        after.max_coin_stake_usd,
-        after.max_sub_stake_usd,
-        after.backstop_leverage,
+        value,
         now,
         operator_id,
     )
+    if updated is None:
+        await conn.execute(
+            """
+            INSERT INTO risk_limits
+                (id, floor_day_notional_usd, floor_open_interest_usd, max_coin_stake_usd,
+                 max_sub_stake_usd, backstop_leverage, updated_at, updated_by)
+            VALUES (1, $1, $2, $3, $4, $5, $6, $7)
+            """,
+            after.floor_day_notional_usd,
+            after.floor_open_interest_usd,
+            after.max_coin_stake_usd,
+            after.max_sub_stake_usd,
+            after.backstop_leverage,
+            now,
+            operator_id,
+        )
     return before, after
 
 

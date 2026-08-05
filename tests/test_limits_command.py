@@ -79,6 +79,42 @@ async def test_setting_a_knob_reports_old_to_new_and_audits_it(
     assert row["actor"] == "operator"
 
 
+async def test_a_rejected_value_leaves_neither_the_row_nor_the_trail_touched(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+) -> None:
+    """The change and its audit row commit together, so the two can never
+    disagree about whether a limit moved."""
+    await feed_text(admin_dp, bot, "/limits max_leverage 7.5", user_id=ADMIN)
+
+    assert (await risk_limits.load(pool)).backstop_leverage == 20
+    assert await pool.fetchval(
+        "SELECT count(*) FROM execution_audit WHERE action = 'risk_limit_changed'"
+    ) == 0
+
+
+async def test_setting_one_knob_leaves_the_others_exactly_as_they_were(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+) -> None:
+    """One knob per command means one COLUMN per command: the write names the
+    knob that moved and re-states nothing else, so it cannot carry a stale copy
+    of a value someone changed in between."""
+    await feed_text(admin_dp, bot, "/limits floor_oi 250000", user_id=ADMIN)
+    await feed_text(admin_dp, bot, "/limits coin_stake 275", user_id=ADMIN)
+
+    limits = await risk_limits.load(pool)
+    assert limits.floor_open_interest_usd == Decimal("250000")
+    assert limits.max_coin_stake_usd == Decimal("275")
+    assert limits.floor_day_notional_usd == risk_limits.DEFAULT_FLOOR_DAY_NOTIONAL_USD
+    assert limits.max_sub_stake_usd == risk_limits.DEFAULT_MAX_SUB_STAKE_USD
+    assert limits.backstop_leverage == risk_limits.DEFAULT_BACKSTOP_LEVERAGE
+
+
 async def test_a_floor_can_be_turned_off_but_a_stake_cap_cannot_be_zeroed(
     admin_dp: Dispatcher,
     bot: Bot,

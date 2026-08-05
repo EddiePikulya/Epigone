@@ -210,9 +210,10 @@ async def set_limits(pool: asyncpg.Pool, clock: FakeClock, **knobs: str) -> None
     so a test can never configure a limit by a route the operator does not
     have (and so a knob renamed in the registry fails these tests too)."""
     for name, raw in knobs.items():
-        await risk_limits.set_knob(
-            pool, name=name, raw=raw, operator_id=OPERATOR, now=clock.now()
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            await risk_limits.set_knob(
+                conn, name=name, raw=raw, operator_id=OPERATOR, now=clock.now()
+            )
 
 
 async def emit(

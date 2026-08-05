@@ -505,6 +505,18 @@ margin cannot absorb simply rejects.
   0036), not added beside its predecessor. The two cannot coexist honestly: a
   row carrying both is a row where nothing says which number sized the last
   order, and a silently reinterpreted $200 is a 20× larger position.
+- **EXISTING MAPPINGS ARE PINNED TO `fixed 1x` BY THE MIGRATION.** A rename
+  makes CODE fail loudly; it does nothing for DATA. A mapping written before
+  A5 stores a number that meant a POSITION, and the new column's default would
+  have put it in `mirror` mode — so the next copied open behind a 20x Leader
+  would have been twenty times the position the operator configured, with no
+  action from them and no message to them. At `fixed 1x`, position = stake × 1
+  = the number already stored, so a pre-A5 mapping sizes IDENTICALLY across the
+  upgrade; the only thing that changes for it is that its margin is now
+  isolated, which can only reduce what it can lose. Raising such a sub to
+  `mirror` is a deliberate act: re-run `/copy` for that Leader, confirm tap and
+  all. (Operator decision at PR #182's merge gate; the migration carries the
+  reasoning beside the statement.)
 - **`/copy` grows a leverage argument** — `/copy <leader> <allocation> <stake>
   <leverage> <mode> [tp% sl%]` — and its prompt states the stake as margin and
   spells out the position it buys.

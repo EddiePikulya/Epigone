@@ -56,6 +56,11 @@ and the default for every tracked wallet is off.
   **This argument changed meaning in A5.** It used to be Base Notional: the
   size of the position itself. A pre-A5 habit of typing `200` now means $200
   of margin, which at a 10x Leader is a $2,000 position.
+  **Mappings that already existed were pinned to `fixed 1x` by migration
+  0036**, precisely so the change of meaning could not move them: at 1x the
+  stored number is still the position, to the cent. If you want one of them
+  mirroring, re-run `/copy` for that Leader with the leverage you want — the
+  upgrade will not do it for you.
 - **leverage** — `mirror` (the Leader's own leverage on that position) or a
   whole number for fixed. Either is an ASK: the final leverage is the lowest
   of it, `/limits max_leverage`, and the asset's own maximum. A `mirror` open

@@ -9,11 +9,13 @@ erase: a fresh empty database and a pre-migration-era database with data.
 import asyncio
 import os
 from collections.abc import AsyncGenerator
+from decimal import Decimal
 
 import asyncpg
 import pytest
 
 from epigone.db import Migration, load_migrations, migrate
+from epigone.execute.pricing import open_size, round_size
 from tests.conftest import DEFAULT_TEST_DATABASE_URL
 from tests.support.db import reset_database
 
@@ -290,6 +292,76 @@ async def test_0027_purges_mkts_snapshots_and_leaves_covered_venues_alone(
         ]
     assert positions == ["BTC", "xyz:META"]
     assert orders == ["BTC", "xyz:META"]
+
+
+async def test_0036_pins_pre_existing_copy_subs_so_their_sizing_does_not_move(
+    scratch_pool: asyncpg.Pool,
+) -> None:
+    """0036 renames `base_notional_usd` to `base_stake_usd`, which
+    re-interprets a number nobody re-typed: it used to fix the POSITION and now
+    fixes the MARGIN behind it. Left to the column default, a mapping written
+    before A5 would come out of the migration in `mirror` mode, and the next
+    copied open behind a 20x Leader would be TWENTY TIMES the position the
+    operator configured — with no action from them and no message to them.
+
+    So the backfill pins every pre-existing mapping to `fixed 1x`, under which
+    position = stake × 1 = exactly the stored number. This test is that claim
+    as arithmetic: the same row, the same mark, sized through the pre-A5 rule
+    and through the post-A5 rule, must produce the identical order."""
+    before_0036 = [m for m in load_migrations() if m.version < 36]
+    assert any(m.version == 36 for m in load_migrations()), "0036 not packaged"
+    await migrate(scratch_pool, before_0036)
+
+    now = "2026-08-05 00:00:00+00"
+    async with scratch_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO traders (address, first_seen_at, last_seen_at) "
+            f"VALUES ('0xleader', '{now}', '{now}')"
+        )
+        # A mapping as A4 wrote it: $200 meant a $200 POSITION.
+        await conn.execute(
+            "INSERT INTO copy_subs (operator_id, leader_address, sub_name, allocation_usd, "
+            "base_notional_usd, copy_mode, enabled, created_at) "
+            f"VALUES (42, '0xleader', 'epicopy-old', 1000, 200, 'default', TRUE, '{now}')"
+        )
+
+    await migrate(scratch_pool)
+
+    async with scratch_pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM copy_subs")
+    assert row is not None
+    assert row["base_stake_usd"] == Decimal("200")  # the number itself is untouched
+    assert row["leverage_mode"] == "fixed"
+    assert row["fixed_leverage"] == 1
+
+    # The pre-A5 sizing rule was `base_notional / mark`; the post-A5 rule is
+    # `stake × leverage / mark`. At the pinned 1x they are the same order —
+    # which is the whole property the backfill exists to preserve.
+    mark, sz_decimals = Decimal("2000"), 4
+    pre_a5 = round_size(Decimal("200") / mark, sz_decimals)
+    post_a5 = open_size(
+        row["base_stake_usd"], Decimal(row["fixed_leverage"]), mark, sz_decimals
+    )
+    assert post_a5 == pre_a5 == Decimal("0.1")
+
+    # And a mapping made AFTER the migration still gets the intended default:
+    # the backfill pins history, it does not change what /copy means from now
+    # on (the column default stays `mirror`).
+    async with scratch_pool.acquire() as conn:
+        # A different Leader: one sub per Leader is a unique index (decision 1).
+        await conn.execute(
+            "INSERT INTO traders (address, first_seen_at, last_seen_at) "
+            f"VALUES ('0xnewleader', '{now}', '{now}')"
+        )
+        await conn.execute(
+            "INSERT INTO copy_subs (operator_id, leader_address, sub_name, allocation_usd, "
+            "base_stake_usd, copy_mode, enabled, created_at) "
+            f"VALUES (42, '0xnewleader', 'epicopy-new', 1000, 200, 'default', TRUE, '{now}')"
+        )
+        fresh = await conn.fetchrow(
+            "SELECT leverage_mode FROM copy_subs WHERE sub_name = 'epicopy-new'"
+        )
+    assert fresh is not None and fresh["leverage_mode"] == "mirror"
 
 
 async def test_concurrent_startups_apply_once(scratch_pool: asyncpg.Pool) -> None:

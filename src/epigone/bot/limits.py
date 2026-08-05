@@ -63,30 +63,36 @@ async def cmd_limits(
         await message.answer(USAGE, reply_markup=with_delete_button())
         return
     name, raw = parts
+    # THE CHANGE AND ITS TRAIL COMMIT TOGETHER. A limit that moved with no
+    # audit row is a limit nobody can account for afterwards, and a row
+    # claiming a change that rolled back is worse — the same reason the
+    # executor's claim and its attempt share one transaction (ADR-0006).
     try:
-        before, after = await risk_limits.set_knob(
-            pool, name=name, raw=raw, operator_id=message.from_user.id, now=clock.now()
-        )
+        async with pool.acquire() as conn, conn.transaction():
+            before, after = await risk_limits.set_knob(
+                conn, name=name, raw=raw, operator_id=message.from_user.id, now=clock.now()
+            )
+            entry = risk_limits.knob(name)
+            old, new = risk_limits.render(before, entry), risk_limits.render(after, entry)
+            await ExecutionAudit(pool, clock).record_event(
+                actor=OPERATOR_ACTOR,
+                action="risk_limit_changed",
+                risk_decision=(
+                    f"operator {message.from_user.id} set {entry.name}: {old} → {new} "
+                    f"({entry.description})"
+                ),
+                detail={
+                    "knob": entry.name,
+                    "column": entry.column,
+                    "old": old,
+                    "new": new,
+                    "operator_id": message.from_user.id,
+                },
+                conn=conn,
+            )
     except (risk_limits.UnknownKnobError, ValueError) as exc:
         await message.answer(f"{exc}\n\n{USAGE}", reply_markup=with_delete_button())
         return
-    entry = risk_limits.knob(name)
-    old, new = risk_limits.render(before, entry), risk_limits.render(after, entry)
-    await ExecutionAudit(pool, clock).record_event(
-        actor=OPERATOR_ACTOR,
-        action="risk_limit_changed",
-        risk_decision=(
-            f"operator {message.from_user.id} set {entry.name}: {old} → {new} "
-            f"({entry.description})"
-        ),
-        detail={
-            "knob": entry.name,
-            "column": entry.column,
-            "old": old,
-            "new": new,
-            "operator_id": message.from_user.id,
-        },
-    )
     await message.answer(
         f"✅ {entry.name}: {old} → {new}\n\n"
         f"{entry.description}. The executor re-reads these every cycle — no restart.",

@@ -900,6 +900,97 @@ async def test_an_entry_over_a_stake_cap_is_clamped_to_the_headroom_not_refused(
     assert "asked $200" in decision and "given $50.00" in decision
 
 
+async def test_a_scale_in_over_a_stake_cap_is_clamped_on_its_derived_stake(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A scale-in decides nothing about leverage — the position already runs at
+    one the exchange enforces — so its stake is DERIVED: the margin the added
+    notional will consume at that leverage. The caps bound it through that
+    derivation, and the clamp scales the coin-unit size by the same ratio.
+
+    Held: 0.1 ETH at 1x on a $2,000 mark = $200 of margin against a $250
+    per-coin cap, so $50 of room. The Leader grows 50%, which asks for 0.05 ETH
+    = $100 of margin: twice what is left."""
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, coin_stake="250")
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+
+    await emit(pool, scaled("scale_in", "5", "7.5"), clock.now())
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()
+    # Half the asked size, because half the asked stake was granted.
+    assert orders[0].size == Decimal("0.025")
+    decision = next(
+        decision for _, decision in await h.audit_actions() if "allowed-clamped" in decision
+    )
+    assert "asked $100" in decision and "given $50.00" in decision
+    # A scale-in never re-decides leverage, so nothing was signed to change it.
+    assert not [m for m, _ in h.exec_fake.actions if m == "update_leverage"]
+
+
+async def test_an_unreadable_read_on_a_flips_open_leg_does_not_promise_a_retry(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A flip's open leg runs already-claimed (its close leg claimed the single
+    event both come from), so "the next cycle asks again" is a sentence that
+    cannot come true. The trail has to say what actually happened instead:
+    no retry, and — since the close filled — we are FLAT."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.market_stats_errors[None] = GatewayError("metaAndAssetCtxs down")
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(
+        pool,
+        PositionEvent(
+            kind="flip",
+            coin="ETH",
+            side="short",
+            prev_side="long",
+            size_usd=Decimal("10000"),
+            size_coin=Decimal("5"),
+            leverage=Decimal("1"),
+        ),
+        clock.now(),
+    )
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1  # the close leg only: we end FLAT
+    decision = next(
+        decision for _, decision in await h.audit_actions() if "unreadable" in decision
+    )
+    assert "no retry" in decision and "FLAT" in decision
+    assert "asks again" not in decision
+    # The event is gone from the backlog — claimed by the close leg — which is
+    # exactly why the sentence above must not promise another look.
+    assert await outstanding(pool) == []
+
+
 async def test_an_order_that_rounds_to_dust_is_not_sent_even_when_the_stake_cleared(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:

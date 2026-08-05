@@ -15,7 +15,8 @@
 -- would be a row where nothing says which number sized the last order. A
 -- rename also makes every reader fail loudly at the moment the meaning
 -- changed, which is the point — a silently-reinterpreted $200 is a 20x
--- larger position.
+-- larger position. CODE fails loudly at a rename; DATA does not, which is
+-- what the backfill below is for.
 --
 --   leverage_mode / fixed_leverage — how a copied open picks its leverage.
 --   `mirror` takes the Leader's own leverage on that position (the position
@@ -65,7 +66,9 @@ ALTER TABLE copy_subs RENAME COLUMN base_notional_usd TO base_stake_usd;
 ALTER TABLE copy_subs
     -- 'mirror' is the default because it is the mode the Base Stake model was
     -- designed around: the Leader's conviction scales the exposure while the
-    -- money at risk stays the operator's constant.
+    -- money at risk stays the operator's constant. It is the right default for
+    -- a mapping the operator creates FROM NOW ON, and the wrong one for a
+    -- mapping that already exists — see the backfill below.
     ADD COLUMN leverage_mode  TEXT NOT NULL DEFAULT 'mirror'
                                 CHECK (leverage_mode IN ('mirror', 'fixed')),
     ADD COLUMN fixed_leverage INT CHECK (fixed_leverage > 0),
@@ -73,6 +76,34 @@ ALTER TABLE copy_subs
         CHECK (leverage_mode <> 'fixed' OR fixed_leverage IS NOT NULL),
     ADD CONSTRAINT copy_subs_mirror_has_no_fixed
         CHECK (leverage_mode <> 'mirror' OR fixed_leverage IS NULL);
+
+-- THE BACKFILL, and it is the most important statement in this file
+-- (operator decision, PR #182 merge gate).
+--
+-- The rename above re-interprets a number nobody re-typed. A mapping created
+-- before A5 configured `200` meaning "open a $200 POSITION"; after the rename
+-- the same stored 200 means "put up $200 of MARGIN", and the column default
+-- would have put that mapping in `mirror` mode. A Leader running 20x would
+-- then have turned a $200 position into a $4,000 one on the next copied open,
+-- with the operator having done nothing and been told nothing. The header
+-- above names exactly that hazard as the reason for renaming loudly; leaving
+-- the default to apply would have walked into it anyway.
+--
+-- So every mapping that PREDATES this migration is pinned to `fixed 1x`,
+-- under which position = stake x 1 = the number already stored. A $200 config
+-- stays a $200 position, to the cent — the only thing that changes for it is
+-- that the margin is now isolated, which can only reduce what it can lose.
+--
+-- PRE-EXISTING ROWS ONLY, by construction rather than by a WHERE clause:
+-- this runs inside the migration, before any process can insert, so every row
+-- it can see is by definition one that predates A5. New mappings arrive
+-- through /copy, which requires the leverage argument explicitly.
+--
+-- The operator raises a backfilled sub to `mirror` the way they would set any
+-- other term — by re-running /copy for that Leader, which re-enables the
+-- existing mapping and its sub-account with the new terms. That is a
+-- deliberate act with a confirm tap in front of it, which is the entire point.
+UPDATE copy_subs SET leverage_mode = 'fixed', fixed_leverage = 1;
 
 ALTER TABLE copy_episodes
     ADD COLUMN leverage NUMERIC CHECK (leverage > 0);

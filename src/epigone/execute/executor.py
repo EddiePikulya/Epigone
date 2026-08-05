@@ -1548,13 +1548,22 @@ class CopyExecutor:
         `metaAndAssetCtxs` leaves the event OUTSTANDING for the next cycle,
         exactly as an unreadable leader equity does: "I cannot tell" must never
         become "denied", or a network blip silently stops copying. A market the
-        venue simply does not list IS a verdict, and the policy owns it."""
+        venue simply does not list IS a verdict, and the policy owns it.
+
+        EXCEPT ON A FLIP'S OPEN LEG, where "the next cycle asks again" is a
+        sentence that cannot come true and must not be written down. That leg
+        runs with `claim=False` because its close leg already claimed the
+        single event both legs come from (decision 3), so the event will never
+        be offered again — `_claim_and_skip` knows this and reports the skip
+        instead of deferring it, and the AUDIT PROSE has to say the same thing
+        the mechanism does. What actually happens there is decision 3's chosen
+        failure direction: the close filled, the open did not, and we are
+        FLAT."""
         stats = await self._market_stats()
         if stats is None:
-            return _Skip(
-                f"market liquidity unreadable — {coin} entry not judged this cycle",
-                {"coin": coin, "leg": leg, "retry": True},
-            )
+            return _Skip(_unreadable(f"market liquidity unreadable — {coin}", leg), {
+                "coin": coin, "leg": leg, "retry": True
+            })
         verdict = self._policy.judge_coin(coin=coin, stats=stats.get(coin), limits=self._limits)
         if verdict.allowed:
             return None
@@ -1602,7 +1611,10 @@ class CopyExecutor:
                 exc_info=True,
             )
             return _Skip(
-                f"leader equity unreadable — entry not taken this cycle ({coin})",
+                # Same leg-aware wording as the floor's read failure, and for
+                # the same reason: a flip's open leg is already claimed, so
+                # "this cycle" would promise a retry that cannot happen.
+                _unreadable(f"leader equity unreadable — {coin}", leg),
                 {"coin": coin, "leg": leg, "retry": True},
             )
         if state.account_value < LEADER_EQUITY_FLOOR:
@@ -2228,6 +2240,25 @@ def _short(address: str) -> str:
     business importing the bot runtime to render six characters. The
     duplication is one line; the dependency would be a package."""
     return f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
+
+
+def _unreadable(what: str, leg: str) -> str:
+    """A read-failure skip's sentence, told straight for the leg it happened
+    on.
+
+    An ordinary entry leaves its event outstanding, so "not judged this cycle"
+    is exactly true — the next cycle asks again. A FLIP'S OPEN LEG cannot:
+    its close leg claimed the single event both legs come from, so there is no
+    next ask, and the honest sentence is the outcome (decision 3's chosen
+    failure direction — the close filled, so we end FLAT) rather than a
+    promise the mechanism will not keep."""
+    if leg == "flip_open":
+        return (
+            f"{what}: the flip's open leg could not be judged, and this event is "
+            f"already claimed by its close leg — no retry. The close filled, so the "
+            f"copy is FLAT until the leader's next event"
+        )
+    return f"{what}: entry not judged this cycle — the next cycle asks again"
 
 
 def _held(state: SubState, coin: str) -> Decimal:
