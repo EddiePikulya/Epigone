@@ -48,6 +48,9 @@ its own clearinghouseState/PnL, so per-Leader copy stats are exchange-native.
   a retired Leader's sub is REUSED rather than replaced. Far above phase A's
   handful — it constrains nothing today, and it is the number that would
   decide whether deferred multi-Leader subs ever need to return.
+  **At the cap, provisioning ADOPTS an orphaned sub instead of failing** —
+  amendment D-3 below, added once the cap probe itself had spent all ten
+  slots on the testnet master and left `/copy` with nothing to mint.
 
 ### 2. Sizing: fixed Base Notional per sub, relative mirroring
 
@@ -361,3 +364,74 @@ fetch on the most common event kind.
 risk-increasing, so it stays staleness-guarded. The asymmetry the ADR runs on
 is intact — this narrows one gate to its stated scope, it does not open
 exits to gating.
+
+### D-3 (2026-08-05, issue #178). At the sub-account cap, provisioning ADOPTS
+### an orphaned sub — extends decision 12's provisioning leg
+
+**Decision.** When `createSubAccount` is refused `"Too many sub-accounts."`
+(finding 10's flat cap of 10), provisioning does not fail: it adopts an
+existing sub of the master that is **unmapped** — no `copy_subs` row, of any
+operator, enabled or disabled, points at it — and **position-free** on every
+venue Epigone covers. The mapping records that address and goes through the
+ordinary funding leg, which already treats the allocation as a TARGET BALANCE
+and moves only the difference, so an orphan that inherited a balance is
+funded correctly without a special case. Fresh creation is still attempted
+first on every pass; adoption is the refusal's fallback, never the first
+choice.
+
+**Why the cap needed an answer at all.** The probe that established the cap
+(decision 1's "probe before implementation") consumed all ten slots on the
+testnet master with empty probe subs. Every `/copy` on that master therefore
+refuses at the create leg, and no Leader can be copied — the A4 shakedown
+would have had nothing to run against. On mainnet the same shape arrives more
+slowly (ten Leaders, or ten subs spent on anything else) and is permanent
+when it does, because subs cannot be deleted. The venue leaves exactly one
+recovery: re-use what is already there.
+
+**The two refusals to keep apart.**
+
+- **Cap refused, an orphan is adoptable** → adopt, audit `copy_sub_adopted`,
+  and say ADOPTED to the operator. It reads differently from a creation
+  because it *is* different: the sub was taken over, not minted for this
+  Leader, and only the operator can say whether that is what they wanted. The
+  address, the audit row and that notice commit in ONE transaction at the
+  moment of adoption — not at the end of the run — so a funding leg that
+  defers cannot cost the operator the sentence that says which of the two
+  happened. The ready notice repeats it when the run does finish.
+- **Cap refused, nothing adoptable** → fail loudly: `copy_provisioning_cap_
+  exhausted`, the mapping DISABLED, nothing funded, and the same "was NOT set
+  up" sentence the risk-declined path uses — with its own fix, since freeing a
+  slot is a different action from lowering an allocation. The notice states
+  what does NOT free one: `/uncopy` keeps its sub by design, and the exchange
+  deletes nothing. A master whose ten subs are all mapped is genuinely at
+  decision 1's ceiling, and the way past it is retiring a mapping for good or
+  using another master.
+
+A read that fails is neither: an unreadable listing, a candidate whose
+positions will not load, or a listing that comes back EMPTY while the exchange
+is refusing at the cap (a contradiction, and no evidence of anything) all DEFER
+to the next cycle with the mapping left pending. "I cannot tell" is not "there
+is none", and disabling a Leader over a transient read failure is the wrong
+direction of mistake.
+
+**Never adopted, both from decision 10's never-touch rule.** A sub mapped to
+any Leader, *including a disabled one* — /uncopy stops event consumption, not
+ownership, and a later /copy re-enables that row onto that same sub — and a
+sub holding an open position, whoever opened it. Resting orders are not part
+of the test: the disqualifier is a live position, and an inherited resting
+order belongs to no Copy Episode, so reconciliation never acts on it and the
+next /kill sweep cancels it with everything else on that book.
+
+**The name follows the Leader, best-effort.** Probed for this ticket
+(`scripts/testnet_subaccount_rename_probe.py`, gateway TESTNET FINDING 11):
+`subAccountModify` renames an existing sub and the listing reads the new name
+back immediately. So an adopted `capprobe_003` is renamed for its Leader. It
+is cosmetic — nothing in Epigone keys off the exchange-side name — so a
+refusal is reported in the ready notice and the provisioning run carries on.
+Renaming frees no slot; the sub is still permanent.
+
+**What it does not change.** The halt gate is unchanged and covers adoption:
+the path signs a rename and a transfer and hands a live sub to a Leader, so it
+sits behind the same late re-check minting one does. One sub per pass still
+holds. And the cap is still a cap — adoption re-uses slots, it does not create
+them, so ten remains the ceiling on concurrent Leaders (decision 1).

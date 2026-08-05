@@ -293,6 +293,26 @@ async def test_sub_account_provisioning_signs_the_documented_wire(replaying: Any
     assert h.recovered_signer(funded) == AGENT.address
 
 
+async def test_renaming_a_sub_account_signs_the_probed_wire(replaying: Any) -> None:
+    """`subAccountModify` renames an existing sub (finding 11, probed
+    2026-08-05). The SDK has no method for it, so the key order and the
+    lowercased subAccountUser are this gateway's to get right — the recovered
+    signer is what proves it did."""
+    sub = "0xB583637E" + "aa" * 16
+    h = await replaying(OK_DEFAULT)
+
+    await h.gateway.rename_sub_account(sub, "epicopy-leader")
+
+    (renamed,) = h.received
+    assert renamed["action"] == {
+        "type": "subAccountModify",
+        "subAccountUser": sub.lower(),
+        "name": "epicopy-leader",
+    }
+    assert renamed["vaultAddress"] is None
+    assert h.recovered_signer(renamed) == AGENT.address
+
+
 async def test_a_create_sub_account_without_an_address_is_ambiguous(replaying: Any) -> None:
     # A sub may exist under a name that can never be freed (finding 10 caps
     # the master at 10), so an unreadable ack must not read as "nothing

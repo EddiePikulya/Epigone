@@ -62,6 +62,30 @@ master holds at most **10** of them (probed 2026-08-04; the 11th is refused
 `"Too many sub-accounts."`), so a second `/copy` for the same Leader
 re-enables the existing mapping rather than burning another slot.
 
+**At the cap, `/copy` ADOPTS a sub instead of minting one.** When all ten
+slots are spent, the executor takes over an existing sub of the master that is
+**not mapped to any Leader** (a disabled mapping still owns its sub) and
+**holds no open position**, renames it for its Leader, and funds it to the
+allocation from whatever it was already holding. Nothing about copying changes
+afterwards — it is an ordinary Copy Sub-account from that point. You will know
+it happened because a notice says **ADOPTED** the moment it does — before the
+funding leg, so you hear it even if funding has to retry — and again in the
+ready message; the audit trail carries `copy_sub_adopted`.
+Check that sub's balance if the figure matters to you: it inherited whatever
+was in it, and the top-up only moves the difference.
+
+**When nothing is adoptable, `/copy` fails loudly and does nothing.** All ten
+subs mapped or holding positions means the notice says the copy **was NOT set
+up**, the mapping is disabled, and no money moved. Note what does NOT free a
+slot: `/uncopy` does not — a disabled mapping still owns its sub, because that
+is what makes re-copying reuse it — and neither does deleting anything on the
+exchange, since sub-accounts are permanent. A master whose ten subs are all
+mapped is genuinely full at ten Leaders (decision 1's ceiling, arrived at).
+The ways out are to retire a Leader's mapping for good (a database change
+today; there is deliberately no command that throws a sub away), to flatten
+and un-map a sub held by something outside Epigone, or to run this operator
+from another master.
+
 ## What you will see in the chat
 
 Everything. Events are rare and you are one person acting manually on what you

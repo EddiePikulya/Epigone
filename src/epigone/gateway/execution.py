@@ -188,6 +188,17 @@ Open questions 1–3 (research §11) — ANSWERED on funded testnet 2026-07-28
    number that decides whether multi-Leader subs (deferred in decision 1)
    ever need to come back.
 
+11. A SUB-ACCOUNT CAN BE RENAMED, AND THE ACTION IS `subAccountModify` (issue
+   #178, scripts/testnet_subaccount_rename_probe.py, 2026-08-05): submitting
+   `{"type": "subAccountModify", "subAccountUser": <sub>, "name": <new>}`
+   signed as the master answered `{"status": "ok", "response": {"type":
+   "default"}}` and the `subAccounts` listing read the new name back
+   immediately. The SDK has no method for it, so the wire dict is built here
+   like every other action. This is what lets ADOPTION (the cap-refusal
+   fallback, ADR-0007 amendment D-3) name a sub it did not mint after its
+   Leader: the NAME is the only part of a sub-account that is not permanent
+   — the sub itself still cannot be deleted, and renaming frees no slot.
+
 A4 IMPLICATION (the question #142 existed to answer): sub-accounts are NOT
 a key-compromise boundary. A compromised master-approved agent key reaches
 the master AND every sub — it trades subs via vaultAddress, shuffles funds
@@ -302,6 +313,12 @@ class RejectReason(Enum):
     # both refuse with this shape. The dead-man's-switch eligibility probe
     # (issue #135) keys on this reason — the refusal string is unambiguous.
     VOLUME_GATED = "volume_gated"
+    # The master already holds its ten sub-accounts (finding 10): "Too many
+    # sub-accounts." A class of its own because it is the ONE refusal
+    # provisioning can recover from without the operator — issue #178 adopts
+    # an orphaned sub instead of minting one — and telling it apart from
+    # every other refusal is what makes that recovery safe to attempt.
+    SUB_ACCOUNT_CAP = "sub_account_cap"
     # A throttle the exchange voices as reject PROSE (e.g. the address-based
     # budget's trickle) rather than as HTTP 429 — the 429 path surfaces as
     # ExecutionRateLimitedError after in-place retry instead (research §5).
@@ -339,6 +356,10 @@ _REJECT_PATTERNS: tuple[tuple[str, RejectReason], ...] = (
     # Observed live 2026-07-28 (funded probe, module docstring): the shared
     # tail of every cumulative-volume eligibility refusal.
     ("until enough volume traded", RejectReason.VOLUME_GATED),
+    # Observed live 2026-08-04 (cap probe, finding 10): the 11th creation's
+    # verbatim refusal. Narrow enough that no other cap can land here by
+    # accident — the neighbouring "too many requests" arm cannot collide.
+    ("too many sub-accounts", RejectReason.SUB_ACCOUNT_CAP),
     # "too many REQUESTS" specifically — a bare "too many" would misread a
     # "Too many open orders" cap (research §5's 1,000-order limit) as a
     # throttle; an order-count cap has no arm yet and classifies UNKNOWN.
@@ -709,8 +730,25 @@ class SubAccountProvisioning(Protocol):
         """Create a sub-account of the master and return its address,
         lowercased. Behind a $100k cumulative-volume gate (finding 6) and
         capped at 10 per master (finding 10); both refuse as
-        ActionRejectedError with the exchange's own prose. Sub-accounts
-        cannot be deleted, so a name is spent for good."""
+        ActionRejectedError with the exchange's own prose. The cap refusal
+        classifies RejectReason.SUB_ACCOUNT_CAP, which is the signal the
+        caller adopts an existing sub on (issue #178). Sub-accounts cannot be
+        deleted, so a slot is spent for good — the NAME, however, is not:
+        rename_sub_account takes it back."""
+        ...
+
+    async def rename_sub_account(self, sub_address: str, name: str) -> None:
+        """Rename an existing sub-account of the master (finding 11's
+        `subAccountModify`).
+
+        Cosmetic BY CONTRACT: the name is what the operator reads in the
+        Hyperliquid UI, and nothing in Epigone keys off it. It exists for
+        adoption — a sub minted as `capprobe_003` and handed to a Leader
+        should say so on the exchange — so a caller treats a failure here as
+        a blemish to report, never as a reason to abandon a provisioning run
+        that has already moved money. Raises ActionRejectedError if the
+        exchange refuses; the address rides inside the action, so it is
+        lowercased on the wire like every other one (finding 2)."""
         ...
 
     async def sub_account_transfer(
