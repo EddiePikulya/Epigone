@@ -27,7 +27,7 @@ from decimal import Decimal
 
 import asyncpg
 
-from epigone.execute.policy import LEVERAGE_MODES
+from epigone.execute.policy import FIXED_LEVERAGE, LEVERAGE_MODES
 
 DEFAULT_MODE = "default"
 BRACKET_MODE = "bracket"
@@ -78,10 +78,15 @@ class CopySub:
 
     @property
     def leverage_summary(self) -> str:
-        """How this sub picks its leverage, as one phrase for a chat message."""
+        """How this sub picks its leverage, as one phrase for a chat message.
+
+        Reads the MODE, not the presence of a number: the two agree by CHECK
+        constraint today, and the mode is the column that decides — a reader
+        keying off the number would quietly answer "mirroring" for any future
+        mode that also happens to leave `fixed_leverage` NULL."""
         return (
             f"fixed {self.fixed_leverage}x"
-            if self.fixed_leverage is not None
+            if self.leverage_mode == FIXED_LEVERAGE
             else "mirroring the leader"
         )
 
@@ -307,9 +312,9 @@ async def record_sub_equity(
     HISTORY, not a latest-value row, which is the whole difference from
     `trader_equity` (0032): that table answers "what is this wallet worth now"
     and nothing needed more; this one exists to be a CURVE. The daily-loss
-    pause is deferred precisely because nobody knows what threshold to set,
-    and the only honest way to pick one is to look at what a sub's equity
-    actually does across a day of copying.
+    pause (issue #181) is deferred precisely because nobody knows what
+    threshold to set, and the only honest way to pick one is to look at what a
+    sub's equity actually does across a day of copying.
 
     The equity is already in hand — the reconcile reads each sub's
     clearinghouseState every cycle and drops the account value — so this costs

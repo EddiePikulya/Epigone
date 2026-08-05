@@ -900,6 +900,36 @@ async def test_an_entry_over_a_stake_cap_is_clamped_to_the_headroom_not_refused(
     assert "asked $200" in decision and "given $50.00" in decision
 
 
+async def test_an_order_that_rounds_to_dust_is_not_sent_even_when_the_stake_cleared(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The policy judges the $10 minimum in DOLLARS, on the stake it granted.
+    The exchange judges the ORDER — which has been rounded DOWN to the asset's
+    precision since. On a coarse asset those disagree, and the last word
+    belongs to the size that will actually be signed: sending it would buy a
+    guaranteed MIN_NOTIONAL reject and the alarming audit row the constant
+    exists to avoid."""
+    h = await build_harness(pool, clock, gateway)
+    # A $6 coin quoted in WHOLE units: $11 of stake at 1x buys 1.83 of them,
+    # which rounds DOWN to 1 — an $11 grant the policy allows, and a $6 order
+    # the exchange would refuse.
+    gateway.perp_universes[None] = ["BTC", "ETH", "CHUNK"]
+    gateway.sz_decimals["CHUNK"] = 0
+    gateway.mid_prices[None]["CHUNK"] = Decimal("6")
+    await copy_sub(pool, clock, base_stake="11")
+    gateway.set_positions(SUB, [])
+
+    await emit(pool, opened(coin="CHUNK"), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert await outstanding(pool) == []
+    assert any(
+        "under the exchange's $10 minimum order value" in decision
+        for _, decision in await h.audit_actions()
+    )
+
+
 async def test_a_clamp_below_the_exchange_minimum_becomes_a_denial(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:

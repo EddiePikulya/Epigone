@@ -83,25 +83,27 @@ class Knob:
     name: str
     column: str
     is_integer: bool
+    # Whether 0 MEANS something for this knob. It does for the two floors —
+    # the floor is a default stance, not a cage — and it does not for a stake
+    # cap or the leverage backstop, where zero would be "copy nothing" wearing
+    # a limit's clothes (/uncopy says that, and says it reversibly). A field on
+    # the registry row rather than a rule derived from the NAME: a knob renamed
+    # for legibility must not silently change what values it accepts.
+    zero_means_off: bool
     unit: str
     description: str
 
     def parse(self, raw: str) -> Decimal | int:
-        """The operator's word as this knob's value, or ValueError.
-
-        Zero is accepted only where zero MEANS something: the two floors turn
-        off at zero (the floor is a default stance, not a cage), while a zero
-        stake cap or a zero leverage backstop would be "copy nothing" wearing
-        a limit's clothes — /uncopy says that, and says it reversibly."""
+        """The operator's word as this knob's value, or ValueError."""
         try:
             value = Decimal(raw)
         except InvalidOperation as exc:
             raise ValueError(f"{self.name} must be a number, got {raw!r}") from exc
-        floor = Decimal(0) if self.name.startswith("floor_") else Decimal("0.0000001")
+        floor = Decimal(0) if self.zero_means_off else Decimal("0.0000001")
         if value < floor:
             raise ValueError(
                 f"{self.name} must be at least {floor}"
-                + (" (0 turns this floor off)" if floor == 0 else "")
+                + (" (0 turns this floor off)" if self.zero_means_off else "")
             )
         if self.is_integer:
             if value != value.to_integral_value():
@@ -115,6 +117,7 @@ KNOBS: tuple[Knob, ...] = (
         name="floor_volume",
         column="floor_day_notional_usd",
         is_integer=False,
+        zero_means_off=True,
         unit="$",
         description="Liquidity Floor: minimum 24h traded notional (0 = off)",
     ),
@@ -122,6 +125,7 @@ KNOBS: tuple[Knob, ...] = (
         name="floor_oi",
         column="floor_open_interest_usd",
         is_integer=False,
+        zero_means_off=True,
         unit="$",
         description="Liquidity Floor: minimum open-interest notional (0 = off)",
     ),
@@ -129,6 +133,7 @@ KNOBS: tuple[Knob, ...] = (
         name="coin_stake",
         column="max_coin_stake_usd",
         is_integer=False,
+        zero_means_off=False,
         unit="$",
         description="max stake (margin) per coin per sub — orders over it CLAMP",
     ),
@@ -136,6 +141,7 @@ KNOBS: tuple[Knob, ...] = (
         name="sub_stake",
         column="max_sub_stake_usd",
         is_integer=False,
+        zero_means_off=False,
         unit="$",
         description="max aggregate stake (margin) per sub — orders over it CLAMP",
     ),
@@ -143,6 +149,7 @@ KNOBS: tuple[Knob, ...] = (
         name="max_leverage",
         column="backstop_leverage",
         is_integer=True,
+        zero_means_off=False,
         unit="x",
         description="backstop cap on mirrored leverage (the asset's own max still applies)",
     ),
@@ -238,7 +245,7 @@ def render(limits: RiskLimits, entry: Knob) -> str:
     """One knob as the operator reads it: `12x`, `$100000`, `$0 (off)`."""
     value = value_of(limits, entry)
     text = f"{value}{entry.unit}" if entry.unit == "x" else f"{entry.unit}{value}"
-    if entry.name.startswith("floor_") and value == 0:
+    if entry.zero_means_off and value == 0:
         text += " (off)"
     return text
 

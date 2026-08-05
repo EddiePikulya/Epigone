@@ -126,6 +126,36 @@ FIXED_LEVERAGE = "fixed"
 LEVERAGE_MODES = (MIRROR_LEVERAGE, FIXED_LEVERAGE)
 
 
+class UnpriceableStakeError(ValueError):
+    """A stake or leverage that cannot express a position. Its own error rather
+    than an assertion because both inputs cross a process boundary — the
+    operator's `/copy`, and the Leader's own event — and neither is something
+    this module gets to assume."""
+
+
+def open_position_notional(stake_usd: Decimal, leverage: Decimal) -> Decimal:
+    """The dollar POSITION a stake buys at a leverage (amendment D-4).
+
+    One line, and it is its own function because it is the whole amendment:
+    the configured dollars used to BE the position and are now the margin
+    behind it. Every reader going stake → position comes through here — the
+    exchange-minimum check below, and `pricing.open_size` — so the two numbers
+    cannot be confused in one place and not another. Readers going the other
+    way (a scale-in deriving its stake from a size the exchange already fixed,
+    a fill report naming the stake behind what filled) divide instead, and are
+    deliberately not forced through an inverse helper: their input is a
+    measured size, not a configured stake.
+
+    It lives HERE, beside MIN_ORDER_NOTIONAL, rather than in `pricing` where
+    the rest of the sizing arithmetic sits, because `pricing` already depends
+    on this module for ADR-0007's constants and the dependency runs one way.""" 
+    if stake_usd <= 0:
+        raise UnpriceableStakeError(f"stake {stake_usd} is not positive")
+    if leverage <= 0:
+        raise UnpriceableStakeError(f"leverage {leverage} is not positive")
+    return stake_usd * leverage
+
+
 @dataclass(frozen=True)
 class RiskVerdict:
     """One policy decision. `decision` is prose because that is what
@@ -266,16 +296,13 @@ class RiskPolicy:
 
     The GLOBAL limits are passed per call rather than held: the executor
     re-reads `risk_limits` each cycle, and a policy holding its own copy would
-    be judging this cycle's order against last restart's numbers."""
+    be judging this cycle's order against last restart's numbers.
 
-    def __init__(
-        self,
-        *,
-        min_order_notional: Decimal = MIN_ORDER_NOTIONAL,
-        max_allocation: Decimal = MAX_ALLOCATION_USD,
-    ) -> None:
-        self._min_notional = min_order_notional
-        self._max_allocation = max_allocation
+    The class therefore holds NO configuration at all. A4's version took its
+    ceilings as constructor arguments; A5 has exactly two kinds of number —
+    the operator's, which arrive per call as `limits`, and ADR-0007's, which
+    are module constants documented as one-line edits — and a third,
+    per-instance kind would only be somewhere for the two to disagree."""
 
     def judge_provisioning(
         self, *, allocation_usd: Decimal, base_stake_usd: Decimal, limits: RiskLimits
@@ -290,11 +317,11 @@ class RiskPolicy:
         above its own cap would be clamped on EVERY open — a copy that never
         does what the operator asked for. Better to say so before funding
         anything."""
-        if allocation_usd > self._max_allocation:
+        if allocation_usd > MAX_ALLOCATION_USD:
             return RiskVerdict(
                 False,
                 f"DECLINED: allocation ${allocation_usd} exceeds the funding ceiling "
-                f"${self._max_allocation} — a typo catcher on the one irreversible money "
+                f"${MAX_ALLOCATION_USD} — a typo catcher on the one irreversible money "
                 f"move, not a risk limit (the stake caps are)",
             )
         if base_stake_usd > allocation_usd:
@@ -324,7 +351,7 @@ class RiskPolicy:
         )
 
     def judge_coin(
-        self, coin: str, stats: MarketStats | None, limits: RiskLimits
+        self, *, coin: str, stats: MarketStats | None, limits: RiskLimits
     ) -> RiskVerdict:
         """Is this coin a Copyable Coin — does its live market clear the
         Liquidity Floor?
@@ -405,12 +432,12 @@ class RiskPolicy:
                 f"${limits.max_sub_stake_usd} in this sub are already committed — did not "
                 f"enter, and nothing held was touched",
             )
-        notional = granted * leverage.value
-        if notional < self._min_notional:
+        notional = open_position_notional(granted, Decimal(leverage.value))
+        if notional < MIN_ORDER_NOTIONAL:
             return RiskVerdict(
                 False,
                 f"DECLINED: ${_round(granted)} of stake at {leverage.value}x is a "
-                f"${_round(notional)} position, under the exchange's ${self._min_notional} "
+                f"${_round(notional)} position, under the exchange's ${MIN_ORDER_NOTIONAL} "
                 f"minimum order value"
                 + (
                     f" — the ask was ${requested_stake_usd}, clamped to the stake headroom "
@@ -469,6 +496,8 @@ __all__ = [
     "LEVERAGE_MODES",
     "MAX_ALLOCATION_USD",
     "MIN_ORDER_NOTIONAL",
+    "UnpriceableStakeError",
+    "open_position_notional",
     "MIRROR_LEVERAGE",
     "SLIPPAGE_CAP",
     "LeverageChoice",

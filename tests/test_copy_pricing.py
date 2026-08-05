@@ -15,10 +15,11 @@ from decimal import Decimal
 
 import pytest
 
+from epigone.execute.policy import UnpriceableStakeError, open_position_notional
 from epigone.execute.pricing import (
     UnpriceableError,
+    clamped_size,
     ioc_limit_price,
-    open_position_notional,
     open_size,
     relative_size,
     round_price,
@@ -39,10 +40,36 @@ def test_a_position_is_the_stake_times_the_leverage() -> None:
 
 
 def test_a_stake_or_leverage_that_is_not_positive_is_an_error_not_a_zero() -> None:
-    with pytest.raises(UnpriceableError):
+    with pytest.raises(UnpriceableStakeError):
         open_position_notional(Decimal("0"), Decimal("10"))
-    with pytest.raises(UnpriceableError):
+    with pytest.raises(UnpriceableStakeError):
         open_position_notional(Decimal("100"), Decimal("0"))
+
+
+def test_a_full_grant_sends_the_asked_size_untouched() -> None:
+    # A clamp must be the ONLY thing that can change what was sized, so a full
+    # grant does not re-derive the size by a second route that could disagree.
+    assert clamped_size(
+        Decimal("0.5"), asked_stake=Decimal("100"), granted_stake=Decimal("100"), sz_decimals=4
+    ) == Decimal("0.5")
+
+
+def test_a_clamped_grant_scales_the_size_by_the_same_ratio_and_rounds_down() -> None:
+    # $100 asked, $40 given → 40% of the size, re-rounded DOWN at the asset's
+    # precision so rounding can never put a clamp back over the cap.
+    assert clamped_size(
+        Decimal("0.5"), asked_stake=Decimal("100"), granted_stake=Decimal("40"), sz_decimals=4
+    ) == Decimal("0.2")
+    assert clamped_size(
+        Decimal("0.00314"), asked_stake=Decimal("200"), granted_stake=Decimal("70"), sz_decimals=5
+    ) == Decimal("0.00109")  # 0.001099 truncated, never rounded up
+
+
+def test_a_clamp_that_rounds_to_nothing_is_an_error_not_a_zero_order() -> None:
+    with pytest.raises(UnpriceableError):
+        clamped_size(
+            Decimal("0.01"), asked_stake=Decimal("100"), granted_stake=Decimal("1"), sz_decimals=2
+        )
 
 
 def test_an_open_sizes_stake_times_leverage_whatever_the_leader_holds() -> None:

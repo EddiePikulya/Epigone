@@ -87,6 +87,7 @@ from epigone.execute.policy import (
 )
 from epigone.execute.pricing import (
     UnpriceableError,
+    clamped_size,
     ioc_limit_price,
     open_size,
     relative_size,
@@ -1253,18 +1254,30 @@ class CopyExecutor:
             return
         assert verdict.stake_usd is not None  # an allowed entry always grants a stake
         try:
-            size = _granted_size(ask, verdict.stake_usd, spec.sz_decimals)
+            size = clamped_size(
+                ask.size_coin,
+                asked_stake=ask.stake_usd,
+                granted_stake=verdict.stake_usd,
+                sz_decimals=spec.sz_decimals,
+            )
         except UnpriceableError as exc:
-            # The clamp survived the $10 check in dollars but not the asset's
-            # own precision — a real answer, not a bug, and one the operator
-            # should read rather than see as a silent no-op.
+            # The grant survived the policy's $10 check in dollars but not the
+            # asset's own precision — a real answer, not a bug, and one the
+            # operator should read rather than see as a silent no-op.
             await self._claim_and_skip(
                 event,
                 sub,
-                _Skip(f"clamped below this asset's precision: {exc}", {"coin": coin, "leg": leg}),
+                _Skip(
+                    f"did not enter: clamped below this asset's precision — {exc}",
+                    {"coin": coin, "leg": leg},
+                ),
                 now,
                 claim=claim,
             )
+            return
+        dust = self._rounded_below_minimum(size, mark, coin, leg)
+        if dust is not None:
+            await self._claim_and_skip(event, sub, dust, now, claim=claim)
             return
         order = OrderSpec(
             asset=spec.asset_id,
@@ -1312,6 +1325,30 @@ class CopyExecutor:
         )
         await self._settle_entry(
             event, sub, state, results[0], size, mark, coin, side, leg, attempt, ask.leverage
+        )
+
+    def _rounded_below_minimum(
+        self, size: Decimal, mark: Decimal, coin: str, leg: str
+    ) -> _Skip | None:
+        """Whether the order we are about to send is dust once ROUNDED.
+
+        The policy judges the exchange minimum in dollars, on the stake it
+        granted — which is the right question for a clamp, and not quite the
+        question the exchange asks. The venue judges the ORDER, and the order
+        has been rounded DOWN to the asset's precision since: on a coarse
+        asset a $10.40 grant can become one unit worth $6. Sending that buys a
+        guaranteed MIN_NOTIONAL reject and an alarming audit row, which is
+        exactly what the constant exists to avoid — so the last word belongs to
+        the size that will actually be signed. The exit path has carried the
+        same check since A4 (`_sub_minimum_skip`); this is its entry twin."""
+        notional = size * mark
+        if notional >= MIN_ORDER_NOTIONAL:
+            return None
+        return _Skip(
+            f"did not enter: {size} {coin} rounds to about ${notional:.2f} at this asset's "
+            f"precision, under the exchange's ${MIN_ORDER_NOTIONAL} minimum order value — "
+            f"not sent, since it would only be rejected",
+            {"coin": coin, "leg": leg, "size": str(size), "notional": str(notional)},
         )
 
     async def _entry_ask(
@@ -1518,7 +1555,7 @@ class CopyExecutor:
                 f"market liquidity unreadable — {coin} entry not judged this cycle",
                 {"coin": coin, "leg": leg, "retry": True},
             )
-        verdict = self._policy.judge_coin(coin, stats.get(coin), self._limits)
+        verdict = self._policy.judge_coin(coin=coin, stats=stats.get(coin), limits=self._limits)
         if verdict.allowed:
             return None
         return _Skip(verdict.decision, {"coin": coin, "leg": leg})
@@ -2191,20 +2228,6 @@ def _short(address: str) -> str:
     business importing the bot runtime to render six characters. The
     duplication is one line; the dependency would be a package."""
     return f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
-
-
-def _granted_size(ask: _Ask, granted_stake: Decimal, sz_decimals: int) -> Decimal:
-    """The order size for the stake the policy actually granted.
-
-    A full grant sends the ask untouched — no re-derivation, so a clamp is the
-    ONLY thing that can change what was sized. A partial grant scales the size
-    by the same ratio the stake was cut by and re-rounds DOWN at the asset's
-    precision, which keeps the two properties that matter: the position stays
-    stake × leverage, and rounding never rounds a clamp back UP over the cap it
-    was clamped to."""
-    if granted_stake >= ask.stake_usd:
-        return ask.size_coin
-    return round_size(ask.size_coin * granted_stake / ask.stake_usd, sz_decimals)
 
 
 def _held(state: SubState, coin: str) -> Decimal:

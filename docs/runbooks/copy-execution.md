@@ -256,8 +256,8 @@ of them.
 
 ## The daily-loss pause is NOT in yet
 
-A5 ships its enabler, not the pause: every cycle records each sub's equity in
-`copy_sub_equity`, which is what a threshold will eventually be chosen from.
-Until the follow-up lands, small stakes and the notices in your chat are the
-interim cover — nothing stops a sub that is having a bad day except `/uncopy`
-or `/kill`.
+A5 ships its enabler, not the pause (filed as **#181**): every cycle records
+each sub's equity in `copy_sub_equity`, which is what a threshold will
+eventually be chosen from. Until #181 lands, small stakes and the notices in
+your chat are the interim cover — nothing stops a sub that is having a bad day
+except `/uncopy` or `/kill`.

@@ -31,7 +31,7 @@ makes the "the Leader closes while our entry rests" edge dissolve.
 
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
-from epigone.execute.policy import SLIPPAGE_CAP
+from epigone.execute.policy import SLIPPAGE_CAP, open_position_notional
 
 # The wire's own precision floor (epigone.gateway.execution.decimal_to_wire).
 MAX_WIRE_DECIMALS = 8
@@ -67,20 +67,22 @@ def round_size(size_coin: Decimal, sz_decimals: int) -> Decimal:
     return rounded
 
 
-def open_position_notional(stake_usd: Decimal, leverage: Decimal) -> Decimal:
-    """The dollar POSITION a stake buys at a leverage (amendment D-4).
+def clamped_size(
+    size_coin: Decimal, *, asked_stake: Decimal, granted_stake: Decimal, sz_decimals: int
+) -> Decimal:
+    """The order size for the stake the policy actually granted (issue #137 §5).
 
-    One line, and it is its own function because it is the whole amendment:
-    the configured dollars used to BE the position and are now the margin
-    behind it. Every reader that needs "how big is this order in dollars" —
-    the exchange-minimum check, the operator's notice, the clamp arithmetic —
-    goes through here, so the two numbers can never be confused in one place
-    and not another."""
-    if stake_usd <= 0:
-        raise UnpriceableError(f"stake {stake_usd} is not positive")
-    if leverage <= 0:
-        raise UnpriceableError(f"leverage {leverage} is not positive")
-    return stake_usd * leverage
+    A full grant sends the asked size untouched — no re-derivation, so a clamp
+    is the ONLY thing that can change what was sized. A partial grant scales
+    the size by the same ratio the stake was cut by and re-rounds DOWN at the
+    asset's precision, which keeps the two properties that matter: the position
+    stays stake × leverage, and rounding can never round a clamp back UP over
+    the cap it was clamped to."""
+    if asked_stake <= 0:
+        raise UnpriceableError(f"asked stake {asked_stake} is not positive")
+    if granted_stake >= asked_stake:
+        return size_coin
+    return round_size(size_coin * granted_stake / asked_stake, sz_decimals)
 
 
 def open_size(

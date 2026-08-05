@@ -59,7 +59,6 @@ its own clearinghouseState/PnL, so per-Leader copy stats are exchange-native.
 > text below is left standing so the reasoning that produced it stays
 > readable, and D-4 says which half of it survived.
 
-
 Option (a) of the grill: each Copy Sub-account has a Base Notional (e.g. $200).
 A Leader's open is copied at Base Notional regardless of the Leader's absolute
 size — the Leader's size NEVER determines copy size; only relative changes do.
@@ -568,12 +567,13 @@ and open interest, not the book itself), and the rule that **the floor defaults
 must be revisited whenever the stake caps are raised** — a $100k floor bounds
 slippage for a $4,000 position and does not for a $40,000 one.
 
-**Deferred with its enabler shipped:** the daily-loss pause. Small stakes plus
-operator alerting cover the interim; what ships now is per-cycle **sub-equity
-history** (`copy_sub_equity`), recorded from the equity the reconcile already
-reads and used to discard — because the honest way to pick a daily-loss
-threshold is to look at what a sub's equity actually does across a day of
-copying.
+**Deferred with its enabler shipped:** the daily-loss pause, filed as **issue
+#181**. Small stakes plus operator alerting cover the interim; what ships now
+is per-cycle **sub-equity history** (`copy_sub_equity`), recorded from the
+equity the reconcile already reads and used to discard — because the honest way
+to pick a daily-loss threshold is to look at what a sub's equity actually does
+across a day of copying. #181 also owns that table's retention window, since
+the window it needs is the one that decides how far back the pause looks.
 
 **The live gate is now a flag, not an absence.** `EXECUTOR_ALLOW_MAINNET`
 wires the capability `HttpExecutionGateway` has always demanded. Mainnet takes

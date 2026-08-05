@@ -82,7 +82,7 @@ def test_a_coin_with_no_market_data_is_denied_not_waved_through() -> None:
     # This gate only ever stops an ENTRY: not entering costs a missed copy,
     # entering blind costs money in exactly the market the gate exists to keep
     # us out of.
-    verdict = RiskPolicy().judge_coin("ZZZ", None, LIMITS)
+    verdict = RiskPolicy().judge_coin(coin="ZZZ", stats=None, limits=LIMITS)
     assert verdict.allowed is False
     assert "no live market data" in verdict.decision
 
@@ -92,7 +92,7 @@ def test_a_missing_market_is_denied_even_with_the_floor_switched_off() -> None:
     # have no data for" — and the same read carries the asset's own leverage
     # ceiling, so a coin missing from it cannot be sized either.
     off = RiskLimits(floor_day_notional_usd=Decimal(0), floor_open_interest_usd=Decimal(0))
-    verdict = RiskPolicy().judge_coin("ZZZ", None, off)
+    verdict = RiskPolicy().judge_coin(coin="ZZZ", stats=None, limits=off)
     assert verdict.allowed is False
     assert "what leverage the asset allows" in verdict.decision
 
@@ -100,7 +100,7 @@ def test_a_missing_market_is_denied_even_with_the_floor_switched_off() -> None:
 def test_a_denial_says_did_not_enter_and_never_did_not_exit() -> None:
     # §3's wording rule. Nothing in this policy can stop an exit, so no denial
     # may read as though it did.
-    verdict = RiskPolicy().judge_coin("ETH", market(volume="10"), LIMITS)
+    verdict = RiskPolicy().judge_coin(coin="ETH", stats=market(volume="10"), limits=LIMITS)
     assert verdict.allowed is False
     assert "did not enter" in verdict.decision
     assert "did not exit" not in verdict.decision

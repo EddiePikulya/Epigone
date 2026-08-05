@@ -46,17 +46,17 @@
 --
 -- copy_sub_equity — per-cycle equity history per Copy Sub-account. Unlike
 -- trader_equity (0032), which keeps only the latest observation because
--- nothing needed the history, this one IS the history: the daily-loss pause is
--- deferred precisely because nobody knows what threshold to set, and a
--- recorded curve is what will set it. The executor already reads each sub's
--- equity every cycle to reconcile it and then discards it, so recording costs
--- no request and no weight.
+-- nothing needed the history, this one IS the history: the daily-loss pause
+-- (deferred to issue #181) is deferred precisely because nobody knows what
+-- threshold to set, and a recorded curve is what will set it. The executor
+-- already reads each sub's equity every cycle to reconcile it and then
+-- discards it, so recording costs no request and no weight.
 --
 -- KNOWN GAP, recorded not built: nothing prunes this table. At the 5s executor
 -- cadence it grows ~17k rows per sub per day, which is small for a
--- single-operator phase-A run and would not be for a long one. The follow-up
--- that ships the daily-loss pause owns the retention window, because the
--- window it needs is the one that decides how far back the pause looks.
+-- single-operator phase-A run and would not be for a long one. Issue #181 (the
+-- filed daily-loss pause) owns the retention window, because the window it
+-- needs is the one that decides how far back the pause looks.
 --
 -- Timestamps come from the injected clock; additive, no wipe.
 

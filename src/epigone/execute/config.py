@@ -87,8 +87,6 @@ class ExecutorConfig:
         return self.exchange_url == MAINNET_EXCHANGE_URL and self.allow_mainnet
 
 
-
-
 def _parse_exchange_url(raw: str | None) -> str:
     if not raw:
         return TESTNET_EXCHANGE_URL
