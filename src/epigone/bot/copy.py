@@ -38,7 +38,7 @@ bot-wide: the usage lines want literal `<leader>` placeholders and the mapping
 listing wants a bold header, while the rest of the bot goes on sending
 unescaped plain text. Every dynamic value here goes through `esc` — a leader
 argument is only checked for `0x` and a length, so it reaches these replies as
-whatever the operator typed — and every dollar figure through `plain`, so a
+whatever the operator typed — and every dollar figure through `fixed_point`, so a
 `1e5` typed here or a round NUMERIC read back from the row never reaches chat
 as `1.0E+5`.
 """
@@ -56,7 +56,7 @@ from epigone.bot.access import ADMIN_ONLY_TEXT, _is_admin
 from epigone.bot.delete import with_delete_button
 from epigone.bot.format import HTML, esc
 from epigone.clock import Clock
-from epigone.decimals import plain
+from epigone.decimals import fixed_point
 from epigone.execute import limits as risk_limits
 from epigone.execute.episodes import live_episodes
 from epigone.execute.policy import FIXED_LEVERAGE, MIRROR_LEVERAGE, RiskPolicy
@@ -183,29 +183,33 @@ def _prompt(parsed: CopyRequest) -> str:
     lines = [
         f"{CONFIRM_MARKER} {esc(parsed.leader)}?",
         "",
-        f"• A dedicated sub-account funded with ${plain(parsed.allocation)} — that "
+        f"• A dedicated sub-account funded with ${fixed_point(parsed.allocation)} — that "
         f"balance is the hard exposure cap for this leader, enforced by the "
         f"exchange, not by us.",
-        f"• Every copied open puts up ${plain(parsed.stake)} of YOUR margin, isolated "
-        f"per position — so ${plain(parsed.stake)} is the most any one copied "
+        f"• Every copied open puts up ${fixed_point(parsed.stake)} of YOUR margin, isolated "
+        f"per position — so ${fixed_point(parsed.stake)} is the most any one copied "
         f"position can lose. Their scales and trims are mirrored as "
         f"percentages.",
         f"• Leverage: {parsed.leverage_phrase}, capped by /limits max_leverage "
         f"and by the asset's own maximum. The position is stake × that "
         f"leverage — "
         + (
-            f"${plain(parsed.stake)} behind a 10x leader is a "
-            f"${plain(parsed.stake * 10)} position."
+            f"${fixed_point(parsed.stake)} behind a 10x leader is a "
+            f"${fixed_point(parsed.stake * 10)} position."
             if parsed.fixed_leverage is None
-            else f"here, ${plain(parsed.stake * parsed.fixed_leverage)} per position."
+            else f"here, ${fixed_point(parsed.stake * parsed.fixed_leverage)} per position."
         ),
     ]
     if parsed.mode == BRACKET_MODE:
         legs = " / ".join(
             part
             for part in (
-                None if parsed.take_profit_pct is None else f"TP {plain(parsed.take_profit_pct)}%",
-                None if parsed.stop_loss_pct is None else f"SL {plain(parsed.stop_loss_pct)}%",
+                None
+                if parsed.take_profit_pct is None
+                else f"TP {fixed_point(parsed.take_profit_pct)}%",
+                None
+                if parsed.stop_loss_pct is None
+                else f"SL {fixed_point(parsed.stop_loss_pct)}%",
             )
             if part is not None
         )
@@ -288,8 +292,8 @@ async def _register(
         return (
             f"♻️ Re-enabled copying of {esc(leader)} on its existing sub-account "
             f"{esc(reenabled.sub_address or '(not yet provisioned)')} — allocation "
-            f"${plain(reenabled.allocation_usd)}, stake "
-            f"${plain(reenabled.base_stake_usd)} per open, "
+            f"${fixed_point(reenabled.allocation_usd)}, stake "
+            f"${fixed_point(reenabled.base_stake_usd)} per open, "
             f"{esc(reenabled.leverage_summary)}, mode {esc(reenabled.copy_mode)}."
         )
     except asyncpg.ForeignKeyViolationError:
@@ -371,8 +375,8 @@ async def cmd_copies(
             state = "⏳ provisioning"
         lines.append(
             f"{state} · {esc(sub.leader_address)}\n"
-            f"   ${plain(sub.allocation_usd)} allocation · "
-            f"${plain(sub.base_stake_usd)} stake · "
+            f"   ${fixed_point(sub.allocation_usd)} allocation · "
+            f"${fixed_point(sub.base_stake_usd)} stake · "
             f"{esc(sub.leverage_summary)} · {esc(sub.copy_mode)}"
         )
     await message.answer(

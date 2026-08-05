@@ -27,7 +27,7 @@ from typing import Any
 
 import asyncpg
 
-from epigone.decimals import plain
+from epigone.decimals import fixed_point
 
 # Conservative by intent, and the same numbers migration 0036 seeds (module
 # docstring). Measured 2026-08-05 against the live universe: a $100k/$100k
@@ -104,7 +104,7 @@ class Knob:
         floor = Decimal(0) if self.zero_means_off else Decimal("0.0000001")
         if value < floor:
             raise ValueError(
-                f"{self.name} must be at least {plain(floor)}"
+                f"{self.name} must be at least {fixed_point(floor)}"
                 + (" (0 turns this floor off)" if self.zero_means_off else "")
             )
         if self.is_integer:
@@ -265,13 +265,13 @@ def value_of(limits: RiskLimits, entry: Knob) -> Decimal | int:
 def render(limits: RiskLimits, entry: Knob) -> str:
     """One knob as the operator reads it: `12x`, `$100000`, `$0 (off)`.
 
-    FIXED-POINT, NEVER SCIENTIFIC (issue #185). A knob loaded from the row
-    arrives as Postgres wrote it — `100000` decodes to `Decimal('1.0E+5')` —
-    and this string is read twice: once in the /limits reply, once as the old →
-    new of the `risk_limit_changed` audit row. One renderer means the trail
-    cannot disagree with the message that announced the change."""
+    Through `fixed_point`, because a knob loaded from the row arrives as
+    Postgres wrote it (issue #185). This string is read twice — once in the
+    /limits reply, once as the old → new of the `risk_limit_changed` audit row
+    — and one renderer means the trail cannot disagree with the message that
+    announced the change."""
     value = value_of(limits, entry)
-    shown = plain(value)
+    shown = fixed_point(value)
     text = f"{shown}{entry.unit}" if entry.unit == "x" else f"{entry.unit}{shown}"
     if entry.zero_means_off and value == 0:
         text += " (off)"

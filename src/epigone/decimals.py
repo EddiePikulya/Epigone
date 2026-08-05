@@ -16,10 +16,10 @@ surface should get to hold differently.
 
 from decimal import Decimal
 
-__all__ = ["plain"]
+__all__ = ["fixed_point"]
 
 
-def plain(value: Decimal | int) -> str:
+def fixed_point(value: Decimal | int) -> str:
     """`value` in fixed-point, never in scientific notation.
 
     Every digit the value carries is kept, trailing zeros included: a Decimal's

@@ -73,6 +73,9 @@ def trader_header(label: str | None, address: str) -> tuple[str, MessageEntity]:
     reads `name (0xfull…)` or the bare full address. A `code` entity is used in
     preference to an HTML parse mode: parse mode would force escaping every piece
     of dynamic text (a nickname may hold `<` or `&`) across the whole message.
+    That is this message's own choice, not a bot-wide ban — parse mode is per
+    message (see `HTML` above), and the operator's copy and limits replies do
+    take it, because their dynamic values are few and all escaped.
 
     The entity offset is in UTF-16 code units — Telegram's unit — since a name
     may carry emoji, so the prefix is measured in UTF-16, not characters. The
