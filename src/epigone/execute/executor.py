@@ -237,7 +237,7 @@ class CopyExecutor:
         # about the book this process trades. Every other read goes through
         # `self._read`, which stays pinned to the exchange url; on a mainnet
         # deployment the two gateways point at the same endpoint.
-        self._signal = signal_gateway
+        self._signal_read = signal_gateway
         self._exec = exec_gateway
         self._provisioning = provisioning
         self._audit = audit
@@ -1614,7 +1614,7 @@ class CopyExecutor:
         gateway; only the endpoint moved."""
         await self._budget.spend(POSITIONS_WEIGHT)
         try:
-            state = await self._signal.get_account_state(event.trader_address)
+            state = await self._signal_read.get_account_state(event.trader_address)
         except Exception:
             # Unreadable is not "below the floor". A gate that fails CLOSED on
             # a network blip would silently stop copying; the event stays

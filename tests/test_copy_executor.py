@@ -279,12 +279,16 @@ async def test_a_leader_below_the_liveness_floor_is_not_copied_into(
     await emit(pool, opened(), clock.now())
     await h.executor.run_cycle()
 
+    observed = str(LEADER_EQUITY_FLOOR - Decimal("1"))
     assert h.placed() == []
     assert await outstanding(pool) == []  # claimed: a decision, not a deferral
-    notices = await h.notices()
-    assert any("liveness floor" in body for body in notices)
-    # The observed figure is the SIGNAL side's, and it is what the operator reads.
-    assert any(str(LEADER_EQUITY_FLOOR - Decimal("1")) in body for body in notices)
+    # The observed figure is the SIGNAL side's, in both places the operator
+    # can look: the notice they read and the trail that answers for it later.
+    assert any("liveness floor" in body and observed in body for body in await h.notices())
+    assert any(
+        action == "copy_skipped" and "liveness floor" in reason and observed in reason
+        for action, reason in await h.audit_actions()
+    )
 
 
 async def test_a_leader_alive_on_the_signal_network_is_copied_though_the_book_reads_zero(
