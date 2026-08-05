@@ -4,6 +4,7 @@ Operator-only; one knob per command; every change audited old → new; and the
 executor re-reads the row each cycle, so a change lands without a restart.
 """
 
+import json
 from decimal import Decimal
 
 import asyncpg
@@ -15,7 +16,7 @@ from epigone.bot.handlers import build_router
 from epigone.execute import limits as risk_limits
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_text
+from tests.support.telegram import HTML_PARSE_MODE, RecordingSession, feed_text
 
 ADMIN = 370818090
 GUEST = 111
@@ -172,3 +173,73 @@ async def test_a_knob_set_on_a_missing_row_recreates_it(
     limits = await risk_limits.load(pool)
     assert limits.max_sub_stake_usd == Decimal("500")
     assert limits.max_coin_stake_usd == risk_limits.DEFAULT_MAX_COIN_STAKE_USD
+
+
+async def test_a_round_dollar_knob_reads_as_a_plain_number_not_scientific_notation(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession
+) -> None:
+    """Postgres hands a round NUMERIC back as an exponent-carrying Decimal
+    (100000 decodes to Decimal('1.0E+5')), so a knob rendered with plain str()
+    reaches the operator as `$1.0E+5` — observed live on the first /limits."""
+    await feed_text(admin_dp, bot, "/limits floor_volume 100000", user_id=ADMIN)
+    await feed_text(admin_dp, bot, "/limits", user_id=ADMIN)
+
+    listing = session.sent_messages()[-1].text or ""
+    assert "$100000" in listing
+    assert "E+" not in listing
+
+
+async def test_the_audit_trail_carries_the_plain_number_the_reply_carries(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The old value in `risk_limit_changed` is read back from the row, so it
+    is exactly where the exponent form gets in — and the trail is the copy
+    nobody can re-read in chat to work out what `$1.0E+5` meant."""
+    await feed_text(admin_dp, bot, "/limits floor_volume 100000", user_id=ADMIN)
+    await feed_text(admin_dp, bot, "/limits floor_volume 50000", user_id=ADMIN)
+
+    row = await pool.fetchrow(
+        "SELECT * FROM execution_audit WHERE action = 'risk_limit_changed' "
+        "ORDER BY id DESC LIMIT 1"
+    )
+    assert row is not None
+    assert "floor_volume: $100000 → $50000" in row["risk_decision"]
+    detail = json.loads(row["detail"])
+    assert (detail["old"], detail["new"]) == ("$100000", "$50000")
+
+
+async def test_the_knob_listing_reads_as_labels_and_values_not_as_markup(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession
+) -> None:
+    """The listing is written in HTML and, before #185, sent with no parse
+    mode — so the operator's first /limits after A5 arrived as literal
+    `<b>floor_volume</b>`."""
+    await feed_text(admin_dp, bot, "/limits", user_id=ADMIN)
+
+    reply = session.sent_messages()[-1]
+    assert reply.parse_mode == HTML_PARSE_MODE
+    assert "floor_volume $100000" in session.rendered(reply)
+    assert "<b>" not in session.rendered(reply)
+
+
+async def test_the_usage_line_reads_as_placeholders_not_as_entities(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession
+) -> None:
+    await feed_text(admin_dp, bot, "/limits coin_stake 250 extra", user_id=ADMIN)
+
+    usage = session.rendered(session.sent_messages()[-1])
+    assert "/limits <knob> <value>" in usage
+    assert "&lt;" not in usage
+
+
+async def test_an_operators_own_markup_comes_back_as_text_not_as_markup(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The error replies quote what was typed, so the operator's words reach an
+    HTML message. Escaped, they read back as themselves; unescaped, Telegram
+    would either swallow them or reject the whole reply."""
+    await feed_text(admin_dp, bot, "/limits <b>coin_stake</b> 250", user_id=ADMIN)
+
+    reply = session.sent_messages()[-1]
+    assert "unknown limit '<b>coin_stake</b>'" in session.rendered(reply)
+    assert (await risk_limits.load(pool)).max_coin_stake_usd == Decimal("300")

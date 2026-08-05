@@ -1,14 +1,44 @@
 """Shared Telegram text formatting: used by the dialog handlers and the
 Position/Order Alert renderers."""
 
+import html
 from collections.abc import Mapping
 from datetime import datetime
 from decimal import Decimal
 
+from aiogram.enums import ParseMode
 from aiogram.types import MessageEntity
 
 from epigone.gateway import OpenOrder, Position, Side
 from epigone.metrics.library import format_duration
+
+# --- markup, asked for one message at a time (issue #185) ---
+#
+# The bot speaks PLAIN TEXT by default and the Bot object carries no default
+# parse mode, deliberately. Nearly every reply interpolates text Epigone does
+# not control — a User's wallet nickname, a criteria name, a coin ticker, an
+# address — and none of it has ever been escaped, because in plain text there
+# is nothing to escape it from. A bot-wide parse mode would silently start
+# reinterpreting all of that.
+#
+# So a handler that wants markup asks for it on the message: `parse_mode=HTML`
+# at the send, and `esc()` around every dynamic value in the text. The two go
+# together — the test-suite guard in tests/support/telegram.py fails a message
+# that takes one without the other, in either direction.
+HTML = ParseMode.HTML
+
+
+def esc(value: object) -> str:
+    """A dynamic value as HTML *text*: `<`, `>` and `&` become entities, so it
+    reads as itself rather than as markup (or as a parse error that loses the
+    whole message).
+
+    Takes an `object` and stringifies it because the values that reach these
+    messages are addresses, names, Decimals and ints alike, and a call site
+    that had to remember which ones needed the wrapper would be a call site
+    that eventually forgets. Quotes are left alone: nothing here builds an HTML
+    attribute out of dynamic text."""
+    return html.escape(str(value), quote=False)
 
 
 def short_address(address: str) -> str:
