@@ -17,8 +17,14 @@ from epigone.execute import episodes as ep
 from epigone.execute import subs as subs_store
 from epigone.execute.executor import EXECUTOR_CONSUMER
 from epigone.execute.policy import ENTRY_STALENESS_GUARD, LEADER_EQUITY_FLOOR, RiskPolicyV0
-from epigone.gateway import Side
-from epigone.gateway.execution import OrderFilled, OrderRejected, RejectReason, Tif
+from epigone.gateway import GatewayError, Position, Side
+from epigone.gateway.execution import (
+    ActionRejectedError,
+    OrderFilled,
+    OrderRejected,
+    RejectReason,
+    Tif,
+)
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.position_events import ClaimableEvent, PositionEvent, outstanding_events
 from epigone.safety.audit import ExecutionAudit
@@ -26,6 +32,7 @@ from epigone.safety.halt import KILL_SOURCE, request_halt
 from tests.support.clock import FakeClock
 from tests.support.copy import (
     LEADER,
+    MASTER,
     OPERATOR,
     SUB,
     build_harness,
@@ -1267,7 +1274,10 @@ async def test_a_sub_already_holding_its_allocation_is_not_funded_again(
     await h.executor.run_cycle()
 
     assert [m for m, _ in h.exec_fake.actions if m == "sub_account_transfer"] == []
-    assert any("already holds its $1000 allocation" in b for b in await h.notices())
+    # The BALANCE, not the allocation: "already holds its $1000 allocation"
+    # would understate a sub sitting on $1400 — and an adopted orphan is
+    # exactly where the operator needs the real figure.
+    assert any("already holds $1400 against its $1000 allocation" in b for b in await h.notices())
 
 
 async def test_a_failed_funding_transfer_never_mints_a_second_sub_account(
@@ -1313,6 +1323,352 @@ async def test_provisioning_past_the_v0_ceilings_is_declined_before_money_moves(
     assert h.exec_fake.actions == []  # nothing signed, nothing funded
     assert any("was NOT set up" in body for body in await h.notices())
     assert await subs_store.enabled_subs(pool, OPERATOR) == []
+
+
+# --- adoption at the sub-account cap (issue #178) -----------------------------
+#
+# The shape every test here uses is the live testnet master's own, because it
+# is the one the A4 shakedown runs against: TEN sub-accounts, every slot spent
+# (`epicopy`, `agsub`, capprobe_000-007), so `createSubAccount` is refused
+# "Too many sub-accounts." and no Leader could be copied at all without
+# adoption. The probe subs hold nothing, which is exactly what makes them
+# adoptable.
+
+
+def capped_master(gateway: FakeHyperliquidGateway) -> list[str]:
+    """A master at the cap: ten subs, addresses only (what `subAccounts`
+    gives). Returned in listing order — adoption takes the FIRST adoptable
+    one, so order is part of what these tests pin."""
+    held = [f"0x{index:040x}" for index in range(20, 30)]
+    gateway.sub_accounts[MASTER] = held
+    return held
+
+
+def cap_refusal() -> ActionRejectedError:
+    return ActionRejectedError("Too many sub-accounts.")
+
+
+async def test_a_cap_refusal_adopts_an_empty_orphan_and_funds_it_to_the_allocation(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The cap is not a wall, it is a fallback: an orphaned sub of the master
+    — unmapped and position-free — becomes this Leader's sub, and the ordinary
+    funding leg tops it up to the allocation. The inherited balance is handled
+    by the same target-balance logic a re-copy uses; it is not a special
+    case."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    gateway.account_values[(held[0], None)] = Decimal("150")  # whatever it inherited
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    assert [m for m, _ in h.exec_fake.actions if m == "create_sub_account"] == [
+        "create_sub_account"
+    ]  # tried to mint FIRST; adoption is the fallback, never the first choice
+    transfers = [p for m, p in h.exec_fake.actions if m == "sub_account_transfer"]
+    assert transfers == [(held[0], True, 850_000_000)]  # $1000 target, $150 held
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] == held[0] and stored["provisioned_at"] is not None
+    assert "copy_sub_adopted" in [action for action, _ in await h.audit_actions()]
+    assert any("ADOPTED" in body for body in await h.notices())  # never reads as "created"
+
+
+async def test_a_sub_mapped_to_any_leader_is_never_adopted(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Three mappings, three reasons the sub behind them is untouchable: an
+    ENABLED one is obvious; a DISABLED one still belongs to its Leader
+    (/uncopy stops event consumption, not ownership — a later /copy re-enables
+    that mapping onto that same sub); and ANOTHER OPERATOR's is excluded by
+    the same query, which is read unscoped for exactly this reason. Adopting
+    any of them would hand one Leader's money and history to another."""
+    h = await build_harness(pool, clock, gateway)
+    held = capped_master(gateway)
+    enabled_elsewhere = "0xleader11111111111111111111111111111111ff"
+    disabled_elsewhere = "0xleader22222222222222222222222222222222ff"
+    other_operator = "0xleader33333333333333333333333333333333ff"
+    for leader in (enabled_elsewhere, disabled_elsewhere, other_operator):
+        await seed_trader(pool, clock, leader)
+    await copy_sub(pool, clock, leader=enabled_elsewhere, sub_address=held[0])
+    await copy_sub(pool, clock, leader=disabled_elsewhere, sub_address=held[1])
+    await subs_store.disable_sub(
+        pool, operator_id=OPERATOR, leader_address=disabled_elsewhere
+    )
+    foreign = await subs_store.register_sub(
+        pool,
+        operator_id=OPERATOR + 1,
+        leader_address=other_operator,
+        sub_name="someone-elses",
+        allocation_usd=Decimal("1000"),
+        base_notional_usd=Decimal("200"),
+        copy_mode="default",
+        take_profit_pct=None,
+        stop_loss_pct=None,
+        now=clock.now(),
+    )
+    await subs_store.record_sub_address(pool, foreign.id, held[2])
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT sub_address FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None and stored["sub_address"] == held[3]
+
+
+async def test_a_sub_holding_an_open_position_is_never_adopted(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Decision 10's never-touch rule: a sub with a live position is operator
+    territory, whoever opened it. The check walks every venue Epigone covers,
+    so a builder-DEX-only position protects a sub exactly as a core one
+    does."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    gateway.set_positions(held[0], [position(coin="xyz:META")], dex="xyz")
+    gateway.set_positions(held[1], [position(coin="BTC")])
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT sub_address FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None and stored["sub_address"] == held[2]
+
+
+async def test_a_cap_refusal_with_no_adoptable_orphan_provisions_nothing(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Nothing left to adopt is the operator's problem to solve, and it must
+    read as one: a distinct notice, the mapping disabled, and not one dollar
+    moved — the same shape the risk-declined path has."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    for address in held:
+        gateway.set_positions(address, [position(coin="BTC")])
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    assert [m for m, _ in h.exec_fake.actions if m == "sub_account_transfer"] == []
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] is None and not stored["enabled"]
+    assert any("all 10" in body and "was NOT set up" in body for body in await h.notices())
+
+
+async def test_an_unreadable_candidate_defers_adoption_rather_than_failing_loudly(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """"I cannot tell" is not "there is none". A candidate whose positions
+    will not read might be the empty one, so the pass defers and retries —
+    disabling the mapping on a read failure would turn a blip into an
+    operator ticket."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    for address in held[1:]:
+        gateway.set_positions(address, [position(coin="BTC")])
+    gateway.positions_errors[held[0]] = GatewayError("clearinghouseState unavailable")
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] is None and stored["enabled"]  # retried next cycle
+    assert not any("was NOT set up" in body for body in await h.notices())
+
+    # And when the read comes back, the same orphan is adopted.
+    gateway.positions_errors.pop(held[0])
+    h.exec_fake.errors.append(cap_refusal())
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT sub_address FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None and stored["sub_address"] == held[0]
+
+
+async def test_an_unreadable_sub_listing_defers_adoption(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    capped_master(gateway)
+    gateway.sub_account_errors[MASTER] = GatewayError("subAccounts unavailable")
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] is None and stored["enabled"]
+
+
+async def test_an_empty_listing_under_a_cap_refusal_defers_rather_than_disabling(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """"The cap is full" and "the master holds nothing" cannot both be true.
+    One of the two reads is wrong and nothing here can say which, so this is
+    an "I cannot tell" — and an empty candidate loop must not be mistaken for
+    "I looked at ten and none was adoptable"."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    gateway.sub_accounts[MASTER] = []
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] is None and stored["enabled"]
+    assert not any("was NOT set up" in body for body in await h.notices())
+
+
+async def test_an_adopted_sub_is_renamed_for_its_leader(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Finding 11: `subAccountModify` renames a sub, so an adopted
+    `capprobe_003` does not stay `capprobe_003` in the operator's exchange
+    UI. Cosmetic, and ordered before the money so a rename that fails cannot
+    strand a funded sub mid-pass."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    h.exec_fake.errors.append(cap_refusal())
+
+    await h.executor.run_cycle()
+
+    assert [m for m, _ in h.exec_fake.actions] == [
+        "create_sub_account",  # refused at the cap
+        "rename_sub_account",
+        "sub_account_transfer",
+    ]
+    renames = [p for m, p in h.exec_fake.actions if m == "rename_sub_account"]
+    assert renames == [(held[0], sub.sub_name)]
+
+
+async def test_a_refused_rename_never_blocks_an_adoption(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The ticket's own instruction: if the name cannot follow the Leader,
+    note the cosmetic mismatch and move on. A sub that is funded and copying
+    under the wrong label is strictly better than a Leader that is not copied
+    at all."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    h.exec_fake.errors.extend([cap_refusal(), ActionRejectedError("Invalid sub-account name.")])
+
+    await h.executor.run_cycle()
+
+    transfers = [p for m, p in h.exec_fake.actions if m == "sub_account_transfer"]
+    assert transfers == [(held[0], True, 1_000_000_000)]
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None and stored["provisioned_at"] is not None
+    assert any("still named" in body for body in await h.notices())
+
+
+async def test_a_refusal_that_is_not_the_cap_never_adopts(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Adoption is keyed to ONE refusal. Any other — a volume gate, an
+    unauthorized signer — leaves the mapping pending for the next cycle,
+    because taking over someone else's sub is not a reasonable answer to a
+    problem we have not diagnosed."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    capped_master(gateway)
+    h.exec_fake.errors.append(
+        ActionRejectedError(
+            "Cannot create sub-accounts until enough volume traded. Required: $100000"
+        )
+    )
+
+    await h.executor.run_cycle()
+
+    assert [m for m, _ in h.exec_fake.actions if m == "sub_account_transfer"] == []
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] is None and stored["enabled"]
+
+
+async def test_a_halt_landing_between_the_adoption_and_the_rename_signs_nothing(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """THE WINDOW THIS GATE EXISTS FOR. The "create" halt check is already
+    seconds to tens of seconds old by the time a sub is adopted — the listing
+    read and one position read per candidate happen in between — and the
+    rename is a SIGNATURE. So the halt is requested here after the adoption
+    commits and before the rename is called: no subAccountModify is signed, no
+    transfer follows, and the adoption STAYS (a row in our own database is not
+    something the exchange saw), so the next cycle resumes at the funding leg
+    instead of taking over a second sub."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    h.exec_fake.errors.append(cap_refusal())
+    audit = ExecutionAudit(pool, clock)
+    adopt = h.executor._adopt_orphan_sub
+
+    async def adopt_then_halt(*args: object, **kwargs: object) -> str | None:
+        address = await adopt(*args, **kwargs)  # type: ignore[arg-type]
+        await request_halt(
+            pool,
+            clock,
+            audit,
+            source=KILL_SOURCE,
+            reason="operator /kill",
+            requested_by=OPERATOR,
+        )
+        return address
+
+    h.executor._adopt_orphan_sub = adopt_then_halt  # type: ignore[method-assign]
+
+    await h.executor.run_cycle()
+
+    signed = [m for m, _ in h.exec_fake.actions]
+    assert "rename_sub_account" not in signed  # the gap this fix closed
+    assert "sub_account_transfer" not in signed
+    assert any("NOT renamed — execution is halted" in body for body in await h.notices())
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] == held[0] and stored["provisioned_at"] is None
+
+
+async def test_an_adoption_is_reported_before_the_funding_leg_can_fail(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The operator learns a sub was ADOPTED rather than minted at the moment
+    it happens, in the same transaction as the address and the audit row —
+    not at the end of a provisioning run that may not finish. A funding leg
+    that defers must not cost them that sentence."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")
+    held = capped_master(gateway)
+    h.exec_fake.errors.append(cap_refusal())
+
+    # The candidate reads fine while it is being JUDGED and fails only on the
+    # funding leg's equity read, which comes after the rename — so adoption
+    # completes and funding defers.
+    async def unreadable_once_adopted(address: str, dex: str | None = None) -> list[Position]:
+        renamed = any(method == "rename_sub_account" for method, _ in h.exec_fake.actions)
+        if renamed and address == held[0]:
+            raise GatewayError("balance unreadable")
+        return []
+
+    gateway.get_open_positions = unreadable_once_adopted  # type: ignore[method-assign]
+
+    await h.executor.run_cycle()
+
+    stored = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert stored is not None
+    assert stored["sub_address"] == held[0] and stored["provisioned_at"] is None
+    assert any("ADOPTED" in body for body in await h.notices())
+    assert "copy_sub_adopted" in [action for action, _ in await h.audit_actions()]
 
 
 async def test_an_exit_sliver_under_the_exchange_minimum_is_skipped_not_retried(

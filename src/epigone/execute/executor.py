@@ -86,6 +86,7 @@ from epigone.gateway import (
     fetch_asset_specs,
 )
 from epigone.gateway.execution import (
+    ActionRejectedError,
     ExecutionError,
     Grouping,
     OrderFilled,
@@ -93,6 +94,7 @@ from epigone.gateway.execution import (
     OrderResting,
     OrderResult,
     OrderSpec,
+    RejectReason,
     Tif,
     TpSl,
     Trigger,
@@ -122,6 +124,13 @@ POSITIONS_WEIGHT = 2  # clearinghouseState, per venue
 ORDERS_WEIGHT = 20  # frontendOpenOrders, per venue
 MIDS_WEIGHT = 2  # allMids, per venue
 META_WEIGHT = 20  # meta / perpDexs
+SUBS_WEIGHT = 20  # subAccounts — the rate the watchdog bills this listing at
+
+# What the operator is told did not happen, per provisioning leg. Each leg is
+# one signature (`_halted_before_provisioning`), and the sentence names the
+# action rather than the leg because "NOT renamed" is what the chat needs to
+# read — the leg name is for the audit row beside it.
+_HALTED_LEG = {"create": "created", "rename": "renamed", "fund": "funded"}
 FILLS_WEIGHT = 20  # userFills, per endpoint
 
 # Micro-USD is subAccountTransfer's unit (finding 6, measured).
@@ -135,6 +144,18 @@ class SubState:
 
     account_value: Decimal
     positions: dict[str, Position]
+
+
+@dataclass(frozen=True)
+class _Funding:
+    """What one provisioning read learned about a sub's money: what it holds
+    now, and how far that is below the allocation it is targeting. Both,
+    because the transfer needs the gap and the operator's notice needs the
+    balance — and re-reading equity to say the second would bill a second
+    weight for a number already in hand."""
+
+    held: Decimal
+    topup: Decimal
 
 
 @dataclass(frozen=True)
@@ -243,7 +264,17 @@ class CopyExecutor:
         drained sub trade on a cap the operator never agreed to. So the sub's
         live equity is read and only the difference moves. An over-funded sub
         is left alone rather than drained back: taking money OUT is not
-        something provisioning should decide."""
+        something provisioning should decide.
+
+        CREATION IS THE FIRST CHOICE, ADOPTION THE FALLBACK (issue #178). A
+        master holds at most ten subs, flat, and a sub cannot be deleted
+        (finding 10) — so a master whose slots are spent refuses
+        `createSubAccount` and, without a second answer, could copy NO Leader
+        at all. `_adopt_orphan_sub` is that answer: a sub of this master that
+        no mapping claims and that holds no position becomes this Leader's,
+        and the top-up above funds it from whatever it inherited. Minting is
+        still attempted first every pass, because a free slot always beats
+        re-using an account something else named."""
         for sub in subs:
             if sub.is_provisioned:
                 continue
@@ -259,23 +290,58 @@ class CopyExecutor:
             # that matter saying "unspecified".
             self._provisioning.decision = verdict.decision
             address = sub.sub_address
+            adopted = False
+            renamed = True
             try:
                 if address is None:
                     # THE HALT GATE, as late as it can be before an
                     # IRREVERSIBLE action: a halted cycle must not mint a
                     # sub-account or move funding money. The cycle-top check
                     # is seconds-to-tens-of-seconds stale by now, because the
-                    # per-sub reconciles ran in between.
+                    # per-sub reconciles ran in between. It covers adoption
+                    # too — that path signs a rename and a transfer, and
+                    # hands a live sub to a Leader.
                     if await self._halted_before_provisioning(sub, "create", now):
                         return
-                    address = await self._provisioning.create_sub_account(sub.sub_name)
-                    await subs_store.record_sub_address(self._pool, sub.id, address)
-                topup = await self._funding_gap(sub, address)
-                if topup > 0:
+                    try:
+                        address = await self._provisioning.create_sub_account(sub.sub_name)
+                    except ActionRejectedError as exc:
+                        if exc.reason is not RejectReason.SUB_ACCOUNT_CAP:
+                            raise
+                        # The master's ten slots are spent (finding 10). This
+                        # is the ONE refusal with a recovery that does not
+                        # need the operator. Adoption writes the address down
+                        # WITH its own audit row and notice, in one
+                        # transaction, so it persists the same way this branch
+                        # does — see `_adopt_orphan_sub`.
+                        address = await self._adopt_orphan_sub(sub, now)
+                        if address is None:
+                            # Either nothing is adoptable — reported and
+                            # disabled in there — or we could not tell, in
+                            # which case the next cycle asks again.
+                            continue
+                        adopted = True
+                        # A SECOND LATE GATE, and the reason it is not
+                        # redundant: the "create" check above is now SECONDS
+                        # to tens of seconds old — between them sit a
+                        # budget-throttled listing read and a position read
+                        # per candidate — and the rename is a signature. The
+                        # adoption itself is KEPT: a row in our own database
+                        # is not something the exchange saw, so the next
+                        # cycle resumes at the funding leg rather than
+                        # adopting a second sub. Only the name is lost, which
+                        # is the cosmetic half by construction.
+                        if await self._halted_before_provisioning(sub, "rename", now):
+                            return
+                        renamed = await self._rename_adopted_sub(sub, address)
+                    else:
+                        await subs_store.record_sub_address(self._pool, sub.id, address)
+                funding = await self._funding_gap(sub, address)
+                if funding.topup > 0:
                     if await self._halted_before_provisioning(sub, "fund", now):
                         return
                     await self._provisioning.sub_account_transfer(
-                        address, is_deposit=True, usd_micro=int(topup * USD_MICRO)
+                        address, is_deposit=True, usd_micro=int(funding.topup * USD_MICRO)
                     )
             except ExecutionError:
                 # The gateway already left its own attempt/outcome rows. The
@@ -302,32 +368,261 @@ class CopyExecutor:
                     body=(
                         f"✅ Copy sub ready for {_short(sub.leader_address)}\n"
                         f"sub {_short(address)} · "
+                        # Adopted subs read differently on purpose: this one
+                        # was NOT minted for this Leader, it was taken over,
+                        # and the operator is the only one who can tell
+                        # whether that is what they wanted.
                         + (
-                            f"topped up ${topup} to a ${sub.allocation_usd} balance"
-                            if topup > 0
-                            else f"already holds its ${sub.allocation_usd} allocation"
+                            "ADOPTED — the master's 10 slots are full, so an "
+                            "empty unmapped sub was taken over · "
+                            if adopted
+                            else ""
+                        )
+                        + (
+                            f"topped up ${funding.topup} to a ${sub.allocation_usd} balance"
+                            if funding.topup > 0
+                            # The BALANCE, not the allocation: a sub that
+                            # arrived with more than the allocation is not
+                            # "holding its allocation", and an adopted orphan
+                            # is exactly where that happens.
+                            else f"already holds ${funding.held} against its "
+                            f"${sub.allocation_usd} allocation"
                         )
                         + f" · base ${sub.base_notional_usd} · mode {sub.copy_mode}"
+                        + (
+                            ""
+                            if renamed
+                            else f" · still named whatever minted it, not {sub.sub_name}"
+                        )
                     ),
                     now=now,
                 )
             log.info("copy sub %s provisioned at %s", sub.sub_name, address)
             return
 
-    async def _funding_gap(self, sub: CopySub, address: str) -> Decimal:
+    async def _adopt_orphan_sub(self, sub: CopySub, now: datetime) -> str | None:
+        """Find a sub of the master this mapping can take over, or say why it
+        cannot (issue #178). Returns the adopted address, or None — and the
+        two Nones mean different things, which is the whole care in here.
+
+        ADOPTABLE means BOTH of:
+        - **unmapped**: no `copy_subs` row anywhere points at it, enabled or
+          not. A disabled mapping's sub still belongs to its Leader — /uncopy
+          stops event consumption, not ownership, and a later /copy re-enables
+          that row onto that same sub. The exclusion set is deliberately
+          read across EVERY operator, not just this one;
+        - **position-free**: decision 10's never-touch rule. A sub holding a
+          live position is operator territory whoever opened it, and copying
+          a Leader into it would mix two books that must not mix. Checked
+          across every venue Epigone covers, so a builder-DEX-only position
+          protects a sub exactly as a core one does.
+
+        Resting ORDERS are not part of the test, and that is the ticket's rule
+        rather than an oversight: the disqualifier is a live position, which
+        is what "never touch" is about. The residue is small and visible — an
+        adopted sub's inherited resting order belongs to no Copy Episode, so
+        reconciliation never acts on it, and the next /kill sweep cancels it
+        with every other order on that book.
+
+        Equity does NOT disqualify: an orphan holding money is the good case
+        — the funding leg treats the allocation as a target balance and moves
+        only the difference (`_funding_gap`), exactly as it does for a
+        re-copied sub.
+
+        THE TWO NONES. "Nothing is adoptable" is a decision: it is reported
+        loudly and the mapping is disabled, because no later cycle will change
+        it without the operator. "I could not tell" — the listing would not
+        read, came back EMPTY while the exchange was refusing at the cap (a
+        contradiction, so not evidence of anything), or a candidate's
+        positions would not load — is NOT: it defers, leaves the mapping
+        pending and retries next cycle, because disabling a Leader over a
+        transient read failure is the wrong direction of mistake.
+
+        The adopted address is written down WITH the audit row and the
+        operator's notice, in ONE transaction, before this returns. Same rule
+        the create leg follows for the same reason — a trail that says a sub
+        was adopted for a mapping that never recorded it is worse than no
+        trail — and it is also what makes the report durable: if the funding
+        leg then defers, the operator has already been told this sub was
+        adopted rather than minted."""
+        await self._budget.spend(SUBS_WEIGHT)
+        try:
+            held = await self._read.get_sub_accounts(self._master)
+        except GatewayError:
+            log.warning(
+                "copy sub %s: subAccounts unreadable, adoption deferred",
+                sub.sub_name,
+                exc_info=True,
+            )
+            return None
+        if not held:
+            # The exchange refused at the cap and the listing says the master
+            # holds nothing. One of the two is wrong and we cannot tell which,
+            # so this is an "I could not tell", never a "there is none".
+            log.warning(
+                "copy sub %s: createSubAccount refused at the cap but subAccounts "
+                "lists none — adoption deferred",
+                sub.sub_name,
+            )
+            return None
+        mapped = set(await subs_store.sub_addresses(self._pool))
+        undecided = False
+        for candidate in held:
+            if candidate in mapped:
+                continue
+            try:
+                if await self._holds_positions(candidate):
+                    continue
+            except GatewayError:
+                # Might be the empty one; we cannot say. Not adoptable now,
+                # and not evidence that nothing is.
+                undecided = True
+                log.warning(
+                    "copy sub %s: candidate %s unreadable, skipped for adoption",
+                    sub.sub_name,
+                    candidate,
+                    exc_info=True,
+                )
+                continue
+            async with self._pool.acquire() as conn, conn.transaction():
+                await subs_store.record_sub_address(conn, sub.id, candidate)
+                await self._audit.record_event(
+                    actor=EXECUTOR_ACTOR,
+                    action="copy_sub_adopted",
+                    risk_decision=(
+                        f"createSubAccount refused at the cap of 10 (finding 10); adopted "
+                        f"unmapped position-free sub {candidate} for {sub.leader_address}"
+                    ),
+                    detail={
+                        "sub_id": sub.id,
+                        "leader": sub.leader_address,
+                        "sub_address": candidate,
+                        "sub_name": sub.sub_name,
+                    },
+                    master_address=self._master,
+                    conn=conn,
+                )
+                await notify(
+                    conn,
+                    operator_id=self._operator_id,
+                    kind=PROVISIONING,
+                    body=(
+                        f"♻️ Copy sub ADOPTED for {_short(sub.leader_address)}\n"
+                        f"the master's 10 slots are full, so sub {_short(candidate)} — "
+                        f"unmapped and holding no position — was taken over rather than "
+                        f"minted. Funding it to its ${sub.allocation_usd} allocation next."
+                    ),
+                    now=now,
+                )
+            return candidate
+        if undecided:
+            return None
+        await self._report_cap_exhausted(sub, held_count=len(held), now=now)
+        return None
+
+    async def _holds_positions(self, address: str) -> bool:
+        """Does this account hold ANY open position, on any covered venue?
+        Stops at the first one — the question is adoptability, not inventory,
+        and a sub with one position is as untouchable as a sub with ten."""
+        for dex in POSITION_VENUES:
+            await self._budget.spend(POSITIONS_WEIGHT)
+            if await self._read.get_open_positions(address, dex=dex):
+                return True
+        return False
+
+    async def _report_cap_exhausted(
+        self, sub: CopySub, *, held_count: int, now: datetime
+    ) -> None:
+        """The cap is full AND nothing is adoptable: fail loudly, provision
+        nothing, and disable the mapping — the same shape (and the same "was
+        NOT set up" sentence) the risk-declined path has, because from the
+        operator's chair both are "this Leader is not being copied and I have
+        to do something about it". Its own audit action and its own sentence,
+        though: the fix is different (free a sub, or retire a Leader) and a
+        notice that read like a risk decline would send the operator to the
+        wrong place."""
+        async with self._pool.acquire() as conn, conn.transaction():
+            await subs_store.disable_sub(
+                conn, operator_id=self._operator_id, leader_address=sub.leader_address
+            )
+            await self._audit.record_event(
+                actor=EXECUTOR_ACTOR,
+                action="copy_provisioning_cap_exhausted",
+                risk_decision=(
+                    f"createSubAccount refused at the cap and no sub of the master is "
+                    f"adoptable — all {held_count} are mapped to a Leader or hold a position"
+                ),
+                detail={
+                    "leader": sub.leader_address,
+                    "sub_name": sub.sub_name,
+                    "held": held_count,
+                },
+                master_address=self._master,
+                conn=conn,
+            )
+            await notify(
+                conn,
+                operator_id=self._operator_id,
+                kind=SKIP,
+                body=(
+                    f"🚫 Copy of {_short(sub.leader_address)} was NOT set up — the master "
+                    f"holds all {held_count} of its sub-accounts and none can be adopted: "
+                    f"every one is already mapped to a Leader or holds an open "
+                    f"position. /uncopy does "
+                    f"NOT free one (a disabled mapping keeps its sub, so re-copying can "
+                    f"reuse it) and subs cannot be deleted — retire a Leader's mapping "
+                    f"for good, or copy from another master. The mapping is disabled; "
+                    f"nothing was funded."
+                ),
+                now=now,
+            )
+
+    async def _rename_adopted_sub(self, sub: CopySub, address: str) -> bool:
+        """Give the adopted sub this Leader's name (finding 11's
+        `subAccountModify`, probed for this ticket). Cosmetic and best-effort:
+        it changes a label in the operator's exchange UI and nothing else, so
+        a refusal is reported in the ready notice and the pass carries on —
+        a Leader copied under an inherited name beats a Leader not copied."""
+        try:
+            await self._provisioning.rename_sub_account(address, sub.sub_name)
+        except ExecutionError:
+            log.warning(
+                "adopted sub %s could not be renamed to %s; cosmetic only",
+                address,
+                sub.sub_name,
+                exc_info=True,
+            )
+            return False
+        return True
+
+    async def _funding_gap(self, sub: CopySub, address: str) -> _Funding:
         """How much this sub is short of its target balance. Zero when it
         already holds the allocation or more (module docstring: an over-funded
-        sub is left alone, never drained back)."""
+        sub is left alone, never drained back).
+
+        The balance comes back beside the gap because the operator's notice
+        needs it: "already holds its allocation" is a lie about an ADOPTED
+        orphan that arrived holding more than the allocation, and the number
+        that tells them what they actually have is one this read already
+        fetched."""
         await self._budget.spend(POSITIONS_WEIGHT)
         held = (await self._read.get_account_state(address)).account_value
-        return max(sub.allocation_usd - held, Decimal(0))
+        return _Funding(held=held, topup=max(sub.allocation_usd - held, Decimal(0)))
 
     async def _halted_before_provisioning(
         self, sub: CopySub, leg: str, now: datetime
     ) -> bool:
-        """The same discipline the order legs have, applied to the two actions
-        that move money rather than place orders. A halt means Epigone acts on
-        nothing — and unlike an IOC, a funding transfer cannot be un-sent."""
+        """The same discipline the order legs have, applied to the actions that
+        move money and mint accounts rather than place orders. A halt means
+        Epigone SIGNS nothing — and unlike an IOC, a funding transfer cannot
+        be un-sent.
+
+        Every leg that reaches the wire carries its OWN check rather than
+        sharing one, because the gaps between them are real time: adoption's
+        listing read and its per-candidate position reads sit between `create`
+        and `rename`, and the equity read sits between `rename` and `fund`. A
+        gate that fired once at the top would be tens of seconds stale by the
+        last signature."""
         if not await is_halted(self._pool):
             return False
         async with self._pool.acquire() as conn, conn.transaction():
@@ -347,7 +642,7 @@ class CopyExecutor:
                 kind=SKIP,
                 body=(
                     f"🛑 Copy sub for {_short(sub.leader_address)} was NOT "
-                    f"{'created' if leg == 'create' else 'funded'} — execution is halted."
+                    f"{_HALTED_LEG[leg]} — execution is halted."
                 ),
                 now=now,
             )

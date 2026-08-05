@@ -86,6 +86,9 @@ class FakeExecutionGateway:
         self._next_sub += 1
         return f"0x{self._next_sub:040x}"
 
+    async def rename_sub_account(self, sub_address: str, name: str) -> None:
+        self._record("rename_sub_account", (sub_address.lower(), name))
+
     async def sub_account_transfer(
         self, sub_address: str, *, is_deposit: bool, usd_micro: int
     ) -> None:

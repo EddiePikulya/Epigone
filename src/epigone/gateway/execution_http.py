@@ -178,6 +178,20 @@ class HttpExecutionGateway:
             )
         return data.lower()
 
+    async def rename_sub_account(self, sub_address: str, name: str) -> None:
+        """SubAccountProvisioning: rename an existing sub (finding 11). The
+        SDK has no method for `subAccountModify`, so the wire dict is built
+        here in the exchange's own key order like every other action, and the
+        address is lowercased for the same reason subAccountTransfer's is."""
+        await self._submit(
+            {
+                "type": "subAccountModify",
+                "subAccountUser": sub_address.lower(),
+                "name": name,
+            },
+            batch_len=1,
+        )
+
     async def sub_account_transfer(
         self, sub_address: str, *, is_deposit: bool, usd_micro: int
     ) -> None:

@@ -495,6 +495,13 @@ class AuditedProvisioning:
             "createSubAccount", {"name": name}, lambda: self._inner.create_sub_account(name)
         )
 
+    async def rename_sub_account(self, sub_address: str, name: str) -> None:
+        await self._audited(
+            "subAccountModify",
+            {"sub_account_user": _lower(sub_address), "name": name},
+            lambda: self._inner.rename_sub_account(sub_address, name),
+        )
+
     async def sub_account_transfer(
         self, sub_address: str, *, is_deposit: bool, usd_micro: int
     ) -> None:

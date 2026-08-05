@@ -148,6 +148,11 @@ def test_trigger_rejects_a_non_positive_price() -> None:
             "Cannot create sub-accounts until enough volume traded. Required: $100000",
             RejectReason.VOLUME_GATED,
         ),
+        # The sub-account cap, verbatim as observed live (cap probe
+        # 2026-08-04, finding 10). Its own class because provisioning ADOPTS
+        # an orphaned sub on exactly this refusal (issue #178) and on no
+        # other — a cap misread as UNKNOWN would leave /copy dead at the cap.
+        ("Too many sub-accounts.", RejectReason.SUB_ACCOUNT_CAP),
         # An order-COUNT cap is not a throttle (PR #140 review): no arm yet,
         # so it must fall through to UNKNOWN, never RATE_LIMITED.
         ("Too many open orders.", RejectReason.UNKNOWN),
