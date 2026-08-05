@@ -16,6 +16,32 @@ one flag for the pair, because a live executor whose dead-man's switch cannot
 reach the live book is the one configuration nobody should be able to type.
 The executor's start-up audit row records which network it came up on.
 
+## Which network answers which question
+
+**One network for the book, one read for the Leader** (ADR-0007 amendment D-6,
+issue #184). The doctrine that everything comes from the book you trade holds
+for everything the ORDERS depend on, and has exactly one documented exception.
+
+| what is read | from | configured by |
+| --- | --- | --- |
+| mark prices, market stats (Liquidity Floor), asset specs, sub-account state, fills | the network you TRADE | derived from `EXECUTOR_EXCHANGE_URL` — not separately settable, by design |
+| the Leader's live equity, for the liveness floor | the network the SIGNAL came from | `EXECUTOR_SIGNAL_INFO_URL`, default **mainnet** |
+
+Orders and order-adjacent reads are single-network by construction: a size
+priced on one network and sent to another must stay impossible to type, so
+nothing on that side is configurable. The Leader's account is a different kind
+of thing — it belongs to the network Epigone TRACKED them on — and the liveness
+gate asks about that account.
+
+**On a normal mainnet deployment this is invisible**: both urls are mainnet and
+behavior is bit-for-bit what it always was. It matters on the testnet
+shakedown, which mirrors real mainnet Leaders onto the testnet book: without
+it, every entry skipped with `$0 < $10,000` and no episode could open. Set
+`EXECUTOR_SIGNAL_INFO_URL` only if you are tracking Leaders somewhere other
+than mainnet; a value that is not `/info`-shaped is refused, logged, and falls
+back to the mainnet default. The gateway behind it is read-only and holds no
+key — it cannot place anything anywhere.
+
 ## The one fact this page turns on
 
 **Tracking is not copying.** Tracking a wallet tells you what it does. Copying
@@ -144,7 +170,9 @@ flip's open leg only — not scale-ins, and never exits (ADR-0007 amendment
 D-2). This is a signal-quality gate, not a sizing input: it asks "is this
 still the trader whose stats earned the copy?", which is a question about
 starting to follow someone. 38% of quality-screened wallets had emptied their
-accounts while their stored metrics still looked alive.
+accounts while their stored metrics still looked alive. The equity read is the
+one that comes from the SIGNAL network (amendment D-6, table above) — the
+account that earned the stats, not the account on the book we trade.
 
 **A bracket you cancel comes back.** Restoration is a per-cycle INVARIANT
 (amendment D-1): every live position in a `bracket` sub has its triggers, and

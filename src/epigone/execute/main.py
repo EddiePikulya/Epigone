@@ -14,6 +14,13 @@ Wiring notes, each load-bearing:
   outage is exactly when orders go unattended. An EXECUTOR that cannot reach
   the database must NOT trade — it has no halt state, no mappings, no claims,
   and no way to write the audit row that must precede the wire.
+- TWO READ GATEWAYS, ONE OF THEM FOR ONE READ (issue #184): the trade-side
+  gateway is pinned to the info url derived from the exchange url and answers
+  every read the orders depend on; the signal-side gateway is pinned to
+  `EXECUTOR_SIGNAL_INFO_URL` (mainnet by default) and answers only the
+  Leader's liveness equity, which is a fact about the network the signal came
+  from. On a mainnet deployment the two urls coincide. Both are read-only and
+  share the session; neither holds a signer.
 - ONE GATEWAY INSTANCE, TWO PROTOCOLS: `HttpExecutionGateway` serves both the
   order surface and sub-account provisioning, wrapped separately
   (AuditedExecutionGateway / AuditedProvisioning). One instance because
@@ -114,6 +121,13 @@ async def main() -> None:
     budget = SharedWeightBudget(pool, clock, reserve=0)
     async with aiohttp.ClientSession() as session:
         read_gateway = HttpHyperliquidGateway(session, clock, info_url=config.info_url)
+        # The signal network's read-only gateway (issue #184). A SECOND
+        # instance rather than a second url on the first, because the trade
+        # gateway's url is the thing that makes cross-network contamination of
+        # orders impossible: one object, one network, and the only caller of
+        # this one is the liveness fetch. Read-only, so it carries no signer
+        # and shares the session freely.
+        signal_gateway = HttpHyperliquidGateway(session, clock, info_url=config.signal_info_url)
         http_exec = HttpExecutionGateway(
             session,
             clock,
@@ -146,6 +160,7 @@ async def main() -> None:
             audit,
             budget,
             RiskPolicy(),
+            signal_gateway=signal_gateway,
             operator_id=operator_id,
             master_address=master_address,
             signer_address=signer.address,
@@ -157,6 +172,7 @@ async def main() -> None:
             risk_decision="process start",
             detail={
                 "exchange_url": config.exchange_url,
+                "signal_info_url": config.signal_info_url,
                 "interval_seconds": int(config.interval.total_seconds()),
                 "operator_id": operator_id,
                 "risk_policy": "A5 (#137): liquidity floor, stake caps, mirrored leverage",

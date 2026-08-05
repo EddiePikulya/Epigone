@@ -45,6 +45,7 @@ class CopyHarness:
     pool: asyncpg.Pool
     clock: FakeClock
     read: FakeHyperliquidGateway
+    signal: FakeHyperliquidGateway
     exec_fake: FakeExecutionGateway
     audit: ExecutionAudit
 
@@ -114,8 +115,19 @@ async def build_harness(
     policy: RiskPolicy | None = None,
 ) -> CopyHarness:
     """A wired executor over a fake exchange, with a core universe that prices
-    BTC and ETH and a leader comfortably above the liveness floor."""
+    BTC and ETH and a leader comfortably above the liveness floor.
+
+    TWO read fakes, because the executor has two read gateways (issue #184):
+    `read` is the book it trades and answers every read but one; `signal` is
+    the network the signal came from and answers the Leader's liveness equity
+    alone. They are DISTINCT by default, and the leader's equity is set only on
+    the signal side — so the shakedown topology (a mainnet Leader holding $0 on
+    the testnet book) is what every test in this suite runs against, and a
+    liveness read that slipped back onto the trade gateway would read $0 and
+    fail loudly."""
     await seed_trader(pool, clock)
+    signal = FakeHyperliquidGateway()
+    signal.account_values[(LEADER, None)] = Decimal("250000")
     read.perp_universes[None] = ["BTC", "ETH"]
     # The covered builder DEX has to answer too: fetch_asset_specs walks
     # POSITION_VENUES, so an empty perpDexs listing fails the whole map.
@@ -124,7 +136,6 @@ async def build_harness(
     read.sz_decimals = {"BTC": 5, "ETH": 4, "xyz:META": 2}
     read.mid_prices[None] = {"BTC": Decimal("63500"), "ETH": Decimal("2000")}
     read.mid_prices["xyz"] = {"xyz:META": Decimal("600")}
-    read.account_values[(LEADER, None)] = Decimal("250000")
     # The sub holds NOTHING by default — the honest state for an account no
     # test funded, and the one that makes provisioning transfer the whole
     # allocation. Tests about the top-up set a balance explicitly.
@@ -154,6 +165,7 @@ async def build_harness(
         audit,
         WeightBudget(WIDE_OPEN_BUDGET, clock),
         policy or RiskPolicy(),
+        signal_gateway=signal,
         operator_id=OPERATOR,
         master_address=MASTER,
         signer_address=SIGNER,
@@ -163,6 +175,7 @@ async def build_harness(
         pool=pool,
         clock=clock,
         read=read,
+        signal=signal,
         exec_fake=exec_fake,
         audit=audit,
     )

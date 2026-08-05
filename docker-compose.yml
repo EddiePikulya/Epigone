@@ -170,6 +170,12 @@ services:
       EXECUTOR_INTERVAL_SECONDS: ${EXECUTOR_INTERVAL_SECONDS:-5}
       EXECUTOR_ALLOW_MAINNET: ${EXECUTOR_ALLOW_MAINNET:-}
       EXECUTOR_EXCHANGE_URL: ${EXECUTOR_EXCHANGE_URL:-}
+      # The SIGNAL network's read-only info endpoint (#184, amendment D-6):
+      # where the Leader's liveness equity is read, defaulting to MAINNET
+      # because that is where tracking observed them. Unset is correct for
+      # both the shakedown and a live mainnet deployment; it holds no key and
+      # can place nothing.
+      EXECUTOR_SIGNAL_INFO_URL: ${EXECUTOR_SIGNAL_INFO_URL:-}
     volumes:
       - ${KEYSTORE_KEK_FILE:-./.keystore-kek}:/run/secrets/keystore-kek:ro
     depends_on:
