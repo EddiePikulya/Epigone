@@ -1,7 +1,15 @@
 """Copy provisioning commands (issue #136, ADR-0007 decision 12): /copy,
 /uncopy, /copies.
 
-    /copy <leader> <allocation> <base> <mode> [tp% sl%]
+    /copy <leader> <allocation> <stake> <leverage> <mode> [tp% sl%]
+
+The signature grew a LEVERAGE argument in A5 (amendment D-4) and the third
+argument changed meaning under it: `<stake>` is the operator's MARGIN behind
+each open, isolated per position, and the position it buys is that times the
+mirrored leverage. The word in the usage text changed with the meaning
+deliberately — a `/copy … 200 …` that used to open a $200 position now opens
+$200 of margin at up to the backstop, and an operator re-running a habit
+should read a different sentence, not the same one meaning something else.
 
 OPERATOR-ONLY, HARD-GATED. The bot has other users; copy answers exactly one
 Telegram id and everyone else gets the ordinary owner-only refusal. That gate
@@ -38,8 +46,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from epigone.bot.access import ADMIN_ONLY_TEXT, _is_admin
 from epigone.bot.delete import with_delete_button
 from epigone.clock import Clock
+from epigone.execute import limits as risk_limits
 from epigone.execute.episodes import live_episodes
-from epigone.execute.policy import RiskPolicyV0
+from epigone.execute.policy import FIXED_LEVERAGE, MIRROR_LEVERAGE, RiskPolicy
 from epigone.execute.subs import (
     BRACKET_MODE,
     COPY_MODES,
@@ -57,17 +66,24 @@ COPY_CONFIRM_PREFIX = "copyconfirm:"
 COPY_CANCEL_CALLBACK = "copycancel"
 
 USAGE = (
-    "Usage: /copy &lt;leader&gt; &lt;allocation&gt; &lt;base&gt; &lt;mode&gt; [tp% sl%]\n\n"
+    "Usage: /copy &lt;leader&gt; &lt;allocation&gt; &lt;stake&gt; &lt;leverage&gt; "
+    "&lt;mode&gt; [tp% sl%]\n\n"
     "  leader      — the wallet address to mirror\n"
     "  allocation  — dollars to fund the copy sub-account with (the hard "
     "exposure cap, enforced by the exchange)\n"
-    "  base        — dollars per copied open (the leader's own size never "
-    "changes it)\n"
+    "  stake       — YOUR margin per copied open, isolated per position. The "
+    "position is stake × leverage, and the stake is the most it can lose\n"
+    "  leverage    — mirror (the leader's own leverage on that position) or a "
+    "number for fixed. Either way it is capped by /limits max_leverage and by "
+    "the asset's own maximum\n"
     "  mode        — default (exit when the leader exits) or bracket "
     "(our own TP/SL, which ENDS the copy episode when it fires)\n\n"
-    "Example: /copy 0xabc… 1000 200 bracket 10 5\n"
+    "Example: /copy 0xabc… 1000 100 mirror default\n"
+    "  → $100 of margin behind each open; a leader at 10x gives a $1,000 "
+    "position, and $100 is the worst case.\n"
+    "Example: /copy 0xabc… 1000 100 5 bracket 10 5\n"
     "One-legged brackets are fine — use - for the leg you don't want:\n"
-    "  /copy 0xabc… 1000 200 bracket - 5   (stop only)"
+    "  /copy 0xabc… 1000 100 mirror bracket - 5   (stop only)"
 )
 NOT_COPYING_TEXT = "Not copying that wallet."
 CANCELLED_TEXT = "Cancelled — nothing was funded and nothing is being copied."
@@ -84,10 +100,20 @@ class CopyRequest:
 
     leader: str
     allocation: Decimal
-    base: Decimal
+    stake: Decimal
+    leverage_mode: str
+    fixed_leverage: int | None
     mode: str
     take_profit_pct: Decimal | None = None
     stop_loss_pct: Decimal | None = None
+
+    @property
+    def leverage_phrase(self) -> str:
+        return (
+            "mirroring the leader's own leverage"
+            if self.fixed_leverage is None
+            else f"a fixed {self.fixed_leverage}x"
+        )
 
 
 def _kb(token: str) -> InlineKeyboardMarkup:
@@ -118,9 +144,14 @@ async def cmd_copy(
         await message.answer(f"{parsed}\n\n{USAGE}", reply_markup=with_delete_button())
         return
     # Judged BEFORE the confirm, not after the tap: an operator should be told
-    # the v0 ceilings refuse this before being asked to approve it.
-    verdict = RiskPolicyV0().judge_provisioning(
-        allocation_usd=parsed.allocation, base_notional_usd=parsed.base
+    # the caps refuse this before being asked to approve it. Against the LIVE
+    # limits row, not a hardcoded ceiling — the executor will judge the same
+    # mapping against the same row on its next loop, and a command that
+    # approved what the loop then declines would be a promise nobody keeps.
+    verdict = RiskPolicy().judge_provisioning(
+        allocation_usd=parsed.allocation,
+        base_stake_usd=parsed.stake,
+        limits=await risk_limits.load(pool),
     )
     if not verdict.allowed:
         await message.answer(
@@ -138,8 +169,18 @@ def _prompt(parsed: CopyRequest) -> str:
         f"• A dedicated sub-account funded with ${parsed.allocation} — that "
         f"balance is the hard exposure cap for this leader, enforced by the "
         f"exchange, not by us.",
-        f"• Every copied open is ${parsed.base}, whatever the leader's own "
-        f"size is. Their scales and trims are mirrored as percentages.",
+        f"• Every copied open puts up ${parsed.stake} of YOUR margin, isolated "
+        f"per position — so ${parsed.stake} is the most any one copied "
+        f"position can lose. Their scales and trims are mirrored as "
+        f"percentages.",
+        f"• Leverage: {parsed.leverage_phrase}, capped by /limits max_leverage "
+        f"and by the asset's own maximum. The position is stake × that "
+        f"leverage — "
+        + (
+            f"${parsed.stake} behind a 10x leader is a ${parsed.stake * 10} position."
+            if parsed.fixed_leverage is None
+            else f"here, ${parsed.stake * parsed.fixed_leverage} per position."
+        ),
     ]
     if parsed.mode == BRACKET_MODE:
         legs = " / ".join(
@@ -159,7 +200,9 @@ def _prompt(parsed: CopyRequest) -> str:
         lines.append("• Default mode: positions exit when the leader exits.")
     lines += [
         "",
-        "TESTNET only until the A5 risk policy ships.",
+        "Network: whichever the executor is pointed at — testnet unless "
+        "EXECUTOR_ALLOW_MAINNET is set and the URL is the mainnet one "
+        "(docs/runbooks/copy-execution.md).",
     ]
     return "\n".join(lines)
 
@@ -196,7 +239,9 @@ async def _register(
             leader_address=leader,
             sub_name=_sub_name(leader),
             allocation_usd=parsed.allocation,
-            base_notional_usd=parsed.base,
+            base_stake_usd=parsed.stake,
+            leverage_mode=parsed.leverage_mode,
+            fixed_leverage=parsed.fixed_leverage,
             copy_mode=parsed.mode,
             take_profit_pct=parsed.take_profit_pct,
             stop_loss_pct=parsed.stop_loss_pct,
@@ -211,7 +256,9 @@ async def _register(
             operator_id=operator_id,
             leader_address=leader,
             allocation_usd=parsed.allocation,
-            base_notional_usd=parsed.base,
+            base_stake_usd=parsed.stake,
+            leverage_mode=parsed.leverage_mode,
+            fixed_leverage=parsed.fixed_leverage,
             copy_mode=parsed.mode,
             take_profit_pct=parsed.take_profit_pct,
             stop_loss_pct=parsed.stop_loss_pct,
@@ -221,8 +268,8 @@ async def _register(
         return (
             f"♻️ Re-enabled copying of {leader} on its existing sub-account "
             f"{reenabled.sub_address or '(not yet provisioned)'} — allocation "
-            f"${reenabled.allocation_usd}, base ${reenabled.base_notional_usd}, "
-            f"mode {reenabled.copy_mode}."
+            f"${reenabled.allocation_usd}, stake ${reenabled.base_stake_usd} per open, "
+            f"{reenabled.leverage_summary}, mode {reenabled.copy_mode}."
         )
     except asyncpg.ForeignKeyViolationError:
         # copy_subs references traders: a wallet nobody has ever looked at has
@@ -295,8 +342,8 @@ async def cmd_copies(
             state = "⏳ provisioning"
         lines.append(
             f"{state} · {sub.leader_address}\n"
-            f"   ${sub.allocation_usd} allocation · ${sub.base_notional_usd} base · "
-            f"{sub.copy_mode}"
+            f"   ${sub.allocation_usd} allocation · ${sub.base_stake_usd} stake · "
+            f"{sub.leverage_summary} · {sub.copy_mode}"
         )
     await message.answer("\n".join(lines), reply_markup=with_delete_button())
 
@@ -312,38 +359,47 @@ async def on_copy_cancel(
 
 
 def _parse(raw: str) -> CopyRequest | str:
-    """`<leader> <allocation> <base> <mode> [tp sl]`, or the sentence that says
-    what is wrong with it."""
+    """`<leader> <allocation> <stake> <leverage> <mode> [tp sl]`, or the
+    sentence that says what is wrong with it."""
     parts = raw.split()
-    if len(parts) < 4:
+    if len(parts) < 5:
         return "Not enough arguments."
-    leader, allocation, base, mode = parts[:4]
+    leader, allocation, stake, leverage, mode = parts[:5]
     if not leader.startswith("0x") or len(leader) != 42:
         return f"{leader!r} is not a wallet address."
     if mode not in COPY_MODES:
         return f"Mode must be one of {', '.join(COPY_MODES)}."
     try:
         allocation_usd = Decimal(allocation)
-        base_usd = Decimal(base)
+        stake_usd = Decimal(stake)
     except InvalidOperation:
-        return "Allocation and base must be numbers."
-    if allocation_usd <= 0 or base_usd <= 0:
-        return "Allocation and base must be positive."
+        return "Allocation and stake must be numbers."
+    if allocation_usd <= 0 or stake_usd <= 0:
+        return "Allocation and stake must be positive."
+    parsed_leverage = _parse_leverage(leverage)
+    if isinstance(parsed_leverage, str):
+        return parsed_leverage
+    leverage_mode, fixed_leverage = parsed_leverage
     if mode == DEFAULT_MODE:
-        if len(parts) > 4:
+        if len(parts) > 5:
             return "Default mode takes no TP/SL percentages."
         return CopyRequest(
-            leader=leader.lower(), allocation=allocation_usd, base=base_usd, mode=mode
+            leader=leader.lower(),
+            allocation=allocation_usd,
+            stake=stake_usd,
+            leverage_mode=leverage_mode,
+            fixed_leverage=fixed_leverage,
+            mode=mode,
         )
-    if len(parts) != 6:
+    if len(parts) != 7:
         return "Bracket mode takes a TP and an SL percentage (use - to omit one)."
     # ONE-LEGGED BRACKETS ARE LEGAL. Decision 6 calls them "its own OPTIONAL
     # TP% and SL%", and migration 0033 accepts either leg alone — a parser
     # that demanded both would be the only place in the system saying
     # otherwise. `-` omits a leg positionally, so the documented
     # `<tp%> <sl%>` order still reads left to right.
-    tp = _optional_pct(parts[4])
-    sl = _optional_pct(parts[5])
+    tp = _optional_pct(parts[5])
+    sl = _optional_pct(parts[6])
     if tp is _BAD or sl is _BAD:
         return "TP and SL must be numbers (percent), or - to omit that leg."
     assert not isinstance(tp, _Bad) and not isinstance(sl, _Bad)
@@ -356,11 +412,32 @@ def _parse(raw: str) -> CopyRequest | str:
     return CopyRequest(
         leader=leader.lower(),
         allocation=allocation_usd,
-        base=base_usd,
+        stake=stake_usd,
+        leverage_mode=leverage_mode,
+        fixed_leverage=fixed_leverage,
         mode=mode,
         take_profit_pct=tp,
         stop_loss_pct=sl,
     )
+
+
+def _parse_leverage(raw: str) -> tuple[str, int | None] | str:
+    """`mirror`, or a whole number of x. Returns (mode, fixed) or the sentence
+    that says what is wrong.
+
+    WHOLE NUMBERS ONLY, because that is what the exchange takes:
+    `updateLeverage` carries an integer, so a `2.5` accepted here would be
+    silently truncated at the wire — a position half again the size the
+    operator asked for, decided by a rounding rule nobody stated."""
+    if raw == MIRROR_LEVERAGE:
+        return MIRROR_LEVERAGE, None
+    try:
+        value = Decimal(raw)
+    except InvalidOperation:
+        return f"Leverage must be {MIRROR_LEVERAGE!r} or a whole number, got {raw!r}."
+    if value != value.to_integral_value() or value < 1:
+        return "Fixed leverage must be a whole number of at least 1."
+    return FIXED_LEVERAGE, int(value)
 
 
 class _Bad:

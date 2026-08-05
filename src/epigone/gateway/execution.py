@@ -684,9 +684,23 @@ class ExecutionGateway(Protocol):
         filled / rejected per modify)."""
         ...
 
-    async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
+    async def update_leverage(
+        self,
+        asset: int,
+        leverage: int,
+        *,
+        is_cross: bool = True,
+        vault_address: str | None = None,
+    ) -> None:
         """Set leverage for an asset (cross or isolated). Raises
-        ActionRejectedError if the exchange refuses."""
+        ActionRejectedError if the exchange refuses.
+
+        `vault_address` sets it ON A SUB-ACCOUNT's book, exactly as
+        place_orders places on one — the copy executor's Base Stake sizing
+        needs it per (sub, coin) before the first order of an episode, since
+        leverage is a property of the ACCOUNT-asset pair and a sub is its own
+        account (ADR-0007 amendment D-4). Setting it is a SIGNING action like
+        any other: it rides the audit wrapper and the late halt re-check."""
         ...
 
     async def schedule_cancel(self, at: datetime | None) -> None:

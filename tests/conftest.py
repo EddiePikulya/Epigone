@@ -55,7 +55,13 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
             "first_data_notices, criteria, criteria_preset_dismissals, "
             "rate_budget, rate_limit_events, allowlist, agent_keys, "
             "process_heartbeats, execution_halts, execution_audit, "
-            "copy_subs, copy_episodes, copy_bracket_orders, copy_notices"
+            "copy_subs, copy_episodes, copy_bracket_orders, copy_notices, "
+            # risk_limits is TRUNCATED like everything else rather than reset
+            # to its seeded row, and that is safe on purpose: the loader falls
+            # back to the same numbers the migration seeds when the row is
+            # missing (epigone.execute.limits — absence is not permission), so
+            # a test that changed a knob cannot leak into the next one.
+            "copy_sub_equity, risk_limits"
         )
     yield pool
     await pool.close()

@@ -109,8 +109,18 @@ class FakeExecutionGateway:
             results.append(OrderResting(oid=modify.oid, cloid=modify.order.cloid))
         return results
 
-    async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
-        self._record("update_leverage", (asset, leverage, is_cross))
+    async def update_leverage(
+        self,
+        asset: int,
+        leverage: int,
+        *,
+        is_cross: bool = True,
+        vault_address: str | None = None,
+    ) -> None:
+        self._record(
+            "update_leverage",
+            (asset, leverage, is_cross, None if vault_address is None else vault_address.lower()),
+        )
 
     async def schedule_cancel(self, at: datetime | None) -> None:
         self._record("schedule_cancel", at)

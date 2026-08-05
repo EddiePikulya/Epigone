@@ -1854,7 +1854,16 @@ def build_router() -> Router:
     # Deferred import: the criteria and controls flows build on this module's
     # shared seams (track_address, _render_tracked_list, …), so importing them
     # at the top would cycle.
-    from epigone.bot import access, controls, copy, criteria, delete, names, operator
+    from epigone.bot import (
+        access,
+        controls,
+        copy,
+        criteria,
+        delete,
+        limits,
+        names,
+        operator,
+    )
 
     router = Router()
     # Invite-only admin commands (#33). The gate is a dispatcher-level outer
@@ -1866,6 +1875,9 @@ def build_router() -> Router:
     # collisions).
     operator.register(router)
     copy.register(router)
+    # The risk policy's global knobs (#137): /limits, operator-only, read by
+    # the executor every cycle.
+    limits.register(router)
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_screener, Command("screener"))

@@ -1,16 +1,24 @@
-"""ADR-0007's sizing and pricing rules as arithmetic (issue #136).
+"""ADR-0007's sizing and pricing rules as arithmetic (issues #136, #137).
 
-Pure functions, so these tests pin the DECISIONS — fixed Base Notional,
-relative mirroring against actual held size, bounded slippage, venue
+Pure functions, so these tests pin the DECISIONS — Base Stake × mirrored
+leverage, relative mirroring against actual held size, bounded slippage, venue
 precision — without a database or a wire anywhere near them.
+
+The sizing half was rewritten by amendment D-4 (#137): the configured dollars
+used to fix the POSITION and now fix the MARGIN behind it. These tests are
+where that change is nailed down, because it is a change no type system can
+catch — the old and new calls differ by one argument and by a factor of the
+leverage.
 """
 
 from decimal import Decimal
 
 import pytest
 
+from epigone.execute.policy import UnpriceableStakeError, open_position_notional
 from epigone.execute.pricing import (
     UnpriceableError,
+    clamped_size,
     ioc_limit_price,
     open_size,
     relative_size,
@@ -21,23 +29,69 @@ from epigone.execute.pricing import (
 )
 
 
-def test_an_open_is_base_notional_at_the_mark_whatever_the_leader_holds() -> None:
-    # Decision 2: the Leader's absolute size NEVER determines copy size. Two
-    # leaders with wildly different books produce the identical copy.
-    assert open_size(Decimal("200"), Decimal("2000"), 4) == Decimal("0.1")
-    assert open_size(Decimal("200"), Decimal("63500"), 5) == Decimal("0.00314")
+def test_a_position_is_the_stake_times_the_leverage() -> None:
+    # Amendment D-4's whole sentence, as arithmetic: $100 of margin behind a
+    # 10x leader is a $1,000 position, and the $100 is what can be lost.
+    assert open_position_notional(Decimal("100"), Decimal("10")) == Decimal("1000")
+    # 1x is the degenerate case where stake and position coincide — which is
+    # exactly what Base Notional used to mean, so the old model is the new
+    # model with the leverage dial at its floor.
+    assert open_position_notional(Decimal("200"), Decimal("1")) == Decimal("200")
+
+
+def test_a_stake_or_leverage_that_is_not_positive_is_an_error_not_a_zero() -> None:
+    with pytest.raises(UnpriceableStakeError):
+        open_position_notional(Decimal("0"), Decimal("10"))
+    with pytest.raises(UnpriceableStakeError):
+        open_position_notional(Decimal("100"), Decimal("0"))
+
+
+def test_a_full_grant_sends_the_asked_size_untouched() -> None:
+    # A clamp must be the ONLY thing that can change what was sized, so a full
+    # grant does not re-derive the size by a second route that could disagree.
+    assert clamped_size(
+        Decimal("0.5"), asked_stake=Decimal("100"), granted_stake=Decimal("100"), sz_decimals=4
+    ) == Decimal("0.5")
+
+
+def test_a_clamped_grant_scales_the_size_by_the_same_ratio_and_rounds_down() -> None:
+    # $100 asked, $40 given → 40% of the size, re-rounded DOWN at the asset's
+    # precision so rounding can never put a clamp back over the cap.
+    assert clamped_size(
+        Decimal("0.5"), asked_stake=Decimal("100"), granted_stake=Decimal("40"), sz_decimals=4
+    ) == Decimal("0.2")
+    assert clamped_size(
+        Decimal("0.00314"), asked_stake=Decimal("200"), granted_stake=Decimal("70"), sz_decimals=5
+    ) == Decimal("0.00109")  # 0.001099 truncated, never rounded up
+
+
+def test_a_clamp_that_rounds_to_nothing_is_an_error_not_a_zero_order() -> None:
+    with pytest.raises(UnpriceableError):
+        clamped_size(
+            Decimal("0.01"), asked_stake=Decimal("100"), granted_stake=Decimal("1"), sz_decimals=2
+        )
+
+
+def test_an_open_sizes_stake_times_leverage_whatever_the_leader_holds() -> None:
+    # Decision 2 as amended: the Leader's absolute size still NEVER determines
+    # copy size — only their LEVERAGE does. $200 of stake at 1x is the old
+    # $200 position…
+    assert open_size(Decimal("200"), Decimal("1"), Decimal("2000"), 4) == Decimal("0.1")
+    # …and the same stake at 10x is ten times the coin units, on the same mark.
+    assert open_size(Decimal("200"), Decimal("10"), Decimal("2000"), 4) == Decimal("1")
+    assert open_size(Decimal("100"), Decimal("10"), Decimal("63500"), 5) == Decimal("0.01574")
 
 
 def test_an_open_rounds_size_down_so_it_never_asks_for_margin_it_lacks() -> None:
     # 200 / 63500 = 0.003149606…; at 5 dp that truncates rather than rounds up.
-    assert open_size(Decimal("200"), Decimal("63500"), 5) == Decimal("0.00314")
+    assert open_size(Decimal("200"), Decimal("1"), Decimal("63500"), 5) == Decimal("0.00314")
     # And at a coarse precision, down is the only safe direction.
-    assert open_size(Decimal("200"), Decimal("63500"), 3) == Decimal("0.003")
+    assert open_size(Decimal("200"), Decimal("1"), Decimal("63500"), 3) == Decimal("0.003")
 
 
 def test_a_size_too_small_to_express_is_an_error_not_a_zero_order() -> None:
     with pytest.raises(UnpriceableError):
-        open_size(Decimal("200"), Decimal("63500"), 1)  # 0.0031… → 0.0
+        open_size(Decimal("200"), Decimal("1"), Decimal("63500"), 1)  # 0.0031… → 0.0
 
 
 def test_a_scale_supplies_only_the_fraction_and_it_comes_from_coin_units() -> None:

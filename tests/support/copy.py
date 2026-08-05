@@ -13,9 +13,10 @@ from decimal import Decimal
 import asyncpg
 
 from epigone.budget import WeightBudget
+from epigone.execute import limits as risk_limits
 from epigone.execute import subs as subs_store
 from epigone.execute.executor import CopyExecutor
-from epigone.execute.policy import RiskPolicyV0
+from epigone.execute.policy import MIRROR_LEVERAGE, RiskPolicy
 from epigone.execute.subs import CopySub
 from epigone.gateway import Position, Side
 from epigone.gateway.execution_fake import FakeExecutionGateway
@@ -75,12 +76,19 @@ def position(
     size_usd: str = "200",
     size_coin: str = "0.1",
     entry_price: str = "2000",
+    leverage: str = "1",
 ) -> Position:
+    """One held position as the exchange reports it.
+
+    `leverage` defaults to 1x, which makes `Position.margin` equal the notional
+    — the honest reading of an unlevered position, and the one that keeps a
+    test's stake arithmetic obvious: a $200 1x position uses $200 of the stake
+    caps. Tests about levered sizing set it."""
     return Position(
         coin=coin,
         side=side,
         size_usd=Decimal(size_usd),
-        leverage=Decimal("1"),
+        leverage=Decimal(leverage),
         entry_price=Decimal(entry_price),
         unrealized_pnl=Decimal("0"),
         size_coin=Decimal(size_coin),
@@ -103,7 +111,7 @@ async def build_harness(
     clock: FakeClock,
     read: FakeHyperliquidGateway,
     *,
-    policy: RiskPolicyV0 | None = None,
+    policy: RiskPolicy | None = None,
 ) -> CopyHarness:
     """A wired executor over a fake exchange, with a core universe that prices
     BTC and ETH and a leader comfortably above the liveness floor."""
@@ -145,7 +153,7 @@ async def build_harness(
         provisioning,
         audit,
         WeightBudget(WIDE_OPEN_BUDGET, clock),
-        policy or RiskPolicyV0(),
+        policy or RiskPolicy(),
         operator_id=OPERATOR,
         master_address=MASTER,
         signer_address=SIGNER,
@@ -166,7 +174,9 @@ async def copy_sub(
     *,
     provisioned: bool = True,
     mode: str = "default",
-    base_notional: str = "200",
+    base_stake: str = "200",
+    leverage_mode: str = MIRROR_LEVERAGE,
+    fixed_leverage: int | None = None,
     allocation: str = "1000",
     take_profit_pct: str | None = None,
     stop_loss_pct: str | None = None,
@@ -179,7 +189,9 @@ async def copy_sub(
         leader_address=leader,
         sub_name=f"epicopy-{leader[-4:]}",
         allocation_usd=Decimal(allocation),
-        base_notional_usd=Decimal(base_notional),
+        base_stake_usd=Decimal(base_stake),
+        leverage_mode=leverage_mode,
+        fixed_leverage=fixed_leverage,
         copy_mode=mode,
         take_profit_pct=Decimal(take_profit_pct) if take_profit_pct else None,
         stop_loss_pct=Decimal(stop_loss_pct) if stop_loss_pct else None,
@@ -191,6 +203,17 @@ async def copy_sub(
         rows = await subs_store.enabled_subs(pool, OPERATOR)
         return next(s for s in rows if s.id == sub.id)
     return sub
+
+
+async def set_limits(pool: asyncpg.Pool, clock: FakeClock, **knobs: str) -> None:
+    """Move global risk knobs the way /limits does — through the same setter,
+    so a test can never configure a limit by a route the operator does not
+    have (and so a knob renamed in the registry fails these tests too)."""
+    for name, raw in knobs.items():
+        async with pool.acquire() as conn, conn.transaction():
+            await risk_limits.set_knob(
+                conn, name=name, raw=raw, operator_id=OPERATOR, now=clock.now()
+            )
 
 
 async def emit(

@@ -1,10 +1,16 @@
-"""The copy executor's cycle (issue #136, ADR-0007).
+"""The copy executor's cycle (issues #136 and #137, ADR-0007).
 
 One cycle, in the order the ADR forces:
 
+0. **re-read the global risk limits** (issue #137 §7). Before anything is
+   judged, because a `/limits` change must take effect without a restart and
+   because everything below judges against them — and reset the cycle's market
+   view, which is read lazily on the first entry that needs it;
 1. **beat** the heartbeat — the watchdog's only view of us (ADR-0002), and a
    stale one is what trips the dead-man's switch;
-2. **reconcile** every sub against the exchange (decision 10). First, because
+2. **reconcile** every sub against the exchange (decision 10), recording each
+   sub's equity as it goes (§6's enabler for the deferred daily-loss pause).
+   First, because
    every relative operation downstream applies to the size the EXCHANGE
    reports, never to a bookkept expectation — that is the self-damping
    principle, and reading state before acting on it is how it holds. It runs
@@ -40,8 +46,17 @@ observed after signing stays a reconciliation obligation, discharged by step 2
 of the next cycle, never an assumption that the order did not happen.
 
 DIRECTION ASYMMETRY, everywhere: entries are guarded (staleness, liveness,
-risk policy) and fire ONE SHOT; exits are gated by nothing, execute at any
-age, and retry. Closing late is strictly safer than never closing.
+Liquidity Floor, stake caps) and fire ONE SHOT; exits are gated by nothing,
+execute at any age, and retry. Closing late is strictly safer than never
+closing.
+
+WHAT AN ENTRY SIGNS, in order (amendment D-4): the claim and attempt rows
+commit, the halt is re-read, `updateLeverage(isolated)` sets the leverage the
+policy judged, the halt is re-read AGAIN — a signature with its own round trip
+sits between them — and only then does the order go. A halt in the middle
+leaves a leverage setting on an asset the sub holds nothing in, which changes
+nothing about the account; a halt after the order stays a reconciliation
+obligation, as it always was.
 """
 
 import logging
@@ -54,6 +69,7 @@ import asyncpg
 from epigone.budget import Budget
 from epigone.clock import Clock
 from epigone.execute import episodes as ep
+from epigone.execute import limits as risk_limits
 from epigone.execute import subs as subs_store
 from epigone.execute.notices import ACTION, PAGER, PROVISIONING, SKIP, notify
 from epigone.execute.policy import (
@@ -63,10 +79,15 @@ from epigone.execute.policy import (
     EXIT_RETRY_DELAY_SECONDS,
     LEADER_EQUITY_FLOOR,
     MIN_ORDER_NOTIONAL,
-    RiskPolicyV0,
+    LeverageChoice,
+    LeverageUnknownError,
+    RiskPolicy,
+    committed_stake,
+    resolve_leverage,
 )
 from epigone.execute.pricing import (
     UnpriceableError,
+    clamped_size,
     ioc_limit_price,
     open_size,
     relative_size,
@@ -80,10 +101,12 @@ from epigone.gateway import (
     AssetSpec,
     GatewayError,
     HyperliquidGateway,
+    MarketStats,
     OpenOrder,
     Position,
     Side,
     fetch_asset_specs,
+    fetch_market_stats,
 )
 from epigone.gateway.execution import (
     ActionRejectedError,
@@ -124,6 +147,7 @@ POSITIONS_WEIGHT = 2  # clearinghouseState, per venue
 ORDERS_WEIGHT = 20  # frontendOpenOrders, per venue
 MIDS_WEIGHT = 2  # allMids, per venue
 META_WEIGHT = 20  # meta / perpDexs
+MARKET_STATS_WEIGHT = 20  # metaAndAssetCtxs, per venue
 SUBS_WEIGHT = 20  # subAccounts — the rate the watchdog bills this listing at
 
 # What the operator is told did not happen, per provisioning leg. Each leg is
@@ -159,6 +183,22 @@ class _Funding:
 
 
 @dataclass(frozen=True)
+class _Ask:
+    """What an entry WANTS, before the policy has judged it: the leverage it
+    would run at, the stake it would put behind that, and the coin-unit size
+    those two imply at the current mark.
+
+    Computed before the verdict and clamped after it, in that order, because
+    the policy grants STAKE and the wire takes COIN UNITS — keeping the full
+    ask beside its size is what lets a clamp scale the order proportionally
+    instead of re-deriving it by a second route that could disagree."""
+
+    leverage: LeverageChoice
+    stake_usd: Decimal
+    size_coin: Decimal
+
+
+@dataclass(frozen=True)
 class _Skip:
     """A decision not to act, carrying the sentence the operator reads and the
     reason the trail records. Every skip still CLAIMS the event."""
@@ -180,7 +220,7 @@ class CopyExecutor:
         provisioning: AuditedProvisioning,
         audit: ExecutionAudit,
         budget: Budget,
-        policy: RiskPolicyV0,
+        policy: RiskPolicy,
         *,
         operator_id: int,
         master_address: str,
@@ -203,6 +243,14 @@ class CopyExecutor:
         # literal buried in the query.
         self._source = source
         self._specs: dict[str, AssetSpec] = {}
+        # The cycle's own copies of things that must not be stale WITHIN a
+        # cycle and must not be cached ACROSS one. Limits change under the
+        # operator's hand (/limits), market health changes under the market's;
+        # both are re-read at the top of each cycle, and the market read is
+        # LAZY — a cycle with no fresh entry to judge never spends its weight.
+        self._limits = risk_limits.RiskLimits()
+        self._stats: dict[str, MarketStats] | None = None
+        self._stats_unreadable = False
         self._brackets_checked_at: datetime | None = None
         # Episodes already reported as unclassifiable. Decision 10 says
         # "re-flag until resolved", and the AUDIT TRAIL does exactly that —
@@ -217,6 +265,12 @@ class CopyExecutor:
     async def run_cycle(self) -> None:
         now = self._clock.now()
         await heartbeat.beat(self._pool, heartbeat.EXECUTOR_PROCESS, now)
+        # The global knobs, re-read every cycle so a /limits change takes
+        # effect without a restart (the `enabled` precedent, decision 12), and
+        # the market read reset so this cycle judges this cycle's liquidity.
+        self._limits = await risk_limits.load(self._pool)
+        self._stats = None
+        self._stats_unreadable = False
         # Reconciliation covers EVERY mapping; everything below covers only the
         # enabled ones. /uncopy stops event consumption, not the money
         # (decision 12) — a disabled sub still holds positions, its bracket can
@@ -279,7 +333,9 @@ class CopyExecutor:
             if sub.is_provisioned:
                 continue
             verdict = self._policy.judge_provisioning(
-                allocation_usd=sub.allocation_usd, base_notional_usd=sub.base_notional_usd
+                allocation_usd=sub.allocation_usd,
+                base_stake_usd=sub.base_stake_usd,
+                limits=self._limits,
             )
             if not verdict.allowed:
                 await self._decline_provisioning(sub, verdict.decision, now)
@@ -388,7 +444,8 @@ class CopyExecutor:
                             else f"already holds ${funding.held} against its "
                             f"${sub.allocation_usd} allocation"
                         )
-                        + f" · base ${sub.base_notional_usd} · mode {sub.copy_mode}"
+                        + f" · stake ${sub.base_stake_usd} per open, "
+                        + f"{sub.leverage_summary} · mode {sub.copy_mode}"
                         + (
                             ""
                             if renamed
@@ -694,6 +751,14 @@ class CopyExecutor:
                 )
                 continue
             states[sub.id] = state
+            # The equity this read already carried, written down before any
+            # episode work: a sub with no live episodes still has a curve, and
+            # a sub whose reconcile then fails still had a readable equity
+            # (issue #137 §6 — the enabler the deferred daily-loss pause will
+            # be calibrated from).
+            await subs_store.record_sub_equity(
+                self._pool, sub.id, state.account_value, now
+            )
             for episode in await ep.live_episodes(self._pool, sub.id):
                 await self._reconcile_episode(sub, episode, state, now)
         return states
@@ -1158,19 +1223,9 @@ class CopyExecutor:
         is_long = side == Side.LONG.value
         try:
             mark = await self._mark(coin)
-            if leg == "scale_in":
-                episode = await ep.live_episode(self._pool, sub_id=sub.id, coin=coin)
-                assert episode is not None  # _entry_skip proved it
-                position = state.positions[coin]
-                assert position.size_coin is not None
-                fraction = scale_fraction(
-                    event.event.prev_size_coin, event.event.size_coin
-                )
-                size = relative_size(position.size_coin, fraction, spec.sz_decimals)
-            else:
-                size = open_size(sub.base_notional_usd, mark, spec.sz_decimals)
+            ask = await self._entry_ask(event, sub, state, leg=leg, mark=mark, spec=spec)
             price = ioc_limit_price(mark, is_buy=is_long, sz_decimals=spec.sz_decimals)
-        except UnpriceableError as exc:
+        except (UnpriceableError, LeverageUnknownError) as exc:
             await self._claim_and_skip(
                 event,
                 sub,
@@ -1179,14 +1234,50 @@ class CopyExecutor:
                 claim=claim,
             )
             return
-        notional = size * mark
+        # The caps are judged against what the EXCHANGE says is committed, not
+        # against bookkeeping — decision 10's self-damping principle applied to
+        # margin. The sub's own equity is one pool, so a position the operator
+        # opened by hand in it counts too.
+        held = state.positions.get(coin)
         verdict = self._policy.judge_entry(
-            notional_usd=notional, base_notional_usd=sub.base_notional_usd
+            coin=coin,
+            requested_stake_usd=ask.stake_usd,
+            leverage=ask.leverage,
+            coin_stake_used=Decimal(0) if held is None else held.margin,
+            sub_stake_used=committed_stake(state.positions.values()),
+            limits=self._limits,
         )
         if not verdict.allowed:
             await self._claim_and_skip(
                 event, sub, _Skip(verdict.decision, {"coin": coin, "leg": leg}), now, claim=claim
             )
+            return
+        assert verdict.stake_usd is not None  # an allowed entry always grants a stake
+        try:
+            size = clamped_size(
+                ask.size_coin,
+                asked_stake=ask.stake_usd,
+                granted_stake=verdict.stake_usd,
+                sz_decimals=spec.sz_decimals,
+            )
+        except UnpriceableError as exc:
+            # The grant survived the policy's $10 check in dollars but not the
+            # asset's own precision — a real answer, not a bug, and one the
+            # operator should read rather than see as a silent no-op.
+            await self._claim_and_skip(
+                event,
+                sub,
+                _Skip(
+                    f"did not enter: clamped below this asset's precision — {exc}",
+                    {"coin": coin, "leg": leg},
+                ),
+                now,
+                claim=claim,
+            )
+            return
+        dust = self._rounded_below_minimum(size, mark, coin, leg)
+        if dust is not None:
+            await self._claim_and_skip(event, sub, dust, now, claim=claim)
             return
         order = OrderSpec(
             asset=spec.asset_id,
@@ -1199,7 +1290,15 @@ class CopyExecutor:
             event,
             action=f"copy_{leg}",
             risk_decision=verdict.decision,
-            request={"coin": coin, "side": side, "size": str(size), "limit_price": str(price)},
+            request={
+                "coin": coin,
+                "side": side,
+                "size": str(size),
+                "limit_price": str(price),
+                "stake_usd": str(verdict.stake_usd),
+                "leverage": ask.leverage.value,
+                "clamped": verdict.clamped,
+            },
             claim=claim,
         )
         if attempt is None:
@@ -1207,12 +1306,162 @@ class CopyExecutor:
         if await self._halted_before_signing(event, sub, attempt, leg, now):
             return
         self._exec.decision = verdict.decision
+        if leg != "scale_in" and not await self._set_leverage(
+            sub, spec, ask.leverage, attempt, coin, leg, now
+        ):
+            return
+        # THE HALT GATE AGAIN, and not redundantly: `_set_leverage` is a
+        # SIGNATURE with its own HTTP round trip, so the check above is a
+        # request old by the time the order is signed. Every leg that reaches
+        # the wire carries its own check — the same rule provisioning's three
+        # legs follow. A halt landing here leaves a leverage setting on an
+        # asset we hold nothing in, which changes nothing about the account.
+        if leg != "scale_in" and await self._halted_before_signing(
+            event, sub, attempt, leg, now
+        ):
+            return
         results = await self._exec.place_orders(
             [order], vault_address=sub.require_address()
         )
         await self._settle_entry(
-            event, sub, state, results[0], size, mark, coin, side, leg, attempt
+            event, sub, state, results[0], size, mark, coin, side, leg, attempt, ask.leverage
         )
+
+    def _rounded_below_minimum(
+        self, size: Decimal, mark: Decimal, coin: str, leg: str
+    ) -> _Skip | None:
+        """Whether the order we are about to send is dust once ROUNDED.
+
+        The policy judges the exchange minimum in dollars, on the stake it
+        granted — which is the right question for a clamp, and not quite the
+        question the exchange asks. The venue judges the ORDER, and the order
+        has been rounded DOWN to the asset's precision since: on a coarse
+        asset a $10.40 grant can become one unit worth $6. Sending that buys a
+        guaranteed MIN_NOTIONAL reject and an alarming audit row, which is
+        exactly what the constant exists to avoid — so the last word belongs to
+        the size that will actually be signed. The exit path has carried the
+        same check since A4 (`_sub_minimum_skip`); this is its entry twin."""
+        notional = size * mark
+        if notional >= MIN_ORDER_NOTIONAL:
+            return None
+        return _Skip(
+            f"did not enter: {size} {coin} rounds to about ${notional:.2f} at this asset's "
+            f"precision, under the exchange's ${MIN_ORDER_NOTIONAL} minimum order value — "
+            f"not sent, since it would only be rejected",
+            {"coin": coin, "leg": leg, "size": str(size), "notional": str(notional)},
+        )
+
+    async def _entry_ask(
+        self,
+        event: ClaimableEvent,
+        sub: CopySub,
+        state: SubState,
+        *,
+        leg: str,
+        mark: Decimal,
+        spec: AssetSpec,
+    ) -> _Ask:
+        """What this entry would do if nothing capped it: leverage, stake, and
+        the coin-unit size those imply (amendment D-4).
+
+        THE TWO LEGS ASK DIFFERENT QUESTIONS. A fresh open chooses a leverage —
+        the sub's mode answers, the caps trim it — and then sizes Base Stake
+        against it. A SCALE-IN chooses nothing: the position already runs at a
+        leverage the exchange is enforcing, and its size is a fraction of what
+        we ACTUALLY HOLD (decision 10's self-damping principle). Its stake is
+        therefore DERIVED — the margin that added notional will consume at the
+        position's own leverage — which is what lets the same stake caps bound
+        a scale-in without re-deciding anything about it."""
+        if leg == "scale_in":
+            position = state.positions[event.event.coin]
+            assert position.size_coin is not None  # _entry_skip proved it
+            fraction = scale_fraction(event.event.prev_size_coin, event.event.size_coin)
+            size = relative_size(position.size_coin, fraction, spec.sz_decimals)
+            # The venue's own figure for the live position. Floored at 1x: a
+            # leverage of zero is not a thing an open position has, and
+            # dividing by it would be the one arithmetic error that silently
+            # grants infinite stake.
+            live = max(int(position.leverage), 1)
+            leverage = LeverageChoice(
+                value=live,
+                asked=live,
+                reason=f"the position's own {live}x, unchanged by a scale",
+            )
+            return _Ask(leverage=leverage, stake_usd=size * mark / live, size_coin=size)
+        stats = await self._market_stats()
+        assert stats is not None  # _entry_skip defers the whole entry when it is None
+        market = stats.get(event.event.coin)
+        assert market is not None  # _entry_skip denies an unlisted coin
+        leverage = resolve_leverage(
+            mode=sub.leverage_mode,
+            fixed_leverage=sub.fixed_leverage,
+            leader_leverage=event.event.leverage,
+            asset_max_leverage=market.max_leverage,
+            limits=self._limits,
+        )
+        return _Ask(
+            leverage=leverage,
+            stake_usd=sub.base_stake_usd,
+            size_coin=open_size(
+                sub.base_stake_usd, Decimal(leverage.value), mark, spec.sz_decimals
+            ),
+        )
+
+    async def _set_leverage(
+        self,
+        sub: CopySub,
+        spec: AssetSpec,
+        leverage: LeverageChoice,
+        attempt: AuditedAttempt,
+        coin: str,
+        leg: str,
+        now: datetime,
+    ) -> bool:
+        """Put the sub on ISOLATED margin at this leverage for this asset,
+        before the first order of the episode touches it (amendment D-4).
+        Returns whether the order may proceed.
+
+        ISOLATED IS THE POINT, not the leverage: it is what makes the Base
+        Stake the worst case. Under cross margin a position's loss reaches the
+        whole sub's balance, and "the stake is what you can lose" would be a
+        sentence with no mechanism behind it.
+
+        SET EVERY OPEN, not tracked and skipped when unchanged. Leverage is
+        exchange-side state that /copy can change, the operator can change in
+        the UI, and a re-adopted sub can arrive carrying; a cache of what we
+        last set would be a second source of truth that is wrong exactly when
+        it matters. Opens are rare, and this is one extra signature on each.
+
+        A refusal ENDS the entry. The position would open at whatever leverage
+        the account happened to carry — which is a different position from the
+        one the policy judged — so the honest answer is not to open it."""
+        try:
+            await self._exec.update_leverage(
+                spec.asset_id,
+                leverage.value,
+                is_cross=False,
+                vault_address=sub.require_address(),
+            )
+        except ExecutionError as exc:
+            log.warning("copy executor: could not set %s leverage on %s", coin, sub.sub_name)
+            await self._finish(
+                attempt,
+                outcome_detail={
+                    "status": "leverage_not_set",
+                    "coin": coin,
+                    "leverage": leverage.value,
+                    "error": str(exc),
+                },
+                body=(
+                    f"🚫 Copy {leg.replace('_', ' ')} on {coin} "
+                    f"({_short(sub.leader_address)}) NOT sent — the exchange refused to set "
+                    f"{leverage.value}x isolated margin, and opening at whatever leverage the "
+                    f"sub carries is not the position the risk policy judged."
+                ),
+                now=now,
+            )
+            return False
+        return True
 
     async def _entry_skip(
         self,
@@ -1276,17 +1525,77 @@ class CopyExecutor:
             # Gating a scale-in would also spend a weight-2 fetch on the most
             # common event kind. Staleness (decision 8) is unchanged: a
             # scale-in stays guarded, because it increases risk.
-            floor_skip = await self._liveness_skip(event, coin, leg)
-            if floor_skip is not None:
-                return floor_skip
+            liveness = await self._liveness_skip(event, coin, leg)
+            if liveness is not None:
+                return liveness
+            # The Liquidity Floor, and it speaks EXACTLY HERE: at the open that
+            # starts a Copy Episode, and nowhere else. A live episode is never
+            # interrupted by it (a scale-in never reaches this branch, so it
+            # copies even after the coin has gone thin) and never trapped by it
+            # (exits do not consult the policy at all). A flip ends an episode,
+            # so a flip's open leg IS a fresh entry and is judged fresh —
+            # which is how a sub-floor coin makes a flip end flat.
+            floor = await self._floor_skip(coin, leg)
+            if floor is not None:
+                return floor
         return None
+
+    async def _floor_skip(self, coin: str, leg: str) -> _Skip | None:
+        """Is this coin a Copyable Coin — does its live market clear the
+        Liquidity Floor (issue #137 §1)?
+
+        THE READ FAILING IS NOT A VERDICT. An unreadable
+        `metaAndAssetCtxs` leaves the event OUTSTANDING for the next cycle,
+        exactly as an unreadable leader equity does: "I cannot tell" must never
+        become "denied", or a network blip silently stops copying. A market the
+        venue simply does not list IS a verdict, and the policy owns it.
+
+        EXCEPT ON A FLIP'S OPEN LEG, where "the next cycle asks again" is a
+        sentence that cannot come true and must not be written down. That leg
+        runs with `claim=False` because its close leg already claimed the
+        single event both legs come from (decision 3), so the event will never
+        be offered again — `_claim_and_skip` knows this and reports the skip
+        instead of deferring it, and the AUDIT PROSE has to say the same thing
+        the mechanism does. What actually happens there is decision 3's chosen
+        failure direction: the close filled, the open did not, and we are
+        FLAT."""
+        stats = await self._market_stats()
+        if stats is None:
+            return _Skip(_unreadable(f"market liquidity unreadable — {coin}", leg), {
+                "coin": coin, "leg": leg, "retry": True
+            })
+        verdict = self._policy.judge_coin(coin=coin, stats=stats.get(coin), limits=self._limits)
+        if verdict.allowed:
+            return None
+        return _Skip(verdict.decision, {"coin": coin, "leg": leg})
+
+    async def _market_stats(self) -> dict[str, MarketStats] | None:
+        """This cycle's market health for every covered venue, read at most
+        ONCE and only when something needs it.
+
+        One `metaAndAssetCtxs` per venue costs weight 20 — the same as `meta` —
+        so judging every entry in a cycle against the floor costs what judging
+        one does, and a cycle with no fresh entry costs nothing at all. NOT
+        cached across cycles, unlike the asset specs: the universe changes at
+        listing speed, but liquidity is the thing being judged, and a stale
+        answer to "is this market healthy now" is not an answer."""
+        if self._stats is None and not self._stats_unreadable:
+            for _ in POSITION_VENUES:
+                await self._budget.spend(MARKET_STATS_WEIGHT)
+            try:
+                self._stats = await fetch_market_stats(self._read)
+            except Exception:
+                log.warning("copy executor: market liquidity unreadable", exc_info=True)
+                self._stats_unreadable = True
+        return self._stats
 
     async def _liveness_skip(
         self, event: ClaimableEvent, coin: str, leg: str
     ) -> _Skip | None:
         """Decision 7: on ENTRY events only, the Leader must still have real
-        money on the exchange. Not a sizing input — under fixed Base Notional
-        the Leader's equity never enters sizing — but a SIGNAL QUALITY gate:
+        money on the exchange. Not a sizing input — under Base Stake the money
+        at risk is the operator's own constant, and the only thing the Leader
+        contributes to sizing is their LEVERAGE — but a SIGNAL QUALITY gate:
         38% of quality-screened wallets had emptied their accounts while their
         stored metrics still looked alive (2026-07-29 research)."""
         await self._budget.spend(POSITIONS_WEIGHT)
@@ -1302,7 +1611,10 @@ class CopyExecutor:
                 exc_info=True,
             )
             return _Skip(
-                f"leader equity unreadable — entry not taken this cycle ({coin})",
+                # Same leg-aware wording as the floor's read failure, and for
+                # the same reason: a flip's open leg is already claimed, so
+                # "this cycle" would promise a retry that cannot happen.
+                _unreadable(f"leader equity unreadable — {coin}", leg),
                 {"coin": coin, "leg": leg, "retry": True},
             )
         if state.account_value < LEADER_EQUITY_FLOOR:
@@ -1326,6 +1638,7 @@ class CopyExecutor:
         side: str,
         leg: str,
         attempt: AuditedAttempt,
+        leverage: LeverageChoice,
     ) -> None:
         """Decision 5, the entry half: ONE SHOT, accept-and-audit. Requested
         versus filled is recorded and the under-copy corrects at the Leader's
@@ -1370,11 +1683,17 @@ class CopyExecutor:
                 size_coin=filled,
                 opened_at=now,
                 opened_event_id=event.id,
+                leverage=Decimal(leverage.value),
             )
         else:
             await ep.adopt_size(self._pool, episode.id, episode.size_coin + filled)
         self._apply_fill(
-            state, coin, side=side, size_coin=_held(state, coin) + filled, price=price
+            state,
+            coin,
+            side=side,
+            size_coin=_held(state, coin) + filled,
+            price=price,
+            leverage=Decimal(leverage.value),
         )
         if sub.brackets:
             # Decision 6: the bracket is applied at OUR FILL TIME. Waiting for
@@ -1392,12 +1711,17 @@ class CopyExecutor:
                 "requested": str(requested),
                 "filled": str(filled),
                 "avg_price": str(price),
+                "leverage": leverage.value,
                 "episode_id": episode.id,
             },
             body=(
+                # The report leads with the POSITION, because that is what the
+                # operator sees on the exchange, and names the STAKE behind it,
+                # because that is the money that can be lost (amendment D-4).
                 f"📈 Copied {leg.replace('_', ' ')} — {coin} {side} "
                 f"({_short(sub.leader_address)}): requested ${_money(requested * mark)}, "
-                f"filled ${_money(filled * price)} @ {price}"
+                f"filled ${_money(filled * price)} @ {price} · {leverage.value}x isolated, "
+                f"${_money(filled * price / leverage.value)} of stake at risk"
             ),
             now=now,
         )
@@ -1487,6 +1811,9 @@ class CopyExecutor:
             side=episode.side,
             size_coin=held - filled,
             price=position.entry_price,
+            # The exchange's own figure for what is left: an exit changes the
+            # size, never the leverage the position runs at.
+            leverage=position.leverage,
         )
         await self._settle_exit(sub, episode, leg, target, filled, remaining, attempt, coin)
         return True
@@ -1780,7 +2107,14 @@ class CopyExecutor:
     # --- reads ----------------------------------------------------------------
 
     def _apply_fill(
-        self, state: SubState, coin: str, *, side: str, size_coin: Decimal, price: Decimal
+        self,
+        state: SubState,
+        coin: str,
+        *,
+        side: str,
+        size_coin: Decimal,
+        price: Decimal,
+        leverage: Decimal,
     ) -> None:
         """Keep THIS cycle's cached view in step with what we just did.
 
@@ -1790,7 +2124,14 @@ class CopyExecutor:
         this the open leg would read the position its own close leg had just
         removed and skip itself as "coin occupied". The exchange remains the
         authority: this is the cycle's working copy, and the NEXT cycle's
-        reconcile re-reads the truth regardless."""
+        reconcile re-reads the truth regardless.
+
+        LEVERAGE IS CARRIED, not defaulted to 1x, and under Base Stake sizing
+        that is load-bearing rather than cosmetic: `Position.margin` derives
+        the stake from notional over leverage, and the stake caps are judged
+        against it. A synthesized 1x position would report a $1,000 position as
+        $1,000 of margin, and the next entry in the same cycle would find the
+        sub's cap already spent by a position that actually used $100."""
         if size_coin <= 0:
             state.positions.pop(coin, None)
             return
@@ -1798,7 +2139,7 @@ class CopyExecutor:
             coin=coin,
             side=Side(side),
             size_usd=size_coin * price,
-            leverage=Decimal(1),
+            leverage=leverage,
             entry_price=price,
             unrealized_pnl=Decimal(0),
             size_coin=size_coin,
@@ -1899,6 +2240,25 @@ def _short(address: str) -> str:
     business importing the bot runtime to render six characters. The
     duplication is one line; the dependency would be a package."""
     return f"{address[:6]}…{address[-4:]}" if len(address) > 12 else address
+
+
+def _unreadable(what: str, leg: str) -> str:
+    """A read-failure skip's sentence, told straight for the leg it happened
+    on.
+
+    An ordinary entry leaves its event outstanding, so "not judged this cycle"
+    is exactly true — the next cycle asks again. A FLIP'S OPEN LEG cannot:
+    its close leg claimed the single event both legs come from, so there is no
+    next ask, and the honest sentence is the outcome (decision 3's chosen
+    failure direction — the close filled, so we end FLAT) rather than a
+    promise the mechanism will not keep."""
+    if leg == "flip_open":
+        return (
+            f"{what}: the flip's open leg could not be judged, and this event is "
+            f"already claimed by its close leg — no retry. The close filled, so the "
+            f"copy is FLAT until the leader's next event"
+        )
+    return f"{what}: entry not judged this cycle — the next cycle asks again"
 
 
 def _held(state: SubState, coin: str) -> Decimal:

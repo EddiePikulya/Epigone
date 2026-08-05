@@ -3,12 +3,15 @@
 Three separate jobs, all pure functions so the executor's tests can pin the
 arithmetic without a database or a wire.
 
-**Sizing (decision 2).** A copied OPEN is Base Notional at the current mark,
-in coin units — the Leader's absolute size never enters it. A scale is
-RELATIVE: a 50% scale-in grows the copy 50%, a 30% trim sells 30% — and,
-crucially, of what we ACTUALLY HOLD (decision 10's self-damping principle),
-never of a bookkept expectation. The Leader's own event supplies only the
-FRACTION, computed from their before/after sizes.
+**Sizing (decision 2, as amended by D-4).** A copied OPEN is Base Stake times
+the mirrored leverage, at the current mark, in coin units — the Leader's
+absolute size still never enters it, only their leverage does. The configured
+dollars are MARGIN, isolated per position, so they are the worst case; the
+POSITION is that margin levered up. A scale is RELATIVE: a 50% scale-in grows
+the copy 50%, a 30% trim sells 30% — and, crucially, of what we ACTUALLY HOLD
+(decision 10's self-damping principle), never of a bookkept expectation. The
+Leader's own event supplies only the FRACTION, computed from their
+before/after sizes.
 
 **Precision.** Hyperliquid refuses a size with more decimals than the asset's
 `szDecimals`, and a perp price with more than 5 significant figures or more
@@ -28,7 +31,7 @@ makes the "the Leader closes while our entry rests" edge dissolve.
 
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
 
-from epigone.execute.policy import SLIPPAGE_CAP
+from epigone.execute.policy import SLIPPAGE_CAP, open_position_notional
 
 # The wire's own precision floor (epigone.gateway.execution.decimal_to_wire).
 MAX_WIRE_DECIMALS = 8
@@ -64,15 +67,40 @@ def round_size(size_coin: Decimal, sz_decimals: int) -> Decimal:
     return rounded
 
 
-def open_size(notional_usd: Decimal, mark: Decimal, sz_decimals: int) -> Decimal:
-    """Base Notional at the mark, in coin units (decision 2). The Leader's own
-    size is not an input — that is the whole point of fixed sizing: the
-    5%-of-their-account vs 40%-of-ours conflict dissolves by construction, and
-    the model is robust to the stale leader-equity data that made 38% of
-    screened wallets look alive after they had emptied out."""
+def clamped_size(
+    size_coin: Decimal, *, asked_stake: Decimal, granted_stake: Decimal, sz_decimals: int
+) -> Decimal:
+    """The order size for the stake the policy actually granted (issue #137 §5).
+
+    A full grant sends the asked size untouched — no re-derivation, so a clamp
+    is the ONLY thing that can change what was sized. A partial grant scales
+    the size by the same ratio the stake was cut by and re-rounds DOWN at the
+    asset's precision, which keeps the two properties that matter: the position
+    stays stake × leverage, and rounding can never round a clamp back UP over
+    the cap it was clamped to."""
+    if asked_stake <= 0:
+        raise UnpriceableError(f"asked stake {asked_stake} is not positive")
+    if granted_stake >= asked_stake:
+        return size_coin
+    return round_size(size_coin * granted_stake / asked_stake, sz_decimals)
+
+
+def open_size(
+    stake_usd: Decimal, leverage: Decimal, mark: Decimal, sz_decimals: int
+) -> Decimal:
+    """Base Stake × mirrored leverage at the mark, in coin units (decision 2
+    as amended by D-4).
+
+    The Leader's absolute size is still not an input — that is the whole point
+    of fixed sizing: the 5%-of-their-account vs 40%-of-ours conflict dissolves
+    by construction, and the model is robust to the stale leader-equity data
+    that made 38% of screened wallets look alive after they had emptied out.
+    What the Leader now DOES supply is their conviction, as leverage: a $100
+    stake behind a 10x Leader is a $1,000 position, and the $100 is still the
+    most that position can lose, because its margin is isolated."""
     if mark <= 0:
         raise UnpriceableError(f"mark price {mark} is not positive")
-    return round_size(notional_usd / mark, sz_decimals)
+    return round_size(open_position_notional(stake_usd, leverage) / mark, sz_decimals)
 
 
 def scale_fraction(prev_size: Decimal | None, new_size: Decimal | None) -> Decimal:

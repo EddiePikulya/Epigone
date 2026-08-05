@@ -50,6 +50,10 @@ class CopyEpisode:
     opened_event_id: int | None
     entry_price: Decimal
     size_coin: Decimal
+    # What the position was OPENED at, after every cap applied (amendment
+    # D-4). Bookkeeping like `size_coin`: the exchange's own figure on the live
+    # position is what a reader trusts. NULL on episodes that predate A5.
+    leverage: Decimal | None
     ended_at: datetime | None
     ended_reason: str | None
 
@@ -74,6 +78,7 @@ async def open_episode(
     size_coin: Decimal,
     opened_at: datetime,
     opened_event_id: int | None,
+    leverage: Decimal | None = None,
 ) -> CopyEpisode:
     """Start an episode from OUR fill — our average price and the units we
     actually got, never the Leader's. The unique partial index refuses a
@@ -82,8 +87,8 @@ async def open_episode(
     row = await conn.fetchrow(
         """
         INSERT INTO copy_episodes
-            (sub_id, coin, side, opened_at, opened_event_id, entry_price, size_coin)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
+            (sub_id, coin, side, opened_at, opened_event_id, entry_price, size_coin, leverage)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
         RETURNING *
         """,
         sub_id,
@@ -93,6 +98,7 @@ async def open_episode(
         opened_event_id,
         entry_price,
         size_coin,
+        leverage,
     )
     assert row is not None
     return _episode(row)
@@ -231,6 +237,7 @@ def _episode(row: asyncpg.Record) -> CopyEpisode:
         opened_event_id=row["opened_event_id"],
         entry_price=row["entry_price"],
         size_coin=row["size_coin"],
+        leverage=row["leverage"],
         ended_at=row["ended_at"],
         ended_reason=row["ended_reason"],
     )

@@ -8,16 +8,19 @@ Seam per the house convention: fake read gateway, fake execution gateway, fake
 clock, real Postgres.
 """
 
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 
 import asyncpg
+import pytest
 
 from epigone.execute import episodes as ep
 from epigone.execute import subs as subs_store
+from epigone.execute.config import ExecutorConfig
 from epigone.execute.executor import EXECUTOR_CONSUMER
-from epigone.execute.policy import ENTRY_STALENESS_GUARD, LEADER_EQUITY_FLOOR, RiskPolicyV0
-from epigone.gateway import GatewayError, Position, Side
+from epigone.execute.policy import ENTRY_STALENESS_GUARD, LEADER_EQUITY_FLOOR, RiskPolicy
+from epigone.gateway import GatewayError, MarketStats, Position, Side
 from epigone.gateway.execution import (
     ActionRejectedError,
     OrderFilled,
@@ -25,9 +28,11 @@ from epigone.gateway.execution import (
     RejectReason,
     Tif,
 )
+from epigone.gateway.execution_http import MAINNET_EXCHANGE_URL, TESTNET_EXCHANGE_URL
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.position_events import ClaimableEvent, PositionEvent, outstanding_events
 from epigone.safety.audit import ExecutionAudit
+from epigone.safety.config import WatchdogConfig
 from epigone.safety.halt import KILL_SOURCE, request_halt
 from tests.support.clock import FakeClock
 from tests.support.copy import (
@@ -40,10 +45,20 @@ from tests.support.copy import (
     emit,
     position,
     seed_trader,
+    set_limits,
 )
 
 
-def opened(coin: str = "ETH", side: str = "long", size_coin: str = "5") -> PositionEvent:
+def opened(
+    coin: str = "ETH", side: str = "long", size_coin: str = "5", leverage: str = "1"
+) -> PositionEvent:
+    """A Leader's open, as the poller recorded it.
+
+    `leverage` is theirs, and under amendment D-4 it is a SIZING input: the
+    copy runs at min(theirs, the backstop, the asset max). It defaults to 1x
+    so every test that is not ABOUT leverage reads its sizes at face value —
+    stake in, stake-worth of position out — and the tests that are about it
+    say so by passing a number."""
     return PositionEvent(
         kind="open",
         coin=coin,
@@ -51,6 +66,7 @@ def opened(coin: str = "ETH", side: str = "long", size_coin: str = "5") -> Posit
         size_usd=Decimal("10000"),
         size_coin=Decimal(size_coin),
         entry_price=Decimal("2000"),
+        leverage=Decimal(leverage),
     )
 
 
@@ -134,7 +150,7 @@ async def test_an_open_is_copied_at_base_notional_not_the_leaders_size(
     """Decision 2: the Leader opened $10,000 of ETH; we open OUR $200 of it.
     The order is an IOC inside the slippage cap — nothing entry-shaped rests."""
     h = await build_harness(pool, clock, gateway)
-    sub = await copy_sub(pool, clock, base_notional="200")
+    sub = await copy_sub(pool, clock, base_stake="200")
     gateway.set_positions(SUB, [])
     h.exec_fake.place_results.append(
         [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
@@ -417,6 +433,7 @@ async def test_a_flip_closes_reduce_only_then_opens_through_the_full_pipeline(
             size_usd=Decimal("10000"),
             size_coin=Decimal("5"),
             entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
             realized_pnl=Decimal("50"),
         ),
         clock.now(),
@@ -461,6 +478,7 @@ async def test_a_flip_whose_claim_was_lost_never_opens_the_second_leg(
             size_usd=Decimal("10000"),
             size_coin=Decimal("5"),
             entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
         ),
         clock.now(),
     )
@@ -500,6 +518,7 @@ def _claimable(pool: asyncpg.Pool, event_id: int, clock: FakeClock) -> Claimable
             size_usd=Decimal("10000"),
             size_coin=Decimal("5"),
             entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
         ),
     )
 
@@ -542,6 +561,7 @@ async def test_a_flips_open_leg_is_never_dropped_without_an_audit_row(
             size_usd=Decimal("10000"),
             size_coin=Decimal("5"),
             entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
         ),
         clock.now(),
     )
@@ -746,6 +766,7 @@ async def test_a_halt_landing_mid_flip_stops_the_open_leg_and_leaves_us_flat(
             size_usd=Decimal("10000"),
             size_coin=Decimal("5"),
             entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
         ),
         clock.now(),
     )
@@ -827,26 +848,537 @@ async def test_the_backlog_ignores_the_websocket_shadow_lanes_duplicate_rows(
     assert len(h.placed()) == 1
 
 
-# --- the risk policy ----------------------------------------------------------
+# --- the risk policy (issue #137) ---------------------------------------------
 
 
 async def test_a_declined_entry_is_audited_and_claimed_not_silently_dropped(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:
-    # The ticket: "hardcoded v0 risk limits enforced pending A5". A decline is
-    # a decision — it goes on the trail and into the chat, and it claims.
-    h = await build_harness(
-        pool, clock, gateway, policy=RiskPolicyV0(max_base_notional=Decimal("50"))
-    )
-    await copy_sub(pool, clock, base_notional="200")
-    gateway.set_positions(SUB, [])
+    # A decline is a decision — it goes on the trail and into the chat, and it
+    # claims. Here the sub's aggregate stake cap is already spent by a position
+    # on ANOTHER coin, which is what the per-sub cap is for.
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, sub_stake="100")
+    await copy_sub(pool, clock, base_stake="200")
+    gateway.set_positions(SUB, [position(coin="BTC", size_usd="150", size_coin="0.002")])
 
     await emit(pool, opened(), clock.now())
     await h.executor.run_cycle()
 
     assert h.placed() == []
     assert await outstanding(pool) == []
-    assert any("v0 policy DECLINED" in decision for _, decision in await h.audit_actions())
+    decisions = [decision for _, decision in await h.audit_actions()]
+    assert any("no stake headroom left" in decision for decision in decisions)
+    # The denial wording rule: a denial never claims something did not EXIT.
+    assert any("did not enter" in decision for decision in decisions)
+    assert all("did not exit" not in decision for decision in decisions)
+
+
+async def test_an_entry_over_a_stake_cap_is_clamped_to_the_headroom_not_refused(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """§5: an order over a cap is CLAMPED, audited `allowed-clamped` with both
+    the asked and the given size. A copy at reduced size still follows the
+    Leader; refusing outright would leave us half-mirrored."""
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, coin_stake="50")
+    await copy_sub(pool, clock, base_stake="200")
+    gateway.set_positions(SUB, [])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.025"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()
+    # $50 of the $200 asked, at 1x, on a $2000 mark.
+    assert orders[0].size == Decimal("0.025")
+    decision = next(
+        decision for _, decision in await h.audit_actions() if "allowed-clamped" in decision
+    )
+    assert "asked $200" in decision and "given $50.00" in decision
+
+
+async def test_a_scale_in_over_a_stake_cap_is_clamped_on_its_derived_stake(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A scale-in decides nothing about leverage — the position already runs at
+    one the exchange enforces — so its stake is DERIVED: the margin the added
+    notional will consume at that leverage. The caps bound it through that
+    derivation, and the clamp scales the coin-unit size by the same ratio.
+
+    Held: 0.1 ETH at 1x on a $2,000 mark = $200 of margin against a $250
+    per-coin cap, so $50 of room. The Leader grows 50%, which asks for 0.05 ETH
+    = $100 of margin: twice what is left."""
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, coin_stake="250")
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+
+    await emit(pool, scaled("scale_in", "5", "7.5"), clock.now())
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()
+    # Half the asked size, because half the asked stake was granted.
+    assert orders[0].size == Decimal("0.025")
+    decision = next(
+        decision for _, decision in await h.audit_actions() if "allowed-clamped" in decision
+    )
+    assert "asked $100" in decision and "given $50.00" in decision
+    # A scale-in never re-decides leverage, so nothing was signed to change it.
+    assert not [m for m, _ in h.exec_fake.actions if m == "update_leverage"]
+
+
+async def test_an_unreadable_read_on_a_flips_open_leg_does_not_promise_a_retry(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A flip's open leg runs already-claimed (its close leg claimed the single
+    event both come from), so "the next cycle asks again" is a sentence that
+    cannot come true. The trail has to say what actually happened instead:
+    no retry, and — since the close filled — we are FLAT."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.market_stats_errors[None] = GatewayError("metaAndAssetCtxs down")
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(
+        pool,
+        PositionEvent(
+            kind="flip",
+            coin="ETH",
+            side="short",
+            prev_side="long",
+            size_usd=Decimal("10000"),
+            size_coin=Decimal("5"),
+            leverage=Decimal("1"),
+        ),
+        clock.now(),
+    )
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1  # the close leg only: we end FLAT
+    decision = next(
+        decision for _, decision in await h.audit_actions() if "unreadable" in decision
+    )
+    assert "no retry" in decision and "FLAT" in decision
+    assert "asks again" not in decision
+    # The event is gone from the backlog — claimed by the close leg — which is
+    # exactly why the sentence above must not promise another look.
+    assert await outstanding(pool) == []
+
+
+async def test_an_order_that_rounds_to_dust_is_not_sent_even_when_the_stake_cleared(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The policy judges the $10 minimum in DOLLARS, on the stake it granted.
+    The exchange judges the ORDER — which has been rounded DOWN to the asset's
+    precision since. On a coarse asset those disagree, and the last word
+    belongs to the size that will actually be signed: sending it would buy a
+    guaranteed MIN_NOTIONAL reject and the alarming audit row the constant
+    exists to avoid."""
+    h = await build_harness(pool, clock, gateway)
+    # A $6 coin quoted in WHOLE units: $11 of stake at 1x buys 1.83 of them,
+    # which rounds DOWN to 1 — an $11 grant the policy allows, and a $6 order
+    # the exchange would refuse.
+    gateway.perp_universes[None] = ["BTC", "ETH", "CHUNK"]
+    gateway.sz_decimals["CHUNK"] = 0
+    gateway.mid_prices[None]["CHUNK"] = Decimal("6")
+    await copy_sub(pool, clock, base_stake="11")
+    gateway.set_positions(SUB, [])
+
+    await emit(pool, opened(coin="CHUNK"), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert await outstanding(pool) == []
+    assert any(
+        "under the exchange's $10 minimum order value" in decision
+        for _, decision in await h.audit_actions()
+    )
+
+
+async def test_a_clamp_below_the_exchange_minimum_becomes_a_denial(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """§5's one exception to clamping: the exchange refuses anything under $10
+    of order value, so a clamp that lands there is a denial with that said —
+    not a doomed order and an alarming reject on the trail."""
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, coin_stake="4")
+    await copy_sub(pool, clock, base_stake="200")
+    gateway.set_positions(SUB, [])
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert any(
+        "minimum order value" in decision for _, decision in await h.audit_actions()
+    )
+
+
+# --- the Liquidity Floor (§1, §2) ---------------------------------------------
+
+
+def thin(coin: str, *, volume: str = "1000", open_interest: str = "1") -> MarketStats:
+    """A market nobody is trading — the shape the floor exists to keep us out
+    of, where a copied trade's counterparty can be the Leader themselves."""
+    return MarketStats(
+        coin=coin,
+        day_notional_volume=Decimal(volume),
+        open_interest=Decimal(open_interest),
+        mark_price=Decimal("2000"),
+        max_leverage=20,
+    )
+
+
+async def test_a_sub_floor_coin_is_not_entered(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.market_stats["ETH"] = thin("ETH")
+    gateway.set_positions(SUB, [])
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert await outstanding(pool) == []  # claimed: a denial is a decision
+    assert any(
+        "below the Liquidity Floor" in decision for _, decision in await h.audit_actions()
+    )
+
+
+async def test_a_live_episode_is_grandfathered_when_its_coin_goes_thin(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """§2's lifecycle: the floor speaks ONCE, at the open that starts the
+    episode. A scale-in on a coin that has since gone sub-floor still copies —
+    a live episode is never interrupted."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.market_stats["ETH"] = thin("ETH")
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+
+    await emit(pool, scaled("scale_in", "5", "7.5"), clock.now())
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()
+    assert orders[0].size == Decimal("0.05")  # 50% of what we hold
+
+
+async def test_an_exit_is_never_blocked_by_the_floor(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """§3: exits are unconditionally exempt from every limit. A copy trapped in
+    a coin that went thin is exactly the position we most need out of."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.market_stats["ETH"] = thin("ETH")
+    await set_limits(pool, clock, coin_stake="1", sub_stake="1")  # every cap spent
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, closed(), clock.now())
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()
+    assert orders[0].reduce_only is True
+
+
+async def test_a_flip_into_a_sub_floor_coin_ends_flat(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """§2: a flip ENDS the episode, so its opening leg is a fresh entry and the
+    floor speaks again. The close leg signs unconditionally; the open leg is
+    denied; we end flat, both halves audited."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.market_stats["ETH"] = thin("ETH")
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(
+        pool,
+        PositionEvent(
+            kind="flip",
+            coin="ETH",
+            side="short",
+            prev_side="long",
+            size_usd=Decimal("10000"),
+            size_coin=Decimal("5"),
+            leverage=Decimal("1"),
+        ),
+        clock.now(),
+    )
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()  # ONE order: the close
+    assert orders[0].reduce_only is True
+    assert any(
+        "below the Liquidity Floor" in decision for _, decision in await h.audit_actions()
+    )
+
+
+async def test_unreadable_liquidity_defers_the_entry_rather_than_denying_it(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """"I cannot tell" is not "denied": a network blip must not silently stop
+    copying. The event stays OUTSTANDING for the next cycle to ask again."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.market_stats_errors[None] = GatewayError("metaAndAssetCtxs down")
+    gateway.set_positions(SUB, [])
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert await outstanding(pool) != []
+
+
+async def test_the_floor_can_be_turned_off(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Operator-tunable down to 0 = off (§1). The floor is a default stance,
+    not a cage."""
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, floor_volume="0", floor_oi="0")
+    await copy_sub(pool, clock)
+    gateway.market_stats["ETH"] = thin("ETH")
+    gateway.set_positions(SUB, [])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1
+
+
+# --- Base Stake x Mirrored Leverage (amendment D-4) ---------------------------
+
+
+async def test_an_open_is_stake_times_the_leaders_leverage_on_isolated_margin(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The amendment, end to end: $100 of the operator's margin behind a 10x
+    Leader is a $1,000 position — and the leverage is SET on the sub, isolated,
+    before the order, or the stake would not be the worst case."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, base_stake="100")
+    gateway.set_positions(SUB, [])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.5"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, opened(leverage="10"), clock.now())
+    await h.executor.run_cycle()
+
+    leverage_calls = [
+        payload for method, payload in h.exec_fake.actions if method == "update_leverage"
+    ]
+    assert leverage_calls == [(1, 10, False, SUB)]  # ETH's asset id, 10x, ISOLATED, on the sub
+    (orders, _grouping, _builder, _vault), = h.placed()
+    assert orders[0].size == Decimal("0.5")  # $100 x 10 / $2000
+    # And the leverage is signed BEFORE the order it sizes.
+    methods = [method for method, _ in h.exec_fake.actions]
+    assert methods.index("update_leverage") < methods.index("place_orders")
+
+    (episode,) = await h.episodes(sub.id)
+    assert episode["leverage"] == Decimal("10")
+
+
+async def test_the_backstop_caps_a_leaders_leverage(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The Leader's leverage dial is an attack surface without a cap: notional,
+    and everything that scales with it, is stake x leverage."""
+    h = await build_harness(pool, clock, gateway)
+    await set_limits(pool, clock, max_leverage="5")
+    await copy_sub(pool, clock, base_stake="100")
+    gateway.set_positions(SUB, [])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.25"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, opened(leverage="40"), clock.now())
+    await h.executor.run_cycle()
+
+    leverage_calls = [
+        payload for method, payload in h.exec_fake.actions if method == "update_leverage"
+    ]
+    assert leverage_calls == [(1, 5, False, SUB)]
+    (orders, _grouping, _builder, _vault), = h.placed()
+    assert orders[0].size == Decimal("0.25")  # $100 x 5 / $2000
+    assert any(
+        "operator's backstop" in decision for _, decision in await h.audit_actions()
+    )
+
+
+async def test_a_fixed_leverage_sub_ignores_the_leaders_own(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock, base_stake="100", leverage_mode="fixed", fixed_leverage=3)
+    gateway.set_positions(SUB, [])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.15"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, opened(leverage="40"), clock.now())
+    await h.executor.run_cycle()
+
+    leverage_calls = [
+        payload for method, payload in h.exec_fake.actions if method == "update_leverage"
+    ]
+    assert leverage_calls == [(1, 3, False, SUB)]
+
+
+async def test_a_mirror_open_with_no_leader_leverage_is_skipped_not_guessed(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Every plausible default is a decision about position size that nobody
+    made — 1x silently shrinks the copy, the backstop silently maximises it."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+
+    event = opened()
+    await emit(pool, replace(event, leverage=None), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert any("not mirrorable" in decision for _, decision in await h.audit_actions())
+
+
+async def test_a_halt_between_the_leverage_and_the_order_stops_the_order(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """updateLeverage is a signature with its own round trip, so the halt gate
+    before the ORDER is not redundant with the one before it. A leverage
+    setting on an asset we hold nothing in changes nothing about the account."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+
+    async def halt_then_answer(*_args: object, **_kwargs: object) -> None:
+        await request_halt(
+            pool,
+            clock,
+            h.audit,
+            source=KILL_SOURCE,
+            reason="operator /kill mid-entry",
+            requested_by=OPERATOR,
+        )
+
+    h.exec_fake.update_leverage = halt_then_answer  # type: ignore[method-assign]
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert any(action == "copy_halted" for action, _ in await h.audit_actions())
+
+
+async def test_a_refused_leverage_stops_the_entry_rather_than_opening_at_another(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A position opened at whatever leverage the account carried is not the
+    position the policy judged."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+    h.exec_fake.errors.append(ActionRejectedError("Leverage too high"))
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []
+    assert any("refused to set" in body for body in await h.notices())
+
+
+# --- the equity history the deferred daily-loss pause will be built on --------
+
+
+async def test_every_cycle_records_each_subs_equity(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """§6: the pause is deferred; the enabler ships. The executor already reads
+    this figure to reconcile and used to discard it."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    gateway.set_account_value(SUB, Decimal("980"))
+    gateway.set_positions(SUB, [])
+
+    await h.executor.run_cycle()
+    clock.advance(seconds=5)
+    gateway.set_account_value(SUB, Decimal("940"))
+    await h.executor.run_cycle()
+
+    rows = await pool.fetch(
+        "SELECT account_value FROM copy_sub_equity WHERE sub_id = $1 ORDER BY id", sub.id
+    )
+    assert [row["account_value"] for row in rows] == [Decimal("980"), Decimal("940")]
 
 
 # --- reconciliation (decision 10) ---------------------------------------------
@@ -1086,9 +1618,7 @@ async def test_a_fired_bracket_ends_the_episode_and_later_events_are_skipped(
     """The episode rule g1: a bracket exit is a local override of the Leader's
     exit timing, so re-entering would churn against it. Later events on that
     position are claimed and skipped."""
-    h = await build_harness(
-        pool, clock, gateway, policy=RiskPolicyV0()
-    )
+    h = await build_harness(pool, clock, gateway, policy=RiskPolicy())
     sub = await copy_sub(
         pool, clock, mode="bracket", take_profit_pct="10", stop_loss_pct="5"
     )
@@ -1235,7 +1765,9 @@ async def test_a_recopied_sub_is_topped_up_to_its_allocation(
         operator_id=OPERATOR,
         leader_address=LEADER,
         allocation_usd=Decimal("1000"),
-        base_notional_usd=Decimal("200"),
+        base_stake_usd=Decimal("200"),
+        leverage_mode="mirror",
+        fixed_leverage=None,
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
@@ -1265,7 +1797,9 @@ async def test_a_sub_already_holding_its_allocation_is_not_funded_again(
         operator_id=OPERATOR,
         leader_address=LEADER,
         allocation_usd=Decimal("1000"),
-        base_notional_usd=Decimal("200"),
+        base_stake_usd=Decimal("200"),
+        leverage_mode="mirror",
+        fixed_leverage=None,
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
@@ -1316,7 +1850,7 @@ async def test_provisioning_past_the_v0_ceilings_is_declined_before_money_moves(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:
     h = await build_harness(pool, clock, gateway)
-    await copy_sub(pool, clock, provisioned=False, allocation="500000", base_notional="200")
+    await copy_sub(pool, clock, provisioned=False, allocation="500000", base_stake="200")
 
     await h.executor.run_cycle()
 
@@ -1403,7 +1937,9 @@ async def test_a_sub_mapped_to_any_leader_is_never_adopted(
         leader_address=other_operator,
         sub_name="someone-elses",
         allocation_usd=Decimal("1000"),
-        base_notional_usd=Decimal("200"),
+        base_stake_usd=Decimal("200"),
+        leverage_mode="mirror",
+        fixed_leverage=None,
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
@@ -1800,6 +2336,7 @@ async def test_a_stale_flip_half_executes_to_flat(
             size_usd=Decimal("10000"),
             size_coin=Decimal("5"),
             entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
         ),
         clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1),
     )
@@ -1828,26 +2365,60 @@ async def test_every_cycle_beats_the_heartbeat_the_watchdog_watches(
     assert await heartbeat.last_beat(pool, heartbeat.EXECUTOR_PROCESS) == clock.now()
 
 
-def test_no_mainnet_path_is_reachable_from_the_executor() -> None:
-    """The live gate, structurally (the ticket: "no mainnet code path
-    reachable while the live gate is closed"). Nothing in the execute package
-    CALLS HttpExecutionGateway with allow_mainnet, so a mainnet URL is refused
-    at construction (MainnetNotEnabledError) until A5 wires it. Asserted over
-    the parsed source rather than by string search, so a mention in a comment
-    — there is one, explaining the gate — cannot pass or fail it."""
-    import ast
-    import inspect
+# --- the live gate (§8) -------------------------------------------------------
+#
+# A4's version of this section asserted that NOTHING in the execute package
+# passed `allow_mainnet` at all — the gate was closed by there being no wiring.
+# A5 ships the wiring, so the property being pinned changes shape: the gate is
+# now closed by DEFAULT and takes two deliberate acts to open. That is the
+# ticket's §8, and these are the tests that make "the default stays testnet" a
+# fact rather than an intention.
 
-    import epigone.execute.config as config_module
-    import epigone.execute.executor as executor_module
-    import epigone.execute.main as main_module
 
-    for module in (executor_module, main_module, config_module):
-        tree = ast.parse(inspect.getsource(module))
-        keywords = [
-            keyword.arg
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            for keyword in node.keywords
-        ]
-        assert "allow_mainnet" not in keywords
+def test_mainnet_takes_the_flag_and_the_url_and_defaults_to_neither(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("EXECUTOR_ALLOW_MAINNET", raising=False)
+    monkeypatch.delenv("EXECUTOR_EXCHANGE_URL", raising=False)
+    config = ExecutorConfig.from_env()
+    assert config.exchange_url == TESTNET_EXCHANGE_URL
+    assert config.allow_mainnet is False
+    assert config.is_mainnet is False
+
+    # The URL alone is not enough: the gateway still refuses at construction.
+    monkeypatch.setenv("EXECUTOR_EXCHANGE_URL", MAINNET_EXCHANGE_URL)
+    url_only = ExecutorConfig.from_env()
+    assert url_only.allow_mainnet is False
+    assert url_only.is_mainnet is False
+
+    # And the flag alone is not enough either — it leaves the testnet URL.
+    monkeypatch.delenv("EXECUTOR_EXCHANGE_URL")
+    monkeypatch.setenv("EXECUTOR_ALLOW_MAINNET", "true")
+    flag_only = ExecutorConfig.from_env()
+    assert flag_only.allow_mainnet is True
+    assert flag_only.is_mainnet is False
+
+    monkeypatch.setenv("EXECUTOR_EXCHANGE_URL", MAINNET_EXCHANGE_URL)
+    assert ExecutorConfig.from_env().is_mainnet is True
+
+
+def test_a_flag_value_that_is_not_a_yes_leaves_mainnet_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # "EXECUTOR_ALLOW_MAINNET=0 enabled mainnet" must never be a sentence
+    # anyone can say about this system.
+    for value in ("0", "false", "no", "maybe", " "):
+        monkeypatch.setenv("EXECUTOR_ALLOW_MAINNET", value)
+        assert ExecutorConfig.from_env().allow_mainnet is False
+
+
+def test_the_watchdog_opens_on_the_executors_own_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sweep must reach whatever book the executor can trade on. One flag
+    for the pair is what makes a live executor beside a testnet-refused
+    watchdog — a halt that records and never sweeps — impossible to type."""
+    monkeypatch.delenv("EXECUTOR_ALLOW_MAINNET", raising=False)
+    assert WatchdogConfig.from_env().allow_mainnet is False
+    monkeypatch.setenv("EXECUTOR_ALLOW_MAINNET", "1")
+    assert WatchdogConfig.from_env().allow_mainnet is True

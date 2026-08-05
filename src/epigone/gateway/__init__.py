@@ -159,6 +159,36 @@ class PerpAsset:
 
 
 @dataclass(frozen=True)
+class MarketStats:
+    """One perp market's LIVE health, plus the leverage ceiling it enforces
+    (issue #137).
+
+    The risk policy's Liquidity Floor is judged against these: a market with
+    no volume and no open interest is where a copied trade's counterparty can
+    be the Leader themselves, and thinness is a property of the market NOW,
+    not of the coin. `max_leverage` rides along because it comes from the same
+    response — the venue's own ceiling on an asset, which caps a mirrored
+    leverage before the operator's backstop ever has to.
+
+    `open_interest` is in COIN UNITS, exactly as the venue reports it, and the
+    dollar figure the floor judges is the property below. Storing the product
+    instead would hide which of the two numbers moved."""
+
+    coin: str  # venue-namespaced, like every other coin key in the system
+    day_notional_volume: Decimal  # dayNtlVlm: 24h traded notional, in dollars
+    open_interest: Decimal  # openInterest, in coin units
+    mark_price: Decimal  # markPx
+    max_leverage: int  # the asset's own ceiling (meta.universe[].maxLeverage)
+
+    @property
+    def open_interest_usd(self) -> Decimal:
+        """Open interest at the mark — the second half of the Liquidity
+        Floor, and the half that says whether anyone is actually positioned
+        here rather than merely churning."""
+        return self.open_interest * self.mark_price
+
+
+@dataclass(frozen=True)
 class OpenOrder:
     """A resting (unfilled) order on a Trader's book — their plan before it
     executes (issue #115).
@@ -354,6 +384,23 @@ class HyperliquidGateway(Protocol):
         the asset id, szDecimals gives the size and price precision an order
         must be rounded to before it is signed. Raises GatewayError on
         failure."""
+        ...
+
+    async def get_market_stats(self, dex: str | None = None) -> dict[str, MarketStats]:
+        """ONE venue's live per-market health, keyed by namespaced coin (the
+        `metaAndAssetCtxs` info endpoint, issue #137).
+
+        The same `meta` universe `get_perp_assets` reads, zipped with the
+        per-asset contexts served beside it: 24h notional volume, open
+        interest, mark price, and the asset's own leverage ceiling. Weight 20,
+        like `meta`, and ONE call per covered venue per executor cycle — which
+        is what makes judging an order against the Liquidity Floor cost no
+        extra API weight at all.
+
+        Index alignment is the contract: `assetCtxs[i]` describes
+        `universe[i]`. A payload whose two arrays disagree in length raises
+        rather than zipping short — a market judged against another market's
+        volume is worse than no floor. Raises GatewayError on failure."""
         ...
 
     async def get_mid_prices(self, dex: str | None = None) -> dict[str, Decimal]:
@@ -632,6 +679,23 @@ async def fetch_asset_specs(
                     asset_id=offset + index, sz_decimals=asset.sz_decimals
                 )
     return specs
+
+
+async def fetch_market_stats(gateway: HyperliquidGateway) -> dict[str, MarketStats]:
+    """Live market health for every coin on every venue Epigone covers (issue
+    #137), merged into one map.
+
+    One `metaAndAssetCtxs` per POSITION_VENUES entry — the same per-venue walk
+    every other coverage read makes, so a copy on the xyz builder DEX is judged
+    against xyz's own liquidity rather than falling through the floor for lack
+    of data. All-or-raise like its siblings: a partial map would make an
+    unanswered venue's coins look like coins nobody trades, and the floor would
+    deny every entry on it. The executor treats a raise as "cannot judge",
+    which defers the entry rather than denying it."""
+    stats: dict[str, MarketStats] = {}
+    for dex in POSITION_VENUES:
+        stats.update(await gateway.get_market_stats(dex))
+    return stats
 
 
 async def fetch_asset_ids(

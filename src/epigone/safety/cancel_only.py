@@ -73,7 +73,17 @@ class CancelOnlyExecutionGateway:
     async def modify_orders(self, modifies: list[ModifySpec]) -> list[OrderResult]:
         raise self._refusal("modify_orders", len(modifies))
 
-    async def update_leverage(self, asset: int, leverage: int, *, is_cross: bool = True) -> None:
+    async def update_leverage(
+        self,
+        asset: int,
+        leverage: int,
+        *,
+        is_cross: bool = True,
+        vault_address: str | None = None,
+    ) -> None:
+        # Refused on a sub-account exactly as on the master (issue #137 added
+        # the parameter): reaching a wider set of books is subtractive for a
+        # CANCEL and is not for a risk-posture change.
         raise self._refusal("update_leverage", 1)
 
     async def cancel_orders(

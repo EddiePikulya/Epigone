@@ -12,13 +12,20 @@ OUTLIVES the container — the whole point is surviving a restart during a
 Postgres outage — so the compose service points it at a named volume; the
 default is a path under the operator's home for local runs.
 
-The exchange URL defaults to TESTNET and mainnet stays refused by
-construction regardless: HttpExecutionGateway raises MainnetNotEnabledError
-until A5's wiring passes allow_mainnet=True, which nothing here does. The
-info URL is derived from the exchange URL so the watchdog can never read one
-network's book while cancelling on the other — which is also why a malformed
-WATCHDOG_EXCHANGE_URL degrades BOTH urls to the testnet default, never just
-one side of the pair.
+The exchange URL defaults to TESTNET. The info URL is derived from the exchange
+URL so the watchdog can never read one network's book while cancelling on the
+other — which is also why a malformed WATCHDOG_EXCHANGE_URL degrades BOTH urls
+to the testnet default, never just one side of the pair.
+
+MAINNET RIDES THE EXECUTOR'S OWN FLAG, deliberately: `EXECUTOR_ALLOW_MAINNET`
+opens the gate here too (issue #137). The watchdog is the executor's dead-man's
+switch and /kill's only sweeping hand, so a live executor beside a
+testnet-refused watchdog is the one configuration nobody should be able to
+reach by setting a single variable — the halt would record, the sweep would
+raise at gateway construction, and resting orders would stay on a real book.
+One flag for the pair means the dangerous asymmetry cannot be typed. The URL
+is still separately set per process (WATCHDOG_EXCHANGE_URL), so the flag alone
+changes nothing here either.
 """
 
 import logging
@@ -27,7 +34,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
-from epigone.config import parse_positive_int
+from epigone.config import parse_allow_mainnet, parse_positive_int
 from epigone.gateway.execution_http import TESTNET_EXCHANGE_URL
 from epigone.gateway.http import TESTNET_INFO_URL
 from epigone.safety.keycache import default_cache_path
@@ -90,6 +97,7 @@ class WatchdogConfig:
     capability_interval: timedelta
     exchange_url: str
     info_url: str
+    allow_mainnet: bool
     key_cache_path: Path
 
     @classmethod
@@ -148,6 +156,11 @@ class WatchdogConfig:
             ),
             exchange_url=exchange_url,
             info_url=_info_url_for(exchange_url),
+            # The executor's variable by name, on purpose (module docstring):
+            # the sweep must be able to reach whatever book the executor can
+            # trade on, and one flag is what makes that impossible to get half
+            # right.
+            allow_mainnet=parse_allow_mainnet(os.environ.get("EXECUTOR_ALLOW_MAINNET")),
             key_cache_path=Path(cache_file) if cache_file else default_cache_path(),
         )
 

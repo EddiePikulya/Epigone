@@ -106,8 +106,10 @@ services:
   # agent key (`python -m epigone.keystore generate --lane watchdog …`, then
   # the approval ceremony), so it only joins `docker compose up` once the
   # operator opts in with --profile execution after the ceremony. Testnet by
-  # construction until A5 (WATCHDOG_EXCHANGE_URL defaults to testnet, and
-  # mainnet is refused in code regardless).
+  # default: WATCHDOG_EXCHANGE_URL defaults to testnet, and a mainnet URL is
+  # refused in code unless EXECUTOR_ALLOW_MAINNET is set — the EXECUTOR's own
+  # flag, deliberately, because the sweep must reach whatever book the
+  # executor can trade on (#137).
   watchdog:
     build: .
     profiles: ["execution"]
@@ -120,6 +122,10 @@ services:
       # volume below: its whole job is surviving a restart taken during a
       # Postgres outage, which a container-local path would not.
       WATCHDOG_KEY_CACHE_FILE: /var/lib/epigone/watchdog-key-cache.enc
+      # Unset = testnet. Set it (with the mainnet URLs) to go live, and set it
+      # for BOTH services or neither.
+      EXECUTOR_ALLOW_MAINNET: ${EXECUTOR_ALLOW_MAINNET:-}
+      WATCHDOG_EXCHANGE_URL: ${WATCHDOG_EXCHANGE_URL:-}
     volumes:
       # The KEK file (outside git, outside the DB — keystore invariant),
       # mounted read-only where KEYSTORE_KEK_FILE points.
@@ -142,9 +148,11 @@ services:
   # heartbeat that the dead-man's switch reads, and an executor with nothing
   # watching it is the configuration A3 exists to prevent.
   #
-  # TESTNET by construction until A5 (#137): EXECUTOR_EXCHANGE_URL defaults to
-  # testnet and mainnet is refused in code regardless, so the ticket's live
-  # gate does not depend on this file being right.
+  # TESTNET BY DEFAULT (#137 §8). Going live takes both EXECUTOR_ALLOW_MAINNET
+  # and a mainnet EXECUTOR_EXCHANGE_URL — either alone still trades testnet, so
+  # a half-edited env file cannot go live by accident. Set the flag for the
+  # watchdog too (it reads the same variable); the docs/runbooks/copy-execution
+  # runbook has the three-part checklist.
   #
   # UNLIKE the watchdog, this one DOES depend on Postgres being healthy. The
   # asymmetry is deliberate: a blind watchdog must still cancel (subtractive,
@@ -160,6 +168,8 @@ services:
       ADMIN_TELEGRAM_ID: ${ADMIN_TELEGRAM_ID}
       KEYSTORE_KEK_FILE: /run/secrets/keystore-kek
       EXECUTOR_INTERVAL_SECONDS: ${EXECUTOR_INTERVAL_SECONDS:-5}
+      EXECUTOR_ALLOW_MAINNET: ${EXECUTOR_ALLOW_MAINNET:-}
+      EXECUTOR_EXCHANGE_URL: ${EXECUTOR_EXCHANGE_URL:-}
     volumes:
       - ${KEYSTORE_KEK_FILE:-./.keystore-kek}:/run/secrets/keystore-kek:ro
     depends_on:

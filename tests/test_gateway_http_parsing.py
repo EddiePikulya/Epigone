@@ -10,12 +10,13 @@ from decimal import Decimal
 
 import pytest
 
-from epigone.gateway import GatewayError, PerpAsset, Side, Window
+from epigone.gateway import GatewayError, MarketStats, PerpAsset, Side, Window
 from epigone.gateway.http import (
     parse_account_state,
     parse_extra_agents,
     parse_fills,
     parse_leaderboard,
+    parse_market_stats,
     parse_mid_prices,
     parse_open_orders,
     parse_perp_assets,
@@ -239,6 +240,58 @@ def test_parse_perp_assets_rejects_a_universe_without_precision() -> None:
     # to mirror a trade; failing here says why instead.
     with pytest.raises(GatewayError):
         parse_perp_assets({"universe": [{"name": "BTC"}]})
+
+
+# The metaAndAssetCtxs shape (issue #137): a two-element array whose contexts
+# are POSITIONALLY aligned with the meta universe. Trimmed to the fields the
+# Liquidity Floor and the leverage cap read.
+META_AND_CTXS = [
+    {
+        "universe": [
+            {"name": "BTC", "szDecimals": 5, "maxLeverage": 40},
+            {"name": "ETH", "szDecimals": 4, "maxLeverage": 25},
+        ]
+    },
+    [
+        {"dayNtlVlm": "1234567.5", "openInterest": "1500.0", "markPx": "63500.0"},
+        {"dayNtlVlm": "89000.25", "openInterest": "20.0", "markPx": "3120.5"},
+    ],
+]
+
+
+def test_parse_market_stats_zips_the_universe_with_its_contexts() -> None:
+    stats = parse_market_stats(META_AND_CTXS)
+    assert stats["BTC"] == MarketStats(
+        coin="BTC",
+        day_notional_volume=Decimal("1234567.5"),
+        open_interest=Decimal("1500.0"),
+        mark_price=Decimal("63500.0"),
+        max_leverage=40,
+    )
+    # Open interest is reported in COIN units; the floor judges it in dollars.
+    assert stats["ETH"].open_interest_usd == Decimal("62410.0")
+    # Builder-DEX names namespace like every other coin key in the system.
+    namespaced = parse_market_stats(
+        [
+            {"universe": [{"name": "META", "szDecimals": 2, "maxLeverage": 10}]},
+            [{"dayNtlVlm": "1.0", "openInterest": "2.0", "markPx": "600.0"}],
+        ],
+        "xyz",
+    )
+    assert set(namespaced) == {"xyz:META"}
+
+
+def test_parse_market_stats_refuses_a_length_mismatch_rather_than_zipping_short() -> None:
+    # Judging one market against another market's volume is a worse answer
+    # than no answer — and the caller's "cannot judge" path defers the entry.
+    with pytest.raises(GatewayError):
+        parse_market_stats([META_AND_CTXS[0], META_AND_CTXS[1][:1]])
+    with pytest.raises(GatewayError):
+        parse_market_stats([META_AND_CTXS[0]])
+    with pytest.raises(GatewayError):
+        parse_market_stats(
+            [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]}, [{}]]
+        )
 
 
 def test_parse_mid_prices_maps_perp_mids_and_drops_spot() -> None:
