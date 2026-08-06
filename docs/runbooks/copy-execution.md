@@ -186,7 +186,10 @@ stale leaves a position no future event will ever close.
 **A stale flip half-executes.** Close leg fires, open leg skipped, you end
 flat. Both halves are audited. Same asymmetry.
 
-**A Leader under $10,000 of live equity is not copied into.** Opens and a
+**A Leader under $10,000 of live equity is not copied into.** ⚠️ **TEMPORARY
+(issue #193, revert guarded by #192): during the A5 shakedown the floor is
+$100, not $10,000**, so the operator's own ~$300 wallet can drive the copy path
+on demand. Everything below describes the gate either way. Opens and a
 flip's open leg only — not scale-ins, and never exits (ADR-0007 amendment
 D-2). This is a signal-quality gate, not a sizing input: it asks "is this
 still the trader whose stats earned the copy?", which is a question about
@@ -302,7 +305,8 @@ slippage for a $4,000 position and does not for a $40,000 one.
 The numbers the OPERATOR tunes are in `/limits` (above). The numbers ADR-0007
 settled live in `epigone/execute/policy.py`, one line each, beside the
 reasoning that chose them: the 5-minute entry staleness guard, the $10,000
-leader liveness floor, the 1% slippage cap, the 3-attempt exit retry, the
+leader liveness floor (temporarily $100 — see the ⚠️ above and issue #192),
+the 1% slippage cap, the 3-attempt exit retry, the
 bracket verification interval, the $10 exchange minimum, and the $2,000
 allocation funding ceiling (a typo catcher on the one irreversible money move,
 not a risk limit). Per-sub configurability is deliberately not offered for any

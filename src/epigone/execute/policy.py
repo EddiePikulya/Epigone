@@ -71,7 +71,12 @@ ENTRY_STALENESS_GUARD = timedelta(minutes=5)
 # never gated. Leader equity never enters SIZING — under Base Stake the money
 # at risk is the operator's constant — so this protects SIGNAL QUALITY, i.e.
 # "is this still the trader whose stats earned the copy?".
-LEADER_EQUITY_FLOOR = Decimal("10000")
+# TEMPORARY (issue #193, revert guarded by issue #192): lowered from the real
+# value, Decimal("10000"), to $100 for the shakedown period only, so the
+# operator's own ~$300 mainnet wallet — the one leader whose signal timing they
+# control — passes the entry gate and can drive the copy path on demand. This
+# is a visible code change, not a knob, precisely so it cannot be left behind.
+LEADER_EQUITY_FLOOR = Decimal("100")
 
 # Decision 4. Every copy action is an IOC limit at mark with this cap.
 # Fidelity-to-leader beats fill price at $100–400 notionals on a 10–20s-stale
