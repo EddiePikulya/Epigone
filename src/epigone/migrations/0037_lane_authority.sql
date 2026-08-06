@@ -74,6 +74,26 @@ VALUES ('poll', now(), 'pre-cutover: the REST poll pass has always owned product
 ALTER TABLE position_events ADD COLUMN authoritative BOOLEAN NOT NULL DEFAULT TRUE;
 UPDATE position_events SET authoritative = (source = 'poll');
 
+-- Reconciliation's one look of patience (ADR-0009 §4). The coins on which this
+-- poll pass saw a change the websocket had not produced, held over to be judged
+-- again rather than escalated on sight.
+--
+-- The websocket is routinely a few seconds BEHIND the poller even when it is
+-- perfectly healthy: it holds entry bursts for a moment by design, and it
+-- re-sends state on its own ~5s cadence. So a change the poller sees first is
+-- not evidence of a miss — at the standby cadence a meaningful share of all
+-- changes fall in that window, and escalating on sight would make the incident
+-- routine. An incident that fires every day is one nobody reads.
+--
+-- The patience is exactly one look, and it costs nothing: the poller withholds
+-- the verdict by NOT advancing its snapshot of those coins (the same "when in
+-- doubt, do not advance the anchor" move the websocket's coalescing makes), so
+-- the next pass re-diffs the identical change against the identical anchor and
+-- decides for real. It also stops trusting the standby cadence — a wallet with
+-- a pending doubt is re-polled on the next tick — so a genuine miss is produced
+-- ~10s late rather than ~60s late.
+ALTER TABLE position_poll_state ADD COLUMN reconcile_pending TEXT[];
+
 -- The websocket lane's entry-burst debounce (ADR-0009's coalescing decision).
 -- The lane sees INDIVIDUAL FILLS where the 10s poll window coalesced them into
 -- one diff — measured on the shadow dataset: three scale-ins inside 2.5s that

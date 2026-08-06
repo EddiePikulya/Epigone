@@ -49,3 +49,34 @@ async def fetch_poll_set(conn: asyncpg.Pool | asyncpg.Connection) -> list[str]:
         """
     )
     return [row["trader_address"] for row in rows]
+
+
+async def leaders_first(
+    conn: asyncpg.Pool | asyncpg.Connection, addresses: list[str]
+) -> list[str]:
+    """The poll set with copy-enabled Leaders at the front (issue #158).
+
+    Every consumer of the poll set has a scarce resource to spend on it and the
+    same answer about who gets it first: the wallets that move money.
+
+    - The REST pass is paced by the shared weight budget, so a set too large
+      for its cadence stretches at the TAIL — and a Leader must never be in the
+      tail. Ordering IS the prioritisation the degraded mode needs; nothing
+      else is required.
+    - The websocket lanes can hold 15 unique users per IP (ADR-0008) and take a
+      prefix of the poll set when it is larger. An alphabetical prefix decides
+      by leading hex digit, which is the one criterion with no meaning at all
+      (#158's 2026-08-04 comment: "selection needs to be deliberate, not
+      alphabetical").
+
+    Applied in every mode rather than only degraded ones: the ordering is
+    harmless when nothing is scarce, and a rule that only runs during incidents
+    is a rule nobody has tested. Ties break alphabetically, so the order is
+    stable — a lane re-reading the set does not churn its subscriptions."""
+    leaders = {
+        row["leader_address"]
+        for row in await conn.fetch(
+            "SELECT DISTINCT leader_address FROM copy_subs WHERE enabled"
+        )
+    }
+    return sorted(addresses, key=lambda address: (address not in leaders, address))

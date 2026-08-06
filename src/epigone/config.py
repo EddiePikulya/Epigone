@@ -167,6 +167,11 @@ def parse_allow_mainnet(raw: str | None) -> bool:
 # unrecognised is a logged misconfiguration that leaves the cutover in place.
 DISABLING_WORDS = frozenset({"0", "false", "no", "off"})
 
+# Its own affirmative vocabulary rather than MAINNET_WORDS': the two settings
+# are unrelated, and a word added to one must not silently change how the other
+# reads its variable.
+ENABLING_WORDS = frozenset({"1", "true", "yes", "on"})
+
 
 def parse_ws_authoritative(raw: str | None) -> bool:
     """Whether the websocket lane may own position-event production (#158).
@@ -178,12 +183,12 @@ def parse_ws_authoritative(raw: str | None) -> bool:
         return True
     if raw.strip().lower() in DISABLING_WORDS:
         return False
-    if raw.strip().lower() in MAINNET_WORDS:
+    if raw.strip().lower() in ENABLING_WORDS:
         return True
     log.warning(
         "WS_AUTHORITATIVE=%r is not one of %s — the websocket stays authoritative",
         raw,
-        sorted(DISABLING_WORDS | MAINNET_WORDS),
+        sorted(DISABLING_WORDS | ENABLING_WORDS),
     )
     return True
 

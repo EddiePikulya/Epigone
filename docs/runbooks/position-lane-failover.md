@@ -76,6 +76,11 @@ comparing its own diff against what the lane produced.
    and it is the most likely explanation for a single scale-in-shaped drift on a
    quiet position. A missed `open` or `close` is never benign.
 
+   Note what this reason already rules out: the lane merely being slow. The
+   poller withholds its verdict on a change the websocket has not produced and
+   re-polls that wallet on the next tick, so a `reconciliation drift` reason
+   means the change was still missing ~10s later, not that it arrived late.
+
 3. **Nothing needs restarting.** The escalation already transferred production
    and the event was produced by the poller. The lane will re-read absolute
    state for every wallet before it is trusted again.

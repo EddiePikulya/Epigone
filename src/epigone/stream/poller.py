@@ -112,7 +112,7 @@ from epigone.lane_authority import (
     read_authority,
     take_ownership,
 )
-from epigone.poll_set import OFF_THE_POLL_SET, fetch_poll_set
+from epigone.poll_set import OFF_THE_POLL_SET, fetch_poll_set, leaders_first
 from epigone.position_diff import diff_positions, events_of
 from epigone.position_events import POLL_SOURCE, WS_SOURCE, PositionEvent, record_events
 from epigone.position_publish import publish
@@ -156,11 +156,20 @@ POLL_MEMORY_TABLES = ("trader_equity", "position_snapshots", "position_poll_stat
 @dataclass(frozen=True)
 class _Applied:
     """What one Trader's transaction did: how many changes it saw, how many it
-    PRODUCED (authoritatively, for consumers), and whether it found drift."""
+    PRODUCED (authoritatively, for consumers), whether it found drift, and
+    which coins it withheld judgement on.
+
+    A `held` coin is one whose change the websocket has not produced yet: its
+    snapshot is deliberately NOT advanced, so the next pass re-diffs the same
+    change and judges it with more evidence. `deferred` says this pass did that
+    — the loop reads it and re-polls on the next tick instead of waiting out
+    the standby interval, so a real miss costs ~10s rather than ~60s."""
 
     events: int = 0
     produced: int = 0
     drifted: bool = False
+    held: frozenset[str] | set[str] = frozenset()
+    deferred: bool = False
 
 
 @dataclass(frozen=True)
@@ -178,6 +187,10 @@ class PollResult:
     # Wallets whose diff found a change the websocket never produced. Non-zero
     # means this pass raised an incident and took production back.
     drifted: int = 0
+    # Wallets carrying a change the websocket has not produced YET, whose
+    # verdict this pass withheld. Non-zero means the loop should look again on
+    # the next tick rather than wait out the standby interval.
+    deferred: int = 0
 
 
 async def run_poll_pass(
@@ -205,8 +218,8 @@ async def run_poll_pass(
         if (await read_authority(pool)).owner == POLL_OWNER
         else STANDBY_POLL_INTERVAL_SECONDS
     )
-    addresses = await _leaders_first(pool, await fetch_poll_set(pool))
-    polled = failed = events = produced = drifted = consecutive_failures = 0
+    addresses = await leaders_first(pool, await fetch_poll_set(pool))
+    polled = failed = events = produced = drifted = deferred = consecutive_failures = 0
     for address in addresses:
         try:
             state = await fetch_account_state_paced(gateway, budget, address)
@@ -238,6 +251,7 @@ async def run_poll_pass(
                     aborted=True,
                     produced=produced,
                     drifted=drifted,
+                    deferred=deferred,
                 )
             continue
         consecutive_failures = 0
@@ -245,6 +259,7 @@ async def run_poll_pass(
         events += applied.events
         produced += applied.produced
         drifted += int(applied.drifted)
+        deferred += int(applied.deferred)
         polled += 1
     if events or failed:
         log.info(
@@ -261,6 +276,7 @@ async def run_poll_pass(
         aborted=False,
         produced=produced,
         drifted=drifted,
+        deferred=deferred,
     )
 
 
@@ -387,26 +403,31 @@ async def _apply_poll(
 
         previous = await read_snapshots(conn, POLL_SNAPSHOTS, address)
         changes = diff_positions(previous, positions, now)
-        await apply_changes(conn, POLL_SNAPSHOTS, address, changes, now)
         events: list[PositionEvent] = events_of(changes)
+        # WHETHER these are events anyone acts on — and whether this pass is
+        # even ready to judge them — is decided in `_reconcile` (#158). While
+        # the websocket owns production this pass records what it observed and
+        # produces nothing; a change the websocket has not produced YET is held
+        # back rather than escalated on sight.
+        applied = _Applied(events=len(events))
+        if events:
+            applied = await _reconcile(conn, address, events, now, since=polled_before)
+        # The snapshot advance lands with the events that were diffed from it
+        # (ADR-0006's atomicity, inherited rather than reinvented) — except for
+        # the coins whose verdict was withheld, whose anchor stays put so the
+        # next pass re-diffs the identical change and decides for real.
+        await apply_changes(
+            conn,
+            POLL_SNAPSHOTS,
+            address,
+            [change for change in changes if change.coin not in applied.held],
+            now,
+        )
         await conn.execute(
             "UPDATE position_poll_state SET last_polled_at = $2 WHERE trader_address = $1",
             address,
             now,
         )
-        applied = _Applied(events=len(events))
-        if events:
-            # The durable record first (issue #156, ADR-0006), in this same
-            # already-open transaction as the snapshot advances above and the
-            # alert fan-out below — never a second transaction and never a
-            # write outside one. That is what makes an interrupted pass leave
-            # both or neither: the exactly-once property the alerts have always
-            # had, inherited rather than reinvented.
-            #
-            # WHETHER these are events anyone acts on is decided in
-            # `_reconcile` (#158): while the websocket owns production this
-            # pass records what it observed and produces nothing.
-            applied = await _reconcile(conn, address, events, now, since=polled_before)
         # Money leaving the account (issue #171), judged from the same two looks
         # at the book the diff above just judged positions from — `previous` is
         # still what the last pass saw, since apply_changes advanced the table
@@ -447,41 +468,75 @@ async def _reconcile(
     what this pass has been doing all along — it simply now compares before it
     writes.
 
-    Per coin, one question: **did the websocket produce an authoritative event
-    for this (Trader, coin) since the poller's previous look?** If it did, this
-    lane's own diff of the same change is recorded as a shadow row and nothing
-    else happens — the change is already told, already alerted, already copied.
-    If it did not, one of two things is true:
+    Per change, one question: **did the websocket produce an authoritative
+    event MOVING THE SAME DIRECTION on this (Trader, coin) since the poller's
+    previous look?** If it did, this lane's own diff of the same change is
+    recorded as a shadow row and nothing else happens — the change is already
+    told, already alerted, already copied. If it did not, one of three things
+    is true:
 
     - the poller already owns production (websocket degraded, or pre-cutover),
-      and this is simply the poller doing its job; or
-    - the websocket owns production and MISSED a change. That is an incident.
-      The event is not quietly written — quietly writing it would put two
-      writers on one Trader and risk a doubled copy. Ownership transfers first,
-      loudly, and the event is then produced by the now-authoritative poller.
+      and this is simply the poller doing its job;
+    - the websocket owns production and has not produced it YET. Routine: it
+      holds entry bursts by design and re-sends state on its own cadence, so at
+      the standby cadence a real share of changes are seen here first. The
+      verdict is withheld — the coin is `held`, its anchor is not advanced, and
+      the next pass re-diffs the identical change (see `_Applied.held`);
+    - the websocket owns production and the change was ALREADY held once. That
+      is an incident. The event is not quietly written — quietly writing it
+      would put two writers on one Trader and risk a doubled copy. Ownership
+      transfers first, loudly, and the event is then produced by the
+      now-authoritative poller.
 
-    Deliberately compared on PRESENCE, not on kind or size. The two lanes
-    observe at different cadences and legitimately describe the same reality
-    differently — a burst of fills the poller sees as one scale-in, a flip the
-    poller decomposes where the websocket does not (both classes measured on
-    the shadow dataset, 2026-08-02 and 2026-08-06). Treating those as drift
-    would escalate constantly on lanes that agree about what happened.
+    **Direction, not kind or size.** The two lanes observe at different
+    cadences and legitimately describe the same reality differently — a burst
+    of fills the poller sees as one scale-in, a flip one lane decomposes and
+    the other does not (both classes measured on the shadow dataset, 2026-08-02
+    and 2026-08-06). Comparing kinds would escalate constantly on lanes that
+    agree about what happened. Comparing the COIN alone goes wrong the other
+    way: an entry the websocket did produce would vouch for an exit it did not,
+    and an exit nobody produces is a copy position that never closes. Direction
+    is the coarsest comparison that cannot make that mistake — and it is the
+    one thing the two producers were measured agreeing on 100% of the time.
 
-    The lookback reaches `RECONCILE_GRACE_SECONDS` before the previous poll:
-    the websocket can see a change slightly BEFORE the poll that first shows
-    it, and the entry-coalescing window (ADR-0009) can hold a scale-in for a
-    few seconds. The grace must stay comfortably larger than that hold plus the
-    feed's own push cadence, which tests/test_position_cutover.py pins."""
+    The lookback reaches `RECONCILE_GRACE_SECONDS` before the previous poll,
+    because the websocket can also see a change slightly BEFORE the poll that
+    first reveals it (it led the poller by a median 4.2s)."""
     covered = await _websocket_produced(conn, address, since - RECONCILE_GRACE)
-    mine = [event for event in events if event.coin not in covered]
+    pending = set(
+        await conn.fetchval(
+            "SELECT reconcile_pending FROM position_poll_state WHERE trader_address = $1",
+            address,
+        )
+        or ()
+    )
+    mine = [event for event in events if not _vouched_for(event, covered)]
     drifted = False
     if mine and not await owns(conn, POLL_SOURCE):
+        doubted = {event.coin for event in mine}
+        if not doubted & pending:
+            # First sighting. Withhold the verdict AND the memory advance, so
+            # the next pass asks the same question about the same change rather
+            # than about a change it has already forgotten.
+            log.info(
+                "reconciliation: %s %s not yet produced by the websocket lane; "
+                "holding for one more look",
+                address,
+                ", ".join(sorted(doubted)),
+            )
+            await _remember_doubt(conn, address, doubted)
+            duplicated = [event for event in events if _vouched_for(event, covered)]
+            if duplicated:
+                await record_events(
+                    conn, address, duplicated, now, source=POLL_SOURCE, authoritative=False
+                )
+            return _Applied(events=len(events), held=doubted, deferred=True)
         drifted = True
         log.error(
             "reconciliation drift: %s %s never produced by the websocket lane; "
             "escalating and taking production back",
             address,
-            ", ".join(sorted({event.coin for event in mine})),
+            ", ".join(sorted(doubted)),
         )
         await take_ownership(conn, POLL_OWNER, _drift_reason(address, mine), now)
         # Re-read under the exclusive lock. A websocket write that committed
@@ -490,8 +545,10 @@ async def _reconcile(
         # is final rather than merely recent, which is what makes "two writers
         # never produce for one (Trader, coin)" a property of the database.
         covered = await _websocket_produced(conn, address, since - RECONCILE_GRACE)
-        mine = [event for event in events if event.coin not in covered]
-    duplicated = [event for event in events if event.coin in covered]
+        mine = [event for event in events if not _vouched_for(event, covered)]
+    if pending:
+        await _remember_doubt(conn, address, set())
+    duplicated = [event for event in events if _vouched_for(event, covered)]
     if duplicated:
         await record_events(
             conn, address, duplicated, now, source=POLL_SOURCE, authoritative=False
@@ -506,16 +563,47 @@ async def _reconcile(
     return _Applied(events=len(events), produced=produced, drifted=drifted)
 
 
+# Which way a change moves the position. `flip` is both legs at once (ADR-0006
+# keeps it one event), so it vouches for — and is vouched for by — either
+# direction; that is what absorbs the two lanes' different flip decompositions
+# without letting an entry stand in for a missing exit.
+ENTRY = "entry"
+EXIT = "exit"
+_DIRECTIONS = {
+    "open": frozenset({ENTRY}),
+    "scale_in": frozenset({ENTRY}),
+    "close": frozenset({EXIT}),
+    "scale_out": frozenset({EXIT}),
+    "flip": frozenset({ENTRY, EXIT}),
+}
+
+
+def _vouched_for(event: PositionEvent, covered: set[tuple[str, str]]) -> bool:
+    """Whether the websocket already produced something on this coin moving the
+    same way — see `_reconcile` for why direction is the comparison."""
+    return any((event.coin, direction) in covered for direction in _DIRECTIONS[event.kind])
+
+
+async def _remember_doubt(conn: asyncpg.Connection, address: str, coins: set[str]) -> None:
+    """Record (or clear) the coins whose verdict this pass withheld."""
+    await conn.execute(
+        "UPDATE position_poll_state SET reconcile_pending = $2 WHERE trader_address = $1",
+        address,
+        sorted(coins) or None,
+    )
+
+
 async def _websocket_produced(
     conn: asyncpg.Connection, address: str, since: datetime
-) -> set[str]:
-    """The coins the websocket lane produced an AUTHORITATIVE event for since
-    `since`. Shadow rows are deliberately excluded: while the poller owns
-    production the websocket lane keeps writing everything it sees, and reading
-    those as "already produced" would let the silent lane mute the live one."""
+) -> set[tuple[str, str]]:
+    """The (coin, direction) pairs the websocket lane produced an AUTHORITATIVE
+    event for since `since`. Shadow rows are deliberately excluded: while the
+    poller owns production the websocket lane keeps writing everything it sees,
+    and reading those as "already produced" would let the silent lane mute the
+    live one."""
     rows = await conn.fetch(
         """
-        SELECT DISTINCT coin FROM position_events
+        SELECT DISTINCT kind, coin FROM position_events
         WHERE trader_address = $1 AND source = $2 AND authoritative
           AND observed_at >= $3
         """,
@@ -523,7 +611,11 @@ async def _websocket_produced(
         WS_SOURCE,
         since,
     )
-    return {row["coin"] for row in rows}
+    return {
+        (row["coin"], direction)
+        for row in rows
+        for direction in _DIRECTIONS[row["kind"]]
+    }
 
 
 def _drift_reason(address: str, events: list[PositionEvent]) -> str:
@@ -532,26 +624,6 @@ def _drift_reason(address: str, events: list[PositionEvent]) -> str:
     and "0x037e… CASHCAT" is."""
     coins = ", ".join(sorted({event.coin for event in events}))
     return f"reconciliation drift: {address} {coins} never arrived on the websocket"
-
-
-async def _leaders_first(pool: asyncpg.Pool, addresses: list[str]) -> list[str]:
-    """The poll set with copy-enabled Leaders at the front (issue #158).
-
-    Ordering IS the prioritisation, and it needs nothing else. The pass is paced
-    by the shared weight budget, so a poll set too large for the escalated
-    cadence does not fail — it stretches, at the TAIL. Putting the wallets that
-    move money at the head means the stretch lands on tracked-only wallets,
-    whose cost is a later alert, rather than on a Leader, whose cost is a copy
-    position going blind.
-
-    Applied in every mode rather than only the degraded one: the ordering is
-    harmless when there is budget to spare, and a rule that only runs during
-    incidents is a rule nobody has tested."""
-    leaders = {
-        row["leader_address"]
-        for row in await pool.fetch("SELECT DISTINCT leader_address FROM copy_subs WHERE enabled")
-    }
-    return sorted(addresses, key=lambda address: (address not in leaders, address))
 
 
 async def _queue_withdrawal_alerts(

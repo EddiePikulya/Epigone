@@ -92,19 +92,48 @@ It also keeps the shadow comparison alive **through and after** the transition,
 which the ticket asks for and which matters because four days is thin for tail
 behaviour.
 
-### 4. Drift is an incident, never a silent write
+### 4. Drift is an incident, never a silent write — but only on the second look
 
-When the poller's diff finds a change with no authoritative websocket event for
-that (Trader, coin) in the window, it does not quietly write it — that would put
-two writers on one Trader. It escalates (transferring ownership, with the wallet
-and coins named in `reason`), re-checks under the exclusive lock, and only then
-produces the event. The health monitor's `position_lane` check reads that reason
-and puts it in front of the operator.
+When the poller's diff finds a change the websocket has not produced, it does
+not quietly write it: that would put two writers on one Trader. It escalates
+(transferring ownership, with the wallet and coins named in `reason`), re-checks
+under the exclusive lock, and only then produces the event. The health monitor's
+`position_lane` check reads that reason and puts it in front of the operator.
 
-Reconciliation compares on **presence**, not on kind or size. The lanes
-legitimately describe the same reality differently — the granularity difference
-above, the flip-boundary decomposition — and treating those as drift would
-escalate constantly on lanes that agree about what happened.
+**One look of patience first.** The websocket is routinely a few seconds BEHIND
+the poller while perfectly healthy — it holds entry bursts (decision 5) and
+re-sends state on a ~5s cadence — so at the 60s standby cadence a real share of
+all changes are seen here first. Escalating on sight would fire the incident
+most days, and an incident that fires most days is one nobody reads. So the
+first sighting withholds the verdict AND the memory advance
+(`position_poll_state.reconcile_pending`): the coin's anchor stays put, the next
+pass re-diffs the identical change, and it decides then. The wallet is re-polled
+on the next 10s tick rather than after another standby interval, so a genuine
+miss costs ~10s of latency, not ~60s.
+
+Compared on **direction**, not on kind or size, and not on the coin alone. The
+lanes legitimately describe the same reality with different kinds (the
+granularity difference above; the flip-boundary decomposition), so comparing
+kinds would escalate on lanes that agree. Comparing the coin alone fails the
+other way: an entry the websocket did produce would vouch for an exit it did
+not, and an exit nobody produces is a copy position that never closes. `flip`
+counts as both directions, which is exactly what absorbs the two lanes'
+different flip decompositions.
+
+**This is the disposition of the comparison's third condition** ("flip-boundary
+kind normalization so the two producers' vocabularies match during any ownership
+transfer"). The vocabularies already match — both lanes call the same
+`epigone.position_diff`, one rule, one threshold, since #157. What the
+comparison saw was not two vocabularies but one vocabulary applied to
+observations taken at different cadences: a flip the poller reports as
+`scale_out` + `flip` is a flip the websocket saw mid-way. No normalization can
+remove that, because neither description is wrong. What the transfer actually
+requires is that the two descriptions be interchangeable at the boundary —
+neither doubling a leg nor dropping one — and direction-matching is what
+delivers it. Downstream, ADR-0007's self-damping rule finishes the job: every
+relative operation applies to the size the EXCHANGE reports, never to a
+bookkept expectation, so a differently-decomposed flip converges on the next
+cycle rather than compounding.
 
 ### 5. Burst coalescing: entries debounce, exits never do
 
@@ -156,13 +185,21 @@ the union's size, and the honest control is the ws-side ceiling refusing to hand
 over production rather than a per-user number that does not measure the same
 thing. The ticket asked for the choice to be stated; this is it.
 
-### 7. Degraded mode prioritises copy-enabled Leaders
+### 7. Copy-enabled Leaders take the scarce resources first
 
-The poll set is ordered Leaders-first, in every mode rather than only the
-degraded one — a rule that only runs during incidents is a rule nobody has
-tested. Ordering *is* the prioritisation: the pass is paced by the shared weight
-budget, so a set too large for the escalated cadence stretches at its tail, and
-a Leader must never be in the tail.
+`epigone.poll_set.leaders_first` orders the poll set for every consumer that has
+something scarce to spend on it, in every mode rather than only degraded ones —
+a rule that only runs during incidents is a rule nobody has tested.
+
+- **The REST pass**: ordering *is* the prioritisation the ticket asks for. The
+  pass is paced by the shared weight budget, so a set too large for the
+  escalated cadence stretches at its tail, and a Leader must never be in the
+  tail.
+- **The websocket lanes**: which 15 wallets get slots (and which 8 get order
+  connections) is a decision, per #158's 2026-08-04 comment — "selection needs
+  to be deliberate, not alphabetical". It was an address-sorted prefix, which
+  decides by leading hex digit; it is now Leaders first. That also retires
+  #168's deferred finding A3.
 
 ### 8. The kill switch
 

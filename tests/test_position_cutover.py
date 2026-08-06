@@ -38,6 +38,7 @@ from epigone.lane_authority import (
     take_ownership,
 )
 from epigone.position_events import POLL_SOURCE, WS_SOURCE, PositionEvent, record_events
+from epigone.position_publish import publish
 from epigone.safety.heartbeat import beat
 from epigone.stream.main import (
     STANDBY_POLL_INTERVAL_SECONDS,
@@ -188,10 +189,17 @@ async def test_a_change_the_websocket_never_produced_escalates_and_is_then_writt
     change still never arrived — the failure mode a heartbeat cannot see. The
     poller must not quietly write it (that would put two writers on one Trader);
     it takes production back, and the event is then produced by the lane that
-    now owns it."""
+    now owns it.
+
+    Two looks, because the first is not evidence: a lane that is merely a few
+    seconds behind looks identical to a lane that missed the change, and only
+    one of them is still silent a moment later (see the reconciliation-patience
+    tests below)."""
     clock.advance(60)
     gateway.set_positions(TRADER, [])
 
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
     await poll(pool, gateway, clock)
 
     authority = await read_authority(pool)
@@ -220,6 +228,8 @@ async def test_the_escalated_poller_does_not_re_produce_what_the_websocket_produ
     clock.advance(30)
     gateway.set_positions(TRADER, [position(coin="ETH"), position(), position(coin="SOL")])
 
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
     await poll(pool, gateway, clock)
 
     assert (await read_authority(pool)).owner == POLL_OWNER
@@ -278,8 +288,6 @@ async def test_two_producers_racing_one_trader_produce_exactly_one_event(
 
     async def websocket_write() -> None:
         async with pool.acquire() as conn, conn.transaction():
-            from epigone.position_publish import publish
-
             await publish(
                 conn,
                 TRADER,
@@ -456,3 +464,164 @@ async def test_withdrawal_detection_survives_the_standby_cadence(
 
     alerted = await pool.fetch("SELECT * FROM withdrawal_alerts")
     assert [row["amount_usd"] for row in alerted] == [Decimal("60000")]
+
+
+# --- crying wolf, and not crying at all (issue #158) ---------------------------
+#
+# Reconciliation has to survive two facts about the lanes it compares. The
+# websocket can be BEHIND the poller for a few seconds — it holds entry bursts,
+# and it re-sends state on a ~5s cadence — so a change the poller sees first is
+# not yet evidence of a miss. And a coin the websocket reported SOMETHING about
+# is not a coin it reported EVERYTHING about.
+
+
+async def test_a_change_the_websocket_has_not_produced_yet_is_not_an_incident(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The websocket holds entry bursts by design (ADR-0009) and re-sends state
+    on its own cadence, so a change in the seconds before a poll is routinely
+    seen here first. Escalating on the first sighting would make the incident
+    routine — and an incident that fires every day is one nobody reads."""
+    clock.advance(60)
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert [row["authoritative"] for row in await events(pool)] == []
+
+
+async def test_the_websocket_producing_it_late_settles_the_doubt(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The other half of the same patience: the held entry lands, the second
+    look finds it, and nothing was ever an incident."""
+    clock.advance(60)
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+    await poll(pool, gateway, clock)
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await websocket_produced(
+        pool,
+        clock,
+        TRADER,
+        PositionEvent(kind="scale_in", coin="BTC", side="long",
+                      size_usd=Decimal("20000"), prev_size_usd=Decimal("10000")),
+    )
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert [row["authoritative"] for row in await events(pool)] == [True, False]
+
+
+async def test_a_deferred_verdict_makes_the_poller_look_again_at_once(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Patience must not cost a standby interval. A poller that suspects the
+    websocket stops trusting the slow cadence and looks again on the next tick,
+    so a real miss is produced ~10s late rather than ~60s late."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    await healthy_websocket(pool, clock)
+    state = StandbyState()
+    await run_position_cycle(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state)
+
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+    clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    await ws_beating(pool, clock.now())
+    deferring = await run_position_cycle(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state
+    )
+    clock.advance(POLL_INTERVAL_SECONDS)  # one TICK, far short of the standby interval
+    await ws_beating(pool, clock.now())
+    deciding = await run_position_cycle(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state
+    )
+
+    assert deferring is not None and deferring.deferred == 1
+    assert deciding is not None and deciding.drifted == 1
+
+
+async def test_an_exit_the_websocket_missed_is_drift_even_on_a_coin_it_reported(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """A coin the websocket said SOMETHING about is not a coin it said
+    EVERYTHING about. Matching on the coin alone would let an entry the lane did
+    produce vouch for an exit it did not — and an exit nobody produces is a copy
+    position that never closes, the worst outcome this system can reach."""
+    clock.advance(30)
+    await websocket_produced(
+        pool,
+        clock,
+        TRADER,
+        PositionEvent(kind="scale_in", coin="BTC", side="long",
+                      size_usd=Decimal("20000"), prev_size_usd=Decimal("10000")),
+    )
+    clock.advance(30)
+    gateway.set_positions(TRADER, [])  # the Leader is out; the websocket never said so
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == POLL_OWNER
+    authoritative = [row for row in await events(pool) if row["authoritative"]]
+    assert [(row["source"], row["kind"]) for row in authoritative] == [
+        (WS_SOURCE, "scale_in"),
+        (POLL_SOURCE, "close"),
+    ]
+
+
+async def test_alerts_survive_a_cutover_a_failover_and_a_recovery(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The acceptance criterion a User would notice: "Position Alerts continue
+    uninterrupted across a cutover, a failover and a recovery."
+
+    Walked end to end, one Trader, one follower, four changes — one under each
+    regime the cutover can be in. The follower gets four alerts and no
+    duplicates, and could not tell from them which transport was watching.
+    """
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    await poll(pool, gateway, clock)  # pre-cutover: the poller owns and alerts
+    clock.advance(POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, [position(), position(coin="ETH")])
+    await poll(pool, gateway, clock)
+
+    # Cutover. The websocket produces; the poller reads and stays quiet.
+    await healthy_websocket(pool, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    async with pool.acquire() as conn, conn.transaction():
+        await publish(
+            conn,
+            TRADER,
+            [PositionEvent(kind="open", coin="SOL", side="long", size_usd=Decimal("1"))],
+            clock.now(),
+            source=WS_SOURCE,
+        )
+    gateway.set_positions(TRADER, [position(), position(coin="ETH"), position(coin="SOL")])
+    await poll(pool, gateway, clock)
+
+    # Failover: the lane goes silent, the poller escalates and alerts again.
+    clock.advance(WS_HEARTBEAT_STALE_SECONDS + 1)
+    assert (await evaluate_authority(pool, clock)).owner == POLL_OWNER
+    gateway.set_positions(TRADER, [position(), position(coin="SOL")])  # ETH closes
+    await poll(pool, gateway, clock)
+
+    # Recovery: sustained health plus a fresh anchor, and the websocket alerts.
+    await healthy_websocket(pool, clock)
+    async with pool.acquire() as conn, conn.transaction():
+        await publish(
+            conn,
+            TRADER,
+            [PositionEvent(kind="close", coin="SOL", prev_side="long")],
+            clock.now(),
+            source=WS_SOURCE,
+        )
+
+    assert [(row["kind"], row["coin"]) for row in await alerts(pool)] == [
+        ("open", "ETH"),
+        ("open", "SOL"),
+        ("close", "ETH"),
+        ("close", "SOL"),
+    ]

@@ -1,9 +1,9 @@
-"""The websocket shadow lane (issue #157): a second producer of position
-events that nothing consumes.
+"""The websocket position lane (issues #157, #158).
 
-The lane's value is entirely comparative — it exists so the cutover ticket
-(#158) can hold two descriptions of the same reality side by side — so the
-tests are built around the four things that would make that comparison a lie:
+It began as a second producer of position events that nothing consumed, and the
+tests below still pin the four things that would have made THAT comparison a
+lie — because they are the same four things that would make the lane, now the
+producer everything acts on, quietly wrong:
 
 1. **Semantics parity.** If the websocket lane's idea of a scale-in differs
    from the poller's by so much as a threshold, the comparison measures two
@@ -20,8 +20,13 @@ tests are built around the four things that would make that comparison a lie:
    caps as the tracked set changes.
 
 Seam per the house convention: fake gateway, fake clock, staged websocket, real
-Postgres. And one test guards the promise the whole ticket rests on — that
-Position Alerts and the poller are untouched by any of it.
+Postgres.
+
+The final section is the cutover itself (#158): what changes when this lane
+owns event production — it alerts, through the same seam the poller uses — and
+what deliberately does not, since a lane must behave identically whether or not
+anyone is listening, or the moment ownership moves would be a moment its output
+changes shape.
 """
 
 from decimal import Decimal
@@ -962,3 +967,33 @@ async def test_a_lane_that_does_not_own_production_alerts_nobody(
     rows = await events(pool, WS_SOURCE)
     assert [(row["kind"], row["authoritative"]) for row in rows] == [("open", False)]
     assert await pool.fetchval("SELECT count(*) FROM position_alerts") == 0
+
+
+async def test_the_scarce_websocket_slots_go_to_copy_enabled_leaders(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Which wallets a transport that can hold 15 covers is a DECISION (#158,
+    2026-08-04: "selection needs to be deliberate, not alphabetical"). An
+    address-sorted prefix decides it by leading hex digit; a Leader whose wallet
+    happens to start with 0xf would lose its slot to fifteen strangers."""
+    leader = "0xffff"
+    await track(pool, clock, leader, FOLLOWER)
+    for index in range(MAX_SUBSCRIBED_TRADERS):
+        await track(pool, clock, f"0xa{index:03x}", FOLLOWER)
+    await pool.execute(
+        """
+        INSERT INTO copy_subs
+            (operator_id, leader_address, sub_name, allocation_usd, base_stake_usd,
+             copy_mode, enabled, created_at)
+        VALUES (7, $1, 'copy-1', 1000, 100, 'default', TRUE, $2)
+        """,
+        leader,
+        clock.now(),
+    )
+
+    socket = FakeWebsocket(clock, [liveness_message()])
+    await run_lane_once(pool, gateway, clock, socket)
+
+    subscribed = socket.subscriptions(POSITIONS_CHANNEL)
+    assert subscribed[0] == leader
+    assert len(subscribed) == MAX_SUBSCRIBED_TRADERS

@@ -108,13 +108,6 @@ class Authority:
     reason: str
     healthy_since: datetime | None
 
-    @property
-    def degraded(self) -> bool:
-        """Whether the poller is carrying production because something went
-        wrong — as opposed to the operator having switched the cutover off, or
-        the pre-cutover world. The health monitor's alerting question."""
-        return self.owner == POLL_OWNER and self.reason != DISABLED_REASON
-
 
 # What an absent row means, and it is not "nobody owns production": the poll
 # pass does, since before anything was recorded. The risk_limits precedent
@@ -206,7 +199,12 @@ async def evaluate_authority(
         fresh = age is not None and age <= WS_HEARTBEAT_STALE_SECONDS
 
         if not enabled:
-            if authority.owner == WS_OWNER:
+            if authority.owner == WS_OWNER or authority.reason != DISABLED_REASON:
+                # The reason is rewritten even when the poller ALREADY owns
+                # production: a switch flipped after a staleness escalation
+                # would otherwise leave the incident's reason standing, and the
+                # health monitor would keep reporting a degraded lane for a
+                # state the operator chose.
                 return await take_ownership(conn, POLL_OWNER, DISABLED_REASON, now)
             return await _probation(conn, authority, None)
 
@@ -270,7 +268,7 @@ async def _probation(
     return _authority(row)
 
 
-async def _outgrown(conn: asyncpg.Connection) -> str | None:
+async def _outgrown(conn: asyncpg.Connection, tracked: list[str] | None = None) -> str | None:
     """Whether the poll set has outgrown what one IP can stream, as a sentence.
 
     One IP may subscribe MAX_SUBSCRIBED_TRADERS unique users (ADR-0008,
@@ -279,7 +277,8 @@ async def _outgrown(conn: asyncpg.Connection) -> str | None:
     ownership GLOBAL and caps the tracked set rather than splitting ownership
     per wallet — so the whole lane stands down, and the way past the ceiling is
     more source IPs (#29), not more machinery here."""
-    tracked = await fetch_poll_set(conn)
+    if tracked is None:
+        tracked = await fetch_poll_set(conn)
     if len(tracked) <= MAX_SUBSCRIBED_TRADERS:
         return None
     return (
@@ -306,10 +305,10 @@ async def _handback_blocker(conn: asyncpg.Connection, since: datetime) -> str | 
     streaming through a degraded window may be diffing against memory that no
     longer matches reality; its per-Trader `resynced_at` (stamped by its own
     REST re-read, `epigone.ws.lane`) is the evidence, and nothing else is."""
-    outgrown = await _outgrown(conn)
+    tracked = await fetch_poll_set(conn)
+    outgrown = await _outgrown(conn, tracked)
     if outgrown is not None:
         return outgrown
-    tracked = await fetch_poll_set(conn)
     unresynced = await conn.fetchval(
         """
         SELECT count(*)

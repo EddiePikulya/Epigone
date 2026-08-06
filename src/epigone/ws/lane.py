@@ -135,8 +135,8 @@ from epigone.gateway import (
     RateLimitedError,
     on_covered_venue,
 )
-from epigone.lane_authority import read_authority
-from epigone.poll_set import fetch_poll_set
+from epigone.lane_authority import WS_OWNER, read_authority
+from epigone.poll_set import fetch_poll_set, leaders_first
 from epigone.position_diff import CoinChange, diff_positions, events_of
 from epigone.position_events import WS_SOURCE
 from epigone.position_publish import publish
@@ -413,17 +413,22 @@ async def _refresh_subscriptions(
     the proof — `ws_lane_state.resynced_at` is what the ownership decision
     waits for, and it can only be stamped here."""
     await forget_unwatched(pool, "ws_position_snapshots", "ws_lane_state")
-    wanted = await fetch_poll_set(pool)
+    wanted = await leaders_first(pool, await fetch_poll_set(pool))
     stale = await _stale_anchors(pool, wanted)
     if len(wanted) > MAX_SUBSCRIBED_TRADERS:
         log.error(
             "ws lane: %d wallets exceeds the %d unique users one IP may track "
-            "(measured 2026-08-03, ADR-0008); shadowing the first %d only — "
-            "raising this needs another IP, not another constant",
+            "(measured 2026-08-03, ADR-0008); streaming the %d highest-priority "
+            "only — raising this needs another IP, not another constant",
             len(wanted),
             MAX_SUBSCRIBED_TRADERS,
             MAX_SUBSCRIBED_TRADERS,
         )
+        # Copy-enabled Leaders take the slots first (epigone.poll_set): which
+        # wallets a scarce transport covers is a decision, and an alphabetical
+        # prefix decides it by leading hex digit. Note that a set this size also
+        # keeps the poller authoritative (ADR-0009) — the lane cannot cover
+        # everyone, so it produces for no one.
         wanted = wanted[:MAX_SUBSCRIBED_TRADERS]
     for address in sorted(subscribed - set(wanted)):
         # A deferred unsubscribe leaves the wallet subscribed and retries on the
@@ -462,7 +467,7 @@ async def _stale_anchors(pool: asyncpg.Pool, wanted: list[str]) -> set[str]:
     costs one indexed read per refresh and a burst of REST reads exactly once
     per degradation."""
     authority = await read_authority(pool)
-    if authority.owner == WS_SOURCE:
+    if authority.owner == WS_OWNER:
         return set()
     rows = await pool.fetch(
         """

@@ -118,7 +118,7 @@ from epigone.clock import Clock
 from epigone.gateway import GatewayError, HyperliquidGateway, OpenOrder, on_covered_venue
 from epigone.order_diff import OrderChange, RestingOrder, diff_open_orders, stream_change
 from epigone.order_events import record_order_events
-from epigone.poll_set import fetch_poll_set
+from epigone.poll_set import fetch_poll_set, leaders_first
 from epigone.stream.orders import fetch_orders_paced
 from epigone.ws import (
     LIVENESS_CHANNEL,
@@ -354,13 +354,18 @@ async def _shadowed_traders(pool: asyncpg.Pool) -> list[str]:
     Truncation is loud on purpose. The alternative — opening connections until
     the server refuses — leaves the lane silently partial with nothing in the
     logs to say which Traders it gave up on, and this seam's whole value is that
-    a consumer can trust what is missing to be missing for a stated reason."""
-    wanted = await fetch_poll_set(pool)
+    a consumer can trust what is missing to be missing for a stated reason.
+
+    WHICH Traders survive the truncation is a decision, not an accident of
+    address sort (#168 review finding A3, deferred to #158): copy-enabled
+    Leaders take the connections first, because an order feed is worth most on
+    the wallets whose orders this system may one day mirror."""
+    wanted = await leaders_first(pool, await fetch_poll_set(pool))
     if len(wanted) > MAX_ORDER_LANES:
         log.error(
             "ws order lane: %d wallets exceeds the %d order connections one IP allows "
             "(%d total, %d reserved for the position lane and reconnect overlap); "
-            "shadowing orders for the first %d only",
+            "shadowing orders for the %d highest-priority only",
             len(wanted),
             MAX_ORDER_LANES,
             CONNECTION_LIMIT,

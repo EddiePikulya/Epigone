@@ -106,6 +106,14 @@ async def run_position_cycle(
         return None
     state.last_pass_at = now
     result = await run_poll_pass(pool, gateway, budget, clock)
+    if result.deferred:
+        # A wallet is carrying a change the websocket has not produced yet. The
+        # poller stops trusting the standby cadence and looks again on the next
+        # tick: whatever the answer turns out to be — the lane was simply a few
+        # seconds behind, or it genuinely missed something — knowing it 10s from
+        # now beats knowing it a minute from now, and the extra pass costs one
+        # wallet's weight.
+        state.last_pass_at = None
     if result.drifted:
         log.error(
             "position lane: %d wallet(s) drifted from the websocket's production; "
