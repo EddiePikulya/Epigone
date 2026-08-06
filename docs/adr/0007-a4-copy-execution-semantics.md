@@ -726,3 +726,32 @@ The summary reports that one thing, and says where the twenty are.
 - **Only per-event skips coalesce.** Provisioning skips and bracket skips are
   at most one per sub per cycle and cannot storm, so they still send
   individually.
+
+### D-8 (2026-08-06, issue #193). The liveness floor is TEMPORARILY $100 for the
+### A5 shakedown — a suspension of decision 7's number, not a revision of it
+
+**TEMPORARY. Revert guarded by issue #192**, which closes only by restoring
+`LEADER_EQUITY_FLOOR = Decimal("10000")`. This amendment is written to be
+DELETED with it, unlike every amendment above, which are permanent records.
+
+**Decision.** For the shakedown period, `LEADER_EQUITY_FLOOR` is `$100`. The
+real value, and the one it returns to, is `$10,000`.
+
+**Why.** A5 needs one Leader whose signal timing the operator can drive on
+demand — open a position, watch the full copy path run, close it — and the only
+such Leader is the operator's own mainnet wallet, at ~$300 of equity. Under
+decision 7's number that wallet is exactly what the gate exists to refuse, so
+the shakedown could observe the gate but never anything downstream of it.
+
+**Why decision 7's reasoning is untouched.** The floor asks "is this still the
+trader whose stats earned the copy?" of a Leader chosen for their stats. The
+operator's own wallet was never chosen that way, so the question the floor
+protects is not being answered differently — it is not being asked. Nothing
+about the 38%-of-wallets research, the absolute-not-relative form, or the
+entries-only scope changes; only the period in which the number is honest.
+
+**Why it stays a CONSTANT and does not become a knob.** A knob is the failure
+mode this amendment exists to avoid. An env var or a `/limits` entry would let
+$100 outlive the shakedown silently, at which point the gate has been disabled
+rather than suspended, and nothing in the repo would say so. A constant edit is
+loud: it shows in the diff, it shows in this amendment, and it shows in #192.
