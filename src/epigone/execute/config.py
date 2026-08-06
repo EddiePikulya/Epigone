@@ -10,6 +10,28 @@ URL so the executor can never read one network's book while trading on the
 other, which is also why a malformed EXECUTOR_EXCHANGE_URL degrades BOTH urls
 to the testnet default rather than one side of the pair.
 
+THE ONE-NETWORK DOCTRINE, RE-SCOPED (issue #184). "Everything the executor
+reads comes from the book it trades" held until a deployment mirrored MAINNET
+Leaders onto the TESTNET book, and then it said the wrong thing about one read:
+the Leader's liveness equity. Two kinds of read, and only the first is about
+the book:
+
+- ORDERS AND ORDER-ADJACENT READS — marks, market stats, asset specs, sub
+  state, fills — are single-network BY CONSTRUCTION and still derive from the
+  exchange URL. Nothing here is configurable, and nothing here may be: a size
+  priced on one network and sent to another is the failure the derivation
+  exists to make untypeable.
+- THE LEADER'S ACCOUNT is a SIGNAL-NETWORK entity. Decision 7's question — "is
+  this still the trader whose stats earned the copy?" — is about the account
+  tracking observed, so its liveness read is pinned to EXECUTOR_SIGNAL_INFO_URL
+  (default: the tracking product's MAINNET info endpoint, the same one the
+  pollers use) rather than derived. This is the ONE documented exception, and
+  the gateway that serves it is read-only and has exactly one caller.
+
+On a mainnet deployment the two urls coincide and the distinction is invisible,
+which is precisely why nothing caught it until the shakedown (ADR-0007
+amendment D-6).
+
 MAINNET TAKES TWO DELIBERATE ACTS (issue #137's live gate). Pointing
 EXECUTOR_EXCHANGE_URL at mainnet is not enough: `HttpExecutionGateway` refuses
 a mainnet URL at construction unless it is ALSO handed the explicit capability,
@@ -33,7 +55,7 @@ from datetime import timedelta
 
 from epigone.config import parse_allow_mainnet, parse_positive_int
 from epigone.gateway.execution_http import MAINNET_EXCHANGE_URL, TESTNET_EXCHANGE_URL
-from epigone.gateway.http import TESTNET_INFO_URL
+from epigone.gateway.http import INFO_URL, TESTNET_INFO_URL
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +73,7 @@ class ExecutorConfig:
     interval: timedelta
     exchange_url: str
     info_url: str
+    signal_info_url: str
     allow_mainnet: bool
 
     @classmethod
@@ -77,6 +100,7 @@ class ExecutorConfig:
             ),
             exchange_url=exchange_url,
             info_url=_info_url_for(exchange_url),
+            signal_info_url=_parse_signal_info_url(os.environ.get("EXECUTOR_SIGNAL_INFO_URL")),
             allow_mainnet=allow_mainnet,
         )
 
@@ -96,6 +120,24 @@ def _parse_exchange_url(raw: str | None) -> str:
         "EXECUTOR_EXCHANGE_URL %r is not /exchange-shaped; using the testnet default", raw
     )
     return TESTNET_EXCHANGE_URL
+
+
+def _parse_signal_info_url(raw: str | None) -> str:
+    """The SIGNAL network's info endpoint (issue #184) — read-only, and the one
+    read that is deliberately NOT derived from the exchange url.
+
+    Defaults to the tracking product's MAINNET endpoint because that is where
+    the pollers observed the Leader, and the Leader's account is a fact about
+    the network the signal came from, not about the book this process trades.
+    On a mainnet deployment the two coincide and nothing here is observable."""
+    if not raw:
+        return INFO_URL
+    if raw.endswith("/info"):
+        return raw
+    log.warning(
+        "EXECUTOR_SIGNAL_INFO_URL %r is not /info-shaped; using the mainnet default", raw
+    )
+    return INFO_URL
 
 
 def _info_url_for(exchange_url: str) -> str:

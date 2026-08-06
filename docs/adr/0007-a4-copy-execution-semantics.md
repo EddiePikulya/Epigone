@@ -594,3 +594,68 @@ the default is neither. The WATCHDOG opens on the same variable by name: it is
 the executor's dead-man's switch and `/kill`'s only sweeping hand, so a live
 executor beside a testnet-refused watchdog must not be reachable by setting one
 variable.
+
+### D-6 (2026-08-05, issue #184). Leader liveness reads the SIGNAL network, not
+### the network the executor trades — restates decision 7's subject
+
+**Decision.** The $10,000 live-equity floor fetches the Leader's
+`clearinghouseState` from the network the SIGNAL came from, through a second,
+read-only info gateway pinned to `EXECUTOR_SIGNAL_INFO_URL` — default: the
+tracking product's MAINNET info endpoint, the same constant the pollers use.
+Every other executor read — Liquidity Floor market stats, mark prices, asset
+specs, sub-account state, fills — stays pinned to the book the executor trades
+and still derives from the exchange URL.
+
+**Why it took a deployment to notice.** Decision 7 never said which network,
+because until the A5 shakedown there was only one: signal network and trade
+network coincide on a mainnet deployment, and the read was bit-for-bit correct
+by accident. The shakedown mirrors REAL mainnet Leaders onto the TESTNET book —
+real signal, mock money — and tracked Leaders hold $0 on testnet. Every entry
+skipped with `leader below the liveness floor: $0 < $10,000`, and no Copy
+Episode could ever open. Verified live 2026-08-05: all three staged shakedown
+candidates read $0 on testnet.
+
+**Why the signal network is the right answer, not a harness accommodation.**
+The gate asks "is this still the trader whose stats earned the copy?" The stats
+were earned on the network tracking observed, the 38%-emptied finding is about
+THAT account, and a Leader who emptied the account their stats came from is
+exactly what the gate must still catch — on mainnet it does, unchanged, because
+there the two networks are the same one. What the fix removes is a reading in
+which the gate judged an account the Leader never had a reason to fund.
+
+**The one-network doctrine is RE-SCOPED, not repealed.** Orders and
+order-adjacent reads remain single-network by construction: a size priced on
+one network and sent to another must stay untypeable, so nothing on that side
+became configurable. The Leader's account is a signal-network entity, and its
+liveness read is the one documented exception — served by a gateway that is
+read-only, holds no signer, and has exactly one caller.
+
+**Rejected: reading the poll-pass equity capture** (#170's `trader_equity`,
+written in the same transaction as the signal). Genuinely attractive — no API
+spend, freshness at signal time — but it changes decision 7's letter from
+"fetch live" to "read the capture" and imports staleness and missing-row
+semantics the live fetch does not have. Operator chose the live signal-side
+fetch (2026-08-05).
+
+**What it does not change.** Amendment D-2 stands unaltered: the floor fires on
+`open` and a flip's open leg only, never on `scale_in`, and exits are gated by
+nothing — now provably so against BOTH gateways' answers. Unreadable equity
+still skips with retry semantics (event unclaimed on plain entries, leg-aware
+wording on flips), now against the signal-side gateway. The floor constant, the
+audit wording carrying the observed figure, and the weight-2 spend against the
+shared budget are all untouched — only the endpoint moved. The builder-dex
+caveat in decision 7 stands as recorded.
+
+**Consequences, all binding:**
+
+- **`EXECUTOR_SIGNAL_INFO_URL` defaults to MAINNET** — the only env knob in the
+  executor family whose default is not testnet, because it names where the
+  Leaders are, not where the money is. It signs nothing and can place nothing.
+  A value that is not `/info`-shaped degrades to the default with a logged
+  warning, per the executor-config convention.
+- **The start-up audit row records it**, beside the exchange URL, so the trail
+  answers "which account was being judged" as well as "which book was traded".
+- **The test harness runs the shakedown topology by default**: the copy
+  executor's suite gives the leader equity to the SIGNAL fake only, so a
+  liveness read that slipped back onto the trade gateway reads $0 and fails
+  loudly rather than passing on a coincidence.

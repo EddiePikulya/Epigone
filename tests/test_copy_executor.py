@@ -8,6 +8,7 @@ Seam per the house convention: fake read gateway, fake execution gateway, fake
 clock, real Postgres.
 """
 
+import logging
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
@@ -30,6 +31,7 @@ from epigone.gateway.execution import (
 )
 from epigone.gateway.execution_http import MAINNET_EXCHANGE_URL, TESTNET_EXCHANGE_URL
 from epigone.gateway.fake import FakeHyperliquidGateway
+from epigone.gateway.http import INFO_URL, TESTNET_INFO_URL
 from epigone.position_events import ClaimableEvent, PositionEvent, outstanding_events
 from epigone.safety.audit import ExecutionAudit
 from epigone.safety.config import WatchdogConfig
@@ -263,28 +265,67 @@ async def test_a_leader_below_the_liveness_floor_is_not_copied_into(
 ) -> None:
     """Decision 7: 38% of quality-screened wallets had emptied out while their
     stored metrics still looked alive. The gate reads LIVE equity at signal
-    time, and it gates entries only."""
+    time, and it gates entries only.
+
+    The Leader emptied out on the network their stats were earned on (#184),
+    and no amount of money on the book we trade answers for that — so the
+    trade-side fake is deliberately RICH here, and the entry still skips."""
     h = await build_harness(pool, clock, gateway)
     await copy_sub(pool, clock)
     gateway.set_positions(SUB, [])
-    gateway.account_values[(LEADER, None)] = LEADER_EQUITY_FLOOR - Decimal("1")
+    h.signal.account_values[(LEADER, None)] = LEADER_EQUITY_FLOOR - Decimal("1")
+    gateway.account_values[(LEADER, None)] = Decimal("250000")
 
     await emit(pool, opened(), clock.now())
     await h.executor.run_cycle()
 
+    observed = str(LEADER_EQUITY_FLOOR - Decimal("1"))
     assert h.placed() == []
-    assert any("liveness floor" in body for body in await h.notices())
+    assert await outstanding(pool) == []  # claimed: a decision, not a deferral
+    # The observed figure is the SIGNAL side's, in both places the operator
+    # can look: the notice they read and the trail that answers for it later.
+    assert any("liveness floor" in body and observed in body for body in await h.notices())
+    assert any(
+        action == "copy_skipped" and "liveness floor" in reason and observed in reason
+        for action, reason in await h.audit_actions()
+    )
+
+
+async def test_a_leader_alive_on_the_signal_network_is_copied_though_the_book_reads_zero(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Issue #184, the A5 shakedown exactly: a MAINNET Leader mirrored onto the
+    TESTNET book. Their testnet account holds $0 and always will — the account
+    decision 7 asks about is the one the signal came from, so the gate reads
+    the signal network and the entry copies."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+    h.signal.account_values[(LEADER, None)] = LEADER_EQUITY_FLOOR + Decimal("1")
+    gateway.account_values[(LEADER, None)] = Decimal("0")
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1
+    assert not any("liveness floor" in body for body in await h.notices())
+    # ONE liveness read, on the signal side only. Two would double the weight
+    # this fetch has always spent; a trade-side one would be the bug itself.
+    assert [c for c in h.signal.positions_calls if c[0] == LEADER] == [(LEADER, None)]
+    assert [c for c in gateway.positions_calls if c[0] == LEADER] == []
 
 
 async def test_an_unreadable_leader_equity_defers_rather_than_claims(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:
     # A network blip is not a decision about the event. Claiming here would
-    # silently drop a copy; leaving it outstanding asks again next cycle.
+    # silently drop a copy; leaving it outstanding asks again next cycle. The
+    # blip that matters is on the SIGNAL-side gateway (#184) — the trade side
+    # answers for the Leader nowhere.
     h = await build_harness(pool, clock, gateway)
     await copy_sub(pool, clock)
     gateway.set_positions(SUB, [])
-    gateway.positions_errors[LEADER] = RuntimeError("info down")
+    h.signal.positions_errors[LEADER] = RuntimeError("info down")
 
     await emit(pool, opened(), clock.now())
     await h.executor.run_cycle()
@@ -548,8 +589,9 @@ async def test_a_flips_open_leg_is_never_dropped_without_an_audit_row(
     h.exec_fake.place_results.append(
         [OrderFilled(oid=9, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
     )
-    # The close leg reads our sub fine; only the LEADER's equity is unreadable.
-    gateway.positions_errors[LEADER] = RuntimeError("info down")
+    # The close leg reads our sub fine; only the LEADER's equity is unreadable,
+    # and it is the SIGNAL-side gateway that answers for the Leader (#184).
+    h.signal.positions_errors[LEADER] = RuntimeError("info down")
 
     await emit(
         pool,
@@ -1131,6 +1173,40 @@ async def test_an_exit_is_never_blocked_by_the_floor(
 
     (orders, _grouping, _builder, _vault), = h.placed()
     assert orders[0].reduce_only is True
+
+
+async def test_an_exit_is_never_blocked_by_either_networks_answer_on_liveness(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Decision 7's first bullet, across both gateways (#184): a Leader dead on
+    the signal network and unreadable there, holding nothing on the book we
+    trade, still gets their close copied. Gating an exit on a liveness answer
+    would leave us holding a position the Leader has left."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    h.signal.account_values[(LEADER, None)] = Decimal("0")
+    h.signal.positions_errors[LEADER] = RuntimeError("info down")
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, closed(), clock.now())
+    await h.executor.run_cycle()
+
+    (orders, _grouping, _builder, _vault), = h.placed()
+    assert orders[0].reduce_only is True
+    assert [c for c in h.signal.positions_calls if c[0] == LEADER] == []
 
 
 async def test_a_flip_into_a_sub_floor_coin_ends_flat(
@@ -2290,8 +2366,11 @@ async def test_a_scale_in_is_copied_without_a_leader_equity_fetch(
         opened_event_id=None,
     )
     gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
-    # The leader is BELOW the floor and their equity is unreadable besides:
-    # neither may matter to a scale-in.
+    # The leader is dead on the SIGNAL network and unreadable on it besides,
+    # and holds nothing on the book we trade: no side's answer may matter to a
+    # scale-in (#184 keeps amendment D-2's letter across both gateways).
+    h.signal.account_values[(LEADER, None)] = Decimal("1")
+    h.signal.positions_errors[LEADER] = RuntimeError("info down")
     gateway.account_values[(LEADER, None)] = Decimal("1")
     before = len([c for c in gateway.positions_calls if c[0] == LEADER])
 
@@ -2301,6 +2380,7 @@ async def test_a_scale_in_is_copied_without_a_leader_equity_fetch(
     assert len(h.placed()) == 1  # copied
     after = len([c for c in gateway.positions_calls if c[0] == LEADER])
     assert after == before  # …and the leader was never read
+    assert [c for c in h.signal.positions_calls if c[0] == LEADER] == []
 
 
 async def test_a_stale_flip_half_executes_to_flat(
@@ -2422,3 +2502,52 @@ def test_the_watchdog_opens_on_the_executors_own_flag(
     assert WatchdogConfig.from_env().allow_mainnet is False
     monkeypatch.setenv("EXECUTOR_ALLOW_MAINNET", "1")
     assert WatchdogConfig.from_env().allow_mainnet is True
+
+
+# --- the signal network (#184) ------------------------------------------------
+#
+# The one read that is NOT about the book this process trades: the Leader's
+# liveness equity, which is a fact about the account the SIGNAL came from. On a
+# mainnet deployment the two urls coincide and none of this is observable; on
+# the testnet shakedown it is the difference between copying a real mainnet
+# Leader and skipping every entry at $0.
+
+
+def test_the_signal_info_url_defaults_to_the_mainnet_tracking_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default is the endpoint the POLLERS read — the network the signal
+    was observed on — while the trade-side info url stays derived from the
+    exchange url. The harness needs no special configuration."""
+    monkeypatch.delenv("EXECUTOR_SIGNAL_INFO_URL", raising=False)
+    monkeypatch.delenv("EXECUTOR_EXCHANGE_URL", raising=False)
+    config = ExecutorConfig.from_env()
+    assert config.signal_info_url == INFO_URL
+    assert config.info_url == TESTNET_INFO_URL
+
+
+def test_the_signal_info_url_takes_an_env_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A topology change — a Leader tracked on some other network — is a
+    configuration act, not a code change. And it moves NOTHING else: the
+    trade-side info url stays derived from the exchange url, which is what
+    keeps orders and order-adjacent reads single-network by construction."""
+    monkeypatch.setenv("EXECUTOR_SIGNAL_INFO_URL", TESTNET_INFO_URL)
+    monkeypatch.setenv("EXECUTOR_EXCHANGE_URL", MAINNET_EXCHANGE_URL)
+    config = ExecutorConfig.from_env()
+    assert config.signal_info_url == TESTNET_INFO_URL
+    assert config.info_url == INFO_URL  # derived from the exchange url, untouched
+
+
+def test_a_malformed_signal_info_url_degrades_to_the_default_with_a_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The executor-config convention (the exchange-url precedent): a typo
+    never wedges the copy loop, and it never passes silently either."""
+    for bad in ("api.hyperliquid.xyz", "https://api.hyperliquid.xyz/exchange", " "):
+        caplog.clear()
+        monkeypatch.setenv("EXECUTOR_SIGNAL_INFO_URL", bad)
+        with caplog.at_level(logging.WARNING):
+            assert ExecutorConfig.from_env().signal_info_url == INFO_URL
+        assert "EXECUTOR_SIGNAL_INFO_URL" in caplog.text

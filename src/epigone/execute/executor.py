@@ -222,6 +222,7 @@ class CopyExecutor:
         budget: Budget,
         policy: RiskPolicy,
         *,
+        signal_gateway: HyperliquidGateway,
         operator_id: int,
         master_address: str,
         signer_address: str,
@@ -230,6 +231,13 @@ class CopyExecutor:
         self._pool = pool
         self._clock = clock
         self._read = read_gateway
+        # The SIGNAL network's read-only gateway (issue #184). Used for exactly
+        # one read — the Leader's liveness equity — because the Leader's
+        # account is a fact about the network tracking observed them on, not
+        # about the book this process trades. Every other read goes through
+        # `self._read`, which stays pinned to the exchange url; on a mainnet
+        # deployment the two gateways point at the same endpoint.
+        self._signal_read = signal_gateway
         self._exec = exec_gateway
         self._provisioning = provisioning
         self._audit = audit
@@ -1597,10 +1605,16 @@ class CopyExecutor:
         at risk is the operator's own constant, and the only thing the Leader
         contributes to sizing is their LEVERAGE — but a SIGNAL QUALITY gate:
         38% of quality-screened wallets had emptied their accounts while their
-        stored metrics still looked alive (2026-07-29 research)."""
+        stored metrics still looked alive (2026-07-29 research).
+
+        THE ONE SIGNAL-NETWORK READ (issue #184, amendment D-6). The question
+        is about the account whose stats earned the copy, which lives on the
+        network tracking observed it on — not on the book this process trades.
+        Same weight against the same shared budget as when it rode the trade
+        gateway; only the endpoint moved."""
         await self._budget.spend(POSITIONS_WEIGHT)
         try:
-            state = await self._read.get_account_state(event.trader_address)
+            state = await self._signal_read.get_account_state(event.trader_address)
         except Exception:
             # Unreadable is not "below the floor". A gate that fails CLOSED on
             # a network blip would silently stop copying; the event stays
