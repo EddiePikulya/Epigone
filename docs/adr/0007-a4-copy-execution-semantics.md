@@ -249,6 +249,9 @@ notification channel. A4 therefore surfaces to the operator's chat:
 - **Every skip, with its reason**: staleness, liveness floor, coin occupied,
   risk-declined, no-local-position. Events are rare and the operator is one
   person; full verbosity is the point (they act manually on what they see).
+  - **NARROWED by amendment D-7 (2026-08-06)** — a cycle that drains a backlog
+    summarises its skips instead. Live operation, pager cases, copied actions
+    and the audit trail are all unchanged; see the amendments.
 - **Pager cases** ride the existing 🚨 monitor path: unfilled close after
   retries (decision 5), liquidation, unclassifiable divergence (decision 10),
   plus the halt pages A3 already sends.
@@ -659,3 +662,67 @@ caveat in decision 7 stands as recorded.
   executor's suite gives the leader equity to the SIGNAL fake only, so a
   liveness read that slipped back onto the trade gateway reads $0 and fails
   loudly rather than passing on a coincidence.
+
+### D-7 (2026-08-06, issue #190). A cycle that DRAINS A BACKLOG summarises its
+### skips — narrows decision 11's "full verbosity", changes nothing it records
+
+**Decision.** When one executor cycle produces more than `SKIP_DIGEST_THRESHOLD`
+(= 5) skip notices, the operator's chat gets ONE summary for that cycle —
+totals by Leader and by reason, with a pointer to `copy_skipped` on the audit
+trail — instead of one message per event. At or below the threshold, nothing
+changes: each skip sends its own sentence with its own full reason, exactly as
+decision 11 specifies.
+
+**Why the threshold is a constant and not a knob.** It is not a preference
+about how loud the chat should be; it is the line between the two regimes the
+chat has. Live, the poller hands the executor one Leader's one or two events
+per cycle. A drain is the whole retained backlog at once — measured at ~20 on
+the first `/copy` of a long-tracked Leader (observed 2026-08-06), and unbounded
+above that after downtime. Anything from five to a dozen separates them
+identically, so there is nothing for an operator to tune; exposing it would
+only invite the two settings that are actually wrong (0, which coalesces the
+trickle decision 11 exists for, and ∞, which restores the storm).
+
+**Why decision 11's reasoning survives it.** "Events are rare and the reader is
+one person who acts manually on what they see" is a statement about LIVE
+operation, and it is still true there. A drain is the case it does not
+describe: twenty identical sentences about twenty coins do not give the
+operator twenty things to act on, they give them one — "the backlog was stale"
+— buried in a scroll that also buries the copied actions and pages around it.
+The summary reports that one thing, and says where the twenty are.
+
+**Three boundaries, all load-bearing:**
+
+- **The AUDIT TRAIL IS UNTOUCHED.** One `copy_skipped` row per event, with the
+  full per-event sentence, verbatim, in both regimes — the row still commits in
+  the same transaction as the claim. Coalescing is a DELIVERY decision about
+  the doorbell, never about the record.
+- **🚨 pager notices are never coalesced**, at any volume. Volume is the moment
+  a page is most likely to be missed, not least.
+- **Copied actions are never coalesced.** Summarising what did NOT happen is a
+  readability decision; summarising what DID would hide money moving.
+
+**Consequences:**
+
+- **`_Skip` carries a `category`** beside its sentence — the coarse bucket the
+  summary counts. Its WORDS are the ones decision 11 and the runbook already
+  use (`stale entry`, `coin occupied`, `no local position`, `risk-declined`,
+  …), because a summary that renamed them would be a second vocabulary for the
+  same six things. The sentence stays what the trail records and what an
+  under-threshold cycle sends.
+- **Skip notices are held in memory until the end of the cycle** — in BOTH
+  regimes, since only the end of a cycle knows which regime it was — rather
+  than written per event and collapsed afterwards. Collapsing would race the
+  bot's own delivery: a long cycle can have its first notices already in
+  Telegram when its last event is handled, and deleting those would leave the
+  operator with five sentences AND a summary that counts them again. The cost
+  is bounded and named: a crash mid-cycle loses CHAT LINES for events already
+  claimed, never their audit rows, which still commit with the claim.
+- **Within one cycle, skips now arrive after copied actions and pages**, where
+  they used to interleave, because they are all written at the flush. Each
+  still carries the timestamp of the moment it was DECIDED, not of the flush.
+- **A failed notice write leaves the rest held** rather than dropping the
+  tail: these events are already claimed, so nothing would re-offer them.
+- **Only per-event skips coalesce.** Provisioning skips and bracket skips are
+  at most one per sub per cycle and cannot storm, so they still send
+  individually.

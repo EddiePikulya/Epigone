@@ -145,6 +145,27 @@ see, so the executor reports:
   floor, coin occupied, risk-declined, no local position, not mirrorable;
 - **pager cases**, which also ride the 🚨 health-monitor path.
 
+**Except on a drain.** When one cycle disposes of more than five leader events
+without acting on any of them — the first `/copy` of a Leader you have tracked
+for weeks, the cycle after a `/resume`, the first cycle back from downtime —
+you get ONE summary instead: how many died, why, per Leader. Each of those
+events still has its own `copy_skipped` row on the audit trail with its full
+sentence, which is where to look when the counts are not enough. Copied
+actions and 🚨 pages are NEVER summarised, however busy the cycle:
+
+```
+⏭ 21 leader events skipped, summarised — a backlog drain, not that many
+separate problems. Each one has its own row on the audit trail, action
+copy_skipped, carrying its own full reason.
+• 0xabcd…1234 — 18: 15 stale entry, 3 no local position
+• 0xbeef…5678 — 3: 3 coin occupied
+```
+
+One side effect worth knowing before you read a busy cycle's chat: skips are
+now delivered at the END of the cycle, so within a single cycle every copied
+action and 🚨 arrives before every skip, even where the skip was decided
+first. The skip's own timestamp is still the moment it was decided.
+
 These are the executor's OWN messages, on their own queue. They are never
 Position Alerts and never carry alert preferences: a mute or a per-Track size
 floor cannot suppress a copy report, and cannot change what gets traded.

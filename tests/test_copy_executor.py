@@ -20,6 +20,7 @@ from epigone.execute import episodes as ep
 from epigone.execute import subs as subs_store
 from epigone.execute.config import ExecutorConfig
 from epigone.execute.executor import EXECUTOR_CONSUMER
+from epigone.execute.notices import SKIP_DIGEST_THRESHOLD
 from epigone.execute.policy import ENTRY_STALENESS_GUARD, LEADER_EQUITY_FLOOR, RiskPolicy
 from epigone.gateway import GatewayError, MarketStats, Position, Side
 from epigone.gateway.execution import (
@@ -35,7 +36,7 @@ from epigone.gateway.http import INFO_URL, TESTNET_INFO_URL
 from epigone.position_events import ClaimableEvent, PositionEvent, outstanding_events
 from epigone.safety.audit import ExecutionAudit
 from epigone.safety.config import WatchdogConfig
-from epigone.safety.halt import KILL_SOURCE, request_halt
+from epigone.safety.halt import KILL_SOURCE, request_halt, resume
 from tests.support.clock import FakeClock
 from tests.support.copy import (
     LEADER,
@@ -2551,3 +2552,202 @@ def test_a_malformed_signal_info_url_degrades_to_the_default_with_a_warning(
         with caplog.at_level(logging.WARNING):
             assert ExecutorConfig.from_env().signal_info_url == INFO_URL
         assert "EXECUTOR_SIGNAL_INFO_URL" in caplog.text
+
+
+# --- backlog-drain notice coalescing (issue #190, amendment D-7) --------------
+
+
+async def test_a_backlog_drain_reports_one_summary_instead_of_a_storm(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Observed live 2026-08-06: the first /copy of a Leader tracked for weeks
+    flushed ~20 chat messages in one burst, every one of them the same
+    sentence about a different coin. Decision 11's full verbosity is right for
+    the trickle it was written for and useless for a flush — so past the
+    threshold the cycle speaks once."""
+    h = await build_harness(pool, clock, gateway)
+    gateway.set_positions(SUB, [])
+
+    # The events land while the Leader is merely TRACKED: nobody copies them,
+    # so nothing claims them and they sit in the backlog accumulating.
+    stale = clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1)
+    count = SKIP_DIGEST_THRESHOLD + 1
+    for i in range(count):
+        await emit(pool, opened(coin=f"COIN{i}"), stale)
+    assert len(await outstanding(pool)) == count
+
+    await copy_sub(pool, clock)  # /copy — and the whole backlog qualifies at once
+    await h.executor.run_cycle()
+
+    notices = await h.notices()
+    assert len(notices) == 1
+    assert str(count) in notices[0] and "stale entry" in notices[0]
+    assert h.placed() == []
+    assert await outstanding(pool) == []  # every one of them still handled
+
+
+async def test_a_handful_of_skips_still_speaks_one_sentence_each(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The other side of the same line, and the one decision 11 already had
+    right: live operation is a trickle, and a trickle is exactly what full
+    verbosity was written for. At the threshold itself, nothing coalesces."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+
+    stale = clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1)
+    for i in range(SKIP_DIGEST_THRESHOLD):
+        await emit(pool, opened(coin=f"COIN{i}"), stale)
+
+    await h.executor.run_cycle()
+
+    notices = await h.notices()
+    assert len(notices) == SKIP_DIGEST_THRESHOLD
+    assert all(body.startswith("⏭ Skipped open on COIN") for body in notices)
+    assert all("stale entry: observed" in body for body in notices)
+
+
+async def test_the_summary_counts_by_reason_and_by_leader(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """What the operator needs out of a drain is not the list — it is "how
+    many died on the guard, how many referred to positions we never had, whose
+    were they". One message, per leader, per reason."""
+    other = "0xsecond00000000000000000000000000000000ee"
+    other_sub = "0x00000000000000000000000000000000000000002"
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    await seed_trader(pool, clock, other)
+    await copy_sub(pool, clock, leader=other, sub_address=other_sub)
+    gateway.set_positions(SUB, [])
+    gateway.set_positions(other_sub, [])
+
+    stale = clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1)
+    for i in range(6):
+        await emit(pool, opened(coin=f"COIN{i}"), stale)
+    for i in range(2):
+        await emit(pool, closed(coin=f"GONE{i}"), clock.now(), trader=other)
+
+    await h.executor.run_cycle()
+
+    notices = await h.notices()
+    assert len(notices) == 1
+    assert "8 leader events skipped, summarised" in notices[0]
+    # Addresses as the operator reads them, written out rather than derived,
+    # so a change to the shortening has to be a deliberate one.
+    assert "• 0xlead…00aa — 6: 6 stale entry" in notices[0]
+    assert "• 0xseco…00ee — 2: 2 no local position" in notices[0]
+    # The pointer to where the detail actually lives, since the sentences went.
+    assert "audit trail" in notices[0] and "copy_skipped" in notices[0]
+    assert "`" not in notices[0]  # sent with no parse_mode (#185)
+
+
+async def test_pagers_and_copied_actions_stay_individual_inside_a_flush(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The hard boundary on the coalescing: volume is a reason to summarise
+    what did NOT happen, never what did. An order that reached the wire always
+    reports on its own, and a 🚨 is a page — burying either one inside a count
+    would make a busy cycle the best moment to miss the thing that mattered."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    # Decision 10's unclassifiable divergence: the episode's position is gone
+    # and the fills that would explain it are unreadable. Adopt nothing, page.
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [])
+    gateway.fills_errors[SUB] = RuntimeError("fills endpoint down")
+
+    stale = clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1)
+    for i in range(SKIP_DIGEST_THRESHOLD + 1):
+        await emit(pool, opened(coin=f"COIN{i}"), stale)
+    await emit(pool, opened(coin="BTC"), clock.now())  # fresh, and copyable
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.003"), avg_price=Decimal("63500"))]
+    )
+
+    await h.executor.run_cycle()
+
+    notices = await h.notices()
+    assert len(h.placed()) == 1
+    assert len(notices) == 3
+    assert sum(body.startswith("🚨") for body in notices) == 1
+    assert sum(body.startswith("📈 Copied open — BTC long") for body in notices) == 1
+    assert sum("leader events skipped, summarised" in body for body in notices) == 1
+
+
+async def test_a_resume_drains_its_halt_backlog_into_one_summary(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The second shape of the same burst. A halt claims nothing (decision 9
+    keeps the backlog intact for /resume), so the events pile up for as long
+    as the halt lasts and the first cycle after it disposes of all of them —
+    every one past the staleness guard by then, which is decision 8 working,
+    not a failure to report."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+    halt, _ = await request_halt(
+        pool,
+        clock,
+        ExecutionAudit(pool, clock),
+        source=KILL_SOURCE,
+        reason="operator /kill",
+        requested_by=OPERATOR,
+    )
+
+    count = SKIP_DIGEST_THRESHOLD + 3
+    for i in range(count):
+        await emit(pool, opened(coin=f"COIN{i}"), clock.now())
+    await h.executor.run_cycle()
+    assert len(await outstanding(pool)) == count  # a halt drains nothing
+    assert await h.notices() == []
+
+    clock.advance(ENTRY_STALENESS_GUARD.total_seconds() + 1)
+    await resume(pool, clock, ExecutionAudit(pool, clock), halt_id=halt.id, resumed_by=OPERATOR)
+    await h.executor.run_cycle()
+
+    notices = await h.notices()
+    assert h.placed() == []
+    assert len(notices) == 1
+    assert f"⏭ {count} leader events skipped, summarised" in notices[0]
+    assert f"{count} stale entry" in notices[0]
+
+
+async def test_the_audit_trail_is_one_row_per_event_in_both_regimes(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The boundary the coalescing must not cross. Chat delivery is the only
+    thing that changes with volume: the trail records the same row, with the
+    same sentence, whether the cycle sent five messages or one.
+
+    Both regimes run here against the same clock and the same event shape, so
+    the sentences are comparable literally rather than by inspection — and a
+    summary that quietly abbreviated the trail would show up as two."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+    stale = clock.now() - ENTRY_STALENESS_GUARD - timedelta(seconds=1)
+
+    for i in range(3):  # under the threshold: one sentence each
+        await emit(pool, opened(coin=f"TRICKLE{i}"), stale)
+    await h.executor.run_cycle()
+
+    for i in range(SKIP_DIGEST_THRESHOLD + 1):  # over it: one summary
+        await emit(pool, opened(coin=f"FLUSH{i}"), stale)
+    await h.executor.run_cycle()
+
+    assert len(await h.notices()) == 4  # 3 sentences + 1 summary
+    skipped = [reason for action, reason in await h.audit_actions() if action == "copy_skipped"]
+    assert len(skipped) == 3 + SKIP_DIGEST_THRESHOLD + 1
+    assert len(set(skipped)) == 1  # verbatim, and the same sentence in both
+    assert skipped[0].startswith("stale entry: observed")
