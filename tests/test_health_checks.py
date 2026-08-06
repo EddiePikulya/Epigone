@@ -18,6 +18,7 @@ from epigone.monitor.checks import (
     FINE_SUCCESS,
     HALT,
     INGEST,
+    POSITION_LANE,
     RATE,
     WARNING,
     WATCHDOG,
@@ -57,6 +58,9 @@ HEALTHY = HealthSnapshot(
     oldest_undelivered_alert=None,
     recent_rate_limits=0,
     disk_percent_used=47.0,
+    position_lane_owner="ws",
+    position_lane_since=NOW - timedelta(hours=3),
+    position_lane_reason="websocket healthy, resynced and covering the poll set",
 )
 
 
@@ -79,6 +83,7 @@ def test_a_healthy_system_trips_no_check() -> None:
         WATCHDOG,
         HALT,
         COPY_PAGER,
+        POSITION_LANE,
     }
 
 
@@ -460,3 +465,42 @@ def test_digest_carries_watchdog_and_halt_state() -> None:
     )
     assert "watchdog beat 8s ago" in live
     assert "execution HALTED" in live
+
+
+def test_a_degraded_position_lane_is_an_incident_naming_what_caused_it() -> None:
+    """Issue #158: the websocket losing production is exactly the "connected
+    but wrong" class nothing else in this monitor can see. Drift in particular
+    is only ever visible here — the reconciliation writes the reason onto the
+    authority row, and this is where a human reads it."""
+    snapshot = replace(
+        HEALTHY,
+        position_lane_owner="poll",
+        position_lane_since=NOW - timedelta(minutes=4),
+        position_lane_reason="reconciliation drift: 0x037e… CASHCAT never arrived on the websocket",
+    )
+
+    result = _by_name(evaluate_checks(snapshot, THRESHOLDS), POSITION_LANE)
+
+    assert not result.ok
+    assert "CASHCAT" in result.detail
+    assert "4m" in result.detail
+
+
+def test_the_operator_switching_the_cutover_off_is_not_an_incident() -> None:
+    """The kill switch is a decision, not a failure. Paging about a state the
+    operator chose is how a monitor teaches people to ignore it."""
+    snapshot = replace(
+        HEALTHY,
+        position_lane_owner="poll",
+        position_lane_reason="websocket authority disabled by configuration",
+    )
+
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), POSITION_LANE).ok
+
+
+def test_a_deployment_with_no_lane_authority_recorded_is_not_an_incident() -> None:
+    """Pre-cutover, or the instant before the first evaluation writes the row.
+    The poller owning production is what has always been true."""
+    snapshot = replace(HEALTHY, position_lane_owner=None, position_lane_reason=None)
+
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), POSITION_LANE).ok

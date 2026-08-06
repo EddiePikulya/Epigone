@@ -50,20 +50,29 @@ services:
     command: ["/app/.venv/bin/python", "-m", "epigone.stream.main"]
     environment:
       DATABASE_URL: postgresql://epigone:epigone@postgres:5432/epigone
+      # The cutover's kill switch (issue #158, ADR-0009). Unset means the
+      # websocket owns position-event production and this process runs as a
+      # warm standby: still reading every wallet, still reconciling, taking
+      # production back on its own when the lane goes bad. Set to 0/false to
+      # pin production here at the 10s cadence — the pre-cutover world — with
+      # no redeploy of anything else and no probation on the way in.
+      WS_AUTHORITATIVE: ${WS_AUTHORITATIVE:-1}
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
 
-  # The websocket shadow lane (issue #157): a SECOND producer of position
-  # events, writing source = 'ws' rows beside the poller's so the cutover
-  # ticket can compare the two transports. Nothing consumes those rows — REST
-  # polling stays authoritative and Position Alerts are untouched.
+  # The websocket lane (issues #157, #168, #158). Since the cutover it is the
+  # PRODUCER of position events — Position Alerts and copy execution act on its
+  # rows — while `stream` keeps polling as a warm standby that reconciles
+  # against it and takes production back automatically if it goes bad.
   #
   # Its own service rather than a third loop inside `stream`, and that is the
-  # safety argument rather than packaging: sharing the stream process would
-  # give a shadow lane a path to kill the pollers. Here it can crash, wedge, or
-  # be stopped (`docker compose stop ws`) and alerting never notices.
+  # safety argument rather than packaging: sharing a process would give either
+  # lane a path to kill the other. Here it can crash, wedge, or be stopped
+  # (`docker compose stop ws`) and event production simply moves back to the
+  # poller within ~a minute (ADR-0009). Stopping it is a supported operation,
+  # not an outage.
   ws:
     build: .
     command: ["/app/.venv/bin/python", "-m", "epigone.ws.main"]

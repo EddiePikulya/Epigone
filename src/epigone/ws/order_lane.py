@@ -118,8 +118,8 @@ from epigone.clock import Clock
 from epigone.gateway import GatewayError, HyperliquidGateway, OpenOrder, on_covered_venue
 from epigone.order_diff import OrderChange, RestingOrder, diff_open_orders, stream_change
 from epigone.order_events import record_order_events
+from epigone.poll_set import fetch_poll_set
 from epigone.stream.orders import fetch_orders_paced
-from epigone.stream.poller import fetch_poll_set
 from epigone.ws import (
     LIVENESS_CHANNEL,
     ORDERS_CHANNEL,

@@ -197,6 +197,13 @@ Optional knobs, both with safe defaults: `EPIGONE_DUMP_DIR`
 (`~/epigone-dumps`), `EPIGONE_DUMP_KEEP` (`3`; a value below 1 is refused
 rather than obeyed).
 
+**The position lane degrading is not an outage: `docs/runbooks/position-lane-failover.md`.**
+Since the websocket cutover (#158) the monitor can say *"Position lane
+DEGRADED"*. That means event production moved back to the REST poller on its
+own; alerts and copying continue and there is nothing to restart. The runbook
+covers reading the reason, the one case worth investigating (reconciliation
+drift), and the `WS_AUTHORITATIVE=0` kill switch.
+
 **Restoring one of these dumps: `docs/runbooks/restore-from-dump.md`.** Read it
 before you need it — in particular the part about the code on disk re-applying
 the migration you just restored away from.

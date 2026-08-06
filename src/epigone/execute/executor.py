@@ -22,8 +22,9 @@ One cycle, in the order the ADR forces:
 5. **restore brackets** on live positions in bracket-mode subs (decision 9's
    r1a), expressed as a property to maintain rather than a /resume transition
    to detect — see `_maintain_brackets`;
-6. **drain the backlog**: the copy-enabled Leaders' unclaimed `source='poll'`
-   events, oldest first.
+6. **drain the backlog**: the copy-enabled Leaders' unclaimed AUTHORITATIVE
+   events, oldest first — written by whichever lane owned production when it
+   saw the change (ADR-0009), never by whichever transport.
 
 THE WRITE-AHEAD RULE (ADR-0006, inherited): the `position_event_claims` row
 and the `execution_audit` attempt row are written in ONE transaction, before
@@ -129,7 +130,7 @@ from epigone.gateway.execution import (
     TpSl,
     Trigger,
 )
-from epigone.position_events import POLL_SOURCE, ClaimableEvent, claim_event, outstanding_events
+from epigone.position_events import ClaimableEvent, claim_event, outstanding_events
 from epigone.safety import heartbeat
 from epigone.safety.audit import (
     EXECUTOR_ACTOR,
@@ -261,7 +262,6 @@ class CopyExecutor:
         operator_id: int,
         master_address: str,
         signer_address: str,
-        source: str = POLL_SOURCE,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -281,10 +281,6 @@ class CopyExecutor:
         self._operator_id = operator_id
         self._master = master_address.lower()
         self._signer = signer_address.lower()
-        # ADR-0007 decision 4: 'poll' today; flipping to 'ws' is a #158
-        # cutover item, which is why it is a constructor argument and not a
-        # literal buried in the query.
-        self._source = source
         self._specs: dict[str, AssetSpec] = {}
         # The cycle's own copies of things that must not be stale WITHIN a
         # cycle and must not be cached ACROSS one. Limits change under the
@@ -1205,7 +1201,11 @@ class CopyExecutor:
             events = await outstanding_events(
                 conn,
                 EXECUTOR_CONSUMER,
-                source=self._source,
+                # ADR-0007 decision 4's mandatory filter, as ADR-0009
+                # restates it: whichever LANE owns production, never whichever
+                # transport. A source filter cannot survive a failover in
+                # either position — see epigone.position_events.
+                authoritative=True,
                 traders=list(by_leader),
             )
         try:

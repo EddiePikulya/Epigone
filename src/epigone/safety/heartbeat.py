@@ -29,9 +29,16 @@ async def beat(pool: asyncpg.Pool, process: str, now: datetime) -> None:
     )
 
 
-async def last_beat(pool: asyncpg.Pool, process: str) -> datetime | None:
+async def last_beat(
+    pool: asyncpg.Pool | asyncpg.Connection, process: str
+) -> datetime | None:
     """When the process last beat, or None if it never ran (a legitimate
-    pre-deploy state, distinct from stale — callers decide what each means)."""
+    pre-deploy state, distinct from stale — callers decide what each means).
+
+    Takes a pool or a connection: the cutover's ownership decision (#158) reads
+    the websocket lane's beat inside the transaction that may transfer event
+    production on the strength of it, and a second connection there would be a
+    second point in time."""
     beaten: datetime | None = await pool.fetchval(
         "SELECT beaten_at FROM process_heartbeats WHERE process = $1", process
     )

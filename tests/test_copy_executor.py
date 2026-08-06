@@ -871,12 +871,14 @@ async def test_a_replayed_cycle_does_not_double_copy_the_same_event(
     assert len(h.placed()) == 1
 
 
-async def test_the_backlog_ignores_the_websocket_shadow_lanes_duplicate_rows(
+async def test_the_backlog_ignores_whichever_lane_is_only_shadowing(
     pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
 ) -> None:
-    """Decision 4's forced filter. The WS shadow lane dual-writes every
-    (trader, coin) it observes; an unfiltered executor would copy each trade
-    TWICE for as long as the shadow phase runs."""
+    """Decision 4's forced filter, as ADR-0009 restates it. Both lanes write
+    every (trader, coin) they observe — that is what keeps the two-producer
+    comparison alive — so an unfiltered executor would copy every trade TWICE,
+    forever. The filter is `authoritative`, not `source`: here the websocket
+    owns production and the poller is the one shadowing."""
     h = await build_harness(pool, clock, gateway)
     await copy_sub(pool, clock)
     gateway.set_positions(SUB, [])
@@ -884,11 +886,40 @@ async def test_the_backlog_ignores_the_websocket_shadow_lanes_duplicate_rows(
         [OrderFilled(oid=7, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
     )
 
-    await emit(pool, opened(), clock.now(), source="poll")
-    await emit(pool, opened(), clock.now(), source="ws")
+    await emit(pool, opened(), clock.now(), source="ws", authoritative=True)
+    await emit(pool, opened(), clock.now(), source="poll", authoritative=False)
     await h.executor.run_cycle()
 
     assert len(h.placed()) == 1
+
+
+async def test_the_backlog_follows_production_across_a_failover(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Why the filter cannot be on `source`. Pinned to one transport the
+    executor goes blind at exactly the moment the other takes over — the
+    websocket's entry here, the escalated poller's exit next — and a copy that
+    opens and never closes is the worst outcome this system can produce."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=7, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+    await emit(pool, opened(), clock.now(), source="ws", authoritative=True)
+    await h.executor.run_cycle()
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=8, total_size=Decimal("0.1"), avg_price=Decimal("2100"))]
+    )
+
+    # The websocket goes bad; the poller takes production back and produces the
+    # Leader's exit.
+    clock.advance(1)
+    await emit(pool, closed(), clock.now(), source="poll", authoritative=True)
+    await h.executor.run_cycle()
+
+    assert [orders[0].reduce_only for orders, *_rest in h.placed()] == [False, True]
 
 
 # --- the risk policy (issue #137) ---------------------------------------------

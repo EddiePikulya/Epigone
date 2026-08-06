@@ -31,6 +31,7 @@ import asyncpg
 from epigone.bot.alerts import MAX_DELIVERY_ATTEMPTS
 from epigone.clock import Clock
 from epigone.ingest.fine import count_due_traders
+from epigone.lane_authority import DISABLED_REASON, WS_OWNER
 from epigone.metrics.library import format_duration
 
 # Machine names, stable across a check's lifetime so the alerting state machine
@@ -46,6 +47,7 @@ AGENT_KEY = "agent_key"
 WATCHDOG = "watchdog"
 HALT = "halt"
 COPY_PAGER = "copy_pager"
+POSITION_LANE = "position_lane"
 
 WARNING = "warning"
 CRITICAL = "critical"
@@ -181,6 +183,12 @@ class HealthSnapshot:
     # page as well as the message.
     recent_copy_pagers: int | None = None
     latest_copy_pager: str | None = None
+    # Who owns position-event production, since when, and why (issue #158,
+    # migration 0037). None means no cutover has been recorded — the
+    # pre-cutover world, where the poller has always owned it.
+    position_lane_owner: str | None = None
+    position_lane_since: datetime | None = None
+    position_lane_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -251,7 +259,10 @@ async def gather_snapshot(
                 AS recent_copy_pagers,
             (SELECT max(risk_decision) FROM execution_audit
                 WHERE occurred_at >= $4 AND action = ANY($5::text[]))
-                AS latest_copy_pager
+                AS latest_copy_pager,
+            (SELECT owner FROM lane_authority) AS position_lane_owner,
+            (SELECT since FROM lane_authority) AS position_lane_since,
+            (SELECT reason FROM lane_authority) AS position_lane_reason
         """,
         _start_of_day(now),
         MAX_DELIVERY_ATTEMPTS,
@@ -287,6 +298,9 @@ async def gather_snapshot(
         active_halt_positions=row["active_halt_positions"],
         recent_copy_pagers=row["recent_copy_pagers"],
         latest_copy_pager=row["latest_copy_pager"],
+        position_lane_owner=row["position_lane_owner"],
+        position_lane_since=row["position_lane_since"],
+        position_lane_reason=row["position_lane_reason"],
     )
 
 
@@ -329,6 +343,7 @@ def evaluate_checks(
         _watchdog_check(snapshot, thresholds.watchdog_stale),
         _halt_check(snapshot),
         _copy_pager_check(snapshot),
+        _position_lane_check(snapshot),
     ]
 
 
@@ -642,6 +657,58 @@ def _copy_pager_check(snapshot: HealthSnapshot) -> CheckResult:
         detail=(
             f"Copy execution: {count} incident(s) in the last {hours}h needing a human — "
             f"latest: {snapshot.latest_copy_pager}"
+        ),
+    )
+
+
+def _position_lane_check(snapshot: HealthSnapshot) -> CheckResult:
+    """The websocket lane having LOST event production (issue #158, ADR-0009).
+
+    This is the only place a human hears about the failure this cutover was
+    designed around. A lane that is connected, delivering, and silently missing
+    changes trips no heartbeat and no liveness canary; what catches it is the
+    poller's continuous reconciliation, and what the reconciliation does is
+    take production back and write WHY onto the authority row. Reading that row
+    here turns "drift is an incident" from a docstring into a message.
+
+    A degraded lane is not itself an emergency — the warm standby means alerts
+    and copying carry on from the poller, which is the entire point — so this
+    is a WARNING rather than a page. What it must not do is pass silently: a
+    system quietly running on its fallback is a system with no fallback left.
+
+    Two states are deliberately NOT incidents: the operator having switched the
+    cutover off (a decision, not a failure), and no authority recorded at all
+    (pre-cutover, where the poller owning production is what has always been
+    true). Paging about states someone chose is how a monitor teaches people to
+    ignore it."""
+    owner = snapshot.position_lane_owner
+    reason = snapshot.position_lane_reason
+    if owner is None or owner == WS_OWNER:
+        return CheckResult(
+            POSITION_LANE,
+            "Position lane",
+            ok=True,
+            severity=WARNING,
+            detail="Websocket owns position events",
+        )
+    if reason == DISABLED_REASON:
+        return CheckResult(
+            POSITION_LANE,
+            "Position lane",
+            ok=True,
+            severity=WARNING,
+            detail="Websocket authority switched off by the operator",
+        )
+    return CheckResult(
+        POSITION_LANE,
+        "Position lane",
+        ok=False,
+        severity=WARNING,
+        detail=(
+            f"Position lane DEGRADED {_ago(_age(snapshot.now, snapshot.position_lane_since))} "
+            f"ago — the REST poller is producing events: {reason}. "
+            "Alerts and copying continue; ownership returns on its own once the "
+            "websocket is healthy again and has re-established state"
         ),
     )
 

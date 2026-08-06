@@ -75,6 +75,14 @@ class Settings:
     # How often the stream diffs tracked wallets' resting orders (issue #115).
     # Only the stream process reads it.
     order_poll_interval_seconds: int
+    # Whether the websocket lane may own position-event production (issue #158).
+    # The cutover's kill switch, and the one knob that undoes it without a
+    # deploy: false pins production to the REST poll pass at its escalated
+    # cadence — the pre-cutover world — and the websocket lane keeps shadowing.
+    # Only the stream process reads it; the ws lane reads the CONSEQUENCE (the
+    # lane_authority row) rather than the setting, so the two can never
+    # disagree about what the operator wrote.
+    ws_authoritative: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -90,6 +98,7 @@ class Settings:
             order_poll_interval_seconds=_parse_order_poll_interval_seconds(
                 os.environ.get("ORDER_POLL_INTERVAL_SECONDS")
             ),
+            ws_authoritative=parse_ws_authoritative(os.environ.get("WS_AUTHORITATIVE")),
         )
 
     def require_bot_token(self) -> str:
@@ -150,6 +159,33 @@ def parse_allow_mainnet(raw: str | None) -> bool:
             sorted(MAINNET_WORDS),
         )
     return False
+
+
+# What WS_AUTHORITATIVE must say to switch the cutover OFF. The mirror image of
+# MAINNET_WORDS and for the mirror reason: this setting defaults ON, so the
+# dangerous direction is a stray value silently disabling the cutover. Anything
+# unrecognised is a logged misconfiguration that leaves the cutover in place.
+DISABLING_WORDS = frozenset({"0", "false", "no", "off"})
+
+
+def parse_ws_authoritative(raw: str | None) -> bool:
+    """Whether the websocket lane may own position-event production (#158).
+
+    Unset means yes: the cutover is the shipped behaviour, not an opt-in, and a
+    deployment that forgets the variable must not silently run the pre-cutover
+    world — that would be a fast transport nobody listens to."""
+    if raw is None or not raw.strip():
+        return True
+    if raw.strip().lower() in DISABLING_WORDS:
+        return False
+    if raw.strip().lower() in MAINNET_WORDS:
+        return True
+    log.warning(
+        "WS_AUTHORITATIVE=%r is not one of %s — the websocket stays authoritative",
+        raw,
+        sorted(DISABLING_WORDS | MAINNET_WORDS),
+    )
+    return True
 
 
 def _parse_seed_interval_minutes(raw: str | None) -> int:
