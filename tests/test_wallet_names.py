@@ -20,7 +20,12 @@ from epigone.bot.first_data_notice import deliver_first_data_notices
 from epigone.bot.handlers import track_address
 from epigone.bot.names import MAX_NAME_LENGTH, sanitize_name, set_track_name
 from tests.support.clock import FakeClock
-from tests.support.telegram import RecordingSession, feed_callback, feed_text, follow_wallet
+from tests.support.telegram import (
+    RecordingSession,
+    feed_callback,
+    feed_text,
+    follow_wallet,
+)
 from tests.test_alert_delivery import queue_alert
 
 WHALE = "0xaf0fdd39e5d92499b0ed9f68693da99c0ec1e92e"
@@ -348,3 +353,22 @@ async def test_first_data_notice_uses_the_recipients_name(
     (message,) = session.sent_messages()
     assert f"silver guy ({WHALE_SHORT})" in message.text
     assert "full track-record data" in message.text
+
+
+async def test_a_name_that_looks_like_markup_is_never_read_as_markup(
+    dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The rename flow predates any parse mode and interpolates the name raw,
+    as most of the bot does. Scoping the #185 HTML to the operator's copy and
+    limits commands is what keeps that safe: this reply carries no parse mode,
+    so a name full of tags is text, not markup — and nothing here has to be
+    escaped for it to stay that way."""
+    await _track(dp, bot)
+    await feed_callback(dp, bot, f"rename:{WHALE}", user_id=111)
+
+    await feed_text(dp, bot, "<b>whale</b> & co", user_id=111)
+
+    assert await _name(pool, 111) == "<b>whale</b> & co"
+    confirmation = session.sent_messages()[-1]
+    assert session.parse_mode_of(confirmation) is None
+    assert "<b>whale</b> & co" in (confirmation.text or "")

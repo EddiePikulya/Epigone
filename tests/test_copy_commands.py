@@ -350,3 +350,30 @@ async def test_copies_lists_the_mappings_and_their_state(
     listing = session.sent_messages()[-1].text or ""
     assert "provisioning" in listing  # pending until the executor funds it
     assert LEADER in listing
+
+
+async def test_a_refusal_names_the_numbers_in_dollars_a_person_can_read(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession, pool: asyncpg.Pool
+) -> None:
+    """The refusal is the operator's only sight of what the caps are, and both
+    sides of it can arrive in exponent form: the ask is whatever they typed
+    (`1e5` is a Decimal), and the cap is read back from the risk_limits row,
+    where Postgres hands `100000` back as `Decimal('1.0E+5')`."""
+    await feed_text(admin_dp, bot, "/limits coin_stake 100000", user_id=ADMIN)
+
+    await feed_text(admin_dp, bot, f"/copy {LEADER} 1e5 1e5 mirror default", user_id=ADMIN)
+
+    refusal = session.rendered(session.sent_messages()[-1])
+    assert "DECLINED" in refusal
+    assert "E+" not in refusal
+    assert "$100000" in refusal
+
+
+async def test_the_copy_usage_reads_as_placeholders_not_as_entities(
+    admin_dp: Dispatcher, bot: Bot, session: RecordingSession
+) -> None:
+    await feed_text(admin_dp, bot, "/copy nonsense", user_id=ADMIN)
+
+    usage = session.rendered(session.sent_messages()[-1])
+    assert "/copy <leader> <allocation> <stake> <leverage> <mode>" in usage
+    assert "&lt;" not in usage

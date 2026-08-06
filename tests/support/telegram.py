@@ -4,11 +4,14 @@ Tests assert on outgoing Bot API calls (what the User would see) and feed
 incoming updates — no network, no real Telegram.
 """
 
+import re
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from html.parser import HTMLParser
 from typing import Any, cast
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import Default
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import (
     AnswerCallbackQuery,
@@ -33,6 +36,16 @@ class RecordingSession(BaseSession):
         super().__init__()
         self.requests: list[TelegramMethod[Any]] = []
         self._message_id = 0
+        # The bot's own default parse mode, as the #185 guard resolves each
+        # message's `Default('parse_mode')` sentinel against. Captured from the
+        # bot rather than assumed None, so a bot-wide default would be seen by
+        # the guard instead of hidden behind the sentinel.
+        self.default_parse_mode: str | None = None
+        # Every text a User has sent the bot through this session. The #185
+        # guard reads it to tell the bot AUTHORING markup (the bug) from the
+        # bot ECHOING a User's own angle brackets back in a plain reply (a
+        # wallet nickname, a criteria name — correct, and untouched by design).
+        self.user_texts: list[str] = []
 
     async def make_request(
         self,
@@ -41,6 +54,7 @@ class RecordingSession(BaseSession):
         timeout: int | None = None,
     ) -> TelegramType:
         self.requests.append(method)
+        self.default_parse_mode = bot.default.parse_mode
         if isinstance(method, SendMessage):
             self._message_id += 1
             message = Message(
@@ -85,6 +99,33 @@ class RecordingSession(BaseSession):
     def deleted_messages(self) -> list[DeleteMessage]:
         return [m for m in self.requests if isinstance(m, DeleteMessage)]
 
+    def parse_mode_of(self, method: SendMessage | EditMessageText) -> str | None:
+        """The parse mode this message actually goes out with. aiogram leaves a
+        `Default('parse_mode')` sentinel on any send that did not name one, so
+        the sentinel resolves against the bot's own default — which Epigone
+        deliberately leaves unset (epigone.bot.format)."""
+        mode = method.parse_mode
+        return self.default_parse_mode if isinstance(mode, Default) else mode
+
+    def rendered(self, method: SendMessage | EditMessageText) -> str:
+        """What the recipient actually READS — the message after Telegram has
+        applied its parse mode (issue #185). Plain text is itself; HTML has its
+        tags applied (and so removed from the text) and its entities resolved,
+        so `<b>floor_volume</b>` reads `floor_volume` and `&lt;knob&gt;` reads
+        `<knob>`.
+
+        Assertions about what the operator sees belong against this rather than
+        against the wire text: the whole #185 bug was a wire text that looked
+        right and read wrong."""
+        mode = self.parse_mode_of(method)
+        text = method.text or ""
+        if mode != HTML_PARSE_MODE:
+            return text
+        reader = _RenderedText()
+        reader.feed(text)
+        reader.close()
+        return "".join(reader.parts)
+
 
 def make_bot(session: RecordingSession) -> Bot:
     return Bot(token="42:TEST-TOKEN", session=session)
@@ -105,6 +146,8 @@ async def feed_text(
     """Deliver a private text message from a User to the bot, as Telegram would."""
     global _update_id
     _update_id += 1
+    if isinstance(bot.session, RecordingSession):
+        bot.session.user_texts.append(text)
     update = Update(
         update_id=_update_id,
         message=Message(
@@ -304,3 +347,122 @@ def assert_delete_buttons(session: "RecordingSession") -> None:
             "to is_delete_button_exempt if it is a genuine interactive-flow prompt:"
             f"\n  {joined}"
         )
+
+
+# --- the parse-mode / markup structural guard (issue #185) ---
+#
+# The bot sends most of its messages as PLAIN TEXT and always has: names,
+# criteria, addresses and coins are interpolated raw, so a parse mode applied
+# to one of those messages would start reinterpreting text nobody escaped. A
+# handler that wants markup therefore asks for it per message, and this guard
+# holds both halves of that bargain after every test:
+#
+#   no parse mode → the text must carry no markup the sender meant to render
+#                   (the #185 repro: /limits wrote <b> and &lt; into a message
+#                   sent plain, so Telegram showed the tags literally)
+#   parse_mode=HTML → the text must actually BE Telegram HTML: only tags
+#                   Telegram knows, balanced, and every other < and & escaped
+#                   (an unescaped one is a message Telegram rejects outright,
+#                   or worse, silently re-reads)
+#
+# Like the 🗑 guard above it runs from the `session` fixture, so every test that
+# drives the bot is also a rendering regression test.
+
+TELEGRAM_HTML_TAGS = frozenset(
+    {
+        "b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+        "span", "tg-spoiler", "a", "code", "pre", "blockquote",
+    }
+)
+HTML_PARSE_MODE = "HTML"
+# What "the sender meant to render" looks like in a plain-text message: an
+# opening/closing tag, or one of the four entities HTML escaping produces.
+_MARKUP_IN_PLAIN_TEXT = re.compile(r"</?[a-zA-Z][a-zA-Z0-9-]*\s*/?>|&(?:amp|lt|gt|quot);")
+
+
+class _HtmlAudit(HTMLParser):
+    """Reads a message the way Telegram's HTML parser would, collecting every
+    reason it would disagree with the sender."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.open_tags: list[str] = []
+        self.problems: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag not in TELEGRAM_HTML_TAGS:
+            self.problems.append(f"<{tag}> is not a tag Telegram renders")
+        self.open_tags.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self.open_tags or self.open_tags.pop() != tag:
+            self.problems.append(f"</{tag}> closes a tag that is not open")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.problems.append(f"<{tag}/> — Telegram HTML has no self-closing tags")
+
+    def handle_data(self, data: str) -> None:
+        for char in "<&":
+            if char in data:
+                self.problems.append(f"unescaped {char!r} in the text")
+
+    def handle_entityref(self, name: str) -> None:
+        if name not in {"amp", "lt", "gt", "quot"}:
+            self.problems.append(f"&{name}; is not an entity Telegram knows")
+
+    def finish(self) -> list[str]:
+        self.close()
+        return self.problems + [f"<{tag}> is never closed" for tag in self.open_tags]
+
+
+def html_problems(text: str) -> list[str]:
+    """Every way `text` is not valid Telegram HTML. Empty means it renders."""
+    audit = _HtmlAudit()
+    audit.feed(text)
+    return audit.finish()
+
+
+def assert_markup_matches_parse_mode(session: "RecordingSession") -> None:
+    """Fail if any message the session sent or edited disagrees with its own
+    parse mode (issue #185)."""
+    offenders: list[str] = []
+    for method in session.requests:
+        if not isinstance(method, SendMessage | EditMessageText):
+            continue
+        text = method.text or ""
+        mode = session.parse_mode_of(method)
+        preview = text.splitlines()[0] if text else "<no text>"
+        if mode is None:
+            authored = [
+                token
+                for token in _MARKUP_IN_PLAIN_TEXT.findall(text)
+                if not any(token in typed for typed in session.user_texts)
+            ]
+            if authored:
+                offenders.append(
+                    f"{preview!r}: sent as plain text but carries {authored[0]!r}"
+                )
+        elif mode == HTML_PARSE_MODE:
+            for problem in html_problems(text):
+                offenders.append(f"{preview!r}: parse_mode=HTML but {problem}")
+        else:
+            offenders.append(f"{preview!r}: parse_mode={mode!r} is not one this bot uses")
+    if offenders:
+        joined = "\n  ".join(offenders)
+        raise AssertionError(
+            "message(s) whose markup disagrees with their parse mode (issue #185) — "
+            "a plain message must not contain tags or entities, and an HTML one must "
+            "escape every dynamic value (epigone.bot.format.esc):"
+            f"\n  {joined}"
+        )
+
+
+class _RenderedText(HTMLParser):
+    """Telegram HTML as its reader sees it: tags applied, entities resolved."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)

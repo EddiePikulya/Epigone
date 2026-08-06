@@ -32,6 +32,15 @@ mapping is the intent, the exchange state is the executor's business.
 /uncopy stops event consumption and NEVER auto-flattens (decision 12,
 consistent with decision 10's never-auto-fix): it reports what is still open
 in the sub and leaves those positions to the operator.
+
+THIS MODULE'S REPLIES ARE HTML (issue #185), asked for per message rather than
+bot-wide: the usage lines want literal `<leader>` placeholders and the mapping
+listing wants a bold header, while the rest of the bot goes on sending
+unescaped plain text. Every dynamic value here goes through `esc` — a leader
+argument is only checked for `0x` and a length, so it reaches these replies as
+whatever the operator typed — and every dollar figure through `fixed_point`, so a
+`1e5` typed here or a round NUMERIC read back from the row never reaches chat
+as `1.0E+5`.
 """
 
 import logging
@@ -45,7 +54,9 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from epigone.bot.access import ADMIN_ONLY_TEXT, _is_admin
 from epigone.bot.delete import with_delete_button
+from epigone.bot.format import HTML, esc
 from epigone.clock import Clock
+from epigone.decimals import fixed_point
 from epigone.execute import limits as risk_limits
 from epigone.execute.episodes import live_episodes
 from epigone.execute.policy import FIXED_LEVERAGE, MIRROR_LEVERAGE, RiskPolicy
@@ -136,12 +147,16 @@ async def cmd_copy(
     copy_pending: dict[int, CopyRequest],
 ) -> None:
     if not _is_admin(message.from_user, admin_telegram_id):
-        await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
+        await message.answer(
+            ADMIN_ONLY_TEXT, parse_mode=HTML, reply_markup=with_delete_button()
+        )
         return
     assert message.from_user is not None
     parsed = _parse(command.args or "")
     if isinstance(parsed, str):
-        await message.answer(f"{parsed}\n\n{USAGE}", reply_markup=with_delete_button())
+        await message.answer(
+            f"{esc(parsed)}\n\n{USAGE}", parse_mode=HTML, reply_markup=with_delete_button()
+        )
         return
     # Judged BEFORE the confirm, not after the tap: an operator should be told
     # the caps refuse this before being asked to approve it. Against the LIVE
@@ -155,39 +170,46 @@ async def cmd_copy(
     )
     if not verdict.allowed:
         await message.answer(
-            f"🚫 {verdict.decision}", reply_markup=with_delete_button()
+            f"🚫 {esc(verdict.decision)}", parse_mode=HTML, reply_markup=with_delete_button()
         )
         return
     copy_pending[message.from_user.id] = parsed
-    await message.answer(_prompt(parsed), reply_markup=_kb(COPY_CONFIRM_PREFIX + "go"))
+    await message.answer(
+        _prompt(parsed), parse_mode=HTML, reply_markup=_kb(COPY_CONFIRM_PREFIX + "go")
+    )
 
 
 def _prompt(parsed: CopyRequest) -> str:
     lines = [
-        f"{CONFIRM_MARKER} {parsed.leader}?",
+        f"{CONFIRM_MARKER} {esc(parsed.leader)}?",
         "",
-        f"• A dedicated sub-account funded with ${parsed.allocation} — that "
+        f"• A dedicated sub-account funded with ${fixed_point(parsed.allocation)} — that "
         f"balance is the hard exposure cap for this leader, enforced by the "
         f"exchange, not by us.",
-        f"• Every copied open puts up ${parsed.stake} of YOUR margin, isolated "
-        f"per position — so ${parsed.stake} is the most any one copied "
+        f"• Every copied open puts up ${fixed_point(parsed.stake)} of YOUR margin, isolated "
+        f"per position — so ${fixed_point(parsed.stake)} is the most any one copied "
         f"position can lose. Their scales and trims are mirrored as "
         f"percentages.",
         f"• Leverage: {parsed.leverage_phrase}, capped by /limits max_leverage "
         f"and by the asset's own maximum. The position is stake × that "
         f"leverage — "
         + (
-            f"${parsed.stake} behind a 10x leader is a ${parsed.stake * 10} position."
+            f"${fixed_point(parsed.stake)} behind a 10x leader is a "
+            f"${fixed_point(parsed.stake * 10)} position."
             if parsed.fixed_leverage is None
-            else f"here, ${parsed.stake * parsed.fixed_leverage} per position."
+            else f"here, ${fixed_point(parsed.stake * parsed.fixed_leverage)} per position."
         ),
     ]
     if parsed.mode == BRACKET_MODE:
         legs = " / ".join(
             part
             for part in (
-                None if parsed.take_profit_pct is None else f"TP {parsed.take_profit_pct}%",
-                None if parsed.stop_loss_pct is None else f"SL {parsed.stop_loss_pct}%",
+                None
+                if parsed.take_profit_pct is None
+                else f"TP {fixed_point(parsed.take_profit_pct)}%",
+                None
+                if parsed.stop_loss_pct is None
+                else f"SL {fixed_point(parsed.stop_loss_pct)}%",
             )
             if part is not None
         )
@@ -224,7 +246,9 @@ async def on_copy_confirm(
     else:
         text = await _register(pool, clock, callback.from_user.id, parsed)
     if isinstance(callback.message, Message):
-        await callback.message.edit_text(text, reply_markup=with_delete_button())
+        await callback.message.edit_text(
+            text, parse_mode=HTML, reply_markup=with_delete_button()
+        )
     await callback.answer()
 
 
@@ -266,20 +290,21 @@ async def _register(
         if reenabled is None:  # pragma: no cover - the row exists by definition
             return "Could not re-enable that mapping — try /copy again."
         return (
-            f"♻️ Re-enabled copying of {leader} on its existing sub-account "
-            f"{reenabled.sub_address or '(not yet provisioned)'} — allocation "
-            f"${reenabled.allocation_usd}, stake ${reenabled.base_stake_usd} per open, "
-            f"{reenabled.leverage_summary}, mode {reenabled.copy_mode}."
+            f"♻️ Re-enabled copying of {esc(leader)} on its existing sub-account "
+            f"{esc(reenabled.sub_address or '(not yet provisioned)')} — allocation "
+            f"${fixed_point(reenabled.allocation_usd)}, stake "
+            f"${fixed_point(reenabled.base_stake_usd)} per open, "
+            f"{esc(reenabled.leverage_summary)}, mode {esc(reenabled.copy_mode)}."
         )
     except asyncpg.ForeignKeyViolationError:
         # copy_subs references traders: a wallet nobody has ever looked at has
         # no events to copy, so this is a typo, not a state to create.
         return (
-            f"Epigone has never seen {leader}. Paste the address to open its "
+            f"Epigone has never seen {esc(leader)}. Paste the address to open its "
             f"profile first — a wallet with no observed history has nothing to copy."
         )
     return (
-        f"⏳ Copying {leader}. The executor will create and fund the sub-account on "
+        f"⏳ Copying {esc(leader)}. The executor will create and fund the sub-account on "
         f"its next loop and report back here — nothing is copied until it does."
     )
 
@@ -291,26 +316,30 @@ async def cmd_uncopy(
     admin_telegram_id: int | None,
 ) -> None:
     if not _is_admin(message.from_user, admin_telegram_id):
-        await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
+        await message.answer(
+            ADMIN_ONLY_TEXT, parse_mode=HTML, reply_markup=with_delete_button()
+        )
         return
     assert message.from_user is not None
     leader = (command.args or "").strip().lower()
     if not leader:
         await message.answer(
-            "Usage: /uncopy &lt;leader&gt;", reply_markup=with_delete_button()
+            "Usage: /uncopy &lt;leader&gt;", parse_mode=HTML, reply_markup=with_delete_button()
         )
         return
     disabled = await disable_sub(
         pool, operator_id=message.from_user.id, leader_address=leader
     )
     if disabled is None:
-        await message.answer(NOT_COPYING_TEXT, reply_markup=with_delete_button())
+        await message.answer(
+            NOT_COPYING_TEXT, parse_mode=HTML, reply_markup=with_delete_button()
+        )
         return
     # Through the episodes module, which owns every query against that table —
     # a second copy of "what is still live" here would be one more place to
     # keep in step with the executor's own reading of it.
     open_episodes = len(await live_episodes(pool, disabled.id))
-    reply = f"⏹ Stopped copying {leader}. No further events will be mirrored."
+    reply = f"⏹ Stopped copying {esc(leader)}. No further events will be mirrored."
     if open_episodes:
         # Never auto-flatten (decision 12). Say what is still open and leave it
         # to the operator — the same never-auto-fix rule reconciliation obeys.
@@ -319,20 +348,24 @@ async def cmd_uncopy(
             f"They were NOT closed — disabling stops the copying, not the risk. "
             f"Close them from the master wallet if you want out."
         )
-    await message.answer(reply, reply_markup=with_delete_button())
+    await message.answer(reply, parse_mode=HTML, reply_markup=with_delete_button())
 
 
 async def cmd_copies(
     message: Message, pool: asyncpg.Pool, admin_telegram_id: int | None
 ) -> None:
     if not _is_admin(message.from_user, admin_telegram_id):
-        await message.answer(ADMIN_ONLY_TEXT, reply_markup=with_delete_button())
+        await message.answer(
+            ADMIN_ONLY_TEXT, parse_mode=HTML, reply_markup=with_delete_button()
+        )
         return
     assert message.from_user is not None
     mappings = await all_subs(pool, message.from_user.id)
     if not mappings:
         await message.answer(
-            "No copy mappings. /copy sets one up.", reply_markup=with_delete_button()
+            "No copy mappings. /copy sets one up.",
+            parse_mode=HTML,
+            reply_markup=with_delete_button(),
         )
         return
     lines = ["<b>Copy mappings</b>", ""]
@@ -341,11 +374,14 @@ async def cmd_copies(
         if sub.enabled and not sub.is_provisioned:
             state = "⏳ provisioning"
         lines.append(
-            f"{state} · {sub.leader_address}\n"
-            f"   ${sub.allocation_usd} allocation · ${sub.base_stake_usd} stake · "
-            f"{sub.leverage_summary} · {sub.copy_mode}"
+            f"{state} · {esc(sub.leader_address)}\n"
+            f"   ${fixed_point(sub.allocation_usd)} allocation · "
+            f"${fixed_point(sub.base_stake_usd)} stake · "
+            f"{esc(sub.leverage_summary)} · {esc(sub.copy_mode)}"
         )
-    await message.answer("\n".join(lines), reply_markup=with_delete_button())
+    await message.answer(
+        "\n".join(lines), parse_mode=HTML, reply_markup=with_delete_button()
+    )
 
 
 async def on_copy_cancel(
@@ -354,7 +390,9 @@ async def on_copy_cancel(
     if callback.from_user is not None:
         copy_pending.pop(callback.from_user.id, None)
     if isinstance(callback.message, Message):
-        await callback.message.edit_text(CANCELLED_TEXT, reply_markup=with_delete_button())
+        await callback.message.edit_text(
+            CANCELLED_TEXT, parse_mode=HTML, reply_markup=with_delete_button()
+        )
     await callback.answer()
 
 

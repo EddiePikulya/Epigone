@@ -53,6 +53,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
 
+from epigone.decimals import fixed_point
 from epigone.execute.limits import RiskLimits
 from epigone.gateway import MarketStats, Position
 
@@ -320,34 +321,36 @@ class RiskPolicy:
         if allocation_usd > MAX_ALLOCATION_USD:
             return RiskVerdict(
                 False,
-                f"DECLINED: allocation ${allocation_usd} exceeds the funding ceiling "
-                f"${MAX_ALLOCATION_USD} — a typo catcher on the one irreversible money "
-                f"move, not a risk limit (the stake caps are)",
+                f"DECLINED: allocation ${fixed_point(allocation_usd)} exceeds the funding "
+                f"ceiling ${fixed_point(MAX_ALLOCATION_USD)} — a typo catcher on the one "
+                f"irreversible money move, not a risk limit (the stake caps are)",
             )
         if base_stake_usd > allocation_usd:
             return RiskVerdict(
                 False,
-                f"DECLINED: base stake ${base_stake_usd} exceeds the allocation "
-                f"${allocation_usd} — the first open could not be margined",
+                f"DECLINED: base stake ${fixed_point(base_stake_usd)} exceeds the allocation "
+                f"${fixed_point(allocation_usd)} — the first open could not be margined",
             )
         if base_stake_usd > limits.max_coin_stake_usd:
             return RiskVerdict(
                 False,
-                f"DECLINED: base stake ${base_stake_usd} exceeds the per-coin stake cap "
-                f"${limits.max_coin_stake_usd} — every open would be clamped "
-                f"(/limits coin_stake raises it)",
+                f"DECLINED: base stake ${fixed_point(base_stake_usd)} exceeds the per-coin "
+                f"stake cap ${fixed_point(limits.max_coin_stake_usd)} — every open would "
+                f"be clamped (/limits coin_stake raises it)",
             )
         if base_stake_usd > limits.max_sub_stake_usd:
             return RiskVerdict(
                 False,
-                f"DECLINED: base stake ${base_stake_usd} exceeds the per-sub aggregate "
-                f"stake cap ${limits.max_sub_stake_usd} — every open would be clamped "
-                f"(/limits sub_stake raises it)",
+                f"DECLINED: base stake ${fixed_point(base_stake_usd)} exceeds the per-sub "
+                f"aggregate stake cap ${fixed_point(limits.max_sub_stake_usd)} — every "
+                f"open would be clamped (/limits sub_stake raises it)",
             )
         return RiskVerdict(
             True,
-            f"allocation ${allocation_usd} / base stake ${base_stake_usd} within the caps "
-            f"(${limits.max_coin_stake_usd} per coin, ${limits.max_sub_stake_usd} per sub)",
+            f"allocation ${fixed_point(allocation_usd)} / base stake "
+            f"${fixed_point(base_stake_usd)} within the caps "
+            f"(${fixed_point(limits.max_coin_stake_usd)} per coin, "
+            f"${fixed_point(limits.max_sub_stake_usd)} per sub)",
         )
 
     def judge_coin(
@@ -387,8 +390,9 @@ class RiskPolicy:
             return RiskVerdict(
                 False,
                 f"DECLINED: {coin} is below the Liquidity Floor — 24h volume "
-                f"${_round(volume)} (floor ${limits.floor_day_notional_usd}), open interest "
-                f"${_round(oi)} (floor ${limits.floor_open_interest_usd}). A thin book is "
+                f"${_round(volume)} (floor ${fixed_point(limits.floor_day_notional_usd)}), open "
+                f"interest ${_round(oi)} (floor "
+                f"${fixed_point(limits.floor_open_interest_usd)}). A thin book is "
                 f"where a copied trade's counterparty can be the leader — did not enter",
             )
         return RiskVerdict(
@@ -428,20 +432,23 @@ class RiskPolicy:
             return RiskVerdict(
                 False,
                 f"DECLINED: no stake headroom left for {coin} — ${_round(coin_stake_used)} of "
-                f"${limits.max_coin_stake_usd} on this coin and ${_round(sub_stake_used)} of "
-                f"${limits.max_sub_stake_usd} in this sub are already committed — did not "
-                f"enter, and nothing held was touched",
+                f"${fixed_point(limits.max_coin_stake_usd)} on this coin and "
+                f"${_round(sub_stake_used)} of "
+                f"${fixed_point(limits.max_sub_stake_usd)} in this sub are already "
+                f"committed — did not enter, and nothing held was touched",
             )
         notional = open_position_notional(granted, Decimal(leverage.value))
         if notional < MIN_ORDER_NOTIONAL:
             return RiskVerdict(
                 False,
                 f"DECLINED: ${_round(granted)} of stake at {leverage.value}x is a "
-                f"${_round(notional)} position, under the exchange's ${MIN_ORDER_NOTIONAL} "
+                f"${_round(notional)} position, under the exchange's "
+                f"${fixed_point(MIN_ORDER_NOTIONAL)} "
                 f"minimum order value"
                 + (
-                    f" — the ask was ${requested_stake_usd}, clamped to the stake headroom "
-                    f"left ({_caps(coin_stake_used, sub_stake_used, limits)}) — did not enter"
+                    f" — the ask was ${fixed_point(requested_stake_usd)}, clamped to the "
+                    f"stake headroom left "
+                    f"({_caps(coin_stake_used, sub_stake_used, limits)}) — did not enter"
                     if clamped
                     else " — did not enter"
                 ),
@@ -449,8 +456,8 @@ class RiskPolicy:
         if clamped:
             return RiskVerdict(
                 True,
-                f"allowed-clamped: {coin} asked ${requested_stake_usd} of stake, given "
-                f"${_round(granted)} — the headroom left under the caps "
+                f"allowed-clamped: {coin} asked ${fixed_point(requested_stake_usd)} of "
+                f"stake, given ${_round(granted)} — the headroom left under the caps "
                 f"({_caps(coin_stake_used, sub_stake_used, limits)}). {leverage.reason}; "
                 f"position ${_round(notional)}",
                 stake_usd=granted,
@@ -458,8 +465,8 @@ class RiskPolicy:
             )
         return RiskVerdict(
             True,
-            f"{coin}: ${granted} of stake at {leverage.value}x — a ${_round(notional)} "
-            f"position, isolated. {leverage.reason}. Within the caps "
+            f"{coin}: ${fixed_point(granted)} of stake at {leverage.value}x — a "
+            f"${_round(notional)} position, isolated. {leverage.reason}. Within the caps "
             f"({_caps(coin_stake_used, sub_stake_used, limits)})",
             stake_usd=granted,
         )
@@ -475,14 +482,17 @@ def _caps(coin_used: Decimal, sub_used: Decimal, limits: RiskLimits) -> str:
     """The two caps as the operator reads them in a verdict: what is already
     committed against what is allowed."""
     return (
-        f"coin ${_round(coin_used)}/${limits.max_coin_stake_usd}, "
-        f"sub ${_round(sub_used)}/${limits.max_sub_stake_usd}"
+        f"coin ${_round(coin_used)}/${fixed_point(limits.max_coin_stake_usd)}, "
+        f"sub ${_round(sub_used)}/${fixed_point(limits.max_sub_stake_usd)}"
     )
 
 
 def _round(value: Decimal) -> str:
-    """A dollar figure as prose. Two places: these strings are read by a human
-    in a Telegram message, and `0.010000000000001` is noise, not precision."""
+    """A COMPUTED dollar figure as prose. Two places: these strings are read by
+    a human in a Telegram message, and `0.010000000000001` is noise, not
+    precision. A configured figure — a cap, a floor, the operator's own ask —
+    goes through `fixed_point` instead, which drops the exponent form Postgres
+    hands back (issue #185) without inventing cents the operator never set."""
     return f"{value:.2f}"
 
 
