@@ -71,7 +71,14 @@ from epigone.clock import Clock
 from epigone.execute import episodes as ep
 from epigone.execute import limits as risk_limits
 from epigone.execute import subs as subs_store
-from epigone.execute.notices import ACTION, PAGER, PROVISIONING, SKIP, notify
+from epigone.execute.notices import (
+    ACTION,
+    PAGER,
+    PROVISIONING,
+    SKIP,
+    SkipDigest,
+    notify,
+)
 from epigone.execute.policy import (
     BRACKET_VERIFY_INTERVAL,
     ENTRY_STALENESS_GUARD,
@@ -198,11 +205,39 @@ class _Ask:
     size_coin: Decimal
 
 
+# The coarse WHY behind a skip: the bucket a cycle's summary counts when the
+# per-event sentences are too many to read (issue #190). Deliberately blunter
+# than the sentences — a summary answers "what happened to most of them", and
+# the exact coin, age and figure are one click away on the trail.
+#
+# The WORDS are not free choices: decision 11's list and the copy-execution
+# runbook already name these reasons to the operator, and a summary that
+# renamed them would be a second vocabulary for the same six things. Named
+# REASON_* rather than SKIP_*, because `SKIP` in this module is already the
+# notice KIND — one prefix for two concepts is how they get confused.
+REASON_STALE = "stale entry"
+REASON_NO_LOCAL_POSITION = "no local position"
+REASON_COIN_OCCUPIED = "coin occupied"
+REASON_UNORDERABLE = "coin not orderable"
+REASON_NOT_MIRRORABLE = "not mirrorable"
+REASON_RISK_DECLINED = "risk-declined"
+REASON_LIQUIDITY_FLOOR = "below the liquidity floor"
+REASON_LIVENESS_FLOOR = "leader below the liveness floor"
+REASON_BELOW_MINIMUM = "under the exchange minimum"
+REASON_UNREADABLE = "unreadable"
+
+
 @dataclass(frozen=True)
 class _Skip:
     """A decision not to act, carrying the sentence the operator reads and the
-    reason the trail records. Every skip still CLAIMS the event."""
+    reason the trail records. Every skip still CLAIMS the event.
 
+    `category` is the same decision said coarsely, and it exists for one
+    reader: the cycle summary a backlog drain sends instead of the sentences
+    (issue #190). It never replaces `reason` — the trail records the sentence,
+    verbatim, one row per event, in both regimes."""
+
+    category: str
     reason: str
     detail: dict[str, object]
 
@@ -267,6 +302,11 @@ class CopyExecutor:
         # cycle would bury every other notice within minutes. Re-paging is the
         # #52 monitor's job, on its own throttled cadence.
         self._flagged: set[int] = set()
+        # This cycle's per-event skips, held until the drain knows how many
+        # there were (issue #190). Owned by `_drain_backlog`, which fills it
+        # and flushes it inside one cycle — nothing survives across cycles,
+        # because "this many at once" is the only question it answers.
+        self._skips = SkipDigest()
 
     # --- the cycle ------------------------------------------------------------
 
@@ -1168,18 +1208,26 @@ class CopyExecutor:
                 source=self._source,
                 traders=list(by_leader),
             )
-        for event in events:
-            sub = by_leader[event.trader_address]
-            state = states.get(sub.id)
-            if state is None:
-                continue  # this sub was unreadable this cycle; try again next
-            try:
-                await self._handle(event, sub, state)
-            except ExecutionError:
-                # Already on the trail via the audited gateway. The event is
-                # claimed, so it will not be retried: a missed copy, which is
-                # the direction ADR-0006 chose.
-                log.exception("copy executor: event %d failed on the wire", event.id)
+        try:
+            for event in events:
+                sub = by_leader[event.trader_address]
+                state = states.get(sub.id)
+                if state is None:
+                    continue  # this sub was unreadable this cycle; try again next
+                try:
+                    await self._handle(event, sub, state)
+                except ExecutionError:
+                    # Already on the trail via the audited gateway. The event is
+                    # claimed, so it will not be retried: a missed copy, which is
+                    # the direction ADR-0006 chose.
+                    log.exception("copy executor: event %d failed on the wire", event.id)
+        finally:
+            # In a `finally`, because a cycle that dies partway through still
+            # claimed and audited everything it got to, and the operator should
+            # hear about those rather than about nothing.
+            await self._skips.flush(
+                self._pool, operator_id=self._operator_id, now=self._clock.now()
+            )
 
     async def _handle(self, event: ClaimableEvent, sub: CopySub, state: SubState) -> None:
         kind = event.event.kind
@@ -1237,7 +1285,7 @@ class CopyExecutor:
             await self._claim_and_skip(
                 event,
                 sub,
-                _Skip(f"not mirrorable: {exc}", {"coin": coin, "leg": leg}),
+                _Skip(REASON_NOT_MIRRORABLE, f"not mirrorable: {exc}", {"coin": coin, "leg": leg}),
                 now,
                 claim=claim,
             )
@@ -1257,7 +1305,11 @@ class CopyExecutor:
         )
         if not verdict.allowed:
             await self._claim_and_skip(
-                event, sub, _Skip(verdict.decision, {"coin": coin, "leg": leg}), now, claim=claim
+                event,
+                sub,
+                _Skip(REASON_RISK_DECLINED, verdict.decision, {"coin": coin, "leg": leg}),
+                now,
+                claim=claim,
             )
             return
         assert verdict.stake_usd is not None  # an allowed entry always grants a stake
@@ -1276,6 +1328,7 @@ class CopyExecutor:
                 event,
                 sub,
                 _Skip(
+                    REASON_BELOW_MINIMUM,
                     f"did not enter: clamped below this asset's precision — {exc}",
                     {"coin": coin, "leg": leg},
                 ),
@@ -1353,6 +1406,7 @@ class CopyExecutor:
         if notional >= MIN_ORDER_NOTIONAL:
             return None
         return _Skip(
+            REASON_BELOW_MINIMUM,
             f"did not enter: {size} {coin} rounds to about ${notional:.2f} at this asset's "
             f"precision, under the exchange's ${MIN_ORDER_NOTIONAL} minimum order value — "
             f"not sent, since it would only be rejected",
@@ -1490,12 +1544,14 @@ class CopyExecutor:
             # firing a burst of stale opens on restart is the failure this
             # exists to prevent.
             return _Skip(
+                REASON_STALE,
                 f"stale entry: observed {int(age.total_seconds())}s ago, past the "
                 f"{int(ENTRY_STALENESS_GUARD.total_seconds())}s guard",
                 {"coin": coin, "leg": leg, "age_seconds": int(age.total_seconds())},
             )
         if await self._spec(coin) is None:
             return _Skip(
+                REASON_UNORDERABLE,
                 f"{coin} has no asset id in the universe — cannot be ordered",
                 {"coin": coin, "leg": leg},
             )
@@ -1505,12 +1561,14 @@ class CopyExecutor:
                 return await self._no_local_position(sub, coin, leg)
             if state.positions.get(coin) is None or state.positions[coin].size_coin is None:
                 return _Skip(
+                    REASON_NO_LOCAL_POSITION,
                     f"no live {coin} position to scale — the exchange shows none",
                     {"coin": coin, "leg": leg},
                 )
         else:
             if episode is not None:
                 return _Skip(
+                    REASON_COIN_OCCUPIED,
                     f"already in a {coin} copy episode — a fresh open on a coin we "
                     f"already hold would double the position",
                     {"coin": coin, "leg": leg},
@@ -1519,6 +1577,7 @@ class CopyExecutor:
                 # Decision 10's table: a position with no episode is the
                 # operator's own, and we never touch it.
                 return _Skip(
+                    REASON_COIN_OCCUPIED,
                     f"coin occupied: {coin} is held in this sub with no copy episode — "
                     f"the operator's own position, left alone",
                     {"coin": coin, "leg": leg},
@@ -1569,13 +1628,15 @@ class CopyExecutor:
         FLAT."""
         stats = await self._market_stats()
         if stats is None:
-            return _Skip(_unreadable(f"market liquidity unreadable — {coin}", leg), {
-                "coin": coin, "leg": leg, "retry": True
-            })
+            return _Skip(
+                REASON_UNREADABLE,
+                _unreadable(f"market liquidity unreadable — {coin}", leg),
+                {"coin": coin, "leg": leg, "retry": True},
+            )
         verdict = self._policy.judge_coin(coin=coin, stats=stats.get(coin), limits=self._limits)
         if verdict.allowed:
             return None
-        return _Skip(verdict.decision, {"coin": coin, "leg": leg})
+        return _Skip(REASON_LIQUIDITY_FLOOR, verdict.decision, {"coin": coin, "leg": leg})
 
     async def _market_stats(self) -> dict[str, MarketStats] | None:
         """This cycle's market health for every covered venue, read at most
@@ -1625,6 +1686,7 @@ class CopyExecutor:
                 exc_info=True,
             )
             return _Skip(
+                REASON_UNREADABLE,
                 # Same leg-aware wording as the floor's read failure, and for
                 # the same reason: a flip's open leg is already claimed, so
                 # "this cycle" would promise a retry that cannot happen.
@@ -1633,6 +1695,7 @@ class CopyExecutor:
             )
         if state.account_value < LEADER_EQUITY_FLOOR:
             return _Skip(
+                REASON_LIVENESS_FLOOR,
                 f"leader below the liveness floor: ${state.account_value} < "
                 f"${LEADER_EQUITY_FLOOR} live equity — the signal is no longer the "
                 f"trader whose stats earned the copy",
@@ -1776,7 +1839,11 @@ class CopyExecutor:
                 return await self._claim_and_skip(
                     event,
                     sub,
-                    _Skip(f"{coin} has no asset id — cannot be closed", {"coin": coin}),
+                    _Skip(
+                        REASON_UNORDERABLE,
+                        f"{coin} has no asset id — cannot be closed",
+                        {"coin": coin},
+                    ),
                     now,
                 )
             return True
@@ -1790,7 +1857,14 @@ class CopyExecutor:
         except UnpriceableError as exc:
             if claim:
                 return await self._claim_and_skip(
-                    event, sub, _Skip(f"not mirrorable: {exc}", {"coin": coin, "leg": leg}), now
+                    event,
+                    sub,
+                    _Skip(
+                        REASON_NOT_MIRRORABLE,
+                        f"not mirrorable: {exc}",
+                        {"coin": coin, "leg": leg},
+                    ),
+                    now,
                 )
             return True
         sliver = await self._sub_minimum_skip(target, position, coin, leg)
@@ -1847,6 +1921,7 @@ class CopyExecutor:
         if notional >= MIN_ORDER_NOTIONAL:
             return None
         return _Skip(
+            REASON_BELOW_MINIMUM,
             f"exit sliver: {target} {coin} is about ${notional:.2f}, under the "
             f"exchange's ${MIN_ORDER_NOTIONAL} minimum order value — not sent, and "
             f"the residue stays until a larger move or reconciliation resolves it",
@@ -2074,16 +2149,21 @@ class CopyExecutor:
                 master_address=self._master,
                 conn=conn,
             )
-            await notify(
-                conn,
-                operator_id=self._operator_id,
-                kind=SKIP,
-                body=(
-                    f"⏭ Skipped {event.event.kind} on {event.event.coin} "
-                    f"({_short(sub.leader_address)}) — {skip.reason}"
-                ),
-                now=now,
-            )
+        # The AUDIT ROW lands with the claim, in the transaction above, and it
+        # is one row per event with the full sentence — that is the record, and
+        # issue #190 does not touch it. The CHAT LINE is held instead: only the
+        # end of the cycle knows whether this was one of three skips or one of
+        # thirty, and that is the whole question the digest answers.
+        leader = _short(sub.leader_address)
+        self._skips.add(
+            leader=leader,
+            category=skip.category,
+            body=(
+                f"⏭ Skipped {event.event.kind} on {event.event.coin} "
+                f"({leader}) — {skip.reason}"
+            ),
+            now=now,
+        )
         return True
 
     async def _finish(
@@ -2235,6 +2315,7 @@ class CopyExecutor:
                     "closes and re-opens)"
                 )
         return _Skip(
+            REASON_NO_LOCAL_POSITION,
             reason,
             {
                 "coin": coin,
