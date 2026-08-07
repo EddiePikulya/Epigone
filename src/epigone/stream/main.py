@@ -69,11 +69,13 @@ log = logging.getLogger(__name__)
 @dataclass
 class StandbyState:
     """What the position loop remembers between ticks: when it last actually
-    polled. Deliberately not a timer — the loop re-decides from the clock every
-    tick, so a restart, a long pass or a cadence change resolves on the next
-    tick rather than leaving a schedule behind."""
+    polled, and who owned production when it did. Deliberately not a timer —
+    the loop re-decides from the clock every tick, so a restart, a long pass or
+    a cadence change resolves on the next tick rather than leaving a schedule
+    behind."""
 
     last_pass_at: datetime | None = None
+    owner: str | None = None
 
 
 async def run_position_cycle(
@@ -98,6 +100,16 @@ async def run_position_cycle(
         if authority.owner == POLL_OWNER
         else STANDBY_POLL_INTERVAL_SECONDS
     )
+    if authority.owner != state.owner:
+        # A transfer is exactly the moment a change can fall between two
+        # owners: the incoming lane was not authoritative when it observed one,
+        # and the outgoing lane had already stopped producing. So the tick that
+        # moves ownership always polls, whatever the cadence says — a straddler
+        # is then found within a tick rather than a standby interval, and the
+        # reconciliation has the freshest possible view of both lanes at the
+        # instant the handover happened.
+        state.last_pass_at = None
+        state.owner = authority.owner
     now = clock.now()
     if (
         state.last_pass_at is not None

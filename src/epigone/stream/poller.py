@@ -543,16 +543,32 @@ async def _reconcile(
     The lookback reaches `RECONCILE_GRACE_SECONDS` before the previous poll,
     because the websocket can also see a change slightly BEFORE the poll that
     first reveals it (it led the poller by a median 4.2s)."""
-    covered = await _websocket_produced(conn, address, since - RECONCILE_GRACE)
-    unvouched = [event for event in events if not _vouched_for(event, covered)]
+    ws_rows = await _websocket_rows(conn, address, since - RECONCILE_GRACE)
+    unvouched = [event for event in events if not _vouched_for(event, ws_rows.produced)]
     held: set[str] = set()
     drifted = False
     if unvouched and not await owns(conn, POLL_SOURCE):
-        # A coin the websocket's own memory has caught up on is not a miss and
-        # never will be — the benign class drops out here, before any doubt.
         owed = await _still_owed(conn, address, positions, now)
-        unvouched = [event for event in unvouched if event.coin in owed]
-        doubted = {event.coin for event in unvouched}
+        # Two ways a change can still be somebody's to produce, and the anchor
+        # alone only sees the first:
+        #
+        #   MISSED   — the lane's own memory still owes an event on this coin;
+        #   STRANDED — its memory does NOT, but it wrote an unconsumed row
+        #              moving this way inside the window. That row is the
+        #              fingerprint of a change observed while the OTHER lane
+        #              owned production: the anchor advanced past it and the
+        #              event went nowhere, so it will never be produced.
+        #
+        # Anything else is the benign class: no row at all, because the lane's
+        # rules made the change a non-event, and its memory agrees with reality.
+        missed = {event.coin for event in unvouched if event.coin in owed}
+        stranded = {
+            event.coin
+            for event in unvouched
+            if event.coin not in owed and _vouched_for(event, ws_rows.observed)
+        }
+        unvouched = [event for event in unvouched if event.coin in missed | stranded]
+        doubted = missed | stranded
         confirmed = doubted & pending
         if doubted and not confirmed:
             # Every doubt is new. Withhold the verdict AND the memory advance,
@@ -567,24 +583,22 @@ async def _reconcile(
             held, unvouched = doubted, []
         elif confirmed:
             drifted = True
-            log.error(
-                "reconciliation drift: %s %s never produced by the websocket lane; "
-                "escalating and taking production back",
-                address,
-                ", ".join(sorted(confirmed)),
-            )
+            reason = _drift_reason(address, missed & confirmed, stranded & confirmed)
+            log.error("%s; escalating and taking production back", reason)
             # Named by the coins that actually served their look of patience: a
             # doubt raised for the first time this pass is not evidence, and
             # putting it in the reason would blame it for the escalation.
-            await take_ownership(conn, POLL_OWNER, _drift_reason(address, confirmed), now)
+            await take_ownership(conn, POLL_OWNER, reason, now)
             # Re-read under the exclusive lock. A websocket write that committed
             # between the query above and the transfer is now visible, and no
             # further one can commit until this transaction ends — so this
             # answer is final rather than merely recent, which is what makes
             # "two writers never produce for one (Trader, coin)" a property of
             # the database.
-            covered = await _websocket_produced(conn, address, since - RECONCILE_GRACE)
-            unvouched = [event for event in events if not _vouched_for(event, covered)]
+            ws_rows = await _websocket_rows(conn, address, since - RECONCILE_GRACE)
+            unvouched = [
+                event for event in events if not _vouched_for(event, ws_rows.produced)
+            ]
     published: list[PositionEvent] = []
     if unvouched and await publish(conn, address, unvouched, now, source=POLL_SOURCE):
         published = unvouched
@@ -674,39 +688,69 @@ async def _remember_doubt(conn: asyncpg.Connection, address: str, coins: set[str
     )
 
 
-async def _websocket_produced(
+@dataclass(frozen=True)
+class _WsRows:
+    """What the websocket lane wrote about a Trader inside the reconciliation
+    window, as (coin, direction) pairs.
+
+    `produced` is what it wrote AUTHORITATIVELY — the rows consumers acted on,
+    and the only ones that vouch for a change being told. `observed` is every
+    row it wrote, authoritative or not.
+
+    The difference between them is the whole point. A lane that is not the
+    owner still writes everything it sees, unconsumed; those rows must never
+    vouch for a change being produced (that would let the silent lane mute the
+    live one) and must equally never be mistaken for silence — a change the
+    lane observed while the other lane owned production is a change nobody
+    produced and nobody now will."""
+
+    produced: set[tuple[str, str]]
+    observed: set[tuple[str, str]]
+
+
+async def _websocket_rows(
     conn: asyncpg.Connection, address: str, since: datetime
-) -> set[tuple[str, str]]:
-    """The (coin, direction) pairs the websocket lane produced an AUTHORITATIVE
-    event for since `since`. Shadow rows are deliberately excluded: while the
-    poller owns production the websocket lane keeps writing everything it sees,
-    and reading those as "already produced" would let the silent lane mute the
-    live one."""
+) -> _WsRows:
+    """The websocket lane's rows for this Trader since `since`, split by
+    whether anyone consumed them."""
     rows = await conn.fetch(
         """
-        SELECT DISTINCT kind, coin FROM position_events
-        WHERE trader_address = $1 AND source = $2 AND authoritative
-          AND observed_at >= $3
+        SELECT DISTINCT kind, coin, authoritative FROM position_events
+        WHERE trader_address = $1 AND source = $2 AND observed_at >= $3
         """,
         address,
         WS_SOURCE,
         since,
     )
-    return {
-        (row["coin"], direction)
+    keys = [
+        ((row["coin"], direction), row["authoritative"])
         for row in rows
         for direction in _DIRECTIONS[row["kind"]]
-    }
-
-
-def _drift_reason(address: str, coins: set[str]) -> str:
-    """The sentence an operator reads in the health alert. It names the wallet
-    and the coins, because "the websocket missed something" is not actionable
-    and "0x037e… CASHCAT" is."""
-    return (
-        f"reconciliation drift: {address} {', '.join(sorted(coins))} "
-        "never arrived on the websocket"
+    ]
+    return _WsRows(
+        produced={key for key, authoritative in keys if authoritative},
+        observed={key for key, _authoritative in keys},
     )
+
+
+def _drift_reason(address: str, missed: set[str], stranded: set[str]) -> str:
+    """The sentence an operator reads in the health alert.
+
+    It names the wallet and the coins, because "the websocket missed something"
+    is not actionable and "0x037e… CASHCAT" is — and it says which of the two
+    diagnoses this is, because they send a human to different places. A lane
+    that dropped a change is a lane to investigate; a change that fell between
+    two owners is a transfer doing what transfers do, and reading websocket
+    logs for it wastes the incident."""
+    parts = []
+    if missed:
+        parts.append(f"{', '.join(sorted(missed))} never arrived on the websocket")
+    if stranded:
+        parts.append(
+            f"{', '.join(sorted(stranded))} was seen by the websocket while the poller "
+            "owned production, so an ownership transfer left it produced by neither lane"
+        )
+    return f"reconciliation drift: {address} " + "; ".join(parts)
 
 
 async def _queue_withdrawal_alerts(

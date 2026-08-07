@@ -785,3 +785,115 @@ async def test_one_held_doubt_does_not_escalate_a_different_coin(
     assert "BTC" in authority.reason and "ETH" not in authority.reason
     assert await pending_coins(pool, TRADER) == []
     assert sorted(row["coin"] for row in await alerts(pool)) == ["BTC", "ETH"]
+
+
+async def websocket_shadow_wrote(
+    pool: asyncpg.Pool, clock: FakeClock, address: str, event: PositionEvent
+) -> None:
+    """The websocket lane having OBSERVED a change while the poller owned
+    production: the row lands unconsumed (`authoritative = FALSE`) and the
+    lane's anchor advances past it all the same."""
+    async with pool.acquire() as conn, conn.transaction():
+        await record_events(
+            conn, address, [event], clock.now(), source=WS_SOURCE, authoritative=False
+        )
+
+
+async def test_a_change_stranded_by_an_ownership_transfer_is_produced_not_swallowed(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The hole an anchor-only discriminator opens, and the reason the events
+    table has to be consulted too.
+
+    A Leader closes in the seconds before a handback. The websocket sees it,
+    but it does not own production yet, so the row lands unconsumed — and its
+    anchor advances anyway. The poller's last poll-owned pass was moments
+    earlier, so it never diffed the close; by the time it does, the websocket
+    owns production and its memory is flat.
+
+    "Anchor current" would vouch that away, and nobody would ever produce the
+    close: no event, no alert, no incident, and a copy position that never
+    closes. An unconsumed row moving the same direction is exactly the evidence
+    that distinguishes this from the benign class — there, the lane's rules
+    made the change a non-event and there is no row at all."""
+    clock.advance(30)
+    gateway.set_positions(TRADER, [])
+    await websocket_shadow_wrote(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+    await websocket_watching(pool, clock, TRADER, [])  # the lane's anchor moved on
+
+    clock.advance(30)
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "BTC" in authority.reason
+    assert [row["kind"] for row in await alerts(pool)] == ["close"]
+    authoritative = [row for row in await events(pool) if row["authoritative"]]
+    assert [(row["source"], row["kind"]) for row in authoritative] == [(POLL_SOURCE, "close")]
+
+
+async def test_an_incident_says_whether_the_lane_missed_it_or_ownership_did(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """Two very different diagnoses reach the operator through one alert, and
+    the sentence has to tell them apart: a lane that dropped a change is a lane
+    to investigate, while a change that fell between two owners is the transfer
+    doing what transfers do. Sending someone to read websocket logs for the
+    second one wastes the incident."""
+    clock.advance(30)
+    gateway.set_positions(TRADER, [])
+    await websocket_shadow_wrote(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+    await websocket_watching(pool, clock, TRADER, [])
+
+    clock.advance(30)
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    assert "ownership" in (await read_authority(pool)).reason
+
+
+async def test_a_lane_that_still_owes_the_change_is_named_as_the_miss_it_is(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """...and the genuine miss keeps its own words. The lane's anchor is where
+    the position used to be and no row exists at all: it owes an event by its
+    own account and never delivered one."""
+    clock.advance(60)
+    await websocket_watching(pool, clock, TRADER, [position()])
+    gateway.set_positions(TRADER, [])
+
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    reason = (await read_authority(pool)).reason
+    assert "never arrived on the websocket" in reason and "ownership" not in reason
+
+
+async def test_every_ownership_transfer_is_followed_by_a_pass_at_once(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A transfer is exactly the moment a change can fall between two owners:
+    the incoming lane was not authoritative when it saw one, the outgoing lane
+    had stopped diffing. So the tick that moves ownership always polls, however
+    recently the last pass ran — the straddler is then found within a tick
+    instead of a standby interval."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    state = StandbyState()
+    await run_position_cycle(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state)
+
+    await healthy_websocket(pool, clock)  # ownership moves to the websocket
+    clock.advance(1)  # nothing like a standby interval has passed
+    result = await run_position_cycle(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state
+    )
+
+    assert result is not None and result.polled == 1

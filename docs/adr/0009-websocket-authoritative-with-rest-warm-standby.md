@@ -126,20 +126,38 @@ comment requires this be classified as expected, not as a lane error, and a
 version that escalated it would have thrashed ownership daily and taught the
 operator to ignore the incident channel — this design's own stated anti-goal.
 
-**The discriminator is the other lane's own memory.** Before doubting anything,
-the poller diffs what it just read against `ws_position_snapshots` — the
-websocket lane's anchor, which IS its claim about what it has seen — using the
-same `position_diff` both lanes share. Coins where that diff yields no event are
-coins the lane owes nothing on, whatever the poller's longer-baseline diff
-decided: recorded as shadow rows, produced by nobody, which is what the
-websocket's rules already decided. Coins where it yields an event are coins the
-lane is behind reality on *by its own account*, and those are the only ones that
-can become drift. A Trader the lane has never baselined vouches for nothing —
-an empty memory agrees with a flat wallet the way an empty room agrees with an
-empty room, and absence of memory is absence of watching.
+**The discriminator is the other lane's own memory, plus its unconsumed rows.**
+Before doubting anything, the poller diffs what it just read against
+`ws_position_snapshots` — the websocket lane's anchor, which IS its claim about
+what it has seen — using the same `position_diff` both lanes share. Coins where
+that diff yields an event are coins the lane is behind reality on *by its own
+account*: **MISSED**. A Trader the lane has never baselined vouches for nothing
+— an empty memory agrees with a flat wallet the way an empty room agrees with an
+empty room, and absence of memory is absence of watching. The read is strictly
+read-only: each lane's diff memory has exactly one writer, or that writer's next
+diff would be against state it never observed.
 
-The read is strictly read-only: each lane's diff memory has exactly one writer,
-or that writer's next diff would be against state it never observed.
+The anchor alone is not enough, and the gap it leaves is a *silent* one, which
+makes it the more dangerous half. The lane advances its anchor whether or not
+anyone consumes what it wrote — so a change it observed while the POLLER owned
+production leaves an unconsumed row and a moved anchor. Read by the anchor
+alone, that is indistinguishable from the benign class, and it would be vouched
+away by both lanes forever: no event, no alert, no incident, and if it was an
+exit, a copy position that never closes. The window is small (a change observed
+after the poller's last poll-owned pass and before the handback commits) but it
+follows essentially every deploy.
+
+So an unconsumed websocket row moving the same direction inside the window is
+evidence too: **STRANDED** — nobody produced it and nobody now will. Anything
+else — no row at all, and an anchor that agrees with reality — is the benign
+class: the lane's rules made the change a non-event, and it is recorded as a
+shadow row and produced by nobody, which is what those rules already decided.
+
+The incident says which of the two it is, because they send a human to different
+places: a lane that dropped a change is a lane to investigate, while a change
+that fell between two owners is a transfer doing what transfers do. And the tick
+that moves ownership always polls, whatever the cadence says, so a straddler is
+found within a tick rather than a standby interval.
 
 Compared on **direction**, not on kind or size, and not on the coin alone. The
 lanes legitimately describe the same reality with different kinds (the

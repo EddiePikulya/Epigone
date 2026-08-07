@@ -31,6 +31,7 @@ The `reason` is the diagnosis and there are only three shapes:
 | --- | --- |
 | `websocket heartbeat stale (…s > 45s)` | The lane stopped receiving market data, or the process is gone. The ordinary case. |
 | `reconciliation drift: 0x… COIN never arrived on the websocket` | **The important one.** The lane was connected and delivering, and a change still never reached it. This is the failure mode nothing else detects — see below. |
+| `reconciliation drift: 0x… COIN was seen by the websocket while the poller owned production …` | A change caught mid-handover and produced by neither lane, which the poller has now produced. Expected occasionally around deploys; not a lane fault. |
 | `websocket authority disabled by configuration` | Somebody set `WS_AUTHORITATIVE=0`. Not an incident; the monitor does not alert on it. |
 
 ## If it is a stale heartbeat
@@ -83,8 +84,16 @@ comparing its own diff against what the lane produced.
      before doubting anything, and a lane whose memory already matches reality
      owes nothing.
 
-   So a `reconciliation drift` reason means the lane's OWN memory says it still
-   owed an event, twice, ten seconds apart. Treat it as real.
+   So a drift reason means one of two things was true twice, ten seconds apart —
+   and **the reason says which**:
+
+   - *"… never arrived on the websocket"* — the lane's own memory still owed
+     the event. This is the real miss; read the ws logs around that timestamp.
+   - *"… was seen by the websocket while the poller owned production, so an
+     ownership transfer left it produced by neither lane"* — the change fell
+     between two owners. The lane worked; the transfer caught it mid-flight,
+     and the poller has now produced it. Nothing to investigate unless it
+     repeats without a deploy or a failover nearby.
 
 3. **Nothing needs restarting.** The escalation already transferred production
    and the event was produced by the poller. The lane will re-read absolute
