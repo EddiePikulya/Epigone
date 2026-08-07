@@ -287,13 +287,24 @@ fresh + progress lines stopped = stuck on one REST call or on budget
 pacing. Heartbeat stale = the process itself is in trouble; that is the
 monitor's watchdog check, and it means what it says again.
 
-The one place these signals are deliberately silent is a DECLARED INCIDENT
-(a DB-blind window, or a trip whose halt row could not be confirmed): that
-path reaches the wire with zero Postgres behind it by construction, so it
-neither beats nor pushes the dead-man until it reconciles. A blind watchdog
-looks dead to the monitor because it cannot reach the database to say
-otherwise — which is the correct reading, and the reason the DB-blind alert
-exists.
+Note the monitor's own limit here, unchanged by #201: its staleness
+THRESHOLD is 300s (`HEALTHCHECK_WATCHDOG_STALE_SECONDS`) but it only runs
+every 15 minutes (`HEALTHCHECK_INTERVAL_MINUTES`), so a genuinely dead
+watchdog can go up to a check cadence unreported — long enough for the
+dead-man's 300s schedule to fire first. Tightening the cadence to inside
+one dead-man period is issue #201's sixth candidate and is NOT done;
+until it is, do not treat "the monitor has not paged" as "the watchdog is
+alive" during an incident you are already watching.
+
+A DB-BLIND window is deliberately silent on all of these: that path reaches
+the wire with zero Postgres behind it by construction, so it neither beats
+nor pushes the dead-man until it reconciles. A blind watchdog looks dead to
+the monitor because it cannot reach the database to say otherwise — which
+is the correct reading, and the reason the DB-blind alert exists. A trip
+whose halt row could not be confirmed is the other kind of incident and
+DOES beat through its cancel pass: its liveness reads answered that cycle,
+so the database is healthy. If a beat fails mid-pass it goes quiet for the
+rest of that incident by design — reaching the wire outranks saying so.
 
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are

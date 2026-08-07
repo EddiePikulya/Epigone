@@ -1075,6 +1075,7 @@ async def test_the_heartbeat_beats_while_a_long_sweep_grinds(
     assert beaten is not None and beaten > cycle_start
 
 
+@pytest.mark.parametrize("pulsed", [True, False])
 async def test_a_grinding_sweep_keeps_the_dead_mans_switch_pushed_forward(
     pool: asyncpg.Pool,
     clock: FakeClock,
@@ -1083,12 +1084,18 @@ async def test_a_grinding_sweep_keeps_the_dead_mans_switch_pushed_forward(
     audit: ExecutionAudit,
     exec_gateway: FakeExecutionGateway,
     monkeypatch: pytest.MonkeyPatch,
+    pulsed: bool,
 ) -> None:
     """Issue #201, deliverable 2: the dead-man refresh no longer waits for
     the cycle to end. In production the 18:18 push armed the exchange for
     ~18:23 and the sweep entered at 18:20:15 — so the schedule FIRED
     un-refreshed mid-halt, discharging the last-resort net while the
-    watchdog was still working. The push now rides the sweep's own pulse."""
+    watchdog was still working. The push now rides the sweep's own pulse.
+
+    `pulsed=False` is the SAME scenario with no keepalive wired: main's
+    behaviour, pinned as the counterfactual so the causal claim is in the
+    test rather than only in the commit message — same sweep, same clock,
+    and the schedule lapses."""
     from epigone.safety.deadman import DeadMansSwitch
 
     horizon = timedelta(seconds=300)
@@ -1112,7 +1119,7 @@ async def test_a_grinding_sweep_keeps_the_dead_mans_switch_pushed_forward(
         executor_stale=STALE,
         db_blind_after=DB_BLIND,
         capability_interval=CAPABILITY_INTERVAL,
-        keepalive=deadman.maintain,
+        keepalive=deadman.maintain if pulsed else None,
     )
     await deadman.maintain()  # armed: now+300, next push due at now+150
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
@@ -1127,9 +1134,14 @@ async def test_a_grinding_sweep_keeps_the_dead_mans_switch_pushed_forward(
     await watchdog.run_cycle()
 
     armed = [at for name, at in exec_gateway.actions if name == "schedule_cancel"]
-    assert len(armed) >= 3  # the initial arm plus pushes from INSIDE the sweep
     latest = armed[-1]
-    assert isinstance(latest, datetime) and latest > clock.now()  # never lapsed
+    assert isinstance(latest, datetime)
+    if pulsed:
+        assert len(armed) >= 3  # the initial arm plus pushes from INSIDE the sweep
+        assert latest > clock.now()  # the net never lapsed while the sweep ran
+    else:
+        assert len(armed) == 1  # nothing pushes it: the cycle is busy sweeping
+        assert latest < clock.now()  # …so it fired mid-halt, as in production
 
 
 async def test_a_blind_sweep_still_touches_no_postgres_before_the_wire(
@@ -1197,6 +1209,8 @@ async def test_a_long_sweep_reports_its_progress(
 
     progress = [r.getMessage() for r in caplog.records if "sweep progress" in r.getMessage()]
     assert len(progress) >= 4  # core + three builder dexs, per account
+    # Named per venue, `flip` included — the fixture's dex that is NOT in
+    # POSITION_VENUES, so the log proves the FULL scope was walked.
     assert any("flip" in line for line in progress)
     # And the scope is announced up front, so the wall clock is predictable.
     assert any("sweep scope" in r.getMessage() for r in caplog.records)
@@ -1252,3 +1266,88 @@ async def test_a_wedged_keepalive_never_stalls_the_sweep(
     assert attempts >= 3  # cut, and retried at each later pulse
     halt = await active_halt(pool)
     assert halt is not None and halt.swept_at is not None
+
+
+async def test_a_stall_trips_own_cancel_pass_beats_through_its_grind(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The incident gate splits by KIND, on round 6's own precedent. A REAL
+    STALL trip's liveness reads answered this very cycle — Postgres is
+    healthy — and its cancel pass is the same multi-minute enumeration a
+    /kill sweep is, so it beats through it. (The DB-blind window above stays
+    dark; that is the other half of the same split.)"""
+    await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
+    clock.advance(120)
+    trip_at = clock.now()
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 202)])
+    seen: list[datetime | None] = []
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(30)
+        seen.append(await heartbeat.last_beat(pool, heartbeat.WATCHDOG_PROCESS))
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert _cancels(exec_gateway) == [CancelSpec(asset=1, oid=202)]
+    # A beat landed while the trip's own pre-wire enumeration was running,
+    # not merely after the incident reconciled.
+    during_the_pass = seen[: 4]  # the cancel pass, before any reconcile
+    assert any(b is not None and b > trip_at for b in during_the_pass)
+
+
+async def test_a_failing_pulse_goes_quiet_for_the_rest_of_an_incident(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One strike, and the pulse stops competing with the wire. A trip's
+    pass may beat because the database answered this cycle; if the database
+    then dies mid-pass, the beat must cost ONE ceiling, once — not one per
+    pulse for the rest of a multi-minute enumeration on the way to a
+    cancel."""
+    await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
+    clock.advance(120)
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 203)])
+    attempts: list[object] = []
+    at_the_wire: list[int] = []
+
+    async def dying_beat(*args: object) -> None:
+        attempts.append(args)
+        raise ConnectionError("postgres went away mid-pass")
+
+    monkeypatch.setattr(heartbeat, "beat", dying_beat)
+    inner_cancel = exec_gateway.cancel_orders
+
+    async def watched_cancel(*args: object, **kwargs: object) -> object:
+        at_the_wire.append(len(attempts))
+        return await inner_cancel(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(exec_gateway, "cancel_orders", watched_cancel)
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(30)  # far past SWEEP_PULSE_INTERVAL: no throttling here
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert _cancels(exec_gateway) == [CancelSpec(asset=1, oid=203)]
+    # By the time the cancel reached the wire: the cycle-top beat, then
+    # exactly ONE strike inside the pass. Without the mute it would be one
+    # per enumeration step of a pass that in production runs for minutes,
+    # each costing a full DB_BLOCK_CEILING_SECONDS on the way to the wire.
+    assert at_the_wire == [2]
