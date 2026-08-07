@@ -574,12 +574,24 @@ async def _reconcile(
     def lookback(coin: str) -> datetime:
         return (doubted_since if coin in pending else since) - RECONCILE_GRACE
 
-    ws_rows = await _websocket_rows(conn, address, min(since, doubted_since) - RECONCILE_GRACE)
-    unvouched = [
-        event
-        for event in events
-        if not _vouched_for(event, ws_rows.produced, lookback(event.coin))
-    ]
+    # One query, several cutoffs: read from the earliest lookback any coin on
+    # this wallet needs and let each coin apply its own. `doubted_since` is an
+    # earlier pass's own `polled_before` and so is never later than `since` —
+    # the min says that rather than leaving it to be worked out.
+    earliest = min(since, doubted_since) - RECONCILE_GRACE
+
+    async def unproduced() -> tuple[_WsRows, list[PositionEvent]]:
+        """The websocket's rows, and what this pass saw that they do not vouch
+        for. Asked here, and asked again under the exclusive lock after a
+        transfer — the same question, so the same code."""
+        rows = await _websocket_rows(conn, address, earliest)
+        return rows, [
+            event
+            for event in events
+            if not _vouched_for(event, rows.produced, lookback(event.coin))
+        ]
+
+    ws_rows, unvouched = await unproduced()
     held: set[str] = set()
     drifted = False
     if unvouched and not await owns(conn, POLL_SOURCE):
@@ -631,14 +643,7 @@ async def _reconcile(
             # answer is final rather than merely recent, which is what makes
             # "two writers never produce for one (Trader, coin)" a property of
             # the database.
-            ws_rows = await _websocket_rows(
-                conn, address, min(since, doubted_since) - RECONCILE_GRACE
-            )
-            unvouched = [
-                event
-                for event in events
-                if not _vouched_for(event, ws_rows.produced, lookback(event.coin))
-            ]
+            ws_rows, unvouched = await unproduced()
     published: list[PositionEvent] = []
     if unvouched and await publish(conn, address, unvouched, now, source=POLL_SOURCE):
         published = unvouched
@@ -714,18 +719,22 @@ _DIRECTIONS = {
 
 
 def _vouched_for(
-    event: PositionEvent, covered: dict[tuple[str, str], datetime], since: datetime
+    event: PositionEvent,
+    covered: dict[tuple[str, str], datetime],
+    no_earlier_than: datetime,
 ) -> bool:
     """Whether the websocket already wrote something on this coin moving the
-    same way, no earlier than `since` — see `_reconcile` for why direction is
-    the comparison, and why `since` is per coin rather than per pass (#200).
+    same way, inside this coin's lookback — see `_reconcile` for why direction
+    is the comparison, and why the lookback is per coin rather than per pass
+    (#200).
 
     `covered` holds the LATEST such row per (coin, direction), which answers
-    "is there one at or after `since`?" for every cutoff at once — the rows are
-    fetched from the earliest cutoff any coin needs, and each coin then applies
-    its own."""
+    "is there one at or after this instant?" for every cutoff at once — the
+    rows are fetched from the earliest cutoff any coin needs, and each coin
+    then applies its own."""
     return any(
-        (latest := covered.get((event.coin, direction))) is not None and latest >= since
+        (latest := covered.get((event.coin, direction))) is not None
+        and latest >= no_earlier_than
         for direction in _DIRECTIONS[event.kind]
     )
 

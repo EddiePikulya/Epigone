@@ -203,7 +203,7 @@ interval in force), and that observation lands unconditionally on every pass,
 held doubt or not. So freezing the cursor would not have widened withdrawal
 detection today; it would have left a second freshness timestamp beside one that
 stayed honest, with nothing in the code saying which readings must use which.
-`test_a_held_doubt_freezes_the_window_and_not_the_wallets_freshness` pins both
+`test_a_held_doubt_keeps_its_window_without_holding_the_wallets_freshness` pins both
 halves — the doubt keeps its window, the wallet keeps its freshness, and the
 withdrawal is detected across the hold exactly as it would have been without it.
 

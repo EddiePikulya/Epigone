@@ -25,7 +25,7 @@ import asyncpg
 import pytest
 
 from epigone.budget import WeightBudget
-from epigone.gateway import Position, RateLimitedError, Side
+from epigone.gateway import GatewayError, Position, RateLimitedError, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.lane_authority import (
     POLL_OWNER,
@@ -46,7 +46,11 @@ from epigone.stream.main import (
     StandbyState,
     run_position_cycle,
 )
-from epigone.stream.poller import POLL_INTERVAL_SECONDS, run_poll_pass
+from epigone.stream.poller import (
+    MAX_CONSECUTIVE_FAILURES,
+    POLL_INTERVAL_SECONDS,
+    run_poll_pass,
+)
 from epigone.ws import MAX_SUBSCRIBED_TRADERS, WS_LANE_PROCESS
 from epigone.ws.lane import POSITIONS_PUSH_INTERVAL_SECONDS, WS_COALESCE_WINDOW_SECONDS
 from tests.support.clock import FakeClock
@@ -502,7 +506,7 @@ async def test_withdrawal_detection_survives_the_standby_cadence(
     assert [row["amount_usd"] for row in alerted] == [Decimal("60000")]
 
 
-async def test_a_held_doubt_freezes_the_window_and_not_the_wallets_freshness(
+async def test_a_held_doubt_keeps_its_window_without_holding_the_wallets_freshness(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
     """What a pass that WITHHOLDS a verdict still records (issue #200).
@@ -1009,6 +1013,36 @@ async def test_a_doubt_is_confirmed_against_the_window_that_raised_it(
     assert [row["kind"] for row in await alerts(pool)] == ["close"]
     authoritative = [row for row in await events(pool) if row["authoritative"]]
     assert [(row["source"], row["kind"]) for row in authoritative] == [(POLL_SOURCE, "close")]
+
+
+async def test_a_pass_that_aborts_leaves_the_tail_of_the_set_where_it_was(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The other way the pass above can skip a wallet, and the reason the fix
+    is the same one (issue #200). A sustained failure streak means Hyperliquid
+    is down, so the pass gives up and resumes next cycle — and every wallet in
+    the tail of `leaders_first` keeps its `since` untouched, exactly as a rate
+    limited one does.
+
+    Which is what makes the repair complete rather than route-specific: a
+    wallet is skipped by having no `_apply_poll` at all, so a doubt raised on
+    it later is still raised against the last look that actually happened."""
+    baselined_at = clock.now()
+    for index in range(MAX_CONSECUTIVE_FAILURES):
+        # Sorted ahead of TRADER ("0xaaa"), so the abort lands before it: ties
+        # in the poll set break alphabetically (`epigone.poll_set`).
+        down = f"0x1{index:039x}"
+        await track(pool, clock, down, FOLLOWER)
+        gateway.positions_errors[down] = GatewayError("hyperliquid is down")
+
+    clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, [])
+    await poll(pool, gateway, clock)
+
+    polled_at = await pool.fetchval(
+        "SELECT last_polled_at FROM position_poll_state WHERE trader_address = $1", TRADER
+    )
+    assert polled_at == baselined_at
 
 
 async def test_the_reached_back_window_belongs_to_the_doubt_not_to_the_wallet(
