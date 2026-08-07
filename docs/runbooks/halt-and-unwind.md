@@ -261,6 +261,40 @@ withheld. So a halt alert that keeps saying "sweep PENDING" for more than a
 cycle or two means either orders that won't die or degraded coverage; the
 watchdog log says which axis.
 
+**A sweep takes MINUTES, and that is not a wedge (issue #201).** Coverage on
+two axes means one enumeration per (account, dex) pair at 20 weight each,
+paced through the 900/min bucket shared with the stream and ingest — eleven
+accounts across four venues is ~1800 weight per pass and the sweep does up
+to two passes (cancel, then a fresh verify). Two to ten minutes of wall
+clock inside a single watchdog cycle is normal. What that used to look like
+from outside was indistinguishable from a hang, so the sweep now says what
+it is doing:
+
+- `sweep scope: N venue(s) × M account(s) = K enumeration(s) per pass, ~W
+  weight (~Ts …)` — logged before the grind starts. That `~Ts` is the ETA;
+  if the wall clock passes it by a wide margin, something else is wrong.
+- `sweep progress: <phase> i/K — <address> on <dex>: n resting order(s)` —
+  one line per enumeration, for both the cancel pass and the verify pass,
+  plus a line per account whose orders were actually cancelled and one per
+  position-snapshot read.
+- the watchdog's `process_heartbeats` row keeps beating THROUGHOUT (every
+  few seconds), so the #52 monitor no longer reads a sweeping watchdog as a
+  dead one, and the dead-man's `scheduleCancel` schedule is pushed forward
+  from inside the same loop rather than being allowed to fire mid-halt.
+
+So: heartbeat fresh + progress lines advancing = working, wait. Heartbeat
+fresh + progress lines stopped = stuck on one REST call or on budget
+pacing. Heartbeat stale = the process itself is in trouble; that is the
+monitor's watchdog check, and it means what it says again.
+
+The one place these signals are deliberately silent is a DECLARED INCIDENT
+(a DB-blind window, or a trip whose halt row could not be confirmed): that
+path reaches the wire with zero Postgres behind it by construction, so it
+neither beats nor pushes the dead-man until it reconciles. A blind watchdog
+looks dead to the monitor because it cannot reach the database to say
+otherwise — which is the correct reading, and the reason the DB-blind alert
+exists.
+
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are
 resting orders, so a halt CANCELS a bracket-mode sub's stops. The executor

@@ -9,6 +9,8 @@ AmbiguousExecutionError discipline); positions are held and snapshotted per
 the documented policy; and the watchdog beats its own heartbeat for the
 monitor."""
 
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -16,7 +18,7 @@ import asyncpg
 import pytest
 
 from epigone.budget import SharedWeightBudget, WeightBudget
-from epigone.gateway import ExtraAgent, GatewayError, Position, Side
+from epigone.gateway import ExtraAgent, GatewayError, OpenOrder, Position, Side
 from epigone.gateway.execution import AmbiguousExecutionError, CancelSpec
 from epigone.gateway.execution_fake import FakeExecutionGateway
 from epigone.gateway.fake import FakeHyperliquidGateway
@@ -1026,3 +1028,227 @@ async def test_a_post_reconcile_blip_does_not_retrip(
     clock.advance(10)
     await watchdog.run_cycle()
     assert len(_cancels(exec_gateway)) == cancels_after_incident
+
+
+# --- sweep liveness (issue #201) ---------------------------------------
+#
+# The 2026-08-07 shakedown's first real /kill: the sweep ground through
+# account-wide REST enumeration under budget pacing for eight minutes, and
+# for all eight the watchdog's heartbeat was frozen and its dead-man's
+# schedule went un-refreshed (it fired mid-halt). The process was alive and
+# doing its most important work while every liveness signal it owns said
+# otherwise. These tests pin the fix: a sweep pulses.
+
+
+async def test_the_heartbeat_beats_while_a_long_sweep_grinds(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #201, deliverable 1: the beat happens INSIDE the enumeration
+    loop, not only between cycles. Before the fix `beaten_at` froze at the
+    cycle's first instant and the #52 monitor read the busiest watchdog in
+    the system as dead."""
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    cycle_start = clock.now()
+    seen: list[datetime | None] = []
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        # Every enumeration costs ORDERS_WEIGHT against a 900/min bucket
+        # shared with the stream and ingest — seconds of pacing per call in
+        # production, compressed here into the fake clock.
+        clock.advance(30)
+        seen.append(await heartbeat.last_beat(pool, heartbeat.WATCHDOG_PROCESS))
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert len(seen) >= 4  # core + three builder dexs
+    assert seen[-1] is not None and seen[-1] > cycle_start
+    beaten = await heartbeat.last_beat(pool, heartbeat.WATCHDOG_PROCESS)
+    assert beaten is not None and beaten > cycle_start
+
+
+async def test_a_grinding_sweep_keeps_the_dead_mans_switch_pushed_forward(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Issue #201, deliverable 2: the dead-man refresh no longer waits for
+    the cycle to end. In production the 18:18 push armed the exchange for
+    ~18:23 and the sweep entered at 18:20:15 — so the schedule FIRED
+    un-refreshed mid-halt, discharging the last-resort net while the
+    watchdog was still working. The push now rides the sweep's own pulse."""
+    from epigone.safety.deadman import DeadMansSwitch
+
+    horizon = timedelta(seconds=300)
+    deadman = DeadMansSwitch(
+        audited,
+        audit,
+        clock,
+        horizon=horizon,
+        reprobe=timedelta(hours=6),
+        master_address=MASTER,
+    )
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=deadman.maintain,
+    )
+    await deadman.maintain()  # armed: now+300, next push due at now+150
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(100)
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    armed = [at for name, at in exec_gateway.actions if name == "schedule_cancel"]
+    assert len(armed) >= 3  # the initial arm plus pushes from INSIDE the sweep
+    latest = armed[-1]
+    assert isinstance(latest, datetime) and latest > clock.now()  # never lapsed
+
+
+async def test_a_blind_sweep_still_touches_no_postgres_before_the_wire(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The #201 pulse is GATED ON THE INCIDENT (round 5's structural rule,
+    module docstring): once an incident is declared the cycle does no
+    Postgres before the cancel reaches the wire — the liveness beat
+    included. A watchdog that is blind because the database is unreachable
+    cannot say "alive" to that database, and trying is precisely the hang
+    round 5 removed."""
+    from epigone.safety import watchdog as watchdog_module
+
+    async def db_down(_pool: asyncpg.Pool) -> None:
+        raise ConnectionError("postgres unreachable")
+
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 201)])
+    await watchdog.run_cycle()  # the failure streak opens
+    clock.advance(DB_BLIND.total_seconds() + 1)
+
+    beats: list[object] = []
+    real_beat = heartbeat.beat
+
+    async def counting_beat(*args: object) -> None:
+        beats.append(args)
+        await real_beat(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(heartbeat, "beat", counting_beat)
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(30)
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()  # blind trip: the cancel pass runs dark
+
+    assert len(_cancels(exec_gateway)) == 1  # the wire still works
+    # Exactly one beat: the cycle-top beat that ran BEFORE the reads failed
+    # and the incident was declared. The enumeration itself stayed dark.
+    assert len(beats) == 1
+
+
+async def test_a_long_sweep_reports_its_progress(
+    watchdog: Watchdog,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    audit: ExecutionAudit,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Issue #201, deliverable 4: the operator could not tell "sweeping, 60%
+    done" from "wedged" — `swept_at` is the only signal and it lands only at
+    the very end. Per-(account, dex) progress makes the grind observable."""
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+
+    with caplog.at_level(logging.INFO, logger="epigone.safety.watchdog"):
+        await watchdog.run_cycle()
+
+    progress = [r.getMessage() for r in caplog.records if "sweep progress" in r.getMessage()]
+    assert len(progress) >= 4  # core + three builder dexs, per account
+    assert any("flip" in line for line in progress)
+    # And the scope is announced up front, so the wall clock is predictable.
+    assert any("sweep scope" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_wedged_keepalive_never_stalls_the_sweep(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pulse's keepalive is ADVISORY work riding the protective path:
+    a dead-man push that hangs on the exchange must cost its own ceiling and
+    nothing else. The sweep — the thing that actually cancels orders —
+    finishes and stamps, and the next pulse retries the push."""
+    from epigone.safety import watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "KEEPALIVE_CEILING_SECONDS", 0.05)
+    attempts = 0
+
+    async def wedged() -> None:
+        nonlocal attempts
+        attempts += 1
+        await asyncio.sleep(3600)  # real seconds: this call never returns
+
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=wedged,
+    )
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(30)
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert attempts >= 3  # cut, and retried at each later pulse
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None

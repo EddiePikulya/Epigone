@@ -98,16 +98,56 @@ Positions are NOT closed — the sweep applies the documented unwind policy
 (v0: hold-and-alert, docs/runbooks/halt-and-unwind.md), records the open-
 position snapshot on the halt row, and the monitor's halt alert carries it
 to the operator.
+
+A SWEEP PULSES (issue #201). The sweep is account-wide on both axes and
+every (account, dex) pair costs ORDERS_WEIGHT through a 900/min bucket
+shared with the stream and ingest, so a real one is MINUTES of wall clock
+inside a single cycle. The 2026-08-07 shakedown found what that did to the
+watchdog's own liveness signals: for the eight minutes it spent sweeping a
+/kill it never beat its heartbeat (the #52 monitor read the busiest process
+in the system as dead) and never pushed its dead-man's schedule (which
+consequently FIRED un-refreshed mid-halt, discharging the last-resort net
+while the watchdog was still working). Both signals now ride a PULSE
+emitted at every enumeration step: the heartbeat beat, plus an injected
+`keepalive` — in production the dead-man's push (safety/main.py). Three
+properties are load-bearing:
+
+- the pulse is GATED ON THE INCIDENT. While an incident is declared the
+  cycle still does zero Postgres before the wire — no beat, and no
+  keepalive either (the deadman's transition events write to Postgres
+  directly, outside the wire-first audit posture). A watchdog blind because
+  the database is unreachable cannot truthfully beat to that database, and
+  trying is exactly the hang round 5 removed. The reconcile's verify
+  enumeration pulses normally: by then the incident is cleared;
+- it is BEST-EFFORT and throttled to SWEEP_PULSE_INTERVAL. A failed beat or
+  a failed dead-man push is logged and the sweep continues — the same rule
+  the cycle-top beat has followed since round 2;
+- the keepalive runs on THIS task, not a sibling one. Deliverable 2 of
+  issue #201 asked for an independent dead-man task; it is deliberately not
+  one, because the deadman shares this process's single AuditedExecution-
+  Gateway — one signer, ONE NONCE LANE (the execution seam's contract), one
+  mutable `decision` field, one incident posture. Racing a scheduleCancel
+  against a sweep's cancels across that shared state would trade a liveness
+  bug for a correctness bug on the kill path. Pulsing on the sweep's own
+  task removes the emergent race (the schedule is pushed every few seconds
+  of the grind, never left to lapse) while keeping every action on the lane
+  strictly ordered.
+
+Progress is also LOGGED per (account, dex), so a long sweep is legible in
+the container logs while it runs — "sweeping, 60% done" was previously
+indistinguishable from "wedged", `swept_at` being the only signal and
+landing only at the very end.
 """
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import asyncpg
 
-from epigone.budget import Budget
+from epigone.budget import SHARED_WEIGHT_PER_MINUTE, Budget
 from epigone.clock import Clock
 from epigone.gateway import (
     POSITION_VENUES,
@@ -150,6 +190,26 @@ META_WEIGHT = 20  # meta (per venue), perpDexs, extraAgents — the info default
 # clock: this bounds actual awaits, and the fakes finish instantly.
 DB_BLOCK_CEILING_SECONDS = 4 * SAFETY_DB_TIMEOUT_SECONDS
 
+# How often a grinding sweep says "alive" (issue #201). The sweep pulses at
+# every enumeration step and this throttles the resulting work: one
+# single-row heartbeat upsert plus one dead-man check per interval, not per
+# REST call. Well under the monitor's watchdog-staleness window and well
+# under the dead-man horizon's half-cadence push, so neither signal can go
+# stale between two pulses of a sweep that is making progress.
+SWEEP_PULSE_INTERVAL = timedelta(seconds=5)
+
+# The keepalive leg of a pulse is ADVISORY work riding the protective path,
+# so it gets a hard real-time ceiling of its own: nothing about pushing the
+# dead-man's schedule may stall the sweep that is pushing it. 30s is one
+# full exchange REQUEST_TIMEOUT — a healthy attempt fits; a retry storm gets
+# cut — and cutting is safe, because a repeated scheduleCancel set REPLACES
+# the schedule (deadman.py), which is the same self-reconciling retry its
+# ambiguity path already relies on. The next pulse retries five seconds
+# later, inside the half-horizon of slack the push cadence leaves (150s at
+# the default 300s horizon), so a slow exchange costs retries, not a lapsed
+# schedule. Real time, not the injected clock, like every other ceiling here.
+KEEPALIVE_CEILING_SECONDS = 30.0
+
 # A failed capability probe (network blip, info outage, unwritable verdict)
 # retries on this short fuse instead of waiting out the full check interval —
 # but never every cycle, which would burn 20 weight per 10s on a persistent
@@ -157,6 +217,14 @@ DB_BLOCK_CEILING_SECONDS = 4 * SAFETY_DB_TIMEOUT_SECONDS
 # TimeoutError must not re-fire the probe per-cycle just because it isn't a
 # GatewayError.
 CAPABILITY_RETRY = timedelta(minutes=5)
+
+
+# Whatever ELSE must not go stale while a sweep grinds (issue #201). One
+# implementation in production — DeadMansSwitch.maintain, wired in
+# safety/main.py — kept as a callable seam so the watchdog does not have to
+# know about the upgrade path it is the fallback for, and so tests can pulse
+# something trivially observable.
+Keepalive = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
@@ -210,6 +278,7 @@ class Watchdog:
         executor_stale: timedelta,
         db_blind_after: timedelta,
         capability_interval: timedelta,
+        keepalive: Keepalive | None = None,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -222,6 +291,10 @@ class Watchdog:
         self._executor_stale = executor_stale
         self._db_blind_after = db_blind_after
         self._capability_interval = capability_interval
+        self._keepalive = keepalive
+        # When this process last emitted a liveness pulse (issue #201) —
+        # the cycle-top beat counts, so a short cycle adds no extra writes.
+        self._pulsed_at: datetime | None = None
         self._capable: bool | None = None  # last on-chain verdict; None = unchecked
         self._next_capability_at: datetime | None = None  # None → due now
         # Postgres-independence state (module docstring): the onset of the
@@ -255,15 +328,7 @@ class Watchdog:
         if self._blind is not None:
             await self._incident_cycle(now)
             return
-        try:
-            await asyncio.wait_for(
-                heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now),
-                DB_BLOCK_CEILING_SECONDS,
-            )
-        except Exception:
-            # Best-effort beat (round 2 item 1c): losing the liveness signal
-            # is bad; skipping the cycle's protective work over it is worse.
-            log.exception("heartbeat write failed — continuing the protective cycle")
+        await self._beat(now)
         try:
             halt, stall_reason = await asyncio.wait_for(
                 self._read_liveness(now), DB_BLOCK_CEILING_SECONDS
@@ -301,6 +366,53 @@ class Watchdog:
             await self._verify_capability(now)
         except Exception:
             log.exception("capability probe failed; retrying next cycle")
+
+    # --- liveness (issue #201) ---
+
+    async def _beat(self, now: datetime) -> None:
+        """Say ALIVE, best-effort (round 2 item 1c): losing the liveness
+        signal is bad; skipping the cycle's protective work over it is
+        worse. Bounded by the same real-time ceiling as every other state
+        block, and it stamps the pulse clock either way — a beat that FAILS
+        must still throttle the next one, or a broken database turns a long
+        sweep into a per-enumeration retry storm."""
+        self._pulsed_at = now
+        try:
+            await asyncio.wait_for(
+                heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now),
+                DB_BLOCK_CEILING_SECONDS,
+            )
+        except Exception:
+            log.exception("heartbeat write failed — continuing the protective cycle")
+
+    async def _pulse(self) -> None:
+        """One liveness pulse from INSIDE the sweep (module docstring): beat
+        the heartbeat and push whatever else must not go stale while the
+        enumeration grinds — in production the dead-man's schedule.
+
+        Silent while an incident is declared: that path reaches the wire
+        with zero Postgres behind it, and both legs of the pulse write to
+        Postgres (the beat directly, the keepalive through the deadman's
+        transition events). Silent again within SWEEP_PULSE_INTERVAL of the
+        last pulse, so the cost is per-interval, not per-REST-call."""
+        if self._blind is not None:
+            return
+        now = self._clock.now()
+        if self._pulsed_at is not None and now - self._pulsed_at < SWEEP_PULSE_INTERVAL:
+            return
+        await self._beat(now)
+        if self._keepalive is None:
+            return
+        try:
+            await asyncio.wait_for(self._keepalive(), KEEPALIVE_CEILING_SECONDS)
+        except Exception:
+            # Same asymmetry as the beat: the sweep is the protective work
+            # and nothing advisory may stop it. The next pulse retries, and
+            # the deadman's own state machine is self-reconciling.
+            log.warning(
+                "sweep keepalive (dead-man's push) failed — retrying at the next pulse",
+                exc_info=True,
+            )
 
     async def _read_liveness(self, now: datetime) -> tuple[Halt | None, str | None]:
         halt = await active_halt(self._pool)
@@ -553,7 +665,7 @@ class Watchdog:
         unswept and the NEXT cycle's full sweep cancels it."""
         if skip_cancel:
             dexs, accounts, complete = await self._sweep_scope()
-            orders = await self._open_orders(dexs, accounts)
+            orders = await self._open_orders(dexs, accounts, "verify")
         else:
             dexs, accounts, complete, cancelled = await self._cancel_resting(
                 f"halt #{halt.id} ({halt.source}): {halt.reason}"
@@ -564,7 +676,7 @@ class Watchdog:
                 # an order from the verify. An already-empty book needs no
                 # second look (its first enumeration IS the verify).
                 dexs, accounts, complete = await self._sweep_scope()
-                orders = await self._open_orders(dexs, accounts)
+                orders = await self._open_orders(dexs, accounts, "verify")
             else:
                 orders = []
         if orders or not complete:
@@ -615,18 +727,30 @@ class Watchdog:
         action per account, carrying that account's vault flag (the master's
         is None). A sub whose cancel fails leaves the halt unswept and the
         next cycle re-enumerates — the same idempotent retry the venue axis
-        already relies on."""
-        self._exec.decision = decision
+        already relies on.
+
+        `decision` is set on the gateway immediately before each cancel, not
+        once up front (issue #201): the enumeration in between pulses, and a
+        pulse's dead-man push sets `decision` for its own action. Per-cancel
+        assignment makes the attribution correct whatever runs between two
+        cancels, instead of correct-by-luck."""
         dexs, accounts, complete = await self._sweep_scope()
-        orders = await self._open_orders(dexs, accounts)
+        orders = await self._open_orders(dexs, accounts, "cancel pass")
         if orders:
             asset_ids = await self._asset_ids_for(orders)
             for account in accounts:
                 theirs = [o.order for o in orders if o.account == account]
                 if not theirs:
                     continue
+                await self._pulse()
+                self._exec.decision = decision
                 await self._exec.cancel_orders(
                     _cancels_for(theirs, asset_ids), vault_address=account
+                )
+                log.warning(
+                    "sweep progress: cancelled %d resting order(s) on %s",
+                    len(theirs),
+                    account or "the master",
                 )
         return dexs, accounts, complete, orders
 
@@ -643,6 +767,7 @@ class Watchdog:
         flag), and every sub-account follows. Read from the exchange rather
         than from Epigone's own mapping table so the cold-start blind path,
         which has no database, enumerates them identically."""
+        await self._pulse()
         await self._budget.spend(META_WEIGHT)
         try:
             dexs, dexs_complete = await self._read.get_perp_dexs(), True
@@ -668,6 +793,20 @@ class Watchdog:
                 "(PARTIAL; swept_at withheld)",
                 exc_info=True,
             )
+        # The scope, up front: the operator (and the log reader) can size the
+        # grind before it starts instead of inferring it from silence.
+        steps = len(accounts) * (1 + len(dexs))
+        log.warning(
+            "sweep scope: %d venue(s) × %d account(s) = %d enumeration(s) per pass, "
+            "~%d weight (~%ds at the shared %d/min pacing); coverage %s",
+            len(dexs) + 1,
+            len(accounts),
+            steps,
+            steps * ORDERS_WEIGHT,
+            round(steps * ORDERS_WEIGHT * 60 / SHARED_WEIGHT_PER_MINUTE),
+            SHARED_WEIGHT_PER_MINUTE,
+            "complete" if dexs_complete and accounts_complete else "PARTIAL",
+        )
         return dexs, accounts, dexs_complete and accounts_complete
 
     async def _asset_ids_for(self, orders: list[_AccountOrder]) -> dict[str, int]:
@@ -681,20 +820,37 @@ class Watchdog:
         )
         spends = 1 + (1 + len(needed) if needed else 0)
         for _ in range(spends):
+            await self._pulse()
             await self._budget.spend(META_WEIGHT)
         return await fetch_asset_ids(self._read, dexs=needed)
 
     async def _open_orders(
-        self, dexs: list[str], accounts: list[str | None]
+        self, dexs: list[str], accounts: list[str | None], phase: str
     ) -> list[_AccountOrder]:
+        """The account-wide order enumeration — the expensive axis, and the
+        one the whole sweep's wall clock is made of. Every step pulses
+        (issue #201) and reports itself, so a multi-minute pass is both
+        alive to the monitor and legible in the logs while it runs."""
         orders: list[_AccountOrder] = []
+        steps = len(accounts) * (1 + len(dexs))
+        step = 0
         for account in accounts:
             address = account or self._master
             for dex in [None, *dexs]:
+                step += 1
+                await self._pulse()
                 await self._budget.spend(ORDERS_WEIGHT)
-                orders.extend(
-                    _AccountOrder(account=account, order=order)
-                    for order in await self._read.get_open_orders(address, dex=dex)
+                found = await self._read.get_open_orders(address, dex=dex)
+                orders.extend(_AccountOrder(account=account, order=o) for o in found)
+                log.info(
+                    "sweep progress: %s %d/%d — %s on %s: %d resting order(s), %d so far",
+                    phase,
+                    step,
+                    steps,
+                    address,
+                    dex or "core",
+                    len(found),
+                    len(orders),
                 )
         return orders
 
@@ -702,11 +858,23 @@ class Watchdog:
         self, dexs: list[str], accounts: list[str | None]
     ) -> list[Position]:
         positions: list[Position] = []
+        steps = len(accounts) * (1 + len(dexs))
+        step = 0
         for account in accounts:
             address = account or self._master
             for dex in [None, *dexs]:
+                step += 1
+                await self._pulse()
                 await self._budget.spend(POSITIONS_WEIGHT)
                 positions.extend(await self._read.get_open_positions(address, dex=dex))
+                log.info(
+                    "sweep progress: position snapshot %d/%d — %s on %s: %d open",
+                    step,
+                    steps,
+                    address,
+                    dex or "core",
+                    len(positions),
+                )
         return positions
 
     # --- the on-chain capability probe (advisory) ---

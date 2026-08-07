@@ -22,15 +22,21 @@ Wiring notes, each load-bearing:
   a property of the wiring rather than of what the code happens to call.
 - Phase A is operator-only: the account under protection is the operator's
   (ADMIN_TELEGRAM_ID names the keystore row). Multi-account is Phase B.
-- The rate budget is a FallbackBudget over a SharedWeightBudget at
-  reserve 0 — execution-lane priority (issue #133) while Postgres answers,
-  in-process pacing when it doesn't (PR #143 round 2): a dead rate_budget
-  row must never queue a cancel. Safety lane only; the executor's order
-  lane keeps the shared bucket un-degraded.
+- The rate budget comes from `safety_budget` (safety/budget.py): a
+  FallbackBudget over a SharedWeightBudget at reserve 0 — execution-lane
+  priority (issue #133) while Postgres answers, in-process pacing when it
+  doesn't (PR #143 round 2): a dead rate_budget row must never queue a
+  cancel. Safety lane only; the executor's order lane keeps the shared
+  bucket un-degraded.
 - The deadman upgrade path shares the cycle but not the cycle's fate: its
   ambiguity is logged and retried, and any cycle error is logged and
   retried — a broken cycle must never stop the loop (the monitor alerts on
-  a stale watchdog heartbeat if the breakage persists).
+  a stale watchdog heartbeat if the breakage persists). It is ALSO the
+  watchdog's sweep keepalive (issue #201): `deadman.maintain` is handed to
+  the Watchdog so a multi-minute sweep pushes the schedule from inside its
+  own enumeration instead of letting it lapse while it works. Both call
+  sites go through the same due-time state, so the pair never
+  double-pushes — whichever runs first when the push falls due does it.
 - Mainnet is refused by construction in HttpExecutionGateway (the A5 gate);
   this process never passes allow_mainnet.
 """
@@ -42,7 +48,6 @@ from pathlib import Path
 
 import aiohttp
 
-from epigone.budget import SharedWeightBudget
 from epigone.clock import Clock, SystemClock
 from epigone.config import Settings
 from epigone.gateway.execution import AmbiguousExecutionError, ExecutionGateway
@@ -50,7 +55,7 @@ from epigone.gateway.execution_http import HttpExecutionGateway
 from epigone.gateway.http import HttpHyperliquidGateway
 from epigone.keystore import KeystoreError, load_kek
 from epigone.safety.audit import WATCHDOG_ACTOR, AuditedExecutionGateway, ExecutionAudit
-from epigone.safety.budget import PRIMARY_ATTEMPT_CEILING_SECONDS, FallbackBudget
+from epigone.safety.budget import safety_budget
 from epigone.safety.cancel_only import CancelOnlyExecutionGateway
 from epigone.safety.coldstart import open_startup
 from epigone.safety.config import WatchdogConfig
@@ -154,12 +159,7 @@ async def main() -> None:
     master_address = startup.master_address
 
     audit = ExecutionAudit(pool, clock)
-    budget = FallbackBudget(
-        SharedWeightBudget(
-            pool, clock, reserve=0, attempt_ceiling=PRIMARY_ATTEMPT_CEILING_SECONDS
-        ),
-        clock,
-    )
+    budget = safety_budget(pool, clock)
     async with aiohttp.ClientSession() as session:
         read_gateway = HttpHyperliquidGateway(session, clock, info_url=config.info_url)
         exec_gateway = safety_gateway(
@@ -199,6 +199,10 @@ async def main() -> None:
             executor_stale=config.executor_stale,
             db_blind_after=config.db_blind_after,
             capability_interval=config.capability_interval,
+            # Issue #201: the sweep's liveness pulse pushes the dead-man's
+            # schedule from INSIDE the enumeration, so a multi-minute grind
+            # can no longer let the exchange-side net discharge behind it.
+            keepalive=deadman.maintain,
         )
         if startup.cold_start_reason is not None:
             # The incident opens HERE, not after a threshold: the startup

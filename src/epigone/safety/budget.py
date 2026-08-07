@@ -30,7 +30,14 @@ acceptance, same reasoning.
 
 import logging
 
-from epigone.budget import SHARED_WEIGHT_PER_MINUTE, Budget, WeightBudget
+import asyncpg
+
+from epigone.budget import (
+    SHARED_WEIGHT_PER_MINUTE,
+    Budget,
+    SharedWeightBudget,
+    WeightBudget,
+)
 from epigone.clock import Clock
 from epigone.safety.db import SAFETY_DB_TIMEOUT_SECONDS
 
@@ -98,3 +105,34 @@ class FallbackBudget:
                 "shared rate budget unavailable for settle (safety lane, weight %d)", weight
             )
             await self._fallback.settle(weight)
+
+
+def safety_budget(pool: asyncpg.Pool, clock: Clock) -> FallbackBudget:
+    """The kill path's pacing, in ONE place so its priority is a property of
+    the wiring rather than of a constructor argument nobody re-reads.
+
+    RESERVE 0 — the EXECUTION lane's priority (issue #133). `reserve` is the
+    floor a spender must leave in the shared bucket for spenders below it:
+    the pollers leave EXECUTION_RESERVE_WEIGHT and ingest leaves that plus
+    STREAM_RESERVE_WEIGHT, so a spender at zero is the only one that may
+    draw the bucket to empty and is never the one waiting for refill. The
+    sweep's enumeration therefore does not queue behind backfill for tokens
+    (issue #201 deliverable 3, pinned by test_safety_budget).
+
+    What this does NOT buy — stated because the #201 shakedown's eight
+    minutes were mostly this: priority is not speed. An account-wide sweep
+    is hundreds of weight-20 reads and the shared bucket refills at
+    SHARED_WEIGHT_PER_MINUTE for everyone, so minutes of PACING remain by
+    arithmetic. Nor does reserve rank the per-IP send gate, which is a
+    property of the address and applies to every spender alike. Priority
+    stops the sweep from being STARVED; the watchdog's liveness during those
+    minutes is the sweep pulse's job (safety/watchdog.py), and cutting the
+    minutes themselves would mean bounding the enumeration's scope — a
+    separate, deliberately unrushed decision on the safety path.
+    """
+    return FallbackBudget(
+        SharedWeightBudget(
+            pool, clock, reserve=0, attempt_ceiling=PRIMARY_ATTEMPT_CEILING_SECONDS
+        ),
+        clock,
+    )

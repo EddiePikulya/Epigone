@@ -129,7 +129,13 @@ async def test_the_ceiling_is_wired_into_every_db_block_of_a_cycle() -> None:
     the ONE block it black-holes. Every `await` on a Postgres-touching block
     inside `run_cycle` and its incident path goes through `asyncio.wait_for`
     at the module's ceiling — so a future block added without one is a visible
-    diff here rather than a hang at 3am."""
+    diff here rather than a hang at 3am.
+
+    ONE ceiling in the module is deliberately not a DB one: the sweep pulse's
+    keepalive (issue #201) bounds an EXCHANGE call, so it gets its own,
+    separately reasoned KEEPALIVE_CEILING_SECONDS. It is named here rather
+    than exempted by pattern — a second non-DB ceiling must be argued for in
+    this test's diff, not slipped in."""
     import ast
     import inspect
 
@@ -144,9 +150,14 @@ async def test_the_ceiling_is_wired_into_every_db_block_of_a_cycle() -> None:
     ]
     # heartbeat.beat, the liveness read, the reconcile, mark_swept and the
     # capability verdict — the five durable/state blocks the module docstring
-    # enumerates.
-    assert len(ceilinged) >= 5
+    # enumerates — plus the keepalive's own.
+    assert len(ceilinged) >= 6
+    ceilings = [
+        call.args[1].id for call in ceilinged if isinstance(call.args[1], ast.Name)
+    ]
+    assert len(ceilings) == len(ceilinged)  # every one is a named constant
+    assert ceilings.count("KEEPALIVE_CEILING_SECONDS") == 1
     assert all(
-        isinstance(call.args[1], ast.Name) and call.args[1].id == "DB_BLOCK_CEILING_SECONDS"
-        for call in ceilinged
+        name in ("DB_BLOCK_CEILING_SECONDS", "KEEPALIVE_CEILING_SECONDS")
+        for name in ceilings
     )
