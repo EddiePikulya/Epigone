@@ -22,7 +22,7 @@ from epigone.gateway import Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.stream.poller import POLL_INTERVAL_SECONDS, run_poll_pass
 from epigone.withdrawals import (
-    MAX_OBSERVATION_GAP_SECONDS,
+    MAX_OBSERVATION_GAP_INTERVALS,
     WITHDRAWAL_FLOOR_USD,
     WITHDRAWAL_FRACTION_THRESHOLD,
 )
@@ -347,7 +347,7 @@ async def test_a_drop_across_a_gap_in_watching_alerts_nobody(
     await track(pool, clock, WHALE, 1)
     await observe(pool, gateway, clock, equity="400000")
 
-    clock.advance(MAX_OBSERVATION_GAP_SECONDS + 1)
+    clock.advance(MAX_OBSERVATION_GAP_INTERVALS * POLL_INTERVAL_SECONDS + 1)
     await observe(pool, gateway, clock, equity="100000")
 
     assert await alerts(pool) == []

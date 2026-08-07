@@ -20,6 +20,7 @@ def _settings(admin_telegram_id: int | None) -> Settings:
         seed_interval_minutes=DEFAULT_SEED_INTERVAL_MINUTES,
         fine_chunk_size=DEFAULT_FINE_CHUNK_SIZE,
         order_poll_interval_seconds=DEFAULT_ORDER_POLL_INTERVAL_SECONDS,
+        ws_authoritative=True,
     )
 
 

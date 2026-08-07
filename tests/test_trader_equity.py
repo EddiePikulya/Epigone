@@ -13,11 +13,11 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
+from epigone import position_publish
 from epigone.budget import WeightBudget
 from epigone.clock import Clock
 from epigone.gateway import POSITION_VENUES, GatewayError, Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
-from epigone.stream import poller
 from epigone.stream.poller import POLL_INTERVAL_SECONDS, POSITIONS_WEIGHT, run_poll_pass
 from epigone.trader_equity import EquityObservation, record_equity
 from tests.support.clock import FakeClock
@@ -208,7 +208,9 @@ async def test_an_interrupted_pass_leaves_the_equity_where_the_snapshots_are(
     async def die(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("interrupted mid-pass")
 
-    monkeypatch.setattr(poller, "record_events", die)
+    # Patched where the write lives since the cutover (#158): recording an
+    # event moved to epigone.position_publish so both lanes publish alike.
+    monkeypatch.setattr(position_publish, "record_events", die)
     with pytest.raises(RuntimeError):
         await poll(pool, gateway, clock)
 

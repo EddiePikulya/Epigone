@@ -1,9 +1,9 @@
-"""The websocket shadow lane (issue #157): a second producer of position
-events that nothing consumes.
+"""The websocket position lane (issues #157, #158).
 
-The lane's value is entirely comparative — it exists so the cutover ticket
-(#158) can hold two descriptions of the same reality side by side — so the
-tests are built around the four things that would make that comparison a lie:
+It began as a second producer of position events that nothing consumed, and the
+tests below still pin the four things that would have made THAT comparison a
+lie — because they are the same four things that would make the lane, now the
+producer everything acts on, quietly wrong:
 
 1. **Semantics parity.** If the websocket lane's idea of a scale-in differs
    from the poller's by so much as a threshold, the comparison measures two
@@ -20,8 +20,13 @@ tests are built around the four things that would make that comparison a lie:
    caps as the tracked set changes.
 
 Seam per the house convention: fake gateway, fake clock, staged websocket, real
-Postgres. And one test guards the promise the whole ticket rests on — that
-Position Alerts and the poller are untouched by any of it.
+Postgres.
+
+The final section is the cutover itself (#158): what changes when this lane
+owns event production — it alerts, through the same seam the poller uses — and
+what deliberately does not, since a lane must behave identically whether or not
+anyone is listening, or the moment ownership moves would be a moment its output
+changes shape.
 """
 
 from decimal import Decimal
@@ -33,6 +38,7 @@ import pytest
 from epigone.budget import WeightBudget
 from epigone.gateway import Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
+from epigone.lane_authority import POLL_OWNER, WS_OWNER, read_authority, take_ownership
 from epigone.position_events import POLL_SOURCE, WS_SOURCE
 from epigone.safety.heartbeat import last_beat
 from epigone.stream.poller import run_poll_pass
@@ -224,7 +230,16 @@ async def test_websocket_events_match_the_pollers_for_the_same_changes(
 ) -> None:
     """The comparison the whole ticket feeds: one scenario, two transports,
     identical events. Same kinds in the same order, a flip as ONE row carrying
-    both legs, the same scale threshold, and first-observation silence."""
+    both legs, the same scale threshold, and first-observation silence.
+
+    The websocket half is staged the way the real feed behaves — each state
+    pushed, then pushed again after a few seconds of quiet, because the
+    positions feed re-sends absolute state on a ~5s cadence whether or not
+    anything changed. That matters since the cutover: an entry-side scale is
+    held for a moment so a burst of fills becomes one event (ADR-0009), and it
+    emits on the next push. Parity is therefore a claim about what the two
+    lanes SAY, observation to observation — not about the instant they say it,
+    which is the latency the cutover was measured on."""
     await track(pool, clock, TRADER, FOLLOWER)
 
     # The REST lane walks the scenario one poll at a time.
@@ -237,9 +252,16 @@ async def test_websocket_events_match_the_pollers_for_the_same_changes(
     # The websocket lane starts from the same first observation — its resync
     # reads it over REST — and is then streamed the rest.
     gateway.set_positions(TRADER, SCENARIO[0])
+    quiet: list[Any] = [None] * (int(lane.WS_COALESCE_WINDOW_SECONDS / RECEIVE_TICK_SECONDS) + 1)
     socket = FakeWebsocket(
         clock,
-        [liveness_message()] + [positions_message(TRADER, state) for state in SCENARIO[1:]],
+        [liveness_message()]
+        + [
+            staged
+            for state in SCENARIO[1:]
+            for staged in (positions_message(TRADER, state), *quiet,
+                           positions_message(TRADER, state), *quiet)
+        ],
     )
     await run_lane_once(pool, gateway, clock, socket)
     ws_events = [comparable(row) for row in await events(pool, WS_SOURCE)]
@@ -741,3 +763,237 @@ async def test_an_unreadable_message_does_not_end_the_connection(
 
     assert isinstance(ended, WebsocketClosed)  # ran to the end of the script
     assert [row["kind"] for row in await events(pool, WS_SOURCE)] == ["open"]
+
+
+# --- the cutover: this lane becomes the one anyone listens to (issue #158) ---
+#
+# Everything above holds whether or not the lane owns event production, and
+# that is deliberate — the lane's behaviour must not depend on its status, or
+# the moment ownership moves would be a moment its output changes shape. What
+# follows is the part that DOES depend on it.
+
+
+async def websocket_owns(pool: asyncpg.Pool, clock: FakeClock) -> None:
+    async with pool.acquire() as conn, conn.transaction():
+        await take_ownership(conn, WS_OWNER, "test: cutover complete", clock.now())
+
+
+async def test_the_authoritative_lane_alerts_the_traders_followers(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Position Alerts continue uninterrupted across the cutover — from the
+    other lane. A User must not be able to tell which transport saw their
+    Trader open a position, which is why both lanes fan out through one seam
+    (epigone.position_publish) rather than each owning a copy of the rule."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    await websocket_owns(pool, clock)
+
+    socket = FakeWebsocket(
+        clock,
+        [
+            liveness_message(),
+            positions_message(TRADER, [position(), position(coin="ETH", size_coin="5")]),
+        ],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    rows = await events(pool, WS_SOURCE)
+    assert [(row["kind"], row["coin"], row["authoritative"]) for row in rows] == [
+        ("open", "ETH", True)
+    ]
+    alerted = await pool.fetch("SELECT * FROM position_alerts")
+    assert [(row["user_telegram_id"], row["kind"], row["coin"]) for row in alerted] == [
+        (FOLLOWER, "open", "ETH")
+    ]
+
+
+async def test_a_burst_of_fills_becomes_one_entry_event(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The granularity decision (ADR-0009). The websocket sees individual fills
+    where the poll window coalesced them; producing each one would mirror a
+    single entry with three orders, three sets of fees, and three chances of a
+    sliver falling under the exchange minimum. The burst is held by freezing
+    the anchor, so what finally emits is ONE scale-in measured from where the
+    burst began — not three, and not the last leg alone."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position(size_usd="10000", size_coin="100")])
+    await websocket_owns(pool, clock)
+
+    burst = [
+        positions_message(TRADER, [position(size_usd=size, size_coin=coin)])
+        for size, coin in (("13000", "130"), ("16000", "160"), ("20000", "200"))
+    ]
+    quiet: list[Any] = [None] * (int(lane.WS_COALESCE_WINDOW_SECONDS / RECEIVE_TICK_SECONDS) + 1)
+    socket = FakeWebsocket(
+        clock,
+        [liveness_message(), *burst, *quiet, positions_message(
+            TRADER, [position(size_usd="20000", size_coin="200")]
+        )],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    rows = await events(pool, WS_SOURCE)
+    assert [(row["kind"], row["prev_size_usd"], row["size_usd"]) for row in rows] == [
+        ("scale_in", Decimal("10000"), Decimal("20000"))
+    ]
+
+
+async def test_an_exit_inside_the_coalescing_window_is_never_delayed(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The guardrail on the whole decision: only entries may debounce. A close
+    landing mid-burst is produced at the first observation that shows it, with
+    no quiet tick in between — closing late is the one failure the copy path
+    treats as unacceptable (ADR-0007's direction asymmetry)."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position(size_usd="10000", size_coin="100")])
+    await websocket_owns(pool, clock)
+
+    socket = FakeWebsocket(
+        clock,
+        [
+            liveness_message(),
+            positions_message(TRADER, [position(size_usd="13000", size_coin="130")]),
+            positions_message(TRADER, []),
+        ],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    rows = await events(pool, WS_SOURCE)
+    assert [row["kind"] for row in rows] == ["close"]
+
+
+async def test_a_scale_out_inside_the_window_is_never_delayed(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Same guardrail, the other exit. A trim is money coming off the table."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position(size_usd="10000", size_coin="100")])
+    await websocket_owns(pool, clock)
+
+    socket = FakeWebsocket(
+        clock,
+        [
+            liveness_message(),
+            positions_message(TRADER, [position(size_usd="13000", size_coin="130")]),
+            positions_message(TRADER, [position(size_usd="6000", size_coin="60")]),
+        ],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    assert [row["kind"] for row in await events(pool, WS_SOURCE)] == ["scale_out"]
+
+
+async def test_a_held_entry_that_falls_back_emits_nothing(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """A Trader who adds and immediately unwinds the add ended where they
+    started. The held anchor makes that a non-event rather than a scale-in
+    followed by a scale-out, which is the same reading the 10s poll has always
+    given the same behaviour."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position(size_usd="10000", size_coin="100")])
+    await websocket_owns(pool, clock)
+
+    quiet: list[Any] = [None] * (int(lane.WS_COALESCE_WINDOW_SECONDS / RECEIVE_TICK_SECONDS) + 1)
+    socket = FakeWebsocket(
+        clock,
+        [
+            liveness_message(),
+            positions_message(TRADER, [position(size_usd="13000", size_coin="130")]),
+            *quiet,
+            positions_message(TRADER, [position(size_usd="10100", size_coin="101")]),
+        ],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    assert await events(pool, WS_SOURCE) == []
+
+
+async def test_losing_production_re_establishes_absolute_state_in_place(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The handback's precondition, earned rather than assumed. The poller
+    escalates precisely when it suspects this lane of missing changes, so
+    "the connection never dropped" is not evidence of anything: the lane
+    re-reads absolute state for every wallet it holds and stamps that, and the
+    ownership decision waits for the stamp."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    await websocket_owns(pool, clock)
+
+    async def poller_escalates() -> None:
+        clock.advance(5)
+        async with pool.acquire() as conn, conn.transaction():
+            await take_ownership(conn, POLL_OWNER, "test: drift", clock.now())
+
+    refresh_ticks = int(lane.TRACKED_REFRESH_SECONDS / RECEIVE_TICK_SECONDS) + 1
+    socket = FakeWebsocket(
+        clock,
+        [liveness_message(), poller_escalates, *([None] * refresh_ticks)],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    since = (await read_authority(pool)).since
+    resynced_at = await pool.fetchval(
+        "SELECT resynced_at FROM ws_lane_state WHERE trader_address = $1", TRADER
+    )
+    assert resynced_at >= since
+    # And exactly one subscription: the wallet was re-anchored where it stood,
+    # never unsubscribed and resubscribed.
+    assert socket.subscriptions(POSITIONS_CHANNEL) == [TRADER]
+
+
+async def test_a_lane_that_does_not_own_production_alerts_nobody(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The shadow half of the same rule, and the one that keeps the comparison
+    alive after the cutover: a lane that is not authoritative still records
+    everything it sees, and none of it reaches a User or a consumer."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+
+    socket = FakeWebsocket(
+        clock,
+        [
+            liveness_message(),
+            positions_message(TRADER, [position(), position(coin="ETH", size_coin="5")]),
+        ],
+    )
+    await run_lane_once(pool, gateway, clock, socket)
+
+    rows = await events(pool, WS_SOURCE)
+    assert [(row["kind"], row["authoritative"]) for row in rows] == [("open", False)]
+    assert await pool.fetchval("SELECT count(*) FROM position_alerts") == 0
+
+
+async def test_the_scarce_websocket_slots_go_to_copy_enabled_leaders(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """Which wallets a transport that can hold 15 covers is a DECISION (#158,
+    2026-08-04: "selection needs to be deliberate, not alphabetical"). An
+    address-sorted prefix decides it by leading hex digit; a Leader whose wallet
+    happens to start with 0xf would lose its slot to fifteen strangers."""
+    leader = "0xffff"
+    await track(pool, clock, leader, FOLLOWER)
+    for index in range(MAX_SUBSCRIBED_TRADERS):
+        await track(pool, clock, f"0xa{index:03x}", FOLLOWER)
+    await pool.execute(
+        """
+        INSERT INTO copy_subs
+            (operator_id, leader_address, sub_name, allocation_usd, base_stake_usd,
+             copy_mode, enabled, created_at)
+        VALUES (7, $1, 'copy-1', 1000, 100, 'default', TRUE, $2)
+        """,
+        leader,
+        clock.now(),
+    )
+
+    socket = FakeWebsocket(clock, [liveness_message()])
+    await run_lane_once(pool, gateway, clock, socket)
+
+    subscribed = socket.subscriptions(POSITIONS_CHANNEL)
+    assert subscribed[0] == leader
+    assert len(subscribed) == MAX_SUBSCRIBED_TRADERS

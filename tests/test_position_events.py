@@ -18,6 +18,7 @@ from decimal import Decimal
 import asyncpg
 import pytest
 
+from epigone import position_publish
 from epigone.budget import WeightBudget
 from epigone.gateway import Position, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
@@ -26,7 +27,6 @@ from epigone.position_events import (
     claim_event,
     outstanding_events,
 )
-from epigone.stream import poller
 from epigone.stream.poller import run_poll_pass
 from tests.support.clock import FakeClock
 
@@ -454,12 +454,17 @@ async def snapshot_sizes(pool: asyncpg.Pool) -> dict[str, Decimal]:
 
 
 def interrupt(monkeypatch: pytest.MonkeyPatch, target: str) -> None:
-    """Make the pass die at `target`, the way a killed process would."""
+    """Make the pass die at `target`, the way a killed process would.
+
+    Patched on `epigone.position_publish` since the cutover (#158): recording
+    an event and fanning it out moved there, so that both lanes publish
+    identically. The property under test did not move — the pass must still
+    leave both writes or neither."""
 
     async def die(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("interrupted mid-pass")
 
-    monkeypatch.setattr(poller, target, die)
+    monkeypatch.setattr(position_publish, target, die)
 
 
 async def test_an_interrupted_pass_leaves_neither_the_event_nor_the_snapshot(
@@ -510,7 +515,7 @@ async def test_an_event_never_commits_without_the_snapshot_that_produced_it(
     clock.advance(10)
     gateway.set_positions(TRADER, [position(size_coin="200", size_usd="20000")])
     with monkeypatch.context() as interrupted:
-        interrupt(interrupted, "_queue_alerts")
+        interrupt(interrupted, "queue_alerts")
         with pytest.raises(RuntimeError):
             await poll(pool, gateway, clock)
 

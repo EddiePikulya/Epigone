@@ -8,6 +8,10 @@ the tests hand it.
 
 Two details make the staging faithful rather than merely convenient:
 
+- A callable in the script is the WORLD changing mid-connection: it is awaited
+  where it sits and the stream carries on. Ownership moving to the poller, an
+  operator command, a new follow — things a lane has to react to in the middle
+  of a connection, which a test could otherwise only stage before or after one.
 - A `None` in the script is a QUIET TICK: `receive` returns None, exactly as
   the real transport does when its timeout expires with no message. Quiet ticks
   advance the fake clock by the timeout, which is what a real one costs, so a
@@ -18,17 +22,21 @@ Two details make the staging faithful rather than merely convenient:
   which is the only thing the lane ever actually observes.
 """
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from epigone.ws import WebsocketClosed
 from tests.support.clock import FakeClock
 
+# One entry in a staged stream: a message, a quiet tick, or something happening
+# in the world at that moment (see `receive`).
+Staged = dict[str, Any] | None | Callable[[], Awaitable[None]]
+
 
 class FakeWebsocket:
     """One connection, playing a fixed script of messages and quiet ticks."""
 
-    def __init__(self, clock: FakeClock, script: list[dict[str, Any] | None]) -> None:
+    def __init__(self, clock: FakeClock, script: list[Staged]) -> None:
         self._clock = clock
         self._script = list(script)
         self.sent: list[dict[str, Any]] = []
@@ -40,12 +48,22 @@ class FakeWebsocket:
         self.sent.append(dict(message))
 
     async def receive(self, timeout: float) -> dict[str, Any] | None:
-        if not self._script:
-            raise WebsocketClosed("staged stream ended")
-        message = self._script.pop(0)
-        if message is None:
-            self._clock.advance(timeout)
-        return message
+        while True:
+            if not self._script:
+                raise WebsocketClosed("staged stream ended")
+            message = self._script.pop(0)
+            if callable(message):
+                # Something happening in the WORLD at this point in the stream,
+                # rather than on the socket — the poller escalating, an operator
+                # command, a follow landing. Staged inline because a lane's
+                # reaction to it is a reaction to a moment, and a test that can
+                # only change the world before or after a connection cannot
+                # reach the middle of one (issue #158).
+                await message()
+                continue
+            if message is None:
+                self._clock.advance(timeout)
+            return message
 
     async def close(self) -> None:
         self.closed = True

@@ -1,20 +1,32 @@
-"""The websocket shadow lane: a second producer of position events (issue #157).
+"""The websocket position lane: the producer of position events (issues #157,
+#158).
 
 The lane subscribes to every wallet the poll pass watches and writes what it
 sees into `position_events` with `source = 'ws'`, beside the poller's `'poll'`
-rows. **Nothing reads those rows.** REST polling stays fully authoritative,
-Position Alerts are untouched, and a User sees no difference whatsoever. What
-this produces is two independent descriptions of the same reality in one table,
-distinguishable by `source` — the dataset the cutover ticket (#158) needs to
-decide whether the websocket can be trusted.
+rows — two independent descriptions of the same reality in one table.
 
-That "nothing consumes it" property is also the safety argument, and it is
-structural rather than a promise: the lane runs in its OWN process (ADR-0002 —
-processes meet only in Postgres), keeps its diff memory in its OWN tables
-(migration 0030), and the only row it writes that anyone else can see is an
-event nobody selects. If the lane is wrong, flaky or dead, alerting continues
-from the poller exactly as before, because there is no code path from here to
-there.
+**Since the cutover (#158, ADR-0009) those rows are the ones anyone acts on**,
+while this lane owns production. It was a shadow for exactly as long as it took
+to earn that: four days of dual capture, reported on #158, showing 100% side
+agreement, no phantoms, a median 4.2s lead over the poller — and one change the
+lane may have missed while looking perfectly healthy, which is why the poller
+never stopped watching.
+
+What it writes goes through `epigone.position_publish.publish`, the same seam
+the poller writes through, which reads ownership under a lock and decides
+whether this observation is authoritative. So the lane does not decide its own
+status, and a User cannot tell which transport saw their Trader open a
+position: the alert is fanned out by whichever lane owns production, in one
+shape, from one function.
+
+The old safety argument — "nothing consumes these rows" — is retired and
+replaced rather than weakened. What stands in its place: the REST poll pass
+never stops. It reads every wallet at a low cadence, records what it saw, and
+compares against what this lane produced; a change this lane never delivered
+takes production back within a bounded time whether or not this process is
+still alive to notice. The lane still runs in its OWN process (ADR-0002) and
+still keeps its diff memory in its OWN tables (migration 0030), so it can
+crash, wedge or be stopped and alerting simply moves lanes.
 
 Why websocket at all: subscriptions run on a budget entirely separate from the
 REST weight cap, take a `user` parameter for any address, and cover every venue
@@ -39,7 +51,7 @@ something observed. Measuring the real change-to-event latency is exactly what
 this lane's dataset is for (#158), and it is now measurable because both lanes
 stamp `observed_at` on the same change.
 
-## The three things this lane has to get right
+## The four things this lane has to get right
 
 **1. Resync before trusting the stream.** A websocket delivers what happens
 from the moment you subscribe. A reconnect that resumed streaming without first
@@ -81,6 +93,14 @@ than the connection-rate cap allows. The order lanes take a connection each out
 of the same per-IP pool, and no extra user allowance: the same address on a
 second connection is free (measured).
 
+**4. Fills are not decisions.** This lane sees INDIVIDUAL FILLS where the 10s
+poll window merged them — three scale-ins inside 2.5s, on the measured dataset,
+where the poller reported one. Mirroring each would turn one entry into three
+copied orders. So entry-side scales are held briefly and emitted as one event
+(`_coalesce_entries`), and exits — closes, flips, scale-outs — are never held
+for any reason. The whole argument is in that function's docstring and in
+ADR-0009.
+
 ## Measured against testnet/mainnet, 2026-08-02 (issue #157's two unknowns)
 
 - The 2000 messages/min allowance is **outbound-only**: a connection sustaining
@@ -115,14 +135,19 @@ from epigone.gateway import (
     RateLimitedError,
     on_covered_venue,
 )
-from epigone.position_diff import diff_positions, events_of
-from epigone.position_events import WS_SOURCE, record_events
+from epigone.lane_authority import WS_OWNER, read_authority
+from epigone.poll_set import fetch_poll_set, leaders_first
+from epigone.position_diff import CoinChange, diff_positions, events_of
+from epigone.position_events import WS_SOURCE
+from epigone.position_publish import publish
 from epigone.position_snapshots import WS_SNAPSHOTS, apply_changes, read_snapshots, remember
 from epigone.safety.heartbeat import beat, record_start
-from epigone.stream.poller import fetch_poll_set, fetch_positions_paced
+from epigone.stream.poller import fetch_positions_paced
 from epigone.ws import (
     LIVENESS_CHANNEL,
+    MAX_SUBSCRIBED_TRADERS,
     POSITIONS_CHANNEL,
+    WS_LANE_PROCESS,
     Connect,
     RollingMinute,
     WebsocketClosed,
@@ -136,11 +161,6 @@ from epigone.ws import (
 )
 
 log = logging.getLogger(__name__)
-
-# The heartbeat name other processes read the lane's health under. Its own,
-# never shared: a heartbeat row IS the process (epigone.safety.heartbeat), and
-# retiring the lane means deleting this row.
-WS_LANE_PROCESS = "ws_shadow"
 
 # Per-IP websocket allowances (Hyperliquid docs; the message figure verified
 # outbound-only on 2026-08-02 — see the module docstring). These are a budget
@@ -156,28 +176,25 @@ SUBSCRIPTION_LIMIT = 1000
 # There is no constant for that 1: nothing divides by it now that the binding
 # limit counts users rather than subscriptions.
 
-# ⚠️ The real ceiling, and it is NOT the subscription cap. Measured 2026-08-03
-# (scripts/testnet_ws_probe.py users): there is an undocumented allowance of 15
-# UNIQUE USERS PER IP across all user-scoped subscriptions — a 16th address is
-# refused with "Cannot track more than 15 total users." It is per IP rather than
-# per connection (a brand-new address on a freshly opened second connection is
-# refused while the first holds its 15), it counts distinct addresses rather
-# than subscriptions, and closing a connection frees its slots within ~2s.
-#
-# This retires the 499 that ADR-0006's arithmetic produced from the subscription
-# cap, and it is ~33× smaller — small enough that today's tracked set can exceed
-# it (15 wallets per User × 2–3 Users). The lane's promise has always been that
-# passing the cap is a LOGGED REFUSAL rather than the server quietly rejecting
-# subscriptions; against the true number it has been doing the opposite, and
-# this is what makes the promise true. Raising it means more IPs, which is a
-# real decision and not one this constant can make.
-MAX_SUBSCRIBED_TRADERS = 15
-
 # Outbound pacing, kept a margin under the real ceiling: the lane's steady-state
 # outbound is ~2 pings/min, and only a churning tracked set sends more, so this
 # ceiling exists to make a pathological churn degrade into deferred
 # subscriptions rather than a rejected connection.
 OUTBOUND_BUDGET_PER_MINUTE = 1800
+
+# How long an entry-side scale is held so a burst of fills becomes one event
+# (ADR-0009; see _coalesce_entries for the whole argument). Sized against the
+# measured burst — three fills inside 2.5s — and kept well under the latency
+# the cutover buys, so a coalesced entry still beats today's poll-produced one.
+# Exits are never held, whatever this says.
+WS_COALESCE_WINDOW_SECONDS = 3.0
+
+# What the positions feed costs in latency even when nothing is held: it pushes
+# on a ~5s cadence (measured 2026-08-02), so a held entry emits on the first
+# push after the window rather than the instant it closes. Recorded here
+# because the poller's reconciliation grace has to clear the sum of the two —
+# tests/test_position_cutover.py pins that relation.
+POSITIONS_PUSH_INTERVAL_SECONDS = 5.0
 
 # The server closes a connection idle in both directions at ~60s (measured).
 # Ping at less than half that, so one dropped ping is not a disconnect.
@@ -385,18 +402,33 @@ async def _refresh_subscriptions(
     wallet leaving is unsubscribed and forgotten, so a re-follow re-baselines
     silently instead of diffing against months-old memory — the poller's
     re-follow rule (`_prune_untracked`), which this lane owes for the same
-    reason."""
+    reason.
+
+    A wallet already subscribed gets that same treatment once more if the lane
+    LOST production while it was connected (issue #158). Being connected the
+    whole time is not evidence of being right: the poller escalates precisely
+    when it suspects this lane of missing changes, so a lane that keeps
+    streaming from memory formed before the degradation is the one thing the
+    handback cannot accept. Re-reading absolute state is both the repair and
+    the proof — `ws_lane_state.resynced_at` is what the ownership decision
+    waits for, and it can only be stamped here."""
     await forget_unwatched(pool, "ws_position_snapshots", "ws_lane_state")
-    wanted = await fetch_poll_set(pool)
+    wanted = await leaders_first(pool, await fetch_poll_set(pool))
+    stale = await _stale_anchors(pool, wanted)
     if len(wanted) > MAX_SUBSCRIBED_TRADERS:
         log.error(
             "ws lane: %d wallets exceeds the %d unique users one IP may track "
-            "(measured 2026-08-03, ADR-0008); shadowing the first %d only — "
-            "raising this needs another IP, not another constant",
+            "(measured 2026-08-03, ADR-0008); streaming the %d highest-priority "
+            "only — raising this needs another IP, not another constant",
             len(wanted),
             MAX_SUBSCRIBED_TRADERS,
             MAX_SUBSCRIBED_TRADERS,
         )
+        # Copy-enabled Leaders take the slots first (epigone.poll_set): which
+        # wallets a scarce transport covers is a decision, and an alphabetical
+        # prefix decides it by leading hex digit. Note that a set this size also
+        # keeps the poller authoritative (ADR-0009) — the lane cannot cover
+        # everyone, so it produces for no one.
         wanted = wanted[:MAX_SUBSCRIBED_TRADERS]
     for address in sorted(subscribed - set(wanted)):
         # A deferred unsubscribe leaves the wallet subscribed and retries on the
@@ -406,7 +438,7 @@ async def _refresh_subscriptions(
         if await send_if_allowed(connection, allowance, gone):
             subscribed.discard(address)
     for address in wanted:
-        if address in subscribed:
+        if address in subscribed and address not in stale:
             continue
         try:
             await _resync(pool, gateway, budget, address, clock, stats)
@@ -419,10 +451,33 @@ async def _refresh_subscriptions(
         except GatewayError:
             log.warning("ws lane: resync failed for %s; retrying next refresh", address)
             continue
+        if address in subscribed:
+            continue  # re-anchored in place; the feed was never interrupted
         wanted_feed = subscribe(positions_subscription(address))
         if not await send_if_allowed(connection, allowance, wanted_feed):
             continue
         subscribed.add(address)
+
+
+async def _stale_anchors(pool: asyncpg.Pool, wanted: list[str]) -> set[str]:
+    """Subscribed wallets whose absolute state predates the moment this lane
+    lost production (issue #158) — the ones a handback is waiting on.
+
+    Empty whenever the lane owns production, which is the steady state: this
+    costs one indexed read per refresh and a burst of REST reads exactly once
+    per degradation."""
+    authority = await read_authority(pool)
+    if authority.owner == WS_OWNER:
+        return set()
+    rows = await pool.fetch(
+        """
+        SELECT trader_address FROM ws_lane_state
+        WHERE trader_address = ANY($1) AND resynced_at < $2
+        """,
+        wanted,
+        authority.since,
+    )
+    return {row["trader_address"] for row in rows}
 
 
 async def _resync(
@@ -493,9 +548,14 @@ async def _apply_positions(
     The atomicity is ADR-0006's, inherited rather than reinvented: the events
     land with the memory advance they were diffed from, so an interrupted lane
     leaves both or neither and the next observation re-diffs the same change
-    exactly once. `record_events` is the same seam the poller writes through —
-    only `source` differs — which is what makes the two lanes' rows comparable
-    at all."""
+    exactly once. `publish` is the same seam the poller writes through — only
+    `source` differs — which is what makes the two lanes' rows comparable at
+    all, and what makes a Position Alert identical whichever lane produced it.
+
+    Entry bursts are coalesced on the way through (`_coalesce_entries`), never
+    on a resync: a resync is absolute state re-established after a gap, and
+    holding it back would be holding back the very thing it exists to
+    re-anchor."""
     async with pool.acquire() as conn, conn.transaction():
         baselined = await conn.fetchval(
             "SELECT 1 FROM ws_lane_state WHERE trader_address = $1", address
@@ -523,10 +583,14 @@ async def _apply_positions(
 
         previous = await read_snapshots(conn, WS_SNAPSHOTS, address)
         changes = diff_positions(previous, positions, now)
+        held: set[str] = set()
+        if not resync:
+            changes, held = _coalesce_entries(changes, await _pending(conn, address), now)
         await apply_changes(conn, WS_SNAPSHOTS, address, changes, now)
+        await _remember_pending(conn, address, changes, held, now)
         events = events_of(changes)
         if events:
-            await record_events(conn, address, events, now, source=WS_SOURCE)
+            await publish(conn, address, events, now, source=WS_SOURCE)
         if resync:
             await conn.execute(
                 """
@@ -543,6 +607,110 @@ async def _apply_positions(
                 now,
             )
         return len(events)
+
+
+def _coalesce_entries(
+    changes: list[CoinChange], pending: dict[str, datetime], now: datetime
+) -> tuple[list[CoinChange], set[str]]:
+    """Hold entry-side scales back briefly so one burst of fills becomes one
+    event (ADR-0009's coalescing decision). Returns the changes to apply and
+    the coins whose anchor is being held.
+
+    **Why this exists.** The websocket sees individual fills where the 10s poll
+    window coalesced them into a single diff — measured on the shadow dataset:
+    three scale-ins inside 2.5s that the poller reported once, and 29 matched
+    pairs disagreeing on size for the same reason. Producing all three would
+    make the copy path mirror one entry with three orders: three sets of fees,
+    and three chances of a sliver falling under the exchange's minimum notional
+    and being skipped entirely. Nothing about the Leader's intent is finer; the
+    granularity is an artefact of the transport.
+
+    **The guardrail: exits are never delayed, only entries may debounce.**
+    Closes, flips and scale-OUTs pass through untouched, at the first
+    observation that shows them — a late exit is the one failure this system
+    treats as unacceptable, and every direction-asymmetric rule in the copy
+    path (ADR-0007) says the same thing. Only `scale_in` is held.
+
+    **How.** Not a buffer: the coin's snapshot is simply NOT advanced, so the
+    anchor stays where the burst began and the next observation diffs the whole
+    burst as one change measured from it. Nothing is held in memory, so a lane
+    that dies mid-burst loses nothing — the anchor is on disk and the next
+    observation, or the next resync, re-diffs the same change exactly once.
+
+    **The cost, and why it is affordable.** An entry is delayed by up to
+    WS_COALESCE_WINDOW_SECONDS plus the wait for the next push. That is less
+    than the latency the cutover BUYS (the websocket led the poller by a median
+    4.2s), so a coalesced entry still reaches the copy path sooner than it does
+    today — the debounce spends part of the win, never more than the win.
+
+    A coin whose held scale falls back below the significance threshold ends up
+    a silent update: the anchor advances, the window closes, and nothing is
+    emitted. That is the correct reading — the Trader added and removed, and
+    the position ended where it started."""
+    kept: list[CoinChange] = []
+    held: set[str] = set()
+    for change in changes:
+        entry = change.event is not None and change.event.kind == "scale_in"
+        if not entry:
+            kept.append(change)
+            continue
+        started = pending.get(change.coin)
+        if started is None:
+            held.add(change.coin)  # the burst starts here; freeze the anchor
+            continue
+        if (now - started).total_seconds() < WS_COALESCE_WINDOW_SECONDS:
+            held.add(change.coin)  # still gathering
+            continue
+        kept.append(change)  # the window elapsed: emit the whole burst as one
+    return kept, held
+
+
+async def _pending(conn: asyncpg.Connection, address: str) -> dict[str, datetime]:
+    """When each coin's held entry burst started, for the coins holding one."""
+    rows = await conn.fetch(
+        """
+        SELECT coin, coalescing_since FROM ws_position_snapshots
+        WHERE trader_address = $1 AND coalescing_since IS NOT NULL
+        """,
+        address,
+    )
+    return {row["coin"]: row["coalescing_since"] for row in rows}
+
+
+async def _remember_pending(
+    conn: asyncpg.Connection,
+    address: str,
+    applied: list[CoinChange],
+    held: set[str],
+    now: datetime,
+) -> None:
+    """Open a coalescing window for each newly held coin and close it for every
+    coin whose change was just applied.
+
+    Closing is explicit because `remember` rewrites the observed columns and
+    leaves this one alone — which is exactly what a held coin needs (its
+    snapshot is not rewritten at all) and exactly what an emitted one must not
+    keep."""
+    for change in applied:
+        if change.position is not None:
+            await conn.execute(
+                """
+                UPDATE ws_position_snapshots SET coalescing_since = NULL
+                WHERE trader_address = $1 AND coin = $2
+                """,
+                address,
+                change.coin,
+            )
+    for coin in sorted(held):
+        await conn.execute(
+            """
+            UPDATE ws_position_snapshots SET coalescing_since = $3
+            WHERE trader_address = $1 AND coin = $2 AND coalescing_since IS NULL
+            """,
+            address,
+            coin,
+            now,
+        )
 
 
 async def forget_unwatched(pool: asyncpg.Pool, *tables: str) -> None:

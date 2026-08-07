@@ -236,7 +236,14 @@ async def emit(
     *,
     trader: str = LEADER,
     source: str = "poll",
+    authoritative: bool = True,
 ) -> None:
-    """One position event, as the poller would have written it."""
+    """One position event, as the lane that observed it would have written it.
+
+    `authoritative` is what the executor filters on since the cutover (#158):
+    the lane that did NOT own production when it saw the change writes the same
+    row with this False, and nothing consumes it."""
     async with pool.acquire() as conn, conn.transaction():
-        await record_events(conn, trader, [event], observed_at, source=source)
+        await record_events(
+            conn, trader, [event], observed_at, source=source, authoritative=authoritative
+        )

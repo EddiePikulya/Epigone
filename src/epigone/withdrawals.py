@@ -109,9 +109,12 @@ WITHDRAWAL_FRACTION_THRESHOLD = Decimal("0.25")
 # (#10) — that floor judges a POSITION's notional, and a withdrawal has none.
 WITHDRAWAL_FLOOR_USD = Decimal("1000")
 
-# How old the previous observation may be for the delta to mean anything, in
-# seconds — six poll intervals (epigone.stream.poller.POLL_INTERVAL_SECONDS is
-# 10s; imported as a literal to keep this module free of the poller it feeds).
+# How old the previous observation may be for the delta to mean anything,
+# expressed in POLL INTERVALS rather than seconds since the cutover (#158): the
+# poll pass now runs at two cadences — 10s when it owns event production, 60s
+# as a warm standby — and a gate fixed in seconds would have silently turned
+# this alert off at the slower one. The caller multiplies by whichever interval
+# is in force (epigone.stream.poller), which is the only place that knows.
 #
 # The attribution above reads PnL from two snapshots of the book. Across a gap
 # where nothing was watched, a position could have opened, run and closed
@@ -128,7 +131,15 @@ WITHDRAWAL_FLOOR_USD = Decimal("1000")
 # this gate would go quiet rather than fire wrongly, which is the direction to
 # fail in — but it would go quiet SILENTLY, so it is the thing to check first if
 # withdrawal alerts ever stop arriving.
-MAX_OBSERVATION_GAP_SECONDS = 60
+#
+# What the standby cadence costs, stated plainly: at 60s the unwatched window is
+# six times wider, so a leveraged round trip that opens and closes entirely
+# inside it realizes a loss neither observation can see and reads as an outflow.
+# That risk belongs to the cadence, not to this gate — narrowing the gate would
+# not detect the round trip, it would only stop reporting real withdrawals too.
+# The thresholds (25% AND $1,000) are what keep it rare, and the alert is a
+# notification rather than an action.
+MAX_OBSERVATION_GAP_INTERVALS = 6
 
 # How far a coin may plausibly move between two poll passes, as a fraction of
 # notional — the size of the PnL a close can have realized without either
@@ -181,6 +192,8 @@ def detect_withdrawal(
     snapshots: Mapping[str, SnapshotState],
     positions: Sequence[Position],
     now: datetime,
+    *,
+    max_gap_seconds: float,
 ) -> Withdrawal | None:
     """Whether this pass caught money leaving, judged from the observation it
     replaced and the two looks at the book that bracket it.
@@ -197,7 +210,7 @@ def detect_withdrawal(
     ownership of the transaction."""
     if previous is None:
         return None
-    if (now - previous.observed_at).total_seconds() > MAX_OBSERVATION_GAP_SECONDS:
+    if (now - previous.observed_at).total_seconds() > max_gap_seconds:
         return None
     prior_equity = previous.account_value
     if prior_equity <= 0:

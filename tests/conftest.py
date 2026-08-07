@@ -66,7 +66,12 @@ async def pool(database_url: str) -> AsyncGenerator[asyncpg.Pool, None]:
             # back to the same numbers the migration seeds when the row is
             # missing (epigone.execute.limits — absence is not permission), so
             # a test that changed a knob cannot leak into the next one.
-            "copy_sub_equity, risk_limits"
+            # lane_authority is TRUNCATED for the risk_limits reason and with
+            # the same safety: an absent row reads as "the poll pass owns
+            # production" (epigone.lane_authority), never as permission for the
+            # websocket — so a test that moved ownership cannot leak into the
+            # next one, and the next one starts in the pre-cutover world.
+            "copy_sub_equity, risk_limits, lane_authority"
         )
     yield pool
     await pool.close()

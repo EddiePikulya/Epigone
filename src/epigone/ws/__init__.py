@@ -68,6 +68,41 @@ POSITIONS_CHANNEL = "allDexsClearinghouseState"
 ORDERS_CHANNEL = "orderUpdates"
 LIVENESS_CHANNEL = "allMids"
 
+# The heartbeat name other processes read the position lane's health under. Its
+# own, never shared: a heartbeat row IS the process (epigone.safety.heartbeat),
+# and retiring the lane means deleting this row.
+#
+# It lives here rather than in `epigone.ws.lane` because the lane is no longer
+# the only module that needs to name it: since the cutover (#158) the poller
+# decides who produces events by reading exactly this heartbeat's age, and it
+# must not import the lane to learn the name.
+WS_LANE_PROCESS = "ws_shadow"
+
+# ⚠️ The websocket's real ceiling, and it is NOT the subscription cap. Measured
+# 2026-08-03 (scripts/testnet_ws_probe.py users): there is an undocumented
+# allowance of 15 UNIQUE USERS PER IP across all user-scoped subscriptions — a
+# 16th address is refused with "Cannot track more than 15 total users." It is
+# per IP rather than per connection (a brand-new address on a freshly opened
+# second connection is refused while the first holds its 15), it counts
+# distinct addresses rather than subscriptions, and closing a connection frees
+# its slots within ~2s.
+#
+# This retires the 499 that ADR-0006's arithmetic produced from the
+# subscription cap, and it is ~33× smaller — small enough that today's tracked
+# set can approach it. The lane's promise has always been that passing the cap
+# is a LOGGED REFUSAL rather than the server quietly rejecting subscriptions;
+# against the true number it had been doing the opposite, and this is what
+# makes the promise true. Raising it means more IPs (#29, riding #188's
+# egress selection), which is a real decision and not one this constant can
+# make.
+#
+# Since the cutover it is also a CEILING ON THE CUTOVER ITSELF: the websocket
+# may only own event production while it covers every wallet the poller does,
+# so a poll set past this number keeps the poller authoritative (ADR-0009).
+# That is why the constant lives beside the channel names rather than inside
+# the lane — the ownership decision reads it too.
+MAX_SUBSCRIBED_TRADERS = 15
+
 
 class WebsocketClosed(Exception):
     """The peer went away — the connection is finished and must be replaced."""

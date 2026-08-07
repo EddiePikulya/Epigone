@@ -1,4 +1,4 @@
-"""Stream process: the ~10s tracked-wallet position poller (issue #4) plus the
+"""Stream process: the tracked-wallet position poller (issue #4) plus the
 slower resting-order poller (issue #115).
 
 Two loops share the process. Each cycle runs one pass over every distinct
@@ -6,6 +6,25 @@ tracked Trader, then sleeps whatever remains of its interval; when pacing or
 wallet count stretches a pass past the interval, the next one starts
 immediately. Alerts land in position_alerts / order_alerts for the bot process
 to deliver (ADR-0002).
+
+**The position loop keeps two cadences since the cutover (issue #158,
+ADR-0009), and the split is the whole point.** Every tick — 10s, unchanged — it
+re-decides who owns event production by reading the websocket lane's heartbeat
+age. How often it POLLS depends on that answer: at the escalated cadence when
+it owns production, at STANDBY_POLL_INTERVAL_SECONDS when the websocket does.
+
+Deciding punctually while polling slowly is what bounds the failover. Were
+ownership re-decided only on the passes themselves, a dead lane would go
+unnoticed for a standby interval on top of the staleness window; deciding every
+tick keeps the transfer inside staleness + one tick + the pass — under two
+minutes, and the number the ticket asks to be documented.
+
+The standby cadence is not idleness. The poller still reads every wallet, still
+diffs, still records what it saw, and still watches for changes the websocket
+never produced — the reconciliation that catches a lane which is connected,
+delivering, and silently missing changes. What it stops doing is producing
+events anyone acts on. Meanwhile the ~6× cadence drop hands most of its share
+of the weight budget back to ingest, which is the cutover's quieter dividend.
 
 Position polling keeps priority (#115's budget rule): the position loop spends
 behind only the execution lane's floor (issue #133 — signed orders outrank
@@ -18,6 +37,8 @@ latency.
 
 import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 
 import aiohttp
 import asyncpg
@@ -33,13 +54,105 @@ from epigone.config import Settings
 from epigone.db import create_pool, migrate
 from epigone.gateway import HyperliquidGateway
 from epigone.gateway.http import HttpHyperliquidGateway
+from epigone.lane_authority import POLL_OWNER, evaluate_authority
 from epigone.stream.orders import run_order_poll_pass
-from epigone.stream.poller import POLL_INTERVAL_SECONDS, run_poll_pass
+from epigone.stream.poller import (
+    POLL_INTERVAL_SECONDS,
+    STANDBY_POLL_INTERVAL_SECONDS,
+    PollResult,
+    run_poll_pass,
+)
 
 log = logging.getLogger(__name__)
 
 
-async def run(pool_url: str, clock: Clock, order_poll_interval_seconds: int) -> None:
+@dataclass
+class StandbyState:
+    """What the position loop remembers between ticks: when it last actually
+    polled, and who owned production when it did. Deliberately not a timer —
+    the loop re-decides from the clock every tick, so a restart, a long pass or
+    a cadence change resolves on the next tick rather than leaving a schedule
+    behind."""
+
+    last_pass_at: datetime | None = None
+    owner: str | None = None
+
+
+async def run_position_cycle(
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    budget: Budget,
+    clock: Clock,
+    state: StandbyState,
+    *,
+    ws_authoritative: bool = True,
+) -> PollResult | None:
+    """One tick of the position loop: decide who owns production, then poll if
+    this tick's cadence says so. Returns the pass's result, or None on a tick
+    that only re-decided.
+
+    Extracted from the loop so the cadence — the thing that changes under
+    failover, and the thing whose punctuality bounds it — is testable without
+    an infinite loop or a real clock."""
+    authority = await evaluate_authority(pool, clock, enabled=ws_authoritative)
+    cadence = (
+        POLL_INTERVAL_SECONDS
+        if authority.owner == POLL_OWNER
+        else STANDBY_POLL_INTERVAL_SECONDS
+    )
+    if authority.owner != state.owner:
+        # A transfer is exactly the moment a change can fall between two owners:
+        # the incoming lane was not authoritative when it observed one, and the
+        # outgoing lane had already stopped producing. So the tick that moves
+        # ownership always polls, whatever the cadence says.
+        #
+        # ⚠️ This is a CORRECTNESS precondition of the stranded-change repair
+        # (ADR-0009 §4), not a latency optimisation, and the constraint is
+        # invisible from either side of it. The evidence that a straddler was
+        # produced by neither lane is an UNCONSUMED websocket row, and
+        # reconciliation only looks for it back to `last_polled_at` minus the
+        # grace — while the pass that HOLDS the doubt advances `last_polled_at`
+        # itself. So a first post-handback pass arriving a standby interval late
+        # would hold the straddler at t+50s and then confirm it at t+60s against
+        # a window starting at t+20s, which no longer reaches the row written at
+        # t−5s. The change would be reclassified benign, shadow-recorded, and
+        # swallowed for good — the exact hole the repair exists to close, at
+        # every deploy.
+        #
+        # Polling on the transfer keeps the hold within one tick of the handover,
+        # so the confirm's window still contains the row by a comfortable margin
+        # (grace 30s against a worst case of one poll interval plus one tick).
+        # tests/test_position_cutover.py's transfer test fails if this goes.
+        state.last_pass_at = None
+        state.owner = authority.owner
+    now = clock.now()
+    if (
+        state.last_pass_at is not None
+        and (now - state.last_pass_at).total_seconds() < cadence
+    ):
+        return None
+    state.last_pass_at = now
+    result = await run_poll_pass(pool, gateway, budget, clock)
+    if result.deferred:
+        # A wallet is carrying a change the websocket has not produced yet. The
+        # poller stops trusting the standby cadence and looks again on the next
+        # tick: whatever the answer turns out to be — the lane was simply a few
+        # seconds behind, or it genuinely missed something — knowing it 10s from
+        # now beats knowing it a minute from now, and the extra pass costs one
+        # wallet's weight.
+        state.last_pass_at = None
+    if result.drifted:
+        log.error(
+            "position lane: %d wallet(s) drifted from the websocket's production; "
+            "the poller has taken it back",
+            result.drifted,
+        )
+    return result
+
+
+async def run(
+    pool_url: str, clock: Clock, order_poll_interval_seconds: int, *, ws_authoritative: bool = True
+) -> None:
     pool = await create_pool(pool_url)
     await migrate(pool)
     # The position poller spends the shared budget (issue #28) above only the
@@ -53,25 +166,36 @@ async def run(pool_url: str, clock: Clock, order_poll_interval_seconds: int) -> 
     async with aiohttp.ClientSession() as session:
         gateway = HttpHyperliquidGateway(session, clock)
         await asyncio.gather(
-            _position_loop(pool, gateway, position_budget, clock),
+            _position_loop(pool, gateway, position_budget, clock, ws_authoritative),
             _order_loop(pool, gateway, order_budget, clock, order_poll_interval_seconds),
         )
 
 
 async def _position_loop(
-    pool: asyncpg.Pool, gateway: HyperliquidGateway, budget: Budget, clock: Clock
+    pool: asyncpg.Pool,
+    gateway: HyperliquidGateway,
+    budget: Budget,
+    clock: Clock,
+    ws_authoritative: bool,
 ) -> None:
+    state = StandbyState()
     while True:
         started = clock.now()
-        result = await run_poll_pass(pool, gateway, budget, clock)
-        log.debug(
-            "stream cycle: %d polled, %d events, %d failed%s",
-            result.polled,
-            result.events,
-            result.failed,
-            " (aborted)" if result.aborted else "",
+        result = await run_position_cycle(
+            pool, gateway, budget, clock, state, ws_authoritative=ws_authoritative
         )
+        if result is not None:
+            log.debug(
+                "stream cycle: %d polled, %d events (%d produced), %d failed%s",
+                result.polled,
+                result.events,
+                result.produced,
+                result.failed,
+                " (aborted)" if result.aborted else "",
+            )
         elapsed = (clock.now() - started).total_seconds()
+        # The TICK is fixed whatever the polling cadence is: ownership is
+        # re-decided on every one of them, and that is what bounds the failover.
         await clock.sleep(max(0.0, POLL_INTERVAL_SECONDS - elapsed))
 
 
@@ -99,7 +223,12 @@ async def _order_loop(
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = Settings.from_env()
-    await run(settings.database_url, SystemClock(), settings.order_poll_interval_seconds)
+    await run(
+        settings.database_url,
+        SystemClock(),
+        settings.order_poll_interval_seconds,
+        ws_authoritative=settings.ws_authoritative,
+    )
 
 
 if __name__ == "__main__":

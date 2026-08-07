@@ -97,6 +97,14 @@ surface the watchdog sweep already handles.
   would copy every trade TWICE during the shadow phase. Flipping this filter
   to `'ws'` is a #158 cutover checklist item.
 
+  > **SUPERSEDED by ADR-0009 (2026-08-06, issue #158)** — the filter stands,
+  > forced as ever, but it is on `position_events.authoritative` rather than on
+  > `source`, and there is no flip to `'ws'`. Ownership now MOVES between the
+  > lanes: pinned to `'poll'` the executor would go blind the moment the
+  > websocket took over, pinned to `'ws'` the moment the poller took it back.
+  > `authoritative` is this same exclusivity expressed against the thing that
+  > changes, decided by the producers under a lock.
+
 ### 5. Partial/zero fills: policy split by direction
 
 - **Entries** (open, scale-in, flip's open leg): ONE shot, accept-and-audit.
@@ -283,8 +291,10 @@ copying. `/uncopy` flips the flag off.
 
 ## Executor constraints inherited from prior work (not decisions — obligations)
 
-- **Source filter:** backlog query filters `source = 'poll'` (decision 4);
-  flip to `'ws'` is a #158 cutover item.
+- **Source filter:** backlog query filters on `authoritative` (decision 4, as
+  ADR-0009 supersedes it). Not on `source`, and there is no flip to `'ws'`:
+  event production moves between the lanes, so a transport-pinned filter goes
+  blind at exactly the moment the other lane takes over.
 - **The A3 `skip_cancel` residual race** (#136 comment, PR #143 round-6):
   re-check halt state as late as possible before signing; a halt observed
   AFTER signing is a reconciliation obligation — verify against live state,

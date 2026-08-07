@@ -120,11 +120,20 @@ async def record_events(
     observed_at: datetime,
     *,
     source: str = POLL_SOURCE,
+    authoritative: bool = True,
 ) -> None:
     """Persist one Trader's events **inside the caller's open transaction**.
 
     Takes a connection rather than a pool for that reason alone: the rows must
     commit with the snapshot advance they were diffed from, or not at all.
+
+    `authoritative` says whether the lane that observed these OWNED production
+    at that instant (issue #158, ADR-0009) — the column consumers filter on.
+    Both lanes record everything they see, always; the one that does not own
+    production writes rows nothing consumes, which is how the shadow comparison
+    survives the cutover instead of ending at it. Producers do not decide this
+    for themselves: `epigone.position_publish.publish` reads it off the
+    authority row under a lock, and is the seam both lanes write through.
 
     Retention is applied here, in the pass that wrote, rather than by a sweeper
     — the `record_rate_limit` precedent (`epigone.budget` prunes stale
@@ -143,8 +152,8 @@ async def record_events(
         INSERT INTO position_events
             (trader_address, coin, kind, side, size_usd, size_coin, prev_size_usd,
              prev_size_coin, leverage, entry_price, prev_side, realized_pnl, pct_return,
-             opened_at, observed_at, source)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+             opened_at, observed_at, source, authoritative)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
         """,
         [
             (
@@ -164,6 +173,7 @@ async def record_events(
                 event.opened_at,
                 observed_at,
                 source,
+                authoritative,
             )
             for event in events
         ],
@@ -179,6 +189,7 @@ async def outstanding_events(
     consumer: str,
     *,
     source: str | None = None,
+    authoritative: bool | None = None,
     traders: list[str] | None = None,
 ) -> list[ClaimableEvent]:
     """This consumer's backlog: every event it has not claimed, oldest first.
@@ -189,12 +200,19 @@ async def outstanding_events(
     thousand rows. If it ever outgrows that, an index strategy and a batch
     bound are the things to revisit, not the claims model.
 
-    `source` is the filter ADR-0007 decision 4 makes MANDATORY for the copy
-    executor rather than optional, and it lives here — in the query — because
-    that is where the ADR puts it. The WS shadow lane dual-writes every
-    (trader, coin) it observes, so an unfiltered executor would copy every
-    trade TWICE for as long as the shadow phase runs. Flipping the executor's
-    argument from 'poll' to 'ws' is a #158 cutover checklist item.
+    `authoritative` is the filter ADR-0007 decision 4 makes MANDATORY for the
+    copy executor rather than optional, and it lives here — in the query —
+    because that is where the ADR puts it. Both lanes dual-write every (trader,
+    coin) they observe, so an unfiltered executor would copy every trade TWICE.
+
+    The ADR (and #158's own checklist) originally said to filter on `source`
+    and flip it from 'poll' to 'ws' at the cutover. ADR-0009 supersedes that:
+    a source filter cannot survive failover in either position — pinned to
+    'poll' the executor goes blind the moment the websocket takes over, pinned
+    to 'ws' it goes blind the moment the poller takes it back. `authoritative`
+    is the same exclusivity expressed against the thing that actually moves,
+    and it is the producers, under a lock, that decide it. `source` stays
+    available for readers doing lane comparison rather than consumption.
 
     `traders` narrows the backlog to the copy-enabled Leaders. It is a filter,
     not a skip: an event for a wallet nobody copies must never be CLAIMED,
@@ -208,11 +226,13 @@ async def outstanding_events(
         LEFT JOIN position_event_claims c ON c.event_id = e.id AND c.consumer = $1
         WHERE c.event_id IS NULL
           AND ($2::text IS NULL OR e.source = $2)
-          AND ($3::text[] IS NULL OR e.trader_address = ANY($3))
+          AND ($3::boolean IS NULL OR e.authoritative = $3)
+          AND ($4::text[] IS NULL OR e.trader_address = ANY($4))
         ORDER BY e.id
         """,
         consumer,
         source,
+        authoritative,
         traders,
     )
     return [
