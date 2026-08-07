@@ -70,16 +70,21 @@ comparing its own diff against what the lane produced.
    side by side. A `poll` row with no `ws` row near it, on a wallet where the
    lane produced other events either side, is a genuine miss.
 
-2. **Rule out the benign class first.** A gradual size change can cross the 25%
-   significance threshold in one 60s standby diff while never crossing it in any
-   single ~5s websocket push. That is a threshold artefact, not a lost message,
-   and it is the most likely explanation for a single scale-in-shaped drift on a
-   quiet position. A missed `open` or `close` is never benign.
+2. **Note what this reason has already ruled out.** Two innocent explanations
+   are filtered before an incident can be raised, so neither is what you are
+   looking at:
 
-   Note what this reason already rules out: the lane merely being slow. The
-   poller withholds its verdict on a change the websocket has not produced and
-   re-polls that wallet on the next tick, so a `reconciliation drift` reason
-   means the change was still missing ~10s later, not that it arrived late.
+   - *the lane was merely slow* — the poller withholds its verdict on a change
+     the websocket has not produced and re-polls that wallet on the next tick,
+     so drift means the change was still missing ~10s later;
+   - *the threshold artefact* — a gradual size change crossing 25% against the
+     poller's 60s anchor while never crossing it in any single ~5s push. The
+     poller checks the websocket lane's own anchor (`ws_position_snapshots`)
+     before doubting anything, and a lane whose memory already matches reality
+     owes nothing.
+
+   So a `reconciliation drift` reason means the lane's OWN memory says it still
+   owed an event, twice, ten seconds apart. Treat it as real.
 
 3. **Nothing needs restarting.** The escalation already transferred production
    and the event was produced by the poller. The lane will re-read absolute

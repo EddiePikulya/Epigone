@@ -39,6 +39,7 @@ from epigone.lane_authority import (
 )
 from epigone.position_events import POLL_SOURCE, WS_SOURCE, PositionEvent, record_events
 from epigone.position_publish import publish
+from epigone.position_snapshots import WS_SNAPSHOTS, remember
 from epigone.safety.heartbeat import beat
 from epigone.stream.main import (
     STANDBY_POLL_INTERVAL_SECONDS,
@@ -121,6 +122,14 @@ async def events(pool: asyncpg.Pool) -> list[asyncpg.Record]:
 
 async def alerts(pool: asyncpg.Pool) -> list[asyncpg.Record]:
     return await pool.fetch("SELECT * FROM position_alerts ORDER BY id")
+
+
+async def pending_coins(pool: asyncpg.Pool, address: str) -> list[str]:
+    """The coins whose verdict the poller is holding over for another look."""
+    held = await pool.fetchval(
+        "SELECT reconcile_pending FROM position_poll_state WHERE trader_address = $1", address
+    )
+    return sorted(held or ())
 
 
 @pytest.fixture
@@ -625,3 +634,154 @@ async def test_alerts_survive_a_cutover_a_failover_and_a_recovery(
         ("close", "ETH"),
         ("close", "SOL"),
     ]
+
+
+# --- the benign divergence class (issue #158, 2026-08-02 comment) -------------
+#
+# "The scale-significance threshold measures against the last observation, and
+# the lanes observe at different cadences — a gradual size change can cross 25%
+# in one poll yet never in any single ws push. The comparison should classify
+# these as expected, not as lane errors."
+#
+# The same sentence, one cutover later, is a rule about ownership: a change the
+# websocket's own rules never make an event of is not a change it MISSED, and
+# escalating on it would hand the operator an incident channel to learn to
+# ignore.
+
+
+async def websocket_watching(
+    pool: asyncpg.Pool, clock: FakeClock, address: str, positions: list[Position]
+) -> None:
+    """The websocket lane's memory of a Trader: baselined, and anchored on
+    exactly these positions. What the poller reads to ask whether the lane
+    still owes an event — never writes (ADR-0002: the lanes meet in Postgres,
+    and each lane's diff memory has exactly one writer)."""
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO ws_lane_state (trader_address, baselined_at, resynced_at)
+            VALUES ($1, $2, $2)
+            ON CONFLICT (trader_address) DO UPDATE SET resynced_at = EXCLUDED.resynced_at
+            """,
+            address,
+            clock.now(),
+        )
+        await conn.execute(
+            "DELETE FROM ws_position_snapshots WHERE trader_address = $1", address
+        )
+        for pos in positions:
+            await remember(
+                conn, WS_SNAPSHOTS, address, pos, opened_at=clock.now(), updated_at=clock.now()
+            )
+
+
+async def test_a_gradual_change_the_websocket_never_called_an_event_is_not_drift(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The class the spec names. A position that grows ~8% per push crosses the
+    25% threshold against the poller's 60s-old anchor and never against any
+    single websocket observation — so the lane emitted nothing, and its memory
+    is nonetheless completely current. It missed nothing. Treating that as a
+    miss would thrash ownership daily on lanes that agree about reality."""
+    clock.advance(60)
+    grown = [position(size_usd="20000")]
+    gateway.set_positions(TRADER, grown)
+    await websocket_watching(pool, clock, TRADER, grown)
+
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert [(row["kind"], row["authoritative"]) for row in await events(pool)] == [
+        ("scale_in", False)
+    ]
+    assert await alerts(pool) == []
+
+
+async def test_a_change_the_websockets_own_memory_still_owes_is_drift(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The discriminator's other side, and the reason it is the right one: the
+    websocket lane's anchor is where the position USED to be, so by its own
+    rules it owes an event it has not produced. That is the silent-miss failure
+    mode the warm standby exists for — and here the lane's own memory says so.
+    """
+    clock.advance(60)
+    await websocket_watching(pool, clock, TRADER, [position()])  # anchored on the OLD size
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER and "drift" in authority.reason
+    assert [row["kind"] for row in await alerts(pool)] == ["scale_in"]
+
+
+async def test_a_wallet_the_websocket_is_not_watching_vouches_for_nothing(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """A lane with no memory of a Trader agrees with reality about a flat
+    wallet the way an empty room agrees with an empty room. Absence of memory
+    is absence of watching, never evidence of currency — so it vouches for
+    nothing and an unproduced change stays drift."""
+    clock.advance(60)
+    gateway.set_positions(TRADER, [])  # the position closed; the lane never said so
+
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == POLL_OWNER
+    assert [row["kind"] for row in await alerts(pool)] == ["close"]
+
+
+async def test_a_pass_with_nothing_to_report_clears_a_held_doubt(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """A held doubt is about ONE change, and it must not outlive it. The Leader
+    trims back before the second look, so the re-diff is a sub-threshold
+    update — nothing to report, nothing to hold. A doubt left standing here
+    would sit in the wallet's row for days and then escalate the first
+    unrelated change that ever raced the websocket, with no patience at all."""
+    clock.advance(60)
+    await websocket_watching(pool, clock, TRADER, [position()])
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, [position(size_usd="10500")])  # back to ~where it was
+    await poll(pool, gateway, clock)
+
+    assert await pending_coins(pool, TRADER) == []
+    assert (await read_authority(pool)).owner == WS_OWNER
+
+
+async def test_one_held_doubt_does_not_escalate_a_different_coin(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """Patience is per change, not per wallet. BTC has now been doubted twice
+    and is drift; ETH is being seen for the first time in the same pass and is
+    not evidence of anything. The incident must name the coin that earned it —
+    blaming ETH would send an operator looking at the wrong position.
+
+    Both are produced once the escalation lands, because by then the poller
+    owns production and there is nothing left to defer to."""
+    clock.advance(60)
+    await websocket_watching(pool, clock, TRADER, [position()])
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, [position(size_usd="20000"), position(coin="ETH")])
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "BTC" in authority.reason and "ETH" not in authority.reason
+    assert await pending_coins(pool, TRADER) == []
+    assert sorted(row["coin"] for row in await alerts(pool)) == ["BTC", "ETH"]

@@ -197,6 +197,15 @@ Optional knobs, both with safe defaults: `EPIGONE_DUMP_DIR`
 (`~/epigone-dumps`), `EPIGONE_DUMP_KEEP` (`3`; a value below 1 is refused
 rather than obeyed).
 
+**Rolling deploys and the ws cutover (#158).** `docker compose up -d --build`
+replaces containers one at a time, and whichever process starts first migrates
+the database — so for a few seconds a pre-cutover `ws` container can be writing
+`position_events` into a migrated schema. That is safe by construction:
+`authoritative` defaults FALSE (migration 0037), so rows from a writer that has
+not heard of ownership are recorded and consumed by nobody, and the executor
+drains exactly one producer throughout. Nothing about the deploy order needs
+managing.
+
 **The position lane degrading is not an outage: `docs/runbooks/position-lane-failover.md`.**
 Since the websocket cutover (#158) the monitor can say *"Position lane
 DEGRADED"*. That means event production moved back to the REST poller on its

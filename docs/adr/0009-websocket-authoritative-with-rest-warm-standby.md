@@ -100,16 +100,46 @@ not quietly write it: that would put two writers on one Trader. It escalates
 under the exclusive lock, and only then produces the event. The health monitor's
 `position_lane` check reads that reason and puts it in front of the operator.
 
-**One look of patience first.** The websocket is routinely a few seconds BEHIND
-the poller while perfectly healthy — it holds entry bursts (decision 5) and
-re-sends state on a ~5s cadence — so at the 60s standby cadence a real share of
-all changes are seen here first. Escalating on sight would fire the incident
-most days, and an incident that fires most days is one nobody reads. So the
-first sighting withholds the verdict AND the memory advance
+**Two classes of divergence, and only one of them is a fault.** The poller
+seeing a change the websocket has not produced means one of two entirely
+different things, and conflating them was the first version's real defect.
+
+*Latency divergence* — the lane is a few seconds behind. It holds entry bursts
+(decision 5) and re-sends state on a ~5s cadence, so at the 60s standby cadence
+a real share of changes are seen here first. It resolves itself on the next
+look. So the first sighting withholds the verdict AND the memory advance
 (`position_poll_state.reconcile_pending`): the coin's anchor stays put, the next
 pass re-diffs the identical change, and it decides then. The wallet is re-polled
 on the next 10s tick rather than after another standby interval, so a genuine
-miss costs ~10s of latency, not ~60s.
+miss costs ~10s of latency, not ~60s. Every completed pass rewrites the whole
+pending set — including to empty — because a doubt about a change that has since
+evaporated would otherwise sit in the row for days and then escalate the first
+unrelated change that ever raced the lane, with no patience at all.
+
+*Threshold divergence* — **the benign class #158's 2026-08-02 comment names**,
+and it never resolves, because there is nothing to resolve. The significance
+threshold measures against the LAST OBSERVATION, and the lanes observe at
+different cadences: a position creeping up ~8% per push crosses 25% against a
+60s-old anchor and never against any single push. The lane emits nothing, and
+its memory is completely current. Waiting a second look does not help; the
+comment requires this be classified as expected, not as a lane error, and a
+version that escalated it would have thrashed ownership daily and taught the
+operator to ignore the incident channel — this design's own stated anti-goal.
+
+**The discriminator is the other lane's own memory.** Before doubting anything,
+the poller diffs what it just read against `ws_position_snapshots` — the
+websocket lane's anchor, which IS its claim about what it has seen — using the
+same `position_diff` both lanes share. Coins where that diff yields no event are
+coins the lane owes nothing on, whatever the poller's longer-baseline diff
+decided: recorded as shadow rows, produced by nobody, which is what the
+websocket's rules already decided. Coins where it yields an event are coins the
+lane is behind reality on *by its own account*, and those are the only ones that
+can become drift. A Trader the lane has never baselined vouches for nothing —
+an empty memory agrees with a flat wallet the way an empty room agrees with an
+empty room, and absence of memory is absence of watching.
+
+The read is strictly read-only: each lane's diff memory has exactly one writer,
+or that writer's next diff would be against state it never observed.
 
 Compared on **direction**, not on kind or size, and not on the coin alone. The
 lanes legitimately describe the same reality with different kinds (the
@@ -224,4 +254,12 @@ silently run a fast transport nobody listens to.
   that as drift within one standby interval, which is what it is for.
 - `authoritative` is now the column any future consumer must filter on. A
   consumer that forgets it double-copies; the docstring on
-  `outstanding_events` says so at the point of use.
+  `outstanding_events` says so at the point of use. It defaults FALSE, so a
+  WRITER that forgets it produces rows nobody consumes — the safe direction,
+  and the one that matters during a rolling deploy, when a pre-cutover
+  container can still be writing into an already-migrated database.
+- A gradual accumulation that never crosses the threshold against any single
+  websocket observation now produces no event at all, where the 60s poller
+  would have called it a scale-in. That is the websocket's rules being the
+  rules, which is what "authoritative" means; the same change was already
+  invisible at the old 10s cadence for all but the steepest ramps.

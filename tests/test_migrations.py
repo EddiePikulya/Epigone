@@ -372,3 +372,37 @@ async def test_concurrent_startups_apply_once(scratch_pool: asyncpg.Pool) -> Non
     async with scratch_pool.acquire() as conn:
         runs = await conn.fetchval("SELECT count(*) FROM runs")
     assert runs == 1
+
+
+async def test_0037_leaves_a_writer_that_forgets_the_column_unconsumed(
+    scratch_pool: asyncpg.Pool,
+) -> None:
+    """The cutover's fail-safe direction, and it is a DEPLOY property rather
+    than a code one (issue #158).
+
+    `docker compose up -d --build` replaces containers one at a time, and the
+    database is migrated by whichever process starts first. So there is a real
+    window where a PRE-cutover websocket lane — whose INSERT names its columns
+    and does not know about `authoritative` — is writing into a migrated
+    database, beside a poller that owns production and writes the same change.
+    Had the column defaulted TRUE, the executor would have drained both and
+    copied that trade twice, with real money behind it.
+
+    Defaulting FALSE makes the omission mean 'nobody consumes this', which is
+    what any writer that has not heard of ownership must mean."""
+    await migrate(scratch_pool)
+
+    now = "2026-08-07 00:00:00+00"
+    async with scratch_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO traders (address, first_seen_at, last_seen_at) "
+            f"VALUES ('0xaaa', '{now}', '{now}')"
+        )
+        # Exactly the column list the pre-cutover lane writes.
+        await conn.execute(
+            "INSERT INTO position_events (trader_address, coin, kind, side, size_usd, "
+            f"observed_at, source) VALUES ('0xaaa', 'BTC', 'open', 'long', 1000, '{now}', 'ws')"
+        )
+        authoritative = await conn.fetchval("SELECT authoritative FROM position_events")
+
+    assert authoritative is False

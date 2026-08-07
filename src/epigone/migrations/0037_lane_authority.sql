@@ -71,7 +71,18 @@ VALUES ('poll', now(), 'pre-cutover: the REST poll pass has always owned product
 --
 -- The backfill states what was true historically: the poller's rows were the
 -- consumed ones, the shadow lane's were not.
-ALTER TABLE position_events ADD COLUMN authoritative BOOLEAN NOT NULL DEFAULT TRUE;
+--
+-- DEFAULT FALSE, and it is a deploy property rather than a code one. New code
+-- always passes the value explicitly (`epigone.position_events.record_events`),
+-- so the default only ever answers for a writer that has not heard of
+-- ownership — and during `docker compose up -d --build` there is one: the
+-- containers are replaced one at a time, so a PRE-cutover websocket lane can
+-- be writing into an already-migrated database beside a poller that owns
+-- production. Had this defaulted TRUE, the executor would have drained both
+-- rows for the same change and copied that trade twice, with real money behind
+-- it. FALSE means "nobody consumes this", which is the only safe thing an
+-- unknowing writer can be taken to have meant.
+ALTER TABLE position_events ADD COLUMN authoritative BOOLEAN NOT NULL DEFAULT FALSE;
 UPDATE position_events SET authoritative = (source = 'poll');
 
 -- Reconciliation's one look of patience (ADR-0009 §4). The coins on which this
