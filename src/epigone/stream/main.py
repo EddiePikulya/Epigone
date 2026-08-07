@@ -101,13 +101,28 @@ async def run_position_cycle(
         else STANDBY_POLL_INTERVAL_SECONDS
     )
     if authority.owner != state.owner:
-        # A transfer is exactly the moment a change can fall between two
-        # owners: the incoming lane was not authoritative when it observed one,
-        # and the outgoing lane had already stopped producing. So the tick that
-        # moves ownership always polls, whatever the cadence says — a straddler
-        # is then found within a tick rather than a standby interval, and the
-        # reconciliation has the freshest possible view of both lanes at the
-        # instant the handover happened.
+        # A transfer is exactly the moment a change can fall between two owners:
+        # the incoming lane was not authoritative when it observed one, and the
+        # outgoing lane had already stopped producing. So the tick that moves
+        # ownership always polls, whatever the cadence says.
+        #
+        # ⚠️ This is a CORRECTNESS precondition of the stranded-change repair
+        # (ADR-0009 §4), not a latency optimisation, and the constraint is
+        # invisible from either side of it. The evidence that a straddler was
+        # produced by neither lane is an UNCONSUMED websocket row, and
+        # reconciliation only looks for it back to `last_polled_at` minus the
+        # grace — while the pass that HOLDS the doubt advances `last_polled_at`
+        # itself. So a first post-handback pass arriving a standby interval late
+        # would hold the straddler at t+50s and then confirm it at t+60s against
+        # a window starting at t+20s, which no longer reaches the row written at
+        # t−5s. The change would be reclassified benign, shadow-recorded, and
+        # swallowed for good — the exact hole the repair exists to close, at
+        # every deploy.
+        #
+        # Polling on the transfer keeps the hold within one tick of the handover,
+        # so the confirm's window still contains the row by a comfortable margin
+        # (grace 30s against a worst case of one poll interval plus one tick).
+        # tests/test_position_cutover.py's transfer test fails if this goes.
         state.last_pass_at = None
         state.owner = authority.owner
     now = clock.now()

@@ -880,20 +880,45 @@ async def test_a_lane_that_still_owes_the_change_is_named_as_the_miss_it_is(
 async def test_every_ownership_transfer_is_followed_by_a_pass_at_once(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
-    """A transfer is exactly the moment a change can fall between two owners:
-    the incoming lane was not authoritative when it saw one, the outgoing lane
-    had stopped diffing. So the tick that moves ownership always polls, however
-    recently the last pass ran — the straddler is then found within a tick
-    instead of a standby interval."""
+    """The tick that moves ownership polls, however recently the last pass ran.
+
+    This is a CORRECTNESS precondition of the stranded-change repair, not a
+    latency nicety — see the comment at the reset in `epigone.stream.main`. The
+    hold pass advances `last_polled_at`, which is where the confirm look's
+    lookback starts; a first post-handback pass arriving a standby interval
+    late would hold the straddler and then confirm against a window that no
+    longer reaches back to the unconsumed row that proved it. It would be
+    reclassified benign and swallowed — the exact hole round 2 closed.
+
+    Staged so the assertion can only pass because of the transfer: the poller
+    polls, ownership moves ten seconds later, and ten seconds is nothing like
+    the standby interval that would otherwise authorise a pass."""
     await track(pool, clock, TRADER, FOLLOWER)
     gateway.set_positions(TRADER, [position()])
     state = StandbyState()
-    await run_position_cycle(pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state)
 
-    await healthy_websocket(pool, clock)  # ownership moves to the websocket
-    clock.advance(1)  # nothing like a standby interval has passed
+    # The websocket serves its probation while the poller owns and polls: it is
+    # beating throughout, but has not re-established absolute state, so
+    # ownership cannot return yet.
+    await ws_beating(pool, clock.now())
+    await evaluate_authority(pool, clock)
+    clock.advance(WS_RECOVERY_SECONDS + 1)
+    await ws_beating(pool, clock.now())
+    polled_before_handover = await run_position_cycle(
+        pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state
+    )
+    assert polled_before_handover is not None
+    assert (await read_authority(pool)).owner == POLL_OWNER
+
+    # The lane finishes re-anchoring, and the very next tick hands ownership
+    # back — one poll interval after a pass, six times short of the standby
+    # cadence the new owner implies.
+    await websocket_watching(pool, clock, TRADER, [position()])
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await ws_beating(pool, clock.now())
     result = await run_position_cycle(
         pool, gateway, WeightBudget(WIDE_OPEN_BUDGET, clock), clock, state
     )
 
+    assert (await read_authority(pool)).owner == WS_OWNER
     assert result is not None and result.polled == 1
