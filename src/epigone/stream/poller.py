@@ -391,8 +391,8 @@ async def _apply_poll(
         # that instant and this one.
         state_row = await conn.fetchrow(
             """
-            SELECT last_polled_at, reconcile_pending FROM position_poll_state
-            WHERE trader_address = $1
+            SELECT last_polled_at, reconcile_pending, reconcile_since
+            FROM position_poll_state WHERE trader_address = $1
             """,
             address,
         )
@@ -431,6 +431,11 @@ async def _apply_poll(
                 now,
                 since=polled_before,
                 pending=set(state_row["reconcile_pending"] or ()),
+                # The window the doubt was raised against, which is the window
+                # it must be judged in (#200). NULL only when nothing is
+                # pending — or on the one confirm after migration 0038, for a
+                # doubt raised before the column existed.
+                doubted_since=state_row["reconcile_since"] or polled_before,
             )
         # The snapshot advance lands with the events that were diffed from it
         # (ADR-0006's atomicity, inherited rather than reinvented) — except for
@@ -449,14 +454,24 @@ async def _apply_poll(
         # has since evaporated would otherwise sit in this row for days and then
         # escalate the first unrelated change that ever raced the websocket,
         # with no look of patience at all.
+        #
+        # The doubt and the window it was raised in are written by the one
+        # statement, so neither can outlive the other (#200). That window is
+        # `polled_before` — the look this pass diffed FROM — and never `now`:
+        # the change under doubt was observed after that instant, so a confirm
+        # starting there cannot miss the evidence however late it arrives. A
+        # held coin is always a first-look doubt (a doubt already pending is
+        # confirmed, not re-held), so one column says it for all of them.
         await conn.execute(
             """
-            UPDATE position_poll_state SET last_polled_at = $2, reconcile_pending = $3
+            UPDATE position_poll_state
+            SET last_polled_at = $2, reconcile_pending = $3, reconcile_since = $4
             WHERE trader_address = $1
             """,
             address,
             now,
             sorted(applied.held) or None,
+            polled_before if applied.held else None,
         )
         # Money leaving the account (issue #171), judged from the same two looks
         # at the book the diff above just judged positions from — `previous` is
@@ -489,6 +504,7 @@ async def _reconcile(
     *,
     since: datetime,
     pending: set[str],
+    doubted_since: datetime,
 ) -> _Applied:
     """Record what this pass observed, and produce whatever the websocket did
     not (issue #158, ADR-0009).
@@ -540,11 +556,30 @@ async def _reconcile(
     websocket did produce would vouch for an exit it did not, and an exit
     nobody produces is a copy position that never closes.
 
-    The lookback reaches `RECONCILE_GRACE_SECONDS` before the previous poll,
-    because the websocket can also see a change slightly BEFORE the poll that
-    first reveals it (it led the poller by a median 4.2s)."""
-    ws_rows = await _websocket_rows(conn, address, since - RECONCILE_GRACE)
-    unvouched = [event for event in events if not _vouched_for(event, ws_rows.produced)]
+    The lookback reaches `RECONCILE_GRACE_SECONDS` before the poll a change is
+    measured from, because the websocket can also see a change slightly BEFORE
+    the poll that first reveals it (it led the poller by a median 4.2s).
+
+    **Which poll that is, is per coin, and it is the point of #200.** A coin
+    whose verdict was withheld is still being measured from the look the doubt
+    was raised against — its anchor was deliberately not advanced — so it is
+    judged in the window that starts there (`doubted_since`), not in the one
+    that starts at this pass's previous look. Otherwise the hold's own
+    `last_polled_at` advance walks the window forward past the evidence, and a
+    doubt that had to wait for its confirm (the transfer-tick pass skipped this
+    wallet; the hold landed a standby interval late) is reclassified benign and
+    swallowed. Every other coin keeps the ordinary window: one cursor for the
+    whole wallet would widen the lookback for coins that never earned it."""
+
+    def lookback(coin: str) -> datetime:
+        return (doubted_since if coin in pending else since) - RECONCILE_GRACE
+
+    ws_rows = await _websocket_rows(conn, address, min(since, doubted_since) - RECONCILE_GRACE)
+    unvouched = [
+        event
+        for event in events
+        if not _vouched_for(event, ws_rows.produced, lookback(event.coin))
+    ]
     held: set[str] = set()
     drifted = False
     if unvouched and not await owns(conn, POLL_SOURCE):
@@ -565,7 +600,8 @@ async def _reconcile(
         stranded = {
             event.coin
             for event in unvouched
-            if event.coin not in owed and _vouched_for(event, ws_rows.observed)
+            if event.coin not in owed
+            and _vouched_for(event, ws_rows.observed, lookback(event.coin))
         }
         unvouched = [event for event in unvouched if event.coin in missed | stranded]
         doubted = missed | stranded
@@ -595,9 +631,13 @@ async def _reconcile(
             # answer is final rather than merely recent, which is what makes
             # "two writers never produce for one (Trader, coin)" a property of
             # the database.
-            ws_rows = await _websocket_rows(conn, address, since - RECONCILE_GRACE)
+            ws_rows = await _websocket_rows(
+                conn, address, min(since, doubted_since) - RECONCILE_GRACE
+            )
             unvouched = [
-                event for event in events if not _vouched_for(event, ws_rows.produced)
+                event
+                for event in events
+                if not _vouched_for(event, ws_rows.produced, lookback(event.coin))
             ]
     published: list[PositionEvent] = []
     if unvouched and await publish(conn, address, unvouched, now, source=POLL_SOURCE):
@@ -673,10 +713,21 @@ _DIRECTIONS = {
 }
 
 
-def _vouched_for(event: PositionEvent, covered: set[tuple[str, str]]) -> bool:
-    """Whether the websocket already produced something on this coin moving the
-    same way — see `_reconcile` for why direction is the comparison."""
-    return any((event.coin, direction) in covered for direction in _DIRECTIONS[event.kind])
+def _vouched_for(
+    event: PositionEvent, covered: dict[tuple[str, str], datetime], since: datetime
+) -> bool:
+    """Whether the websocket already wrote something on this coin moving the
+    same way, no earlier than `since` — see `_reconcile` for why direction is
+    the comparison, and why `since` is per coin rather than per pass (#200).
+
+    `covered` holds the LATEST such row per (coin, direction), which answers
+    "is there one at or after `since`?" for every cutoff at once — the rows are
+    fetched from the earliest cutoff any coin needs, and each coin then applies
+    its own."""
+    return any(
+        (latest := covered.get((event.coin, direction))) is not None and latest >= since
+        for direction in _DIRECTIONS[event.kind]
+    )
 
 
 async def _remember_doubt(conn: asyncpg.Connection, address: str, coins: set[str]) -> None:
@@ -691,7 +742,12 @@ async def _remember_doubt(conn: asyncpg.Connection, address: str, coins: set[str
 @dataclass(frozen=True)
 class _WsRows:
     """What the websocket lane wrote about a Trader inside the reconciliation
-    window, as (coin, direction) pairs.
+    window: per (coin, direction), when it last wrote one.
+
+    The timestamp is what lets one query serve several cutoffs (#200): the rows
+    are read from the earliest lookback any coin on this wallet needs, and each
+    coin is then judged against its own — a coin under doubt against the window
+    that raised the doubt, everything else against this pass's previous look.
 
     `produced` is what it wrote AUTHORITATIVELY — the rows consumers acted on,
     and the only ones that vouch for a change being told. `observed` is every
@@ -704,33 +760,35 @@ class _WsRows:
     lane observed while the other lane owned production is a change nobody
     produced and nobody now will."""
 
-    produced: set[tuple[str, str]]
-    observed: set[tuple[str, str]]
+    produced: dict[tuple[str, str], datetime]
+    observed: dict[tuple[str, str], datetime]
 
 
 async def _websocket_rows(
     conn: asyncpg.Connection, address: str, since: datetime
 ) -> _WsRows:
     """The websocket lane's rows for this Trader since `since`, split by
-    whether anyone consumed them."""
+    whether anyone consumed them, and dated by the most recent of each kind."""
     rows = await conn.fetch(
         """
-        SELECT DISTINCT kind, coin, authoritative FROM position_events
+        SELECT kind, coin, authoritative, MAX(observed_at) AS observed_at
+        FROM position_events
         WHERE trader_address = $1 AND source = $2 AND observed_at >= $3
+        GROUP BY kind, coin, authoritative
         """,
         address,
         WS_SOURCE,
         since,
     )
-    keys = [
-        ((row["coin"], direction), row["authoritative"])
-        for row in rows
-        for direction in _DIRECTIONS[row["kind"]]
-    ]
-    return _WsRows(
-        produced={key for key, authoritative in keys if authoritative},
-        observed={key for key, _authoritative in keys},
-    )
+    produced: dict[tuple[str, str], datetime] = {}
+    observed: dict[tuple[str, str], datetime] = {}
+    for row in rows:
+        for direction in _DIRECTIONS[row["kind"]]:
+            key, at = (row["coin"], direction), row["observed_at"]
+            observed[key] = max(observed.get(key, at), at)
+            if row["authoritative"]:
+                produced[key] = max(produced.get(key, at), at)
+    return _WsRows(produced=produced, observed=observed)
 
 
 def _drift_reason(address: str, missed: set[str], stranded: set[str]) -> str:
