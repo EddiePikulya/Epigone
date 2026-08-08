@@ -64,6 +64,32 @@ class DeadMansSwitch:
         self._master_address = master_address
         self.state = UNKNOWN
         self._next_attempt_at: datetime | None = None  # None → due now
+        # When the schedule the exchange is KNOWN to hold would fire (issue
+        # #212). Advanced only by a set that ACCEPTED: an ambiguous one may
+        # not have landed and a reject certainly did not, so both leave the
+        # older, earlier deadline standing. That is the conservative
+        # direction for the one reader this exists for — the watchdog's
+        # deadline-aware push, which must keep treating the schedule as
+        # nearly lapsed rather than believe in a push that never happened.
+        self._armed_until: datetime | None = None
+
+    def armed_until(self) -> datetime | None:
+        """When the standing schedule fires, or None if none is known to be
+        armed (never probed, volume-gated, or never yet accepted). Deliberately
+        NOT cleared once that instant passes: the switch does not observe the
+        firing, and "the last schedule this account is known to have held ran
+        out at T" is the true statement — a reader that cares whether one is
+        still standing compares it to now, as both this module's own `_defer`
+        and the watchdog's priority push do.
+
+        THE OPAQUE KEEPALIVE SEAM'S SECOND HALF (issue #212). The watchdog
+        holds this switch as a bare `Keepalive` — "something that must not go
+        stale while a sweep grinds" — which is deliberately all it needs to
+        know to PUSH. To push with PRIORITY it needs one thing more: how long
+        the thing it is pushing has left. A method rather than a property so
+        the seam is a plain callable the watchdog can hold beside
+        `maintain`, without holding the switch itself."""
+        return self._armed_until
 
     async def maintain(self) -> None:
         """Probe or push, whichever the state calls for, when due.
@@ -95,7 +121,7 @@ class DeadMansSwitch:
                         master_address=self._master_address,
                     )
                     self.state = INELIGIBLE
-                self._next_attempt_at = now + self._reprobe
+                self._defer(now)
                 return
             # An unexpected reject: nothing new was armed — and if a
             # previously armed schedule still stands, it will FIRE within the
@@ -115,8 +141,12 @@ class DeadMansSwitch:
                     master_address=self._master_address,
                 )
                 self.state = UNKNOWN
-            self._next_attempt_at = now + self._reprobe
+            self._defer(now)
             return
+        # The set was ACCEPTED, so this is the schedule the exchange now
+        # holds — recorded before the transition event, because it is true
+        # of the exchange whether or not the trail write lands.
+        self._armed_until = now + self._horizon
         if self.state != ACTIVE:
             # Event before state, same rule as the ineligible branch.
             await self._audit.record_event(
@@ -134,3 +164,34 @@ class DeadMansSwitch:
         # Push forward well before the horizon arrives: half-cadence leaves a
         # full half-horizon of slack for a slow cycle before a spurious fire.
         self._next_attempt_at = now + self._horizon / 2
+
+    def _defer(self, now: datetime) -> None:
+        """How long a REJECTED attempt waits before the next one — the slow
+        eligibility cadence, unless a schedule this switch armed is still
+        standing.
+
+        The re-probe cadence answers "has this account crossed $1M yet",
+        which moves in weeks; a standing schedule's horizon answers "is the
+        last-resort net about to discharge", which moves in minutes. Deferring
+        the second by the first is how a single unexpected reject used to
+        silence this switch for six hours while the net it had already armed
+        ran out — and, since issue #212, how the watchdog's budget-EXEMPT
+        priority push could return without ever reaching the wire, logging an
+        attempt that never happened. So while something stands, a reject
+        leaves this switch DUE: the next call retries, at whatever cadence its
+        caller runs (the watchdog's cycle, or a sweep's own pulse). The cost
+        is bounded by the horizon — once the schedule lapses there is nothing
+        left to lose and the slow cadence takes over again, which is the
+        branch a volume-gated account, having never armed anything, takes from
+        the start."""
+        if self._armed_until is not None and now < self._armed_until:
+            self._next_attempt_at = None
+            log.warning(
+                "dead-man's switch: retrying at once rather than in %dh — the "
+                "schedule armed until %s UTC still stands and has %ds left",
+                int(self._reprobe.total_seconds() // 3600),
+                f"{self._armed_until:%Y-%m-%d %H:%M:%S}",
+                int((self._armed_until - now).total_seconds()),
+            )
+            return
+        self._next_attempt_at = now + self._reprobe

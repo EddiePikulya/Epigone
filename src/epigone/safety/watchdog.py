@@ -162,7 +162,19 @@ properties are load-bearing:
   while keeping every action on the lane strictly ordered. Not "never left to
   lapse": under a saturated exchange the worst gap between two push attempts
   still exceeds the half-horizon of slack, and PULSE_LEG_REFILL_SECONDS walks
-  that residual out step by step (issue #212).
+  that residual out step by step;
+- and the last of that residual is walked out by a DEADLINE (issue #212). A
+  budget and a throttle are the right shape for advisory work, and the push
+  stops being advisory when its schedule is about to lapse — so the armed
+  horizon crosses the Keepalive seam (`KeepaliveDeadline`,
+  `DeadMansSwitch.armed_until`), and at any boundary where the step about to
+  start could outlive that horizon the push is exempt from both gates —
+  paced at SWEEP_PULSE_INTERVAL so the exemption can never hot-loop.
+  PRIORITY_PUSH_WINDOW_SECONDS states the window, the guarantee it buys (no
+  armed schedule lapses without a full-ceiling attempt having been made
+  against it — for as long as every await between two boundaries is itself
+  bounded, which the pacing sleep below is not), what a wedged leg pays for
+  it, and what it does NOT close.
 
 AND EVERY READ BETWEEN TWO PULSES IS BOUNDED (issue #204). Pulsing at every
 enumeration step only bounds the liveness gap if the step itself is bounded,
@@ -327,6 +339,15 @@ PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
 # bounded" is therefore not literally true; the pacing sleep is the exception,
 # on purpose.
 #
+# THE WALK ABOVE IS THE BUDGET'S OWN ARITHMETIC AND IT NO LONGER ENDS THERE
+# (issue #212): from D+65 on, every one of those boundaries is inside
+# PRIORITY_PUSH_WINDOW_SECONDS of the horizon, and inside that window a push
+# attempt stops asking this budget for permission. That constant re-walks the
+# same numbers with the exemption in place and states what survives it. Read
+# the rest of this comment as what the budget alone leaves — which is still
+# the right frame for reading the budget's own size — rather than as the
+# module's residual.
+#
 # WHY THIS IS SHIPPED ANYWAY, and what it costs when it fires: the residual
 # discharges in the FAIL-SAFE direction. The dead-man firing cancels every
 # resting order on the exchange, during a halt whose whole job was cancelling
@@ -339,10 +360,11 @@ PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
 # THE SWEEP — minutes, because a per-CYCLE budget lasts a whole sweep — and is
 # now at most this window. Minutes-to-45s is the difference between a residual
 # that needs conjunctive bad luck and one that the 2026-08-07 incident hit on
-# its first try. Closing it properly wants a deadline-aware priority push (one
-# attempt exempted from the budget when the armed schedule is within ~60s of
-# its horizon), which needs the deadman's armed-until time across the opaque
-# Keepalive seam: issue #212, a mainnet gate.
+# its first try. What this window could never buy — an attempt at the boundary
+# where it actually matters, rather than at whichever boundary the refill clock
+# happened to land on — is what the deadline buys instead
+# (PRIORITY_PUSH_WINDOW_SECONDS); the two are complementary, and this one still
+# governs every pulse outside that window, which is all of a normal sweep.
 #
 # The price is bounded and paid only when a leg is genuinely wedged: at worst
 # one budget plus one overrunning attempt per window, so a wedged keepalive
@@ -350,6 +372,123 @@ PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
 # is the failure PR #203's budget existed to stop. Real time like every other
 # ceiling here — this measures actual awaits, and the fakes finish instantly.
 PULSE_LEG_REFILL_SECONDS = 45.0
+
+# The longest step this process can START and then not be able to cut short.
+# The cancel POST is the binding one: it bounds ITSELF (the gateway's 429 loop
+# at RATE_LIMIT_TOTAL_BUDGET_SECONDS ≈ 35s plus one REQUEST_TIMEOUT ≈ 30s) and
+# deliberately cannot be cut from outside, because cutting a write orphans its
+# attempt row (`_push_keepalive`'s own comment argues the exception). A read is
+# shorter — SAFETY_READ_CEILING_SECONDS binds it at 45s — so one number covers
+# every step, and it is this one. Stated here rather than imported, like
+# SAFETY_READ_CEILING_SECONDS and for the same reason: this module's whole
+# history is bounds that had one more layer underneath them, so the safety path
+# states its own numbers and a change to the gateway's shows up as a diff here.
+STEP_BOUND_SECONDS = 65.0
+
+# How close to its horizon the armed dead-man's schedule may come before a
+# push stops being advisory work and becomes the thing the sweep does FIRST —
+# exempt from the leg budget and from the pulse throttle alike (issue #212,
+# the residual PR #209's merge-gate review left open and the operator's
+# 2026-08-08 decision closed).
+#
+# THE WINDOW IS A STEP PLUS A PUSH, not a step alone. The check happens at an
+# enumeration boundary, and what must fit before the horizon is the step about
+# to start PLUS the ceiling of the attempt that would follow it. A window of
+# one step bound alone lets a boundary at horizon−1s be the first one that
+# fires, which grants the attempt a full KEEPALIVE_CEILING_SECONDS it does not
+# have. (The issue's "~60s" is the step term only; the ceiling term is this
+# comment's correction to it.)
+#
+# NOT ONE ATTEMPT PER ARMED SCHEDULE — and the issue's own arithmetic is why,
+# which is worth spelling out because "one budget-exempt push attempt" is what
+# the decision comment says. Walk the issue's worst case from the moment D at
+# which a push falls due (armed_until = D+150 at the default horizon):
+#
+#   D        a 65s cancel POST is already in flight and cannot be cut
+#   D+65     boundary, 85s left: inside this window, so an exempted attempt —
+#            but the ORDINARY leg would have attempted here too (the refill at
+#            PULSE_LEG_REFILL_SECONDS grants it a budget at exactly this
+#            point). It wedges and is cut at its ceiling
+#   D+95     boundary, 55s left. The ordinary leg is spent; a one-per-schedule
+#            exemption is spent too — so the next 65s step starts and the
+#            schedule lapses at D+150 with the sweep mid-POST
+#
+# A single exemption therefore buys NOTHING over the refill in the exact case
+# the issue was opened about. What closes it is the attempt at D+95: it has
+# 55s of horizon in front of it and its ceiling is 30s, so it either lands —
+# saving the schedule with 25s to spare — or proves the exchange could not
+# accept a scheduleCancel across two full ceilings inside 95s. So the rule is
+# ONE ATTEMPT PER BOUNDARY INSIDE THE WINDOW, paced (below) rather than
+# counted, and the guarantee is:
+#
+#   NO ARMED SCHEDULE LAPSES WITHOUT A FULL-CEILING PUSH ATTEMPT HAVING BEEN
+#   MADE AGAINST IT WITH THE WHOLE CEILING AHEAD OF THE HORIZON —
+#
+# conditional, and the condition is STEP_BOUND_SECONDS: the induction is "the
+# last boundary outside the window had more than 95s left, so after a step of
+# at most 65s the next boundary still has more than 30s". An await longer than
+# a step bound between two boundaries breaks it, and one exists on purpose (the
+# pacing sleep, below).
+#
+# The attempts are made until the window is dealt with rather than one per
+# boundary (`_pulse`), and that is load-bearing rather than tidy: the cancel
+# pass pulses ONCE per account and then commits to a POST nothing can cut, so
+# a per-boundary rule gave the last attempt before a write no successor and
+# reproduced 65+30+65 = 160 > 150 on the write path exactly.
+#
+# PACED LIKE AN ORDINARY PULSE (SWEEP_PULSE_INTERVAL, on the injected clock —
+# the same clock the deadline is on) so the exemption can never become a hot
+# loop: a push that fails in milliseconds costs the sweep nothing but must not
+# be re-issued at every one of a fast sweep's enumeration steps.
+#
+# WHAT IT COSTS, honestly, and the two shapes differ:
+#
+# - every attempt WEDGES: attempts start only while the horizon is still
+#   ahead, so at most ceil(WINDOW / KEEPALIVE_CEILING) = 4 of them can be
+#   started per armed schedule — ≤ ~2 minutes of sweep wall clock per 300s
+#   horizon. Real, and deliberately NOT the per-step tax PR #203's budget
+#   exists to prevent: bounded per horizon rather than per step, and smaller
+#   than what the budgeted path alone already permits over the same span (one
+#   ceiling per PULSE_LEG_REFILL_SECONDS window ≈ 6 per horizon);
+# - every attempt FAILS FAST: wall clock is ~nil, but the pace is the only
+#   bound left, so a 95s window admits up to ~19 attempts — 19 signed POSTs,
+#   each spending its pre-sign weight through the same shared bucket the sweep
+#   is paying from, against an exchange the premise says is saturated. That is
+#   the honest upper end; it buys the case where the exchange starts answering
+#   again mid-window, and it is why the pace is a pace and not "every
+#   boundary".
+#
+# WHAT IT DOES NOT CLOSE, stated so no reader has to rediscover it:
+#
+# - if every attempt inside the window wedges for its full ceiling, the
+#   schedule still lapses. What the fix removes is the COMPOSITION — a push
+#   skipped because a budget was spent, or throttled, while a push would have
+#   succeeded; what remains needs the exchange to be unable to accept a
+#   scheduleCancel across the window, which is a push that was impossible
+#   rather than one that was deprioritised;
+# - the pre-sign budget PACING SLEEP is deliberately un-ceilinged
+#   (SharedWeightBudget's docstring), so a token-deficit wait can outlast the
+#   whole window between two boundaries. There IS a pulse on the far side of
+#   every pacing sleep (`_walk_scope` pulses, spends, and `_safety_read`
+#   pulses again), so the attempt happens the moment the sleep ends — but a
+#   sleep longer than the window is a lapse nothing in this process prevents;
+# - a DB-BLIND window does not pulse at all (`_pulse_allowed`), so it does not
+#   push either, priority or otherwise. That is #201's gating decision left
+#   deliberately untouched: a blind sweep is already cancelling every resting
+#   order account-wide, so a schedule that fires under it produces the same
+#   outcome by the belt-and-braces route;
+# - and none of this touches R4 from the same review — a watchdog whose
+#   cancels fail while its pushes succeed keeps the exchange-side net
+#   postponed indefinitely. Inherent to any keepalive design, and made
+#   sharper rather than softer by everything above: issue #219, the mainnet
+#   risk register, holds it.
+#
+# The window assumes the deadman's own push cadence leaves more slack than the
+# window is wide (half of the 300s default horizon: 150s > 95s). Under a
+# horizon configured below ~190s the two coincide, and an exempted attempt can
+# find the deadman not yet due and do nothing; the default is nowhere near
+# that, and the whole slack arithmetic here reads differently at that horizon.
+PRIORITY_PUSH_WINDOW_SECONDS = STEP_BOUND_SECONDS + KEEPALIVE_CEILING_SECONDS
 
 # The hard REAL-TIME ceiling on ONE read of the safety path (issue #204).
 #
@@ -399,6 +538,21 @@ CAPABILITY_RETRY = timedelta(minutes=5)
 # watchdog without one is a real configuration (the deadman is the UPGRADE
 # path, ineligible below the $1M volume gate), not just a test shortcut.
 Keepalive = Callable[[], Awaitable[None]]
+
+# …and WHEN the thing the keepalive refreshes would lapse if it stopped being
+# refreshed (issue #212): the armed schedule's horizon, or None while nothing
+# is armed (never probed, volume-gated, or an accepted set still awaited).
+# `DeadMansSwitch.armed_until` in production.
+#
+# A SECOND, NARROWER SEAM rather than a widened Keepalive. Keepalive says "do
+# the thing that must not go stale" and is deliberately opaque about what the
+# thing is — the watchdog is the fallback for an upgrade path it does not model
+# — and a deadline is exactly one more fact, optional in the same way and for
+# the same reason (a watchdog below the $1M volume gate has no schedule to be
+# near the horizon of). Keeping them two callables also keeps every existing
+# caller — the tests that pulse something trivially observable included —
+# passing a plain function rather than an object satisfying a protocol.
+KeepaliveDeadline = Callable[[], datetime | None]
 
 # `Watchdog._safety_read` as a value, so a collaborator can be handed the
 # seam without being handed the watchdog (`_PulsedUniverseReads`). Generic in
@@ -463,6 +617,7 @@ class Watchdog:
         db_blind_after: timedelta,
         capability_interval: timedelta,
         keepalive: Keepalive | None = None,
+        keepalive_deadline: KeepaliveDeadline | None = None,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -476,6 +631,12 @@ class Watchdog:
         self._db_blind_after = db_blind_after
         self._capability_interval = capability_interval
         self._keepalive = keepalive
+        self._keepalive_deadline = keepalive_deadline
+        # When this process last made a budget-exempt push attempt (issue
+        # #212). Injected-clock time, because it paces attempts against a
+        # deadline that is on that same clock — the leg budgets' monotonic
+        # seconds measure something else, what an attempt COST.
+        self._priority_pushed_at: datetime | None = None
         # When this process last emitted a liveness pulse (issue #201) —
         # the cycle-top beat counts, so a short cycle adds no extra writes —
         # and, per leg, how much wall clock it has spent since the budgets
@@ -696,10 +857,42 @@ class Watchdog:
         whole of it — long enough for an armed dead-man schedule to reach its
         horizon mid-halt. PULSE_LEG_REFILL_SECONDS states the window and the
         argument for its size; the bound it costs is in
-        PULSE_LEG_BUDGET_SECONDS."""
+        PULSE_LEG_BUDGET_SECONDS.
+
+        AND ONE PUSH OUTRANKS BOTH GATES (issue #212). A budget and a throttle
+        are the right shape for advisory work, and the dead-man's push stops
+        being advisory when its schedule is about to lapse: at that boundary
+        the sweep makes one exempted attempt BEFORE the step, because after
+        the step there may be no schedule left to push — for as long as the
+        step is the longest thing between two boundaries, which the pacing
+        sleep is not. PRIORITY_PUSH_WINDOW_SECONDS states when, what the
+        exemption guarantees, and what it does not close."""
         if not self._pulse_allowed():
             return
         self._refill_leg_budgets()
+        # UNTIL THE WINDOW IS DEALT WITH, not once per boundary (round 1 of the
+        # main-session gate on PR #215). An attempt that WEDGED spent a whole
+        # ceiling and the horizon is that much nearer, so the deadline has to
+        # be re-read before this pulse hands control back — because what the
+        # caller does next may be a cancel POST, which pulses ONCE per account
+        # and then commits to a write that cannot be cut from outside. On the
+        # enumeration path the re-check falls out of the structure (`_walk_scope`
+        # pulses, `_safety_read` pulses again); on the write path it does not,
+        # and one wedge plus one saturated POST reproduced the very 65+30+65
+        # composition issue #212 was opened about. Putting the retry HERE
+        # rather than at the write site is the same choice `_safety_read`
+        # embodies: one seam, so no call site can forget it.
+        #
+        # It terminates and is bounded by the same three facts the single
+        # attempt was: a landed push moves the horizon out of the window, a
+        # FAST failure fails the SWEEP_PULSE_INTERVAL pace on the very next
+        # turn, and every attempt needs the horizon still ahead of it.
+        pushed = False
+        while await self._priority_push(self._clock.now()):
+            pushed = True
+        # Re-read: the attempt above can have spent a whole KEEPALIVE_CEILING,
+        # and both the throttle below and the beat it gates want the time it
+        # is NOW, not the time the pulse was entered.
         now = self._clock.now()
         if self._pulsed_at is not None and now - self._pulsed_at < SWEEP_PULSE_INTERVAL:
             return
@@ -713,12 +906,90 @@ class Watchdog:
         # first would put a wedged database's ceiling in front of the push on
         # every pulse, which is the one term the gap arithmetic at
         # PULSE_LEG_REFILL_SECONDS cannot afford.
-        if self._keepalive is not None and self._keepalive_spent < PULSE_LEG_BUDGET_SECONDS:
-            self._keepalive_spent += await self._push_keepalive()
-            _report_if_spent("dead-man's push", self._keepalive_spent)
+        if (
+            not pushed  # the priority attempt above WAS this pulse's push
+            and self._keepalive is not None
+            and self._keepalive_spent < PULSE_LEG_BUDGET_SECONDS
+        ):
+            await self._charge_push()
         if self._beat_spent < PULSE_LEG_BUDGET_SECONDS:
             self._beat_spent += await self._beat(now)
             _report_if_spent("heartbeat", self._beat_spent)
+
+    async def _priority_push(self, now: datetime) -> bool:
+        """The armed schedule is close enough to its horizon that the step
+        about to start could outlive it: push NOW, exempt from the leg budget
+        and from the pulse throttle (issue #212). Answers whether it pushed,
+        so the pulse does not immediately push a second time.
+
+        WHY THE EXEMPTION IS SAFE AGAINST THE BUDGET IT OVERRIDES: that budget
+        exists to stop a wedged leg taxing every enumeration STEP of a
+        multi-minute sweep (PR #203 round 1), and this cannot become that. It
+        fires only inside PRIORITY_PUSH_WINDOW_SECONDS of a horizon, only
+        while that horizon is still ahead, and no more often than
+        SWEEP_PULSE_INTERVAL — so its worst case is bounded per armed
+        schedule, not per step, and the constant's comment does that
+        arithmetic. The cost is still CHARGED to the leg's counter — exempt at
+        the gate, not free — so it can never hand the budgeted path a longer
+        purse than it had.
+
+        Paced on the INJECTED clock, unlike the leg budgets' monotonic
+        seconds, because the thing being paced against is the deadline, and a
+        deadline and its own pacing must be read off one clock or a fake can
+        satisfy neither.
+
+        The deadline is re-read at every boundary rather than cached: the
+        keepalive is the thing that moves it, so a cached one would be stale
+        by exactly the push it is deciding about — a landed push closes the
+        window by 300s, which is the whole reason a healthy system never
+        reaches this code."""
+        if self._keepalive is None or self._keepalive_deadline is None:
+            return False
+        armed_until = self._keepalive_deadline()
+        if armed_until is None:
+            return False  # nothing armed: no horizon to be near
+        left = (armed_until - now).total_seconds()
+        # `left > 0`: a horizon already past is a schedule that has fired or
+        # lapsed, and jumping the queue saves nothing — the ordinary budgeted
+        # leg re-arms it on the deadman's own overdue cadence rather than the
+        # sweep paying a ceiling at every step until the exchange answers.
+        # No lower guard: a healthy push is milliseconds, so an attempt with
+        # 5s left is still a schedule saved, and refusing it to protect the
+        # sweep's pace would be trading the thing this exists for.
+        if not 0 < left <= PRIORITY_PUSH_WINDOW_SECONDS:
+            return False
+        if (
+            self._priority_pushed_at is not None
+            and now - self._priority_pushed_at < SWEEP_PULSE_INTERVAL
+        ):
+            return False
+        # Stamped BEFORE the attempt: a wedge is cut by the ceiling inside
+        # `_push_keepalive` and a failure is swallowed there, so the stamp has
+        # to be about attempts rather than successes or a fast-failing push
+        # would be re-issued at every step of a fast sweep.
+        self._priority_pushed_at = now
+        # ERROR deliberately, for an event the runbook calls expected and
+        # self-healing: this module's levels say what CHANGED on the safety
+        # path, not how alarmed to be (`_report_if_spent` and the swept-halt
+        # line are ERROR on the same principle), and "the last-resort net came
+        # within a step of discharging" is the most operator-visible posture
+        # change a sweep can make. The runbook reads it back as expected.
+        log.error(
+            "dead-man's schedule is %.0fs from its horizon and the next sweep step "
+            "could outlive it — a budget-exempt push attempt now (issue #212)",
+            left,
+        )
+        await self._charge_push()
+        return True
+
+    async def _charge_push(self) -> None:
+        """Push, and bill what it cost to the leg's counter. One place because
+        the exempted path and the budgeted one differ in WHETHER they push,
+        never in what a push costs — a priority attempt is exempt at the gate,
+        not free (`_priority_push`), and both must report the same way when
+        the counter goes over."""
+        self._keepalive_spent += await self._push_keepalive()
+        _report_if_spent("dead-man's push", self._keepalive_spent)
 
     def _refill_leg_budgets(self, *, force: bool = False) -> None:
         """Give both pulse legs their budgets back — at every cycle top

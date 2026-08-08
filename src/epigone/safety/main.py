@@ -37,6 +37,11 @@ Wiring notes, each load-bearing:
   own enumeration instead of letting it lapse while it works. Both call
   sites go through the same due-time state, so the pair never
   double-pushes — whichever runs first when the push falls due does it.
+  `deadman.armed_until` goes across the same seam (issue #212), which is
+  what lets the sweep tell an advisory push from an urgent one: within
+  PRIORITY_PUSH_WINDOW_SECONDS of the armed horizon, one attempt jumps the
+  pulse throttle and the leg budget both, because after the next step there
+  may be no schedule left to push.
 - Mainnet is refused by construction in HttpExecutionGateway (the A5 gate);
   this process never passes allow_mainnet.
 """
@@ -203,6 +208,10 @@ async def main() -> None:
             # schedule from INSIDE the enumeration, so a multi-minute grind
             # can no longer let the exchange-side net discharge behind it.
             keepalive=deadman.maintain,
+            # Issue #212: and the deadline the push is against, so a step
+            # whose own bound would outlive the armed schedule is preceded by
+            # one budget-exempt attempt instead of following a lapse.
+            keepalive_deadline=deadman.armed_until,
         )
         if startup.cold_start_reason is not None:
             # The incident opens HERE, not after a threshold: the startup
