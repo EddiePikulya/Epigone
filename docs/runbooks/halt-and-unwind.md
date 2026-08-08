@@ -264,8 +264,9 @@ watchdog log says which axis.
 **A sweep takes MINUTES, and that is not a wedge (issue #201).** Coverage on
 two axes means one enumeration per (account, dex) pair at 20 weight each,
 paced through the 900/min bucket shared with the stream and ingest — eleven
-accounts across four venues is ~1800 weight per pass and the sweep does up
-to two passes (cancel, then a fresh verify). Two to ten minutes of wall
+accounts across four venues is 44 enumerations, 880 weight per pass, and the
+sweep does up to two passes (cancel, then a fresh verify) for ~1760 weight
+all told plus the scope and asset-id reads. Two to ten minutes of wall
 clock inside a single watchdog cycle is normal. What that used to look like
 from outside was indistinguishable from a hang, so the sweep now says what
 it is doing:
@@ -303,8 +304,17 @@ the monitor because it cannot reach the database to say otherwise — which
 is the correct reading, and the reason the DB-blind alert exists. A trip
 whose halt row could not be confirmed is the other kind of incident and
 DOES beat through its cancel pass: its liveness reads answered that cycle,
-so the database is healthy. If a beat fails mid-pass it goes quiet for the
-rest of that incident by design — reaching the wire outranks saying so.
+so the database is healthy.
+
+In every posture, each leg of the pulse — the heartbeat and the dead-man's
+push — may spend at most ONE ceiling per cycle: a leg that WEDGES goes quiet
+for the rest of that cycle and is retried by the next one, because reaching
+the wire outranks saying so. A leg that fails FAST keeps trying (a refused
+connection or a single 429 costs the sweep nothing, and must not silence a
+signal for the whole grind), and the two legs never gate each other — a dead
+database still lets the schedule be pushed, a wedged exchange still lets the
+heartbeat beat. So `sweep progress` lines advancing with a heartbeat that
+has stopped means the database leg wedged, not that the watchdog died.
 
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are

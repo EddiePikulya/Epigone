@@ -46,8 +46,8 @@ dependency instead of bounding another leg:
   losing it to a crash-after-cancel would be a hole nothing else covers.
   Issue #201 extends that SAME carve-out, and only it, to the liveness
   pulse: a real-stall trip's own cancel pass is a multi-minute enumeration
-  and beats through it, one strike and out (see "A SWEEP PULSES" below);
-  a DB-blind window still runs entirely dark;
+  and beats through it, at a bounded one ceiling per leg per cycle (see
+  "A SWEEP PULSES" below); a DB-blind window still runs entirely dark;
 - everything durable — halt row, audit events, sweep verification — runs
   AFTER the cancel attempt, best-effort, under a hard real-time ceiling
   (DB_BLOCK_CEILING_SECONDS; safe because Pool.release is shielded, so a
@@ -123,25 +123,34 @@ properties are load-bearing:
   because the database is unreachable cannot truthfully beat to it anyway.
   A REAL-STALL trip does pulse — its liveness reads answered that very
   cycle, so the database is healthy, and its own cancel pass is a
-  multi-minute enumeration that would otherwise read as death. One strike
-  bounds the downside: the first failing pulse leg silences the pulse for
-  the rest of that incident, so a database that dies mid-pass costs one
-  ceiling once, never a per-pulse tax on the way to the wire. The
+  multi-minute enumeration that would otherwise read as death. The
   reconcile's verify enumeration always pulses: by then the incident is
   cleared;
-- it is BEST-EFFORT and throttled to SWEEP_PULSE_INTERVAL. A failed beat or
-  a failed dead-man push is logged and the sweep continues — the same rule
-  the cycle-top beat has followed since round 2;
+- its two legs are INDEPENDENT, and each may spend ONE CEILING PER CYCLE.
+  Independent because coupling them recreates the incident: a refused
+  Postgres connection fails in milliseconds, so a beat failure that
+  short-circuited the push would leave a full-speed-looking sweep with an
+  unrefreshed schedule. One strike because the throttle cannot bound a SLOW
+  leg — a wedged database or exchange would otherwise charge a full ceiling
+  at every enumeration step, an hour and more on a real sweep. On SLOWNESS
+  and not on failure, because a leg that fails fast costs the sweep nothing
+  and one blip must not silence a signal for a ten-minute grind. `_pulse`
+  carries the full argument;
 - the keepalive runs on THIS task, not a sibling one. Deliverable 2 of
   issue #201 asked for an independent dead-man task; it is deliberately not
   one, because the deadman shares this process's single AuditedExecution-
-  Gateway — one signer, ONE NONCE LANE (the execution seam's contract), one
-  mutable `decision` field, one incident posture. Racing a scheduleCancel
-  against a sweep's cancels across that shared state would trade a liveness
-  bug for a correctness bug on the kill path. Pulsing on the sweep's own
-  task removes the emergent race (the schedule is pushed every few seconds
-  of the grind, never left to lapse) while keeping every action on the lane
-  strictly ordered.
+  Gateway and that wrapper carries MUTABLE PER-ACTION STATE — `decision`
+  (the risk_decision prose every audit row is stamped with) and the
+  incident posture `wire_first`. A sibling task calling `maintain()` would
+  overwrite `decision` between a sweep's enumeration and its cancels, so
+  kill-path rows would carry the dead-man's prose instead of the halt's:
+  a liveness bug traded for a corrupted audit trail on the one path whose
+  evidence matters most. (NOT a nonce-ordering argument — NonceSource is an
+  atomic counter and the exchange accepts out-of-order landing at this
+  concurrency; the shared audit state is the real constraint.) Pulsing on
+  the sweep's own task removes the emergent race — the schedule is pushed
+  every few seconds of the grind, never left to lapse — while keeping every
+  action on the lane strictly ordered.
 
 Progress is also LOGGED per (account, dex), so a long sweep is legible in
 the container logs while it runs — "sweeping, 60% done" was previously
@@ -306,10 +315,11 @@ class Watchdog:
         self._keepalive = keepalive
         # When this process last emitted a liveness pulse (issue #201) —
         # the cycle-top beat counts, so a short cycle adds no extra writes —
-        # and whether a failed pulse leg has silenced the rest of the
-        # CURRENT incident (`_mute_mid_incident`; reset with the incident).
+        # and, per leg, whether it has already spent its one ceiling THIS
+        # cycle and gone quiet (`_pulse`; both re-arm at every cycle top).
         self._pulsed_at: datetime | None = None
-        self._pulse_muted = False
+        self._beat_struck = False
+        self._keepalive_struck = False
         self._capable: bool | None = None  # last on-chain verdict; None = unchecked
         self._next_capability_at: datetime | None = None  # None → due now
         # Postgres-independence state (module docstring): the onset of the
@@ -337,13 +347,18 @@ class Watchdog:
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
+        # Each cycle re-arms both pulse legs (issue #201, `_pulse`): a leg
+        # that wedged during the last one gets exactly one more chance here,
+        # so the strike is a per-cycle bound and never a permanent give-up.
+        self._beat_struck = False
+        self._keepalive_struck = False
         # INCIDENT-FIRST (round 5, the structural rule): an open incident
         # reaches the wire before this cycle touches Postgres AT ALL — no
         # beat, no reads, no state. Durable catch-up comes after the cancel.
         if self._blind is not None:
             await self._incident_cycle(now)
             return
-        await self._beat(now)
+        self._beat_struck = not await self._beat(now)
         try:
             halt, stall_reason = await asyncio.wait_for(
                 self._read_liveness(now), DB_BLOCK_CEILING_SECONDS
@@ -388,19 +403,54 @@ class Watchdog:
         """Say ALIVE, best-effort (round 2 item 1c): losing the liveness
         signal is bad; skipping the cycle's protective work over it is
         worse. Bounded by the same real-time ceiling as every other state
-        block, and it stamps the pulse clock either way — a beat that FAILS
-        must still throttle the next one, or a broken database turns a long
-        sweep into a per-enumeration retry storm. Answers whether it landed,
-        which is what mutes the pulse mid-incident (`_pulse`)."""
+        block, and it stamps the pulse clock.
+
+        Answers whether this leg is WORTH ATTEMPTING AGAIN this cycle — see
+        `_pulse` for the rule. A fast failure answers yes: it costs the
+        sweep nothing, and one dropped connection must not silence the
+        heartbeat for a ten-minute grind. A CEILING HIT answers no."""
         self._pulsed_at = now
         try:
             await asyncio.wait_for(
                 heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now),
                 DB_BLOCK_CEILING_SECONDS,
             )
+        except TimeoutError:
+            log.error(
+                "heartbeat write hit its %.0fs ceiling — no further beats this cycle; "
+                "the protective work continues",
+                DB_BLOCK_CEILING_SECONDS,
+            )
+            return False
         except Exception:
             log.exception("heartbeat write failed — continuing the protective cycle")
+        return True
+
+    async def _push_keepalive(self) -> bool:
+        """The pulse's other leg: whatever else must not go stale while a
+        sweep grinds — in production the dead-man's schedule. Same answer
+        contract as `_beat`, same reasoning: a rejected push is free to
+        retry five seconds later and the schedule must not be abandoned
+        over one 429; a push WEDGED on the exchange costs a ceiling and is
+        not paid twice in one cycle."""
+        assert self._keepalive is not None
+        try:
+            await asyncio.wait_for(self._keepalive(), KEEPALIVE_CEILING_SECONDS)
+        except TimeoutError:
+            log.error(
+                "sweep keepalive (dead-man's push) hit its %.0fs ceiling — no further "
+                "pushes this cycle; the schedule is re-pushed from the next one",
+                KEEPALIVE_CEILING_SECONDS,
+            )
             return False
+        except Exception:
+            # The sweep is the protective work and nothing advisory may stop
+            # it. The next pulse retries, and the deadman's own state
+            # machine is self-reconciling (a repeated set REPLACES).
+            log.warning(
+                "sweep keepalive (dead-man's push) failed — retrying at the next pulse",
+                exc_info=True,
+            )
         return True
 
     def _pulse_allowed(self) -> bool:
@@ -416,55 +466,42 @@ class Watchdog:
         database one bounded write before the wire is worth its evidence
         (there it was the write-ahead attempt row; here it is the beat that
         keeps the monitor from reading a trip's own multi-minute cancel pass
-        as a dead watchdog). `_pulse_muted` bounds the downside: the moment
-        anything in a pulse fails mid-incident the whole pulse goes quiet
-        for the rest of that incident, so a database that dies DURING a
-        trip's pass costs one ceiling, once, and never a per-pulse tax on
-        the path to the wire."""
-        if self._blind is None:
-            return True
-        return not self._blind.db_blind and not self._pulse_muted
+        as a dead watchdog)."""
+        return self._blind is None or not self._blind.db_blind
 
     async def _pulse(self) -> None:
         """One liveness pulse from INSIDE the sweep (module docstring): beat
-        the heartbeat and push whatever else must not go stale while the
-        enumeration grinds — in production the dead-man's schedule.
+        the heartbeat and push the dead-man's schedule while the enumeration
+        grinds. Silent in the postures `_pulse_allowed` refuses, and silent
+        within SWEEP_PULSE_INTERVAL of the last pulse.
 
-        Silent in the postures `_pulse_allowed` refuses, and silent again
-        within SWEEP_PULSE_INTERVAL of the last pulse, so the cost is
-        per-interval, not per-REST-call."""
+        TWO INDEPENDENT LEGS, EACH WITH ONE SLOW STRIKE PER CYCLE (review of
+        PR #203). Independent, because coupling them recreates the very
+        incident: a refused Postgres connection fails in milliseconds, so a
+        beat failure that short-circuited the push would leave a
+        full-speed-looking sweep with an unrefreshed schedule — and the
+        audited gateway is best-effort exactly so a protective EXCHANGE
+        action survives a database outage. One strike, because the throttle
+        cannot bound a SLOW leg: DB_BLOCK_CEILING_SECONDS is four times
+        SWEEP_PULSE_INTERVAL, so a wedged database would charge a full
+        ceiling at every enumeration step — an hour and more on a real
+        sweep, heartbeat frozen and schedule lapsed the whole time. On
+        SLOWNESS and not on failure, because a leg that fails fast costs the
+        sweep nothing and giving up on it would silence a signal over one
+        blip. The strike lasts the CYCLE, not the process: the next cycle
+        gives each leg one more chance."""
         if not self._pulse_allowed():
             return
         now = self._clock.now()
         if self._pulsed_at is not None and now - self._pulsed_at < SWEEP_PULSE_INTERVAL:
             return
-        if not await self._beat(now):
-            self._mute_mid_incident()
-            return
-        if self._keepalive is None:
-            return
-        try:
-            await asyncio.wait_for(self._keepalive(), KEEPALIVE_CEILING_SECONDS)
-        except Exception:
-            # Same asymmetry as the beat: the sweep is the protective work
-            # and nothing advisory may stop it. The next pulse retries (or,
-            # mid-incident, does not — advisory work stops competing with
-            # the wire the moment it starts failing), and the deadman's own
-            # state machine is self-reconciling.
-            self._mute_mid_incident()
-            log.warning(
-                "sweep keepalive (dead-man's push) failed — retrying at the next pulse",
-                exc_info=True,
-            )
-
-    def _mute_mid_incident(self) -> None:
-        """A pulse leg failed. In NORMAL operation that is nothing: the next
-        pulse retries, five seconds of sweep later. During an incident it
-        ends the pulsing for the rest of that incident — the pass is racing
-        to the wire, and advisory work that has already proved it can fail
-        must not be given another ceiling's worth of the cancel's time."""
-        if self._blind is not None:
-            self._pulse_muted = True
+        # The pulse clock advances even when both legs are struck, so a
+        # quiet sweep does not re-enter this body at every step.
+        self._pulsed_at = now
+        if not self._beat_struck:
+            self._beat_struck = not await self._beat(now)
+        if self._keepalive is not None and not self._keepalive_struck:
+            self._keepalive_struck = not await self._push_keepalive()
 
     async def _read_liveness(self, now: datetime) -> tuple[Halt | None, str | None]:
         halt = await active_halt(self._pool)
@@ -481,13 +518,11 @@ class Watchdog:
         row to after the call (wire_first)."""
         self._blind = incident
         self._blind_passes = 0
-        self._pulse_muted = False  # each incident gets its own one strike
         self._set_incident_posture(incident)
 
     def _clear_incident(self) -> None:
         self._blind = None
         self._blind_passes = 0
-        self._pulse_muted = False
         # The failure streak dies with the incident (round 6 item 1): the
         # reconcile's successful writes ARE the interruption, so a later
         # blip must open a FRESH streak — carrying the old onset would
