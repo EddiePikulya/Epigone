@@ -7,6 +7,14 @@ schema_migrations. A shipped migration file is frozen history — never edit
 one; add the next number. Migration 0001 is the pre-runner schema.sql and is
 idempotent so it doubles as the baseline for databases that predate the
 runner; later migrations run exactly once and need no such care.
+
+`create_pool` is UNBOUNDED BY DEFAULT and stays that way (issue #213): fine
+backfills and migrations run legitimately long queries and must not inherit
+a timeout tuned for a process that has a deadline. The optional bounds exist
+for the processes that DO have one — the watchdog (epigone.safety.db) and,
+since #213, the health monitor — and the mechanism lives here rather than in
+either caller because the release-budget seam below is asyncpg-version-
+specific knowledge that must not be maintained in two places.
 """
 
 import re
@@ -29,8 +37,101 @@ class Migration:
     sql: str
 
 
-async def create_pool(database_url: str) -> asyncpg.Pool:
-    return await asyncpg.create_pool(database_url)
+async def create_pool(
+    database_url: str,
+    *,
+    timeout_seconds: float | None = None,
+    lock_timeout: str | None = None,
+) -> asyncpg.Pool:
+    """A pool over `database_url`. With no arguments it is byte-for-byte the
+    pool this function has always returned — asyncpg's own defaults, including
+    its 60s connect timeout, and no query bound — which is the scanners' and
+    the migration runner's pool.
+
+    `timeout_seconds` bounds EVERY plain touch of the pool, which is what a
+    process with a deadline needs and what the module docstring explains the
+    default cannot be:
+
+    - CONNECT: asyncpg's per-connection `timeout`, so a dead host refuses
+      fast instead of waiting out the 60s default;
+    - PER QUERY: `command_timeout`, enforced CLIENT-side by asyncpg — which
+      is what makes it fire even when the server is a black hole rather than
+      a server that says no;
+    - THE CANCEL-WAIT ON RELEASE: when `command_timeout` fires, asyncpg sends
+      its CancelRequest over a FRESH connection opened with NO timeout, and
+      release then AWAITS that cancellation with the holder's budget — which
+      is the ACQUIRE timeout, `None` for a plain `pool.execute`. Against a
+      black-holed host that turns "≤N seconds per query" into N seconds plus
+      a kernel SYN timeout (~2 minutes on Linux) PER TOUCH. So the pool's
+      `acquire()` carries a DEFAULT timeout, which asyncpg stamps onto the
+      holder and applies as the release budget: a cancellation that cannot
+      complete inside it gets the connection TERMINATED instead of awaited,
+      and a fully hung touch costs roughly 2× `timeout_seconds`.
+
+    `lock_timeout` (a Postgres interval string) additionally bounds server-
+    side lock waits, so a `SELECT … FOR UPDATE` behind a holder that died
+    mid-transaction answers with an error instead of queueing forever.
+
+    HONEST SCOPE, unchanged from where this mechanism came from (PR #143
+    round 5): these bounds reach plain execute/fetch/acquire touches. They
+    can NOT reach a transaction exit — every asyncpg protocol op awaits an
+    UNTIMED cancel_waiter before its own command timeout arms, so a ROLLBACK
+    issued after a black-holed statement outlives all of them. Callers that
+    need a bound on a whole block wrap it in `asyncio.wait_for` as well
+    (epigone.safety.watchdog's DB_BLOCK_CEILING_SECONDS, the monitor's
+    MONITOR_DB_CEILING_SECONDS); that composes safely because Pool.release is
+    shielded, so a cancelled block's connection is still terminated within
+    the acquire budget.
+    """
+    # Passed only when set, never as an explicit None. asyncpg's `connect`
+    # defaults to `timeout=60`, and `create_pool` forwards **connect_kwargs
+    # straight into it — so handing it `timeout=None` does not mean "the
+    # default", it means `asyncio.timeout(None)`, i.e. NO connect bound at
+    # all. An unbounded default pool would be strictly LOOSER than the plain
+    # one this function used to return, and looser in the exact direction
+    # issue #213 exists to close: every scanner would hang forever on a
+    # black-holed host instead of failing in a minute.
+    bounds: dict[str, object] = {}
+    if timeout_seconds is not None:
+        bounds["timeout"] = timeout_seconds
+        bounds["command_timeout"] = timeout_seconds
+    if lock_timeout is not None:
+        bounds["server_settings"] = {"lock_timeout": lock_timeout}
+    pool = await asyncpg.create_pool(database_url, **bounds)
+    assert pool is not None
+    if timeout_seconds is None:
+        return pool
+
+    # The acquire-timeout default (docstring above). asyncpg 0.31 offers no
+    # pool_class hook and Pool declares __slots__, so the least invasive seam
+    # is a layout-compatible subclass swapped onto the live pool: acquire()
+    # gains a default timeout, which asyncpg itself then carries into the
+    # holder as the RELEASE budget ("Record the timeout, as we will apply it
+    # by default in release()" — asyncpg/pool.py). Every caller — pool.execute,
+    # pool.fetchrow, a bare pool.acquire() in a shared state module —
+    # inherits the bound with no call-site changes.
+    bound = timeout_seconds
+
+    class _BoundedAcquirePool(type(pool)):  # type: ignore[misc]
+        # Empty slots keep the layout identical to Pool (which declares
+        # __slots__), which is what makes the __class__ assignment legal —
+        # and is also why the per-pool timeout lives in this closure rather
+        # than on the instance. HONESTLY: this construction can NEVER fail
+        # loudly on an asyncpg upgrade — deriving from type(pool) with empty
+        # slots is layout-compatible with whatever Pool becomes, and every
+        # realistic drift (helpers no longer routing through self.acquire(),
+        # the acquire timeout no longer becoming the release budget) degrades
+        # SILENTLY. The real guard is the version pin (pyproject:
+        # asyncpg>=0.31,<0.32 — an upgrade is a deliberate visit to this
+        # seam) plus the black-holed-connection tests in CI, which exercise
+        # the actual behaviour.
+        __slots__ = ()
+
+        def acquire(self, *, timeout: float | None = None) -> "asyncpg.pool.PoolAcquireContext":
+            return super().acquire(timeout=bound if timeout is None else timeout)
+
+    pool.__class__ = _BoundedAcquirePool
+    return pool
 
 
 def load_migrations() -> list[Migration]:

@@ -51,17 +51,28 @@ still terminated within the acquire budget). These pool bounds remain the
 NORMAL-operation guarantee and the reason a ceilinged block usually exits
 in ~2× TIMEOUT instead of at the ceiling.
 
-Only the safety process uses this. The scanner processes keep
-epigone.db.create_pool's unbounded defaults on purpose: fine backfills and
-migrations run legitimately long queries and must not inherit an
-incident-tuned timeout — which is also why the watchdog runs its MIGRATIONS
-on a plain pool that closes before this one takes over
+The scanner processes keep epigone.db.create_pool's unbounded defaults on
+purpose: fine backfills and migrations run legitimately long queries and must
+not inherit an incident-tuned timeout — which is also why the watchdog runs
+its MIGRATIONS on a plain pool that closes before this one takes over
 (epigone.safety.main). Everything after that — the keystore's single-row
 reads included — runs bounded here: startup failing fast inside the bound
 is exactly the fail-fast the watchdog wants.
+
+WHERE THE MECHANISM LIVES (issue #213). This module used to build the
+bounded pool itself. It no longer does: the #52 health monitor turned out to
+need the same bounds — a black-holed database hung its loop instead of
+tripping its DB-down check, so the checker went silent in the one failure it
+shares with the watchdog it checks — and a second copy of the release-budget
+subclass would be two places to get an asyncpg upgrade wrong. So the four
+bounds above are `epigone.db.create_pool`'s optional arguments, documented
+there, and this module is now the SAFETY LANE'S NUMBERS: what a watchdog's
+deadline can afford, and why.
 """
 
 import asyncpg
+
+from epigone.db import create_pool
 
 # One bound for connect, per-query, and the acquire/release budget alike:
 # far above any healthy safety query (single-row reads/upserts) and far
@@ -78,43 +89,9 @@ async def create_safety_pool(
     timeout_seconds: float = SAFETY_DB_TIMEOUT_SECONDS,
     lock_timeout: str = SAFETY_LOCK_TIMEOUT,
 ) -> asyncpg.Pool:
-    """The watchdog's runtime pool. The overrides exist for tests, which
-    prove the bounds with sub-second values; production takes the defaults."""
-    pool = await asyncpg.create_pool(
-        database_url,
-        timeout=timeout_seconds,
-        command_timeout=timeout_seconds,
-        server_settings={"lock_timeout": lock_timeout},
+    """The watchdog's runtime pool: all four bounds of the module docstring,
+    at the safety lane's numbers. The overrides exist for tests, which prove
+    the bounds with sub-second values; production takes the defaults."""
+    return await create_pool(
+        database_url, timeout_seconds=timeout_seconds, lock_timeout=lock_timeout
     )
-    assert pool is not None
-
-    # The acquire-timeout default (module docstring, round 4). asyncpg 0.31
-    # offers no pool_class hook and Pool declares __slots__, so the least
-    # invasive seam is a layout-compatible subclass swapped onto the live
-    # pool: acquire() gains a default timeout, which asyncpg itself then
-    # carries into the holder as the RELEASE budget ("Record the timeout, as
-    # we will apply it by default in release()" — asyncpg/pool.py). Every
-    # caller — pool.execute, pool.fetchrow, bare pool.acquire() in the
-    # shared state modules — inherits the bound with no call-site changes.
-    class _BoundedAcquirePool(type(pool)):  # type: ignore[misc]
-        # Empty slots keep the layout identical to Pool (which declares
-        # __slots__), which is what makes the __class__ assignment legal —
-        # and is also why the per-pool timeout lives in this closure rather
-        # than on the instance. HONESTLY (round 5): this construction can
-        # NEVER fail loudly on an asyncpg upgrade — deriving from type(pool)
-        # with empty slots is layout-compatible with whatever Pool becomes,
-        # and every realistic drift (helpers no longer routing through
-        # self.acquire(), the acquire timeout no longer becoming the release
-        # budget) degrades SILENTLY. The real guard is the version pin
-        # (pyproject: asyncpg>=0.31,<0.32 — an upgrade is a deliberate visit
-        # to this seam) plus the black-holed-connection tests in CI, which
-        # exercise the actual behavior.
-        __slots__ = ()
-
-        def acquire(self, *, timeout: float | None = None) -> "asyncpg.pool.PoolAcquireContext":
-            return super().acquire(
-                timeout=timeout_seconds if timeout is None else timeout
-            )
-
-    pool.__class__ = _BoundedAcquirePool
-    return pool
