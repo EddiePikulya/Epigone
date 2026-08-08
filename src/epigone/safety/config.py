@@ -12,7 +12,7 @@ OUTLIVES the container — the whole point is surviving a restart during a
 Postgres outage — so the compose service points it at a named volume; the
 default is a path under the operator's home for local runs.
 
-`WATCHDOG_DEADMAN_PING_URL` is the other one, and it is the only knob here
+`WATCHDOG_EXTERNAL_PING_URL` is the other one, and it is the only knob here
 that is a SECRET (issue #213): the operator creates a check on an external
 dead-man service and pastes its ping URL, whose path is the credential. It
 has no default and cannot have one — nobody but the operator can create that
@@ -21,6 +21,12 @@ watchdog runs exactly as before and the out-of-band page path simply does not
 exist. `epigone.safety.main` says which of the two the process is in at
 startup, loudly, because that is the assumption an operator is most likely to
 make wrongly. Setting it is a MAINNET GATE, not a testnet one.
+
+It is also the ONE knob here that can refuse to start the process. A
+malformed value under `EXECUTOR_ALLOW_MAINNET` raises `WatchdogConfigError`
+rather than degrading, because degrading would answer a typo'd secret with a
+silently unwatched mainnet watchdog — see `_parse_ping_url` for why that
+inverts the usual rule. Unset, as distinct from malformed, still only warns.
 
 The exchange URL defaults to TESTNET. The info URL is derived from the exchange
 URL so the watchdog can never read one network's book while cancelling on the
@@ -50,6 +56,18 @@ from epigone.gateway.http import TESTNET_INFO_URL
 from epigone.safety.keycache import default_cache_path
 
 log = logging.getLogger(__name__)
+
+
+class WatchdogConfigError(Exception):
+    """A configuration the watchdog refuses to start on.
+
+    Rare by design — nearly every knob here degrades to a safe default with a
+    warning, because a misconfiguration must not wedge the switch. This exists
+    for the cases where STARTING is the unsafe direction, and there is one:
+    a mainnet watchdog whose out-of-band page path was meant to be armed and
+    is not (`_parse_ping_url`). Raised out of `from_env`, so the process dies
+    at startup and crash-loops visibly under `restart: unless-stopped`."""
+
 
 DEFAULT_INTERVAL_SECONDS = 10
 # The executor (A4+) will beat every loop, i.e. every few seconds; a minute
@@ -100,7 +118,7 @@ DEFAULT_CAPABILITY_CHECK_HOURS = 6
 # watchdog trips the check on the operator's own schedule rather than a
 # multiple of ours. Tunable mostly for the free tiers of ping services that
 # meter by request count.
-DEFAULT_DEADMAN_PING_SECONDS = 60
+DEFAULT_EXTERNAL_PING_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -119,13 +137,16 @@ class WatchdogConfig:
     # None = no out-of-band page path configured (module docstring). The
     # interval is still parsed and carried, so setting the URL later is the
     # only change an operator has to make.
-    deadman_ping_url: str | None
-    deadman_ping_interval: timedelta
+    external_ping_url: str | None
+    external_ping_interval: timedelta
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
         exchange_url = _parse_exchange_url(os.environ.get("WATCHDOG_EXCHANGE_URL"))
         cache_file = os.environ.get("WATCHDOG_KEY_CACHE_FILE")
+        # Read before the ping URL is parsed: whether a malformed one is a
+        # warning or a refusal depends on it (`_parse_ping_url`).
+        allow_mainnet = parse_allow_mainnet(os.environ.get("EXECUTOR_ALLOW_MAINNET"))
         return cls(
             interval=timedelta(
                 seconds=parse_positive_int(
@@ -182,28 +203,43 @@ class WatchdogConfig:
             # the sweep must be able to reach whatever book the executor can
             # trade on, and one flag is what makes that impossible to get half
             # right.
-            allow_mainnet=parse_allow_mainnet(os.environ.get("EXECUTOR_ALLOW_MAINNET")),
+            allow_mainnet=allow_mainnet,
             key_cache_path=Path(cache_file) if cache_file else default_cache_path(),
-            deadman_ping_url=_parse_ping_url(os.environ.get("WATCHDOG_DEADMAN_PING_URL")),
-            deadman_ping_interval=timedelta(
+            external_ping_url=_parse_ping_url(
+                os.environ.get("WATCHDOG_EXTERNAL_PING_URL"), allow_mainnet=allow_mainnet
+            ),
+            external_ping_interval=timedelta(
                 seconds=parse_positive_int(
-                    os.environ.get("WATCHDOG_DEADMAN_PING_SECONDS"),
-                    default=DEFAULT_DEADMAN_PING_SECONDS,
-                    name="WATCHDOG_DEADMAN_PING_SECONDS",
+                    os.environ.get("WATCHDOG_EXTERNAL_PING_SECONDS"),
+                    default=DEFAULT_EXTERNAL_PING_SECONDS,
+                    name="WATCHDOG_EXTERNAL_PING_SECONDS",
                 )
             ),
         )
 
 
-def _parse_ping_url(raw: str | None) -> str | None:
-    """The external dead-man ping URL, or None for "not configured".
+def _parse_ping_url(raw: str | None, *, allow_mainnet: bool) -> str | None:
+    """The external ping URL, or None for "not configured".
 
-    The house convention for a bad value is a safe default, and here the safe
-    default is OFF: a URL we cannot ping is not a page path, and pretending it
-    is would be worse than admitting there is none — an operator who believes
-    the out-of-band path is armed stops looking for the fact that it isn't.
-    So a malformed value degrades to unconfigured, and the startup log the
-    unconfigured case already prints is what carries it.
+    A MALFORMED VALUE IS FATAL UNDER MAINNET, and that is a deliberate
+    exception to the house convention (review of PR #216). Everywhere else in
+    this file a bad value degrades to the safe default with a warning, because
+    a misconfigured duration must never wedge the switch. Here that rule points
+    the wrong way: the operator TRIED to arm the out-of-band page path and
+    fat-fingered the secret, so degrading leaves a mainnet watchdog whose only
+    observer is the in-domain monitor — the precise state issue #213 is a gate
+    against — and it leaves it that way behind a log line nobody reads twice.
+    Refusing to boot is the safe default for this knob: the process crash-loops
+    visibly instead of running unwatched, and the fix is one line of `.env`.
+
+    On testnet it stays a warning. There is nothing at stake but a testnet
+    book, and a watchdog that refuses to start is strictly worse than one that
+    runs without a page path it never had.
+
+    UNSET is a warning in BOTH postures, deliberately left alone here: whether
+    mainnet should also refuse to start with no ping URL at all is an operator
+    policy call, not an implementation detail, and it is surfaced for the
+    operator to rule on rather than decided by this function.
 
     Scheme-checked and nothing more. The path is opaque on purpose (it is the
     credential), the host is the operator's choice of service, and a URL that
@@ -213,9 +249,17 @@ def _parse_ping_url(raw: str | None) -> str | None:
         return None
     url = raw.strip()
     if not url.startswith(("http://", "https://")):
+        if allow_mainnet:
+            raise WatchdogConfigError(
+                "WATCHDOG_EXTERNAL_PING_URL is not an http(s) URL, and "
+                "EXECUTOR_ALLOW_MAINNET is set. Refusing to start rather than run a "
+                "MAINNET watchdog with no out-of-band page path (issue #213): fix the "
+                "URL, or unset it deliberately if you accept running without one."
+            )
         log.warning(
-            "WATCHDOG_DEADMAN_PING_URL is not an http(s) URL; the watchdog will run "
-            "with NO out-of-band page path"
+            "WATCHDOG_EXTERNAL_PING_URL is not an http(s) URL; the watchdog will run "
+            "with NO out-of-band page path (this would REFUSE TO START under "
+            "EXECUTOR_ALLOW_MAINNET)"
         )
         return None
     if url.startswith("http://"):
@@ -225,7 +269,7 @@ def _parse_ping_url(raw: str | None) -> str | None:
         # it on the wire for anyone between here and there, and the operator
         # should hear that once at startup rather than never.
         log.warning(
-            "WATCHDOG_DEADMAN_PING_URL is plain http; the ping URL's path is a "
+            "WATCHDOG_EXTERNAL_PING_URL is plain http; the ping URL's path is a "
             "credential and will travel in clear — prefer https"
         )
     return url

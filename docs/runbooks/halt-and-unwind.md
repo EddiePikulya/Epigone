@@ -381,7 +381,7 @@ domain cannot report the domain failing, however well bounded it is.
 So the watchdog also pings **outward**, on the inverted logic a dead man's
 switch needs. You create a check on an external dead-man service
 (healthchecks.io and friends), set its ping URL in
-`WATCHDOG_DEADMAN_PING_URL`, and the watchdog says "still here" every 60s from
+`WATCHDOG_EXTERNAL_PING_URL`, and the watchdog says "still here" every 60s from
 the same pulse that beats its heartbeat — at every cycle top and at every
 enumeration step of a sweep, so a multi-minute grind keeps pinging. **When the
 pings stop, the external service pages you from its own infrastructure.**
@@ -409,7 +409,19 @@ reassurance:
   trade: the alternative (stop pinging when blind) would page "watchdog
   dead" for a watchdog that is working, which is the wrong sentence at 3am.
 - **Anything but the watchdog.** One check, one process. The executor, the
-  bot, ingest and the websocket lane are not in it.
+  bot, ingest and the websocket lane are not in it — **and neither is the
+  monitor**. A monitor that crash-loops, wedges or is stopped by hand on an
+  otherwise healthy host is silent, and takes the DB-down page and every other
+  check with it; the only present signal is the daily digest not arriving,
+  which is a once-a-day negative someone has to notice. **Issue #220** tracks
+  that residual (the cheap fix is a second dead-man check for the monitor
+  itself, reusing this same code) and flags for the operator whether it should
+  also be a mainnet gate.
+- **A monitor that never finishes starting.** Its migration run is bounded
+  (5 minutes) so a host black-holing mid-startup crash-loops the container
+  rather than hanging it silently before the first cycle. A crash loop is
+  *visible* in `docker compose ps` and the logs — it is not a page. Same
+  residual, same issue.
 - **The external service itself.** It is a third-party dependency with its
   own uptime and its own delivery path (email, SMS, push). If *it* is down,
   most such services do not page — silence there is ambiguous, not safe.
@@ -435,7 +447,7 @@ anyway.
    silence is thirty missed pings).
 2. Point its notifications somewhere that does not depend on this host or on
    the Epigone bot — a personal email and an SMS/push channel.
-3. Put the ping URL in the server's `.env` as `WATCHDOG_DEADMAN_PING_URL`.
+3. Put the ping URL in the server's `.env` as `WATCHDOG_EXTERNAL_PING_URL`.
    **Treat it as a secret:** on healthchecks.io and services like it the path
    IS the credential, and anyone holding it can forge this watchdog's
    liveness. Epigone logs the host and never the path — including on the
@@ -444,21 +456,33 @@ anyway.
    a plain-`http` URL is accepted (a self-hosted checker is legitimate) but
    warned about at startup, because it puts the credential on the wire.
 4. `docker compose --profile execution up -d watchdog` and confirm the first
-   log line reads `out-of-band dead-man ping ARMED`. If it reads `NO
+   log line reads `out-of-band ping ARMED`. If it reads `NO
    out-of-band page path`, the variable did not reach the container.
 5. Confirm the check went green on the service's own dashboard, then stop the
    watchdog for six minutes and confirm you are actually paged. An untested
    page path is not a page path.
 
+**A malformed URL refuses to start the watchdog under
+`EXECUTOR_ALLOW_MAINNET`.** It is the one knob in the watchdog's config that
+does not degrade to a safe default, and the exception is deliberate: degrading
+answers a fat-fingered secret with a live mainnet watchdog that nothing
+outside this host is watching — the exact state this gate exists to prevent —
+behind a log line nobody reads twice. The container crash-loops instead, and
+the fix is one line of `.env`. On testnet it warns and carries on.
+
 **Unset is a supported configuration, and the watchdog says so at 🚨 volume in
-its first log line.** Everything else runs identically without it — this leg
-cannot slow the kill path even in principle, because `ping()` is a synchronous
-call with no `await` for a stall to be inherited through; the request runs as
-its own task under a 5s aiohttp timeout and a 10s outer ceiling, and those
-bounds protect the ping's own health, not the caller's — but
-"unset" means the only thing that would notice this process dying is the
-monitor, which reads the same database on the same host. That is the state
-this issue exists to end.
+its first log line.** Note that unset is deliberately *not* treated as
+malformed: an operator who has not armed the path may have decided not to, and
+that is a policy call rather than a parser's. **If you want mainnet to refuse
+to boot with no ping URL at all, say so and it is a two-line change** — it was
+left this way to be ruled on rather than assumed. Everything else runs
+identically without it: this leg cannot slow the kill path even in principle,
+because `ping()` is a synchronous call with no `await` for a stall to be
+inherited through (the request runs as its own task under a 5s aiohttp timeout
+and a 10s outer ceiling, and those bounds protect the ping's own health, not
+the caller's). But "unset" means the only thing that would notice this process
+dying is the monitor, which reads the same database on the same host. That is
+the state this issue exists to end.
 
 **The #188 floating-IP secondary is not this and does not replace it.** It
 stays parked.

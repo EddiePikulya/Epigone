@@ -109,8 +109,14 @@ ADMIN_TELEGRAM_ID=370818090
 # holding it can forge this watchdog's liveness. Full setup and the honest
 # list of what this does and does not cover:
 # docs/runbooks/halt-and-unwind.md § "The out-of-band page path".
-# WATCHDOG_DEADMAN_PING_URL=https://hc-ping.com/<your-check-uuid>
-# WATCHDOG_DEADMAN_PING_SECONDS=60       # ping cadence; keep it well under the grace
+#
+# A MALFORMED value here REFUSES TO START the watchdog when EXECUTOR_ALLOW_MAINNET
+# is set — the one knob in the watchdog's config that does not degrade to a safe
+# default, because degrading would answer a typo'd secret with a live mainnet
+# watchdog nothing outside this host is watching. On testnet it warns instead.
+# Leaving it UNSET is not the same as malformed: that warns in both postures.
+# WATCHDOG_EXTERNAL_PING_URL=https://hc-ping.com/<your-check-uuid>
+# WATCHDOG_EXTERNAL_PING_SECONDS=60       # ping cadence; keep it well under the grace
 EOF
 chmod 600 .env
 ```

@@ -32,7 +32,7 @@ its callers do not have to:
   by structure rather than by a number, which is the whole reason for the
   odd-looking sync signature on an I/O object.
 - IT NO-OPS CLEANLY WHEN UNCONFIGURED. There is no ping URL until the
-  operator creates the check and sets `WATCHDOG_DEADMAN_PING_URL`, and the
+  operator creates the check and sets `WATCHDOG_EXTERNAL_PING_URL`, and the
   watchdog must run identically without one — so "unconfigured" is
   represented by not constructing this at all (`epigone.safety.main` passes
   `alive=None`), never by a disabled instance that might still be reached.
@@ -70,7 +70,7 @@ import aiohttp
 log = logging.getLogger(__name__)
 
 # The cadence is NOT defaulted here. It is an operator knob and
-# `epigone.safety.config` owns its default (DEFAULT_DEADMAN_PING_SECONDS, 60s)
+# `epigone.safety.config` owns its default (DEFAULT_EXTERNAL_PING_SECONDS, 60s)
 # beside the URL it goes with; a second 60 in this file would be a source of
 # truth that production never reads and a test could silently drift from.
 # `interval_seconds` is therefore required at construction.

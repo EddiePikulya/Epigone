@@ -144,8 +144,8 @@ services:
       # is the credential. Unset is supported and the watchdog says so loudly
       # at startup; see docs/runbooks/halt-and-unwind.md for setup and for
       # what it does and does not cover.
-      WATCHDOG_DEADMAN_PING_URL: ${WATCHDOG_DEADMAN_PING_URL:-}
-      WATCHDOG_DEADMAN_PING_SECONDS: ${WATCHDOG_DEADMAN_PING_SECONDS:-60}
+      WATCHDOG_EXTERNAL_PING_URL: ${WATCHDOG_EXTERNAL_PING_URL:-}
+      WATCHDOG_EXTERNAL_PING_SECONDS: ${WATCHDOG_EXTERNAL_PING_SECONDS:-60}
     volumes:
       # The KEK file (outside git, outside the DB — keystore invariant),
       # mounted read-only where KEYSTORE_KEK_FILE points.

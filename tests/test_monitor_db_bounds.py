@@ -14,10 +14,11 @@ each into the signal it already knew how to send. Real wall-clock bounds,
 because the timeouts under test are real; sub-second test values, the
 production ones being epigone.monitor.main's.
 
-The last test covers the leg the pool's own timeouts cannot reach at all
-(asyncpg awaits an untimed cancel_waiter before any per-op timeout arms — the
-round-5 finding in epigone.safety.watchdog), which is why the gathers ALSO sit
-under a hard real-time ceiling.
+Two of them cover the hard real-time ceiling the gathers ALSO sit under: that
+it catches a hang no pool bound could, and — the mistake found reviewing this
+change — that it is sized from the number of touches the gather actually
+makes, since a ceiling under-priced against a legal slow run is a FALSE
+DB-down page rather than a missing one.
 """
 
 import asyncio
@@ -31,7 +32,12 @@ from aiogram import Bot
 import epigone.monitor.main as monitor_main
 from epigone.db import create_pool
 from epigone.monitor.alerting import Monitor
-from epigone.monitor.checks import CheckThresholds, HealthSnapshot
+from epigone.monitor.checks import (
+    CheckThresholds,
+    HealthSnapshot,
+    gather_snapshot,
+    gather_watchdog_snapshot,
+)
 from epigone.monitor.config import MonitorConfig
 from epigone.monitor.main import run_monitor_cycle, run_watchdog_liveness_cycle
 from tests.support.clock import FakeClock
@@ -227,7 +233,7 @@ async def test_the_ceiling_catches_the_leg_no_pool_bound_can(
 
     Simulated by a gather that simply never returns, because the shape being
     guarded against is exactly "an await nothing underneath us will end"."""
-    monkeypatch.setattr(monitor_main, "MONITOR_DB_CEILING_SECONDS", BOUND)
+    monkeypatch.setattr(monitor_main, "MONITOR_FULL_CEILING_SECONDS", BOUND)
 
     async def never_returns(*args: object, **kwargs: object) -> HealthSnapshot:
         await asyncio.sleep(FOREVER)
@@ -243,3 +249,145 @@ async def test_the_ceiling_catches_the_leg_no_pool_bound_can(
 
     assert any("Database" in text for text in messages)
     assert len(session.sent_messages()) == 1
+
+
+# --- the ceilings are derived from the gathers, and must stay that way ---
+
+
+class _CountingPool:
+    """A pool that records every touch and delegates it, so a gather's touch
+    COUNT is observable without guessing from the source."""
+
+    def __init__(self, inner: asyncpg.Pool, touches: list[str]) -> None:
+        self._inner = inner
+        self._touches = touches
+
+    async def fetchrow(self, *args: object, **kwargs: object) -> object:
+        self._touches.append("fetchrow")
+        return await self._inner.fetchrow(*args, **kwargs)
+
+    async def fetchval(self, *args: object, **kwargs: object) -> object:
+        self._touches.append("fetchval")
+        return await self._inner.fetchval(*args, **kwargs)
+
+    async def fetch(self, *args: object, **kwargs: object) -> object:
+        self._touches.append("fetch")
+        return await self._inner.fetch(*args, **kwargs)
+
+    async def execute(self, *args: object, **kwargs: object) -> object:
+        self._touches.append("execute")
+        return await self._inner.execute(*args, **kwargs)
+
+
+async def test_the_ceilings_match_what_the_gathers_actually_touch(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """The bug this pins (review of PR #216): the full gather's ceiling was
+    set to ONE touch's worth of budget while the gather makes TWO sequential
+    touches — the big fetchrow, then `count_due_traders`. Their worst legal
+    composition is twice the ceiling, so a loaded-but-answering database could
+    outrun it and fire a 🚨 DB-down page for a database that was merely busy —
+    exactly the false page the per-touch bound is priced to avoid.
+
+    The arithmetic is only right while the counts it is derived from are, and
+    a comment cannot enforce that. Adding a touch to either gather fails HERE,
+    where the fix is one number, rather than in production at 3am."""
+    full_touches: list[str] = []
+    await gather_snapshot(
+        _CountingPool(pool, full_touches),  # type: ignore[arg-type]
+        clock,
+        FakeDiskProbe(),
+        _config().thresholds,
+    )
+    assert len(full_touches) == monitor_main.FULL_GATHER_TOUCHES
+
+    liveness_touches: list[str] = []
+    await gather_watchdog_snapshot(
+        _CountingPool(pool, liveness_touches),  # type: ignore[arg-type]
+        clock,
+    )
+    assert len(liveness_touches) == monitor_main.LIVENESS_GATHER_TOUCHES
+
+    # And the ceilings really are those counts times one hung touch, rather
+    # than a number that happens to be near them.
+    assert monitor_main.MONITOR_FULL_CEILING_SECONDS == (
+        monitor_main.FULL_GATHER_TOUCHES * monitor_main.WORST_TOUCH_SECONDS
+    )
+    assert monitor_main.MONITOR_LIVENESS_CEILING_SECONDS == (
+        monitor_main.LIVENESS_GATHER_TOUCHES * monitor_main.WORST_TOUCH_SECONDS
+    )
+    # The liveness ceiling must stay under the fast tick's cadence, or a hung
+    # tick would swallow the one after it as well.
+    assert monitor_main.MONITOR_LIVENESS_CEILING_SECONDS < 60
+
+
+async def test_one_hung_touch_really_costs_no_more_than_the_ceiling_prices_it(
+    database_url: str,
+) -> None:
+    """`WORST_TOUCH_SECONDS = 3 × the bound` is an ASSUMPTION about asyncpg —
+    that a fully hung touch costs an acquire, a query and a release, each
+    bounded — and the ceilings are built on it. Measured here rather than
+    reasoned about, because if a hung touch actually costs more than that, the
+    ceilings are under-priced again and every argument above them is wrong.
+
+    Sub-second values; production's are the module's. The claim under test is
+    the RATIO, which is what the ceilings are derived from."""
+    pool = await create_pool(database_url, timeout_seconds=BOUND)
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            await pool.fetchrow(f"SELECT pg_sleep({FOREVER})")
+        cost = time.monotonic() - started
+    finally:
+        await pool.close()
+
+    multiple = cost / BOUND
+    assert multiple <= 3, (
+        f"a fully hung touch cost {multiple:.1f}× the per-touch bound, but the "
+        f"ceilings are priced at 3× — they are under-priced"
+    )
+
+
+# --- startup, where nothing is watching yet ---
+
+
+async def test_a_startup_that_cannot_migrate_crashes_instead_of_hanging(
+    database_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bounding the loop while leaving STARTUP unbounded left this issue's own
+    failure shape alive at the worst moment (review of PR #216): a host that
+    black-holes while the monitor is migrating hangs it before the first
+    cycle, so there is no DB-down page, no digest, and silence that looks
+    exactly like health. Crashing crash-loops the container instead, which is
+    at least visible.
+
+    The bound must ALSO not hang while enforcing itself — `asyncio.wait_for`
+    would cancel the migration and then await a rollback through asyncpg's
+    untimed cancel_waiter, which is the hang it was added to prevent. So the
+    elapsed-time assertion is the real content of this test."""
+    monkeypatch.setattr(monitor_main, "MONITOR_MIGRATE_CEILING_SECONDS", BOUND)
+
+    async def never_finishes(*args: object, **kwargs: object) -> None:
+        await asyncio.sleep(FOREVER)
+        raise AssertionError("the startup deadline should have fired long before this")
+
+    monkeypatch.setattr(monitor_main, "migrate", never_finishes)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        await monitor_main.open_monitor_pool(database_url)
+    assert time.monotonic() - started < ELAPSED_CEILING
+
+
+async def test_a_healthy_startup_still_migrates_and_returns_a_bounded_pool(
+    database_url: str,
+) -> None:
+    """The deadline must not have changed the normal path: migrations run,
+    and what comes back is the BOUNDED pool the loop is supposed to use, not
+    the unbounded one they ran on."""
+    pool = await monitor_main.open_monitor_pool(database_url)
+    try:
+        assert pool._connect_kwargs["command_timeout"] == monitor_main.MONITOR_DB_TIMEOUT_SECONDS
+        assert await pool.fetchval("SELECT 1") == 1
+    finally:
+        await pool.close()

@@ -44,7 +44,7 @@ Wiring notes, each load-bearing:
   may be no schedule left to push.
 - THE OUT-OF-BAND PAGE PATH is wired here too (issue #213), and it is the
   one piece of this process that reports to something outside our own
-  infrastructure: when `WATCHDOG_DEADMAN_PING_URL` names an external
+  infrastructure: when `WATCHDOG_EXTERNAL_PING_URL` names an external
   dead-man check, `ExternalPing.ping` becomes the watchdog's `alive` seam
   and the external service pages the operator when the pings stop. Unset is
   a supported configuration and changes nothing else — but it means the only
@@ -180,20 +180,20 @@ async def main() -> None:
         # Constructed before anything else that could fail, so the operator
         # sees which world this process is in in the first lines of its log.
         ping: ExternalPing | None = None
-        if config.deadman_ping_url is not None:
+        if config.external_ping_url is not None:
             ping = ExternalPing(
                 session,
-                config.deadman_ping_url,
-                interval_seconds=config.deadman_ping_interval.total_seconds(),
+                config.external_ping_url,
+                interval_seconds=config.external_ping_interval.total_seconds(),
             )
             log.info(
-                "watchdog: out-of-band dead-man ping ARMED — %s every %ss",
+                "watchdog: out-of-band ping ARMED — %s every %ss",
                 ping.target,
-                int(config.deadman_ping_interval.total_seconds()),
+                int(config.external_ping_interval.total_seconds()),
             )
         else:
             log.warning(
-                "watchdog: NO out-of-band page path — WATCHDOG_DEADMAN_PING_URL is unset, "
+                "watchdog: NO out-of-band page path — WATCHDOG_EXTERNAL_PING_URL is unset, "
                 "so if this process dies the only thing that would notice is the monitor, "
                 "which reads the same database on the same host (issue #213, a mainnet gate)"
             )
