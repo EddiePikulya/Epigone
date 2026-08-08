@@ -669,12 +669,13 @@ async def _reconcile(
         memory = (
             await _lane_memory(conn, address, positions, now)
             if any(
-                event.kind == "flip" and _rows_cover(event, rows.produced, lookback(event.coin))
+                event.kind == "flip"
+                and _every_leg_covered(event, rows.produced, lookback(event.coin))
                 for event in events
             )
             else None
         )
-        owed = memory.owed if memory is not None else set[str]()
+        owed: set[str] = memory.owed if memory is not None else set()
         return (
             rows,
             [
@@ -924,7 +925,7 @@ def _legs_covered(
     )
 
 
-def _rows_cover(
+def _every_leg_covered(
     event: PositionEvent,
     produced: dict[tuple[str, str], datetime],
     no_earlier_than: datetime,
@@ -979,8 +980,14 @@ def _vouched_for(
     same transaction it published from, so it owes nothing on that flip's
     account. It can still owe something ELSE on the coin — a later scale-in the
     lane is coalescing holds its anchor back on purpose — and then the told
-    flip is de-vouched and held for a look. That costs one look and never an
-    escalation, because the coalesce window closes long before the next pass.
+    flip is de-vouched and held for a look. Ordinarily that costs the look and
+    nothing else: the coalesce window closes long before the next pass, so the
+    second look finds a lane that owes nothing. It costs an ESCALATION when the
+    coin was ALREADY under a held doubt, because a doubt landing on a pending
+    coin is a confirmed one (`confirmed = doubted & pending`) and there is no
+    second look left to be patient with. That needs a doubt and a coalescing
+    entry and a flip on one coin inside one window; it is the worst case, not
+    the usual one, and it is stated because a "never" here would not be true.
 
     Ordering was the other candidate and does not work: a decomposed flip is
     exit-before-entry exactly like the two stale rows. A pairing window (both
@@ -995,7 +1002,7 @@ def _vouched_for(
     momentarily-behind anchor would hold coins on the lane's ordinary latency —
     the benign divergence the whole `_lane_memory` discriminator exists to
     stop escalating on."""
-    if not _rows_cover(event, produced, no_earlier_than):
+    if not _every_leg_covered(event, produced, no_earlier_than):
         return False
     return not (event.kind == "flip" and event.coin in owed)
 

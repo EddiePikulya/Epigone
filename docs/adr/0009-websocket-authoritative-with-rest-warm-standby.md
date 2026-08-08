@@ -262,8 +262,13 @@ change its rows appear to account for. A lane that genuinely told the flip
 advanced its anchor in the transaction it published from, so it owes nothing on
 that flip's account. It can still owe something ELSE on the coin — a later
 scale-in it is coalescing holds the anchor back on purpose — and then a told
-flip is de-vouched and held for a look. That costs one look and never an
-escalation: the coalesce window closes long before the next pass.
+flip is de-vouched and held for a look. Ordinarily that costs the look and
+nothing else, because the coalesce window closes long before the next pass. It
+costs an escalation when the coin was ALREADY under a held doubt: a doubt
+landing on a pending coin is a confirmed one, and there is no second look left
+to spend on patience. A doubt, a coalescing entry and a flip on one coin inside
+one window — the worst case rather than the usual one, recorded because a
+"never" here would not be true.
 
 Two alternatives were weighed, and are recorded because both look reasonable.
 ORDERING (exit before entry) cannot separate the cases at all: a decomposed flip
@@ -289,18 +294,21 @@ together and re-baselines the poller too, so the poller has no flip to diff
 across the gap.
 
 A wider one is neither closed nor made worse here, and is written down because
-this fix walks past it. **The vouch never asks whether the rows are from the
-current ownership era.** For roughly one lookback after production moves to the
+this fix walks past it — **issue #218** carries it. **The vouch never asks
+whether the rows are from the current ownership era.** For roughly one lookback
+(previous poll − `RECONCILE_GRACE_SECONDS`) after production moves to the
 poller, pre-transfer AUTHORITATIVE websocket rows are still in the window, while
 the websocket — healthy, merely not producing — keeps observing and advancing
 its anchor, so it owes nothing and the anchor test passes. A change the poller
 diffs in that window can therefore be vouched by rows describing an earlier one
 and produced by neither lane. It is the substitution above with the ownership
 transfer supplying the staleness instead of a deaf subscription, it reaches the
-one-legged kinds as well as `flip`, and it predates both #196 and #208. The
-straddle grace that makes the window wide (`RECONCILE_GRACE`) is deliberate and
+one-legged kinds as well as `flip`, and it predates both #196 and #208 — it
+needs no third event and no fault, only a transfer. The straddle grace that
+makes the window wide (`RECONCILE_GRACE_SECONDS`) is deliberate and
 load-bearing, so narrowing it is not the answer; era-tagging the vouch would be.
-Not attempted here — it belongs to its own change, with its own tests.
+Not attempted here — it belongs to its own change, with its own tests, and #218
+grades it a mainnet gate on #208's own reasoning.
 
 **This is the disposition of the comparison's third condition** ("flip-boundary
 kind normalization so the two producers' vocabularies match during any ownership
