@@ -65,9 +65,10 @@ and the default for every tracked wallet is off.
 ## Setting up a copy
 
 ```
-/copy <leader> <allocation> <stake> <leverage> <mode> [tp% sl%]
+/copy <leader> <allocation> <stake> <leverage> <mode> [tp% sl%] [loss <usd>]
 /copy 0xabc… 1000 100 mirror default
 /copy 0xabc… 1000 100 5 bracket 10 5
+/copy 0xabc… 1000 100 mirror default loss 300
 ```
 
 - **allocation** — dollars transferred into a dedicated sub-account for this
@@ -94,6 +95,10 @@ and the default for every tracked wallet is off.
 - **mode** — `default` exits when the Leader exits. `bracket` wraps each
   position in our own TP/SL at OUR fill price. **Read the episode rule below
   before choosing `bracket`.**
+- **loss** — optional. The total dollars this Leader may cost you before
+  Epigone stops copying him. See **The Loss Budget** below before setting one:
+  it is a trigger, not a floor, and omitting it on a re-issued `/copy` clears
+  a budget that was there.
 
 `/copy` confirms before acting, because it moves money. What the tap writes is
 a ROW, not an exchange call: the bot process holds no signer (ADR-0005), so
@@ -142,7 +147,8 @@ see, so the executor reports:
 
 - **every copied action** — sub, coin, side, requested vs filled;
 - **every skip, with its reason** — stale entry, leader below the liveness
-  floor, coin occupied, risk-declined, no local position, not mirrorable;
+  floor, coin occupied, risk-declined, no local position, not mirrorable, loss
+  budget spent;
 - **pager cases**, which also ride the 🚨 health-monitor path.
 
 **Except on a drain.** When one cycle disposes of more than five leader events
@@ -312,10 +318,96 @@ allocation funding ceiling (a typo catcher on the one irreversible money move,
 not a risk limit). Per-sub configurability is deliberately not offered for any
 of them.
 
-## The daily-loss pause is NOT in yet
+## The Loss Budget — a total cap per Leader, set at `/copy`
 
-A5 ships its enabler, not the pause (filed as **#181**): every cycle records
-each sub's equity in `copy_sub_equity`, which is what a threshold will
-eventually be chosen from. Until #181 lands, small stakes and the notices in
-your chat are the interim cover — nothing stops a sub that is having a bad day
-except `/uncopy` or `/kill`.
+```
+/copy 0xabc… 1000 100 mirror default loss 300     set it
+/copy 0xabc… 1000 100 mirror default loss 500     change it (same command)
+/copy 0xabc… 1000 100 mirror default loss off     turn it off
+/copy 0xabc… 1000 100 mirror default              ALSO turns it off
+```
+
+**What it is.** The total dollars you can afford to lose on this Leader before
+Epigone stops copying him. Optional and per-sub; a mapping without one behaves
+exactly as it did before this existed. The keyword may sit anywhere in the
+arguments and does not disturb the positional ones.
+
+**What happens as it is spent.**
+
+| where the loss is | what happens |
+| --- | --- |
+| ≥ 80% of the budget | one chat notice, once per arming |
+| ≥ the budget | **wind-down**: opens, scale-ins and flip open-legs are refused with a `copy_skipped` row; exits keep copying; brackets stay maintained |
+| wound down AND flat | the mapping is **disabled** — the same terminal state `/uncopy` produces — with a notice and a `copy_budget_disabled` row |
+
+**It is a TRIGGER, NOT A FLOOR.** After the breach, whatever is still open
+rides until the Leader exits it or a bracket fires, so the realised loss can
+end up past the number — sometimes well past, if the last position is a large
+one moving fast. Nothing here closes a position: there is no programmatic
+flatten path and this feature did not create one. What actually bounds the
+tail is what always did — the isolated margin behind each position, the sub's
+exchange-enforced allocation, and your brackets if you set them.
+
+**How the loss is measured.** `baseline + Epigone's own deposits since arming
+− current equity`, where equity is summed across **every venue the executor
+trades** (core plus the xyz builder DEX), because each venue holds its own
+collateral. The baseline is what the sub was worth when the executor armed the
+budget — not the allocation, and not zero: a sub that arrives holding money (an
+adopted orphan, a re-copy) is judged only on what happens after you set the
+number.
+
+**Arming is one cycle late, by design.** `/copy` writes the number; the
+executor takes the baseline on its next cycle and says so in chat (`🎯 Loss
+budget armed`). Until that message, the budget is set but measuring nothing —
+which is also why the funding transfer that fills a new sub is never counted
+against it.
+
+⚠️ **Money moved into a sub from OUTSIDE Epigone reads as profit** and slackens
+the budget by exactly that much — Epigone sees the equity but has no record of
+the deposit. The standing rule is what it always was: **fund subs through
+Epigone.** (Money moved OUT is not a concern for the arithmetic because there
+is no withdrawal path; if you move funds out of a sub by hand, the budget will
+read it as a loss and can wind the copy down.)
+
+**Changing it, and cancelling a wind-down.** Re-issue `/copy`:
+
+- a **higher** budget, or `loss off`, **cancels an in-progress wind-down** and
+  resumes copying on the next cycle — a breach of your own threshold is
+  overridable by an explicit, logged act, never a ratchet;
+- the **baseline and the spend survive** a change of amount. Raising the
+  number is not an amnesty for losses already booked;
+- a **lower** budget is accepted even when it is already spent, and breaches on
+  the next cycle. The confirm prompt tells you so before the tap;
+- **omitting the keyword clears the budget**, exactly as omitting TP/SL leaves
+  a sub bracket-less — `/copy` states a mapping's terms in full. The prompt
+  says loudly when it is about to clear one;
+- after a budget **disable**, a fresh `/copy` starts a clean budget on a fresh
+  baseline. The old ledger does not follow it.
+
+**Where to look.** `/copies` shows the budget, the spend as of the executor's
+last cycle, and `🛑 winding down` when that is the state. The trail carries
+`copy_loss_budget_changed` (yours, old → new), and `copy_budget_armed`,
+`copy_budget_warned`, `copy_budget_breached`, `copy_budget_disabled` (the
+executor's), each written with the state change it describes and independent of
+whether the chat notice was delivered.
+
+**It never pages, and it never interacts with `/kill`.** A page means something
+is broken; a budget doing its job is not that. The halt stays global and
+unconditional and outranks every budget state — halted still means Epigone
+signs nothing, including the exits a wind-down would otherwise copy. Nothing
+about a budget can create, clear or bypass a halt.
+
+**On the mainnet switch: set a Loss Budget on every initial mainnet `/copy`.**
+The feature is opt-in, so the runbook is what arms it on day one. Pick a number
+you would be willing to lose while you are asleep, and remember the trigger-not-
+a-floor caveat above when you pick it.
+
+### The rolling daily-loss pause is not, and may never be, a thing
+
+The 2026-08-05 design for a recoverable rolling-24h pause was **superseded** by
+the total budget above (issue #181, ADR-0007 amendment D-9). `copy_sub_equity`
+is still written every cycle — now with the same covered-venue sum the budget
+measures — but nothing reads it: the budget measures from a stored baseline on
+the sub's own row, not from history. That table's retention window is an
+unowned recorded gap. If a recoverable daily guard is ever wanted alongside the
+total budget, it is a new issue with its own grill.

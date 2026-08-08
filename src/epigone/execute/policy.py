@@ -28,7 +28,7 @@ technicality — the exact failure the asymmetry exists to prevent. Only the
 halt outranks an exit, and denial prose says so: a denial never claims
 something "did not exit", because nothing here can cause that.
 
-THE THREE GATES, and what each is for:
+THE FOUR GATES, and what each is for:
 
 - **The Liquidity Floor** (`judge_coin`) asks whether the MARKET is healthy
   enough to trade at all. It is an anti-extraction tripwire, not a coin
@@ -46,6 +46,13 @@ THE THREE GATES, and what each is for:
   sub. They CLAMP rather than deny — a copy at reduced size still follows the
   Leader — and the one thing they cannot do is clamp below the exchange's own
   minimum order value, where the only honest answer is a denial.
+- **The Loss Budget** (`budget_loss`, `budget_stage`, `judge_wind_down`) bounds
+  the ACCUMULATION of a losing run on one Leader — the one thing the three
+  above cannot: each of them judges a single order, and a Leader having a
+  terrible week grinds through an allocation one perfectly-within-limits trade
+  at a time. It is the operator's own number, taken at /copy, measured from a
+  stored baseline, and it is a TRIGGER rather than a floor — after it bites the
+  open positions ride until the Leader exits them (issue #181).
 """
 
 from collections.abc import Iterable
@@ -122,6 +129,22 @@ MAX_ALLOCATION_USD = Decimal("2000")
 # sub has its triggers" a property it restores every minute, whatever removed
 # them: a halt sweep, a partial fill, an operator's own cancel.
 BRACKET_VERIFY_INTERVAL = timedelta(minutes=1)
+
+# Issue #181, amendment D-9. How much of a Loss Budget must be spent before the
+# operator hears about it — early enough that there is still budget left to
+# decide with, late enough that it is not a routine drawdown announcing itself.
+# A CONSTANT, not a knob, for the reason the skip-digest threshold is one: it
+# is not a preference about verbosity, it is where "this leader is having a bad
+# run" becomes news. The budget itself is the operator's number; when to be
+# warned about it is the design's.
+BUDGET_WARNING_FRACTION = Decimal("0.8")
+
+# The three things a measured loss can be against its budget. Named rather than
+# compared inline because the executor's state machine, its notices and the
+# entry gate all ask the same question and must get the same answer.
+BUDGET_WITHIN = "within"
+BUDGET_WARNING = "warning"
+BUDGET_BREACHED = "breached"
 
 # The per-sub leverage modes (amendment D-4). `mirror` follows the Leader's own
 # leverage on the position; `fixed` takes the operator's number. Either answer
@@ -270,6 +293,50 @@ def committed_stake(positions: Iterable[Position]) -> Decimal:
     a cap that ignored half of what is using the margin would not bound
     anything."""
     return sum((position.margin for position in positions), Decimal(0))
+
+
+def budget_loss(
+    *, baseline_usd: Decimal, deposits_usd: Decimal, equity_usd: Decimal
+) -> Decimal:
+    """How much a Copy Sub-account has LOST since its Loss Budget was armed
+    (issue #181): `baseline + deposits − equity`.
+
+    Transfer-adjusted, and only in one direction. A sub Epigone tops up is
+    worth more without having earned anything, so the top-up is added to what
+    the sub is expected to be worth — otherwise funding a sub would read as
+    trading profit and hand the Leader budget they never earned back (the
+    btcgod lesson). There is no outflow term because there is no withdrawal
+    path: nothing Epigone does takes money OUT of a sub, so the adjustment can
+    only ever subtract inflows from an apparent profit, never invent a loss.
+
+    NEGATIVE MEANS PROFIT, and the sign is kept rather than floored at zero:
+    the number is reported to the operator beside their budget, and "spent
+    −$120" is the honest reading of a Leader who is up.
+
+    MONEY MOVED IN FROM OUTSIDE EPIGONE READS AS PROFIT and slackens the
+    budget by that much. That is the documented misread (#181's Out of Scope):
+    Epigone sees the equity but has no record of the deposit, so the standing
+    rule stays *fund subs through Epigone*.
+
+    EQUITY MUST BE THE COVERED-VENUE SUM, not the core venue's alone — a
+    position whose margin sits on a builder DEX would otherwise read as money
+    lost. The caller owes that (`fetch_account_state`); this function only
+    does the arithmetic."""
+    return baseline_usd + deposits_usd - equity_usd
+
+
+def budget_stage(*, loss_usd: Decimal, budget_usd: Decimal) -> str:
+    """Where a measured loss stands against its budget: within it, past the
+    warning fraction, or past the budget itself.
+
+    Both boundaries are inclusive, which matters at exactly the moment it is
+    read: a loss that lands EXACTLY on the budget has spent it, and a budget
+    that needed one more cent to bite would be a threshold nobody stated."""
+    if loss_usd >= budget_usd:
+        return BUDGET_BREACHED
+    if loss_usd >= budget_usd * BUDGET_WARNING_FRACTION:
+        return BUDGET_WARNING
+    return BUDGET_WITHIN
 
 
 def stake_headroom(
@@ -476,6 +543,33 @@ class RiskPolicy:
             stake_usd=granted,
         )
 
+    def judge_wind_down(
+        self, *, coin: str, loss_usd: Decimal, budget_usd: Decimal
+    ) -> RiskVerdict:
+        """A risk-increasing order on a sub whose Loss Budget is spent (issue
+        #181). Always a denial — the method exists to write the SENTENCE the
+        trail and the operator's chat carry, in the same shape every other
+        entry denial has.
+
+        It is a fourth gate beside the three above, and it asks a different
+        question from all of them: not "is this market/leverage/size
+        acceptable" but "is this Leader still one the operator is willing to
+        lose more on". The answer is per-sub and terminal-ish — it stands until
+        the sub goes flat and is disabled, or the operator re-issues /copy.
+
+        NOTHING HERE CAN TOUCH AN EXIT, and the prose says so out loud, because
+        this is the one gate an operator might expect to be a stop-loss. It is
+        not: it refuses new risk and lets the copy follow the Leader out of
+        what is already open."""
+        return RiskVerdict(
+            False,
+            f"DECLINED: the loss budget for this leader is spent — "
+            f"${_round(loss_usd)} lost of ${fixed_point(budget_usd)} since the budget was "
+            f"set — so this copy is winding down: {coin} did not enter. Exits keep "
+            f"copying and the brackets stay maintained; the sub is disabled once it is "
+            f"flat. /copy with a higher budget resumes it",
+        )
+
     def judge_exit(self) -> RiskVerdict:
         """Exits are NEVER declined (module docstring). The method exists so
         the trail records that the policy saw the action and let it through —
@@ -503,6 +597,10 @@ def _round(value: Decimal) -> str:
 
 __all__ = [
     "BRACKET_VERIFY_INTERVAL",
+    "BUDGET_BREACHED",
+    "BUDGET_WARNING",
+    "BUDGET_WARNING_FRACTION",
+    "BUDGET_WITHIN",
     "ENTRY_STALENESS_GUARD",
     "EXIT_RETRY_ATTEMPTS",
     "EXIT_RETRY_DELAY_SECONDS",
@@ -519,6 +617,8 @@ __all__ = [
     "LeverageUnknownError",
     "RiskPolicy",
     "RiskVerdict",
+    "budget_loss",
+    "budget_stage",
     "clears_liquidity_floor",
     "committed_stake",
     "resolve_leverage",

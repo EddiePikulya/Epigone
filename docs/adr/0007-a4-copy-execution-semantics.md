@@ -600,6 +600,13 @@ to pick a daily-loss threshold is to look at what a sub's equity actually does
 across a day of copying. #181 also owns that table's retention window, since
 the window it needs is the one that decides how far back the pause looks.
 
+> **SUPERSEDED by amendment D-9 (2026-08-08, issue #181)** — the daily-loss
+> pause deferred here was re-decided as a **Loss Budget**: total, terminal, and
+> set per Leader at `/copy`. `copy_sub_equity`'s retention window reverts to an
+> **unowned recorded gap**, because the total budget measures from a stored
+> baseline on the sub's row and never reads the history table. See the
+> amendments.
+
 **The live gate is now a flag, not an absence.** `EXECUTOR_ALLOW_MAINNET`
 wires the capability `HttpExecutionGateway` has always demanded. Mainnet takes
 TWO deliberate acts — the flag AND the mainnet URL — plus a funded account, and
@@ -765,3 +772,106 @@ mode this amendment exists to avoid. An env var or a `/limits` entry would let
 $100 outlive the shakedown silently, at which point the gate has been disabled
 rather than suspended, and nothing in the repo would say so. A constant edit is
 loud: it shows in the diff, it shows in this amendment, and it shows in #192.
+
+### D-9 (2026-08-08, issue #181). Cumulative loss is bounded by a per-Leader
+### LOSS BUDGET set at `/copy` — supersedes the deferred daily-loss pause
+
+**Decision.** `/copy` grows an optional **Loss Budget**: an absolute USD amount
+per Copy Sub-account, the transfer-adjusted loss that sub may accumulate from
+the moment the budget is armed before Epigone stops copying its Leader. At 80%
+the operator gets one chat notice. At the budget the sub enters **wind-down**:
+risk-increasing orders (open, scale-in, flip open-leg) are refused with an
+audited skip; exits keep copying; brackets keep being maintained. When the sub
+goes flat it is **disabled** — the same terminal state `/uncopy` produces.
+Unset means no budget, and a sub without one behaves exactly as it did before.
+
+**What this supersedes.** The 2026-08-05 design deferred above: a rolling-24h
+percentage pause, configured through `/limits`, that cleared itself. Re-decided
+by the operator in the 2026-08-08 grill. Three of its properties are gone
+deliberately:
+
+- **total, not rolling.** The operator's question at `/copy` time is "how much
+  can I lose on this Leader", not "how much per day" — and a rolling window
+  needs a threshold nobody could calibrate, which is exactly why the pause was
+  deferred rather than built.
+- **terminal, not self-clearing.** A guard that re-arms on its own re-enters a
+  Leader the operator has already been told is losing them money. Resuming is
+  an explicit `/copy`, which is logged.
+- **per-`/copy`, not `/limits`.** The split ADR-0007 already draws: one
+  Leader's mapping carries what is true of that Leader, `risk_limits` carries
+  Epigone's global stance. A total loss cap for one Leader is the first kind.
+  **No new `/limits` knob, and no percentage.**
+
+**Why wind-down and not flatten.** No programmatic position-closing path exists
+and this decision does not create one. Riding existing exit copying means the
+copy follows the Leader OUT of what is open, which is the behaviour the copy
+was set up for; a flatten would be Epigone deciding the exit price on a
+position the operator never asked it to time. The cost is stated plainly and
+must keep being stated plainly: **the budget is a trigger, not a floor.** After
+the breach the remaining position rides, so the realised loss can exceed the
+number. What bounds the tail is what always did — isolated margin per position,
+the exchange-enforced allocation, and the sub's brackets if it has them.
+
+**Measurement.** `baseline + Epigone-side deposits since arming − current
+equity`, and each term is load-bearing:
+
+- **equity is summed across POSITION_VENUES**, not read from the core venue.
+  Each venue collateralises itself, so a builder-DEX position's margin would
+  otherwise read as money lost and wind a healthy copy down. `SubState`'s
+  equity became that sum with this amendment, and `copy_sub_equity` records the
+  sum too, so the curve and the budget cannot disagree.
+- **the baseline is snapshotted by the EXECUTOR**, on the first cycle that sees
+  an armed budget without one, and `budget_armed_at` is that instant. The bot
+  process holds no gateway (ADR-0005's seam), so `/copy` writes the number
+  alone. The ordering is also what keeps the arithmetic honest across
+  provisioning: the transfer that funded the sub landed before the baseline
+  read and is inside it, so only later top-ups are added back.
+- **deposits are read from the audit trail**, successful outcomes only, joined
+  by sub address, strictly after arming. Funding a sub must never read as
+  trading profit (the btcgod lesson). There is no outflow term because there is
+  no withdrawal path, so the adjustment can only ever subtract inflows from an
+  apparent profit — it can never invent a loss.
+- **money moved in from outside Epigone reads as profit** and slackens the
+  budget. A documented misread, not a solved problem: the standing rule stays
+  *fund subs through Epigone*.
+
+**Baseline lifecycle.** Snapshotted when a budget goes from unset to set, and
+again on a fresh `/copy` after a disable. Changing the AMOUNT of an armed
+budget keeps the baseline and the ledger — raising the threshold is not an
+amnesty for losses already booked, and lowering it below the current loss is
+accepted and breaches on the next cycle. `loss off`, and an omitted keyword,
+disarm entirely: `/copy` states a mapping's terms in full, exactly as an
+omitted TP/SL leaves a sub bracket-less.
+
+**Re-arm cancels a wind-down.** Re-issuing `/copy` clears the warned and
+breached marks, so a higher budget (or `loss off`) resumes copying — a breach
+of the operator's own threshold is overridable by an explicit, logged act,
+never a ratchet. The change is audited old → new in the same transaction as
+the mapping write, the way `/limits` audits a knob.
+
+**Enforcement is entry-side only,** as a new skip reason in the existing entry
+chain — so the skip digest coalesces it and the audit row carries it.
+**Decision 5's direction asymmetry is untouched**: exit judgement, the
+exits-never-decline contract, and bracket placement are exactly as they were. A
+flip during wind-down copies its close leg and refuses its open leg, ending
+flat on that coin — the same shape the Liquidity Floor's flip semantics have.
+
+**Chat only, never the pager.** The pager action tuple is unchanged. A page
+means something is BROKEN, and a budget doing what it was set to do is not
+that. Breach and disable audit rows are written in the executor's transaction,
+independent of notice delivery, so a Telegram outage can delay the operator's
+notice but never erase the record.
+
+**The A3 halt is untouched and outranks everything here.** The halt stays a
+global gate with no sub dimension; budgets add a per-sub state it outranks
+everywhere, and nothing about a budget can create, clear or bypass a halt. A
+halted cycle still MEASURES a budget — reconciliation signs nothing and runs
+anyway — but cannot act on what it measures, because it cannot act at all.
+
+**`copy_sub_equity` has no consumer.** The curve is still written every cycle,
+and nothing reads it. That is now an unowned recorded gap rather than #181's,
+including its retention window.
+
+**Mainnet-switch checklist gains a line:** set a Loss Budget on every initial
+mainnet `/copy`. The feature is opt-in, so the runbook is what arms it on day
+one.

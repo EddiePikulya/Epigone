@@ -33,6 +33,13 @@ DEFAULT_MODE = "default"
 BRACKET_MODE = "bracket"
 COPY_MODES = (DEFAULT_MODE, BRACKET_MODE)
 
+# Micro-USD is subAccountTransfer's unit (finding 6, measured). It lives here
+# rather than in the executor because two readers need it now and they must
+# not disagree: the executor WRITES a top-up in these units, and
+# `deposits_since` READS those same rows back out of the audit trail to adjust
+# a Loss Budget for money Epigone itself put in (issue #181).
+USD_MICRO = 1_000_000
+
 
 @dataclass(frozen=True)
 class CopySub:
@@ -58,6 +65,29 @@ class CopySub:
     enabled: bool
     created_at: datetime
     provisioned_at: datetime | None
+    # The Loss Budget and its ledger (issue #181). All None on a sub without
+    # one, which is every sub that predates the feature and every /copy that
+    # names no budget — the feature is opt-in and its absence is the old
+    # behaviour exactly.
+    loss_budget_usd: Decimal | None = None
+    # What the sub was worth when the executor armed the budget, summed across
+    # every venue it trades, and when it read that. None while a budget is set
+    # but not yet baselined — /copy writes the number, the executor's next
+    # cycle writes these (migration 0039's header).
+    budget_baseline_usd: Decimal | None = None
+    budget_armed_at: datetime | None = None
+    # The last loss the executor measured, for the operator's echoes. Negative
+    # means the sub is in profit.
+    budget_spent_usd: Decimal | None = None
+    budget_warned_at: datetime | None = None
+    budget_breached_at: datetime | None = None
+
+    @property
+    def winding_down(self) -> bool:
+        """Breached: the book may only shrink. Risk-increasing orders are
+        refused and exits keep copying, until the sub goes flat and is
+        disabled — or the operator re-issues /copy and cancels it."""
+        return self.budget_breached_at is not None
 
     @property
     def is_provisioned(self) -> bool:
@@ -120,10 +150,15 @@ async def register_sub(
     take_profit_pct: Decimal | None,
     stop_loss_pct: Decimal | None,
     now: datetime,
+    loss_budget_usd: Decimal | None = None,
 ) -> CopySub:
     """Record the operator's intent to copy `leader_address`. Writes a PENDING
     mapping — no sub-account exists yet — because this runs in the bot process,
-    which has no key to create one with (module docstring)."""
+    which has no key to create one with (module docstring).
+
+    `loss_budget_usd` is written WITHOUT a baseline: the equity that baselines
+    it is an exchange read across every covered venue, and this process holds
+    no gateway. The executor arms it on its next cycle (issue #181)."""
     if copy_mode not in COPY_MODES:
         raise ValueError(f"copy_mode must be one of {COPY_MODES}, got {copy_mode!r}")
     if leverage_mode not in LEVERAGE_MODES:
@@ -134,8 +169,9 @@ async def register_sub(
             INSERT INTO copy_subs
                 (operator_id, leader_address, sub_name, allocation_usd, base_stake_usd,
                  leverage_mode, fixed_leverage,
-                 copy_mode, take_profit_pct, stop_loss_pct, enabled, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11)
+                 copy_mode, take_profit_pct, stop_loss_pct, enabled, created_at,
+                 loss_budget_usd)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, $11, $12)
             RETURNING *
             """,
             operator_id,
@@ -149,6 +185,7 @@ async def register_sub(
             take_profit_pct,
             stop_loss_pct,
             now,
+            loss_budget_usd,
         )
     except asyncpg.UniqueViolationError as exc:
         raise CopySubExistsError(
@@ -170,9 +207,33 @@ async def reenable_sub(
     copy_mode: str,
     take_profit_pct: Decimal | None,
     stop_loss_pct: Decimal | None,
+    loss_budget_usd: Decimal | None = None,
 ) -> CopySub | None:
     """Turn an existing mapping back on with fresh terms, reusing its
     sub-account. Returns None when there is nothing to re-enable.
+
+    THE BUDGET'S RE-ARM SEMANTICS LIVE IN THE `CASE`s BELOW, and they are three
+    rules (issue #181), all reading the row's OLD values because that is what
+    an UPDATE's SET expressions see:
+
+    - **no budget named** (`loss_budget_usd IS NULL`) — the budget and its whole
+      ledger are cleared. /copy states a mapping's terms in full, exactly as an
+      omitted TP/SL leaves a sub bracket-less, so an omitted budget leaves it
+      budget-less. `loss off` is the same write said out loud.
+    - **a budget named on a sub that is still ENABLED** — the amount changes and
+      the BASELINE AND LEDGER SURVIVE. Raising the threshold is not an amnesty
+      for losses already booked; lowering it below the current loss is allowed
+      and breaches on the next cycle.
+    - **a budget named on a DISABLED sub** — a fresh commitment after /uncopy or
+      after a budget disable, so the baseline is cleared and the executor
+      re-snapshots it. A new copy of the same Leader is not haunted by the old
+      ledger.
+
+    The two MARKS clear in every armed case: the operator has just restated
+    their threshold, so an in-progress wind-down is cancelled (the override
+    this feature promises — a breach of one's own number is never a ratchet)
+    and the 80% notice may fire once against the new number. If the loss is
+    still past the new budget, the next cycle breaches again and says so.
 
     `provisioned_at` is CLEARED, which is what re-opens the funding leg:
     /uncopy never flattens, so the sub comes back holding whatever last time
@@ -193,7 +254,19 @@ async def reenable_sub(
             fixed_leverage = $6,
             copy_mode = $7,
             take_profit_pct = $8,
-            stop_loss_pct = $9
+            stop_loss_pct = $9,
+            loss_budget_usd = $10,
+            budget_baseline_usd = CASE
+                WHEN $10::numeric IS NULL OR NOT enabled THEN NULL
+                ELSE budget_baseline_usd END,
+            budget_armed_at = CASE
+                WHEN $10::numeric IS NULL OR NOT enabled THEN NULL
+                ELSE budget_armed_at END,
+            budget_spent_usd = CASE
+                WHEN $10::numeric IS NULL OR NOT enabled THEN NULL
+                ELSE budget_spent_usd END,
+            budget_warned_at = NULL,
+            budget_breached_at = NULL
         WHERE operator_id = $1 AND leader_address = $2
         RETURNING *
         """,
@@ -206,6 +279,7 @@ async def reenable_sub(
         copy_mode,
         take_profit_pct,
         stop_loss_pct,
+        loss_budget_usd,
     )
     return None if row is None else _sub(row)
 
@@ -226,6 +300,22 @@ async def disable_sub(
         WHERE operator_id = $1 AND leader_address = $2 AND enabled
         RETURNING *
         """,
+        operator_id,
+        leader_address.lower(),
+    )
+    return None if row is None else _sub(row)
+
+
+async def find_sub(
+    conn: asyncpg.Pool | asyncpg.Connection, *, operator_id: int, leader_address: str
+) -> CopySub | None:
+    """One operator's mapping for one Leader, enabled or not.
+
+    /copy needs it BEFORE it writes: the confirmation echoes what an existing
+    budget has already spent, and the audit row that records a budget change
+    needs the old value to state it as old → new (issue #181)."""
+    row = await conn.fetchrow(
+        "SELECT * FROM copy_subs WHERE operator_id = $1 AND leader_address = $2",
         operator_id,
         leader_address.lower(),
     )
@@ -311,10 +401,15 @@ async def record_sub_equity(
 
     HISTORY, not a latest-value row, which is the whole difference from
     `trader_equity` (0032): that table answers "what is this wallet worth now"
-    and nothing needed more; this one exists to be a CURVE. The daily-loss
-    pause (issue #181) is deferred precisely because nobody knows what
-    threshold to set, and the only honest way to pick one is to look at what a
-    sub's equity actually does across a day of copying.
+    and nothing needed more; this one exists to be a CURVE.
+
+    IT HAS NO CONSUMER TODAY, and that is a recorded gap rather than an
+    oversight. The curve was written for the rolling daily-loss pause that
+    issue #181 originally proposed; the Loss Budget that shipped instead
+    measures from a STORED BASELINE on the sub's own row, so it never reads
+    this table (ADR-0007 amendment D-9). What is written here is now the same
+    covered-venue sum the budget measures — the reconcile's own read — so the
+    curve and the budget can never disagree about what a sub was worth.
 
     The equity is already in hand — the reconcile reads each sub's
     clearinghouseState every cycle and drops the account value — so this costs
@@ -331,6 +426,151 @@ async def record_sub_equity(
         account_value,
         now,
     )
+
+
+# --- the Loss Budget's ledger (issue #181) ------------------------------------
+
+
+async def arm_budget(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    sub_id: int,
+    *,
+    baseline_usd: Decimal,
+    now: datetime,
+) -> None:
+    """Snapshot the baseline a budget is measured from, once.
+
+    `budget_baseline_usd IS NULL` in the WHERE is the once: a second cycle can
+    only ever re-arm a budget the operator re-issued (which cleared the
+    baseline itself), never re-baseline a running one — that would forgive
+    every loss booked so far, silently, on a restart."""
+    await conn.execute(
+        """
+        UPDATE copy_subs SET budget_baseline_usd = $2, budget_armed_at = $3
+        WHERE id = $1 AND loss_budget_usd IS NOT NULL AND budget_baseline_usd IS NULL
+        """,
+        sub_id,
+        baseline_usd,
+        now,
+    )
+
+
+async def record_budget_spend(
+    conn: asyncpg.Pool | asyncpg.Connection,
+    sub_id: int,
+    *,
+    spent_usd: Decimal,
+    warned_at: datetime | None = None,
+    breached_at: datetime | None = None,
+    judged_budget_usd: Decimal | None = None,
+    judged_armed_at: datetime | None = None,
+) -> bool:
+    """This cycle's measured loss, and the marks it earned. Returns whether the
+    write landed.
+
+    The marks are written with COALESCE so a mark, once set, is never moved by
+    a later cycle: "warned at" means the first cycle that crossed 80%, and a
+    breach keeps the instant the wind-down actually began. Clearing them is the
+    re-issued /copy's job alone (`reenable_sub`).
+
+    `judged_budget_usd` / `judged_armed_at` are a COMPARE-AND-SET on the terms
+    the verdict was reached against, and they close a small but real race: an
+    executor cycle reads a sub, measures it, and writes — and a /copy raising
+    the budget in that window would have its wind-down cancellation silently
+    undone by a verdict about the old number. Stating the terms makes such a
+    write a no-op, and the next cycle judges the sub the operator actually has.
+    Omitted (the tests' convenience form), the write is unconditional."""
+    result = await conn.execute(
+        """
+        UPDATE copy_subs
+        SET budget_spent_usd = $2,
+            budget_warned_at = COALESCE(budget_warned_at, $3),
+            budget_breached_at = COALESCE(budget_breached_at, $4)
+        WHERE id = $1 AND budget_armed_at IS NOT NULL
+          AND ($5::numeric IS NULL OR loss_budget_usd = $5)
+          AND ($6::timestamptz IS NULL OR budget_armed_at = $6)
+        """,
+        sub_id,
+        spent_usd,
+        warned_at,
+        breached_at,
+        judged_budget_usd,
+        judged_armed_at,
+    )
+    return str(result) != "UPDATE 0"
+
+
+async def disable_for_spent_budget(
+    conn: asyncpg.Pool | asyncpg.Connection, sub_id: int, *, breached_at: datetime
+) -> bool:
+    """End the copy relationship of a wound-down sub that has gone flat.
+    Returns whether this call is the one that did it.
+
+    Conditional on the sub still being ENABLED and still carrying the SAME
+    breach, which makes the terminal step idempotent in both directions: a
+    second cycle cannot re-announce a disable that already happened, and a
+    /copy that cancelled the wind-down between this cycle's measurement and
+    this write cannot be undone by it.
+
+    Deliberately NOT `disable_sub`: that one is /uncopy's, keyed by leader
+    address, and it would happily disable a mapping whose breach had just been
+    cleared."""
+    result = await conn.execute(
+        """
+        UPDATE copy_subs SET enabled = FALSE
+        WHERE id = $1 AND enabled AND budget_breached_at = $2
+        """,
+        sub_id,
+        breached_at,
+    )
+    return str(result) != "UPDATE 0"
+
+
+async def deposits_since(
+    conn: asyncpg.Pool | asyncpg.Connection, *, sub_address: str, since: datetime
+) -> Decimal:
+    """Dollars Epigone itself moved INTO this sub since `since`.
+
+    The transfer-adjustment half of the loss measurement (issue #181): funding
+    a sub must never read as trading profit — the btcgod lesson — so every
+    top-up after the baseline was taken is added back to what the sub is
+    expected to be worth.
+
+    Read from the AUDIT TRAIL rather than from a bookkeeping column, because
+    the trail is the only place a transfer is recorded write-ahead and the
+    provisioning path already writes it there. Two things the join says
+    exactly:
+
+    - **successful outcomes only.** An attempt row with no `ok` outcome is a
+      transfer that may never have landed; counting it would invent equity the
+      sub does not have and slacken the budget by that much. An attempt-only
+      row therefore contributes nothing, which is also the direction that
+      cannot hide a loss.
+    - **strictly after arming.** The transfer that FILLED the sub is already
+      inside the baseline, so counting it again would show the whole allocation
+      as lost on the first cycle. A transfer sharing the baseline's exact
+      instant is excluded for the same reason — the two are indistinguishable
+      by timestamp, and the safe reading of a tie is the one that never invents
+      loss (it reads as profit instead, which the budget's own docs call out).
+
+    Withdrawals are absent because no withdrawal path exists (issue #181's Out
+    of Scope): the adjustment only ever subtracts inflows from an apparent
+    profit, never adds to a loss."""
+    micro = await conn.fetchval(
+        """
+        SELECT COALESCE(SUM((attempt.request ->> 'usd_micro')::numeric), 0)
+        FROM execution_audit AS attempt
+        JOIN execution_audit AS outcome ON outcome.attempt_of = attempt.id
+        WHERE attempt.action = 'subAccountTransfer'
+          AND attempt.request ->> 'sub_account_user' = $1
+          AND (attempt.request ->> 'is_deposit')::boolean
+          AND attempt.occurred_at > $2
+          AND outcome.outcome = 'ok'
+        """,
+        sub_address.lower(),
+        since,
+    )
+    return Decimal(micro) / USD_MICRO
 
 
 def _sub(row: asyncpg.Record) -> CopySub:
@@ -350,4 +590,10 @@ def _sub(row: asyncpg.Record) -> CopySub:
         enabled=row["enabled"],
         created_at=row["created_at"],
         provisioned_at=row["provisioned_at"],
+        loss_budget_usd=row["loss_budget_usd"],
+        budget_baseline_usd=row["budget_baseline_usd"],
+        budget_armed_at=row["budget_armed_at"],
+        budget_spent_usd=row["budget_spent_usd"],
+        budget_warned_at=row["budget_warned_at"],
+        budget_breached_at=row["budget_breached_at"],
     )
