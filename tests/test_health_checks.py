@@ -7,6 +7,7 @@ HealthSnapshot and asserts which checks fail and what numbers the text carries.
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from epigone.lane_authority import PRE_CUTOVER_REASON
 from epigone.monitor.checks import (
     AGENT_KEY,
     ALERTS,
@@ -498,9 +499,27 @@ def test_the_operator_switching_the_cutover_off_is_not_an_incident() -> None:
     assert _by_name(evaluate_checks(snapshot, THRESHOLDS), POSITION_LANE).ok
 
 
+def test_the_seeded_pre_cutover_row_is_not_an_incident() -> None:
+    """The state every deployment actually passes through (issue #198).
+
+    Migration 0037 SEEDS the authority row as poll-owned, so from the deploy
+    until the websocket's first promotion — five minutes of health plus a full
+    re-anchor — the poller owns production for a reason that is not a failure.
+    Warning for that whole window would train the operator to ignore the one
+    check that reports the failure mode nothing else can see."""
+    snapshot = replace(
+        HEALTHY,
+        position_lane_owner="poll",
+        position_lane_reason=PRE_CUTOVER_REASON,
+    )
+
+    assert _by_name(evaluate_checks(snapshot, THRESHOLDS), POSITION_LANE).ok
+
+
 def test_a_deployment_with_no_lane_authority_recorded_is_not_an_incident() -> None:
-    """Pre-cutover, or the instant before the first evaluation writes the row.
-    The poller owning production is what has always been true."""
+    """The absent row, which migration 0037 makes unreachable in a migrated
+    database but which the absence-is-never-permission contract still answers
+    for: the poller owning production is what has always been true."""
     snapshot = replace(HEALTHY, position_lane_owner=None, position_lane_reason=None)
 
     assert _by_name(evaluate_checks(snapshot, THRESHOLDS), POSITION_LANE).ok

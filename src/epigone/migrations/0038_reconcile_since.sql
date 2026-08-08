@@ -32,6 +32,21 @@
 -- confirm; the alternative would be inventing a timestamp for a doubt whose
 -- origin nobody recorded.
 --
+-- ROLLING BACK across a live doubt is the one way to break that pairing, and it
+-- is left unguarded deliberately. Pre-#202 code writes `reconcile_pending` on
+-- its own, so a deploy that goes forward, back, and forward again while a doubt
+-- stands can pair a doubt raised by the OLD code with a window left behind by
+-- the new: the confirm then looks back from an earlier instant than that doubt
+-- was raised against, and a wider window vouches more readily than it should.
+-- A column ADD is not itself reversed by rolling the code back (the schema
+-- stays), so this needs a double deploy inside one wallet's hold — a few tens
+-- of seconds. The read-side guard that would close it (trust the window only
+-- beside a doubt the new code wrote) costs a discriminator column to remove a
+-- race nothing but a hand-driven rollback can reach, so the note stands in its
+-- place: after rolling this deployment back and forward, clear the pending
+-- doubts (`UPDATE position_poll_state SET reconcile_pending = NULL,
+-- reconcile_since = NULL`) and let the next pass re-raise them.
+--
 -- Nothing else moves: `last_polled_at` still means what it has always meant,
 -- when this pass last read this wallet. It is deliberately not frozen while a
 -- doubt stands (the alternative weighed in ADR-0009 §4) — one cursor cannot

@@ -93,6 +93,18 @@ RECONCILE_GRACE = timedelta(seconds=RECONCILE_GRACE_SECONDS)
 # What the operator's kill switch says when it is the reason.
 DISABLED_REASON = "websocket authority disabled by configuration"
 
+# What migration 0037 seeded the row with, and therefore what every deployment
+# reads between the migration and the websocket's first promotion. Duplicated
+# from the migration's literal because a shipped migration never changes and a
+# constant must not diverge from it — tests/test_migrations.py pins the two
+# together.
+#
+# The distinction it carries is the reason it has a name: the poller owning
+# production here is not a lane that FAILED, it is a lane that has not been
+# handed anything yet. The health monitor reads it and stays quiet
+# (`epigone.monitor.checks`); every other poll-owned reason is an incident.
+PRE_CUTOVER_REASON = "pre-cutover: the REST poll pass has always owned production"
+
 
 @dataclass(frozen=True)
 class Authority:

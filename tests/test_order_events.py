@@ -230,7 +230,11 @@ async def test_the_position_event_consumer_cannot_see_order_events(
     )
     async with pool.acquire() as conn, conn.transaction():
         await record_events(
-            conn, TRADER, [PositionEvent(kind="open", coin="BTC", side="long")], NOW
+            conn,
+            TRADER,
+            [PositionEvent(kind="open", coin="BTC", side="long")],
+            NOW,
+            authoritative=True,
         )
     await record(pool, event(), event(order_id=2))
 
@@ -254,7 +258,11 @@ async def test_claiming_an_order_event_leaves_the_position_backlog_alone(
     )
     async with pool.acquire() as conn, conn.transaction():
         await record_events(
-            conn, TRADER, [PositionEvent(kind="open", coin="BTC", side="long")], NOW
+            conn,
+            TRADER,
+            [PositionEvent(kind="open", coin="BTC", side="long")],
+            NOW,
+            authoritative=True,
         )
     await record(pool, event())
 

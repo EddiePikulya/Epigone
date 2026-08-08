@@ -89,7 +89,7 @@ commit together, and the alert fires once.
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import asyncpg
 
@@ -151,6 +151,30 @@ STANDBY_POLL_INTERVAL_SECONDS = 60
 # down, not that wallets are odd — stop burning budget and resume next cycle.
 MAX_CONSECUTIVE_FAILURES = 5
 
+# How long after the poller's own baseline of a wallet the websocket lane may
+# still not have baselined it without that counting as drift (issue #199).
+#
+# What has to fit inside it is one honest arrival: the lane notices a new wallet
+# on its next tracked-set refresh (TRACKED_REFRESH_SECONDS, 30s) and baselines it
+# with a REST read the shared budget can defer under pacing. Six refreshes is
+# room for several deferred attempts and still well inside WS_RECOVERY_SECONDS,
+# so a lane that genuinely cannot baseline the wallet is escalated on long before
+# it could ever be handed production back.
+#
+# What it replaces is short: while the websocket owns production the poller runs
+# at STANDBY_POLL_INTERVAL_SECONDS, so the two looks a doubt used to take to
+# escalate are ~120s. This is 1.5× that, not an order of magnitude — the grace
+# buys a couple more deferred baselines, not a different regime.
+#
+# The cost of being too large is latency on the first change of a brand-new
+# wallet: it is held, never lost, but held means nobody is told, so an alert AND
+# a copy signal on that wallet can wait out the grace. The cost of being too
+# small is the spurious global escalation the grace exists to prevent, which
+# takes production off the websocket for every OTHER wallet and files an
+# incident. It errs large because that second cost is the wider one.
+WS_BASELINE_GRACE_SECONDS = 180.0
+WS_BASELINE_GRACE = timedelta(seconds=WS_BASELINE_GRACE_SECONDS)
+
 # Everything this pass remembers about one wallet, keyed by its address: the
 # diff's memory, the baseline flag, and the latest equity observation (#170).
 # _prune_untracked drops a wallet from all three at once — see its docstring.
@@ -169,12 +193,19 @@ class _Applied:
     snapshot is deliberately NOT advanced, so the next pass re-diffs the same
     change and judges it with more evidence. `deferred` says this pass did that
     — the loop reads it and re-polls on the next tick instead of waiting out
-    the standby interval, so a real miss costs ~10s rather than ~60s."""
+    the standby interval, so a real miss costs ~10s rather than ~60s.
+
+    `held_since` is the window the held doubt was raised in, to be stored beside
+    it (#200): this pass's previous look for a fresh doubt, and the ORIGINAL
+    window for a doubt this pass re-held rather than judged. It always carries a
+    value; when nothing is held it describes nothing, and the write site stores
+    NULL instead — the doubt and its window are written or cleared together."""
 
     events: int = 0
     produced: int = 0
     drifted: bool = False
     held: frozenset[str] | set[str] = frozenset()
+    held_since: datetime | None = None
     deferred: bool = False
 
 
@@ -391,7 +422,7 @@ async def _apply_poll(
         # that instant and this one.
         state_row = await conn.fetchrow(
             """
-            SELECT last_polled_at, reconcile_pending, reconcile_since
+            SELECT baselined_at, last_polled_at, reconcile_pending, reconcile_since
             FROM position_poll_state WHERE trader_address = $1
             """,
             address,
@@ -436,6 +467,11 @@ async def _apply_poll(
                 # pending — or on the one confirm after migration 0038, for a
                 # doubt raised before the column existed.
                 doubted_since=state_row["reconcile_since"] or polled_before,
+                # When THIS lane first saw the wallet, which is the closest
+                # thing the poller has to "when the wallet joined the poll
+                # set" — what the websocket lane's baseline grace is measured
+                # from (#199).
+                poller_baselined_at=state_row["baselined_at"],
             )
         # The snapshot advance lands with the events that were diffed from it
         # (ADR-0006's atomicity, inherited rather than reinvented) — except for
@@ -456,12 +492,24 @@ async def _apply_poll(
         # with no look of patience at all.
         #
         # The doubt and the window it was raised in are written by the one
-        # statement, so neither can outlive the other (#200). That window is
-        # `polled_before` — the look this pass diffed FROM — and never `now`:
-        # the change under doubt was observed after that instant, so a confirm
-        # starting there cannot miss the evidence however late it arrives. A
-        # held coin is always a first-look doubt (a doubt already pending is
-        # confirmed, not re-held), so one column says it for all of them.
+        # statement, so neither can outlive the other (#200). Ordinarily that
+        # window is `polled_before` — the look this pass diffed FROM — and never
+        # `now`: the change under doubt was observed after that instant, so a
+        # confirm starting there cannot miss the evidence however late it
+        # arrives. A doubt that is RE-held keeps the earlier window instead
+        # (`_reconcile` decides which, and says why); re-writing `polled_before`
+        # over it would walk the window forward past the evidence, which is the
+        # swallow #200 exists to prevent. One column for all held coins, since
+        # they are all held by the same pass for the same reason.
+        #
+        # A pass that raises (gateway error, a constraint violation) after the
+        # diff but before this statement leaves the row one pass stale: the
+        # doubt it would have recorded is lost, or a doubt it would have cleared
+        # stands. Both resolve on the next pass, and both are the safe direction
+        # — a stale doubt over-escalates in a narrow abort + same-coin-new-change
+        # race, it never swallows (#199). Noted rather than guarded because the
+        # guard would be a second transaction, and a second transaction is the
+        # thing ADR-0006's atomicity forbids.
         await conn.execute(
             """
             UPDATE position_poll_state
@@ -471,7 +519,7 @@ async def _apply_poll(
             address,
             now,
             sorted(applied.held) or None,
-            polled_before if applied.held else None,
+            applied.held_since if applied.held else None,
         )
         # Money leaving the account (issue #171), judged from the same two looks
         # at the book the diff above just judged positions from — `previous` is
@@ -505,6 +553,7 @@ async def _reconcile(
     since: datetime,
     pending: set[str],
     doubted_since: datetime,
+    poller_baselined_at: datetime,
 ) -> _Applied:
     """Record what this pass observed, and produce whatever the websocket did
     not (issue #158, ADR-0009).
@@ -529,7 +578,7 @@ async def _reconcile(
       significance threshold measures against the LAST OBSERVATION, and the
       lanes observe at different cadences, so a position creeping up ~8% per
       push crosses 25% against a 60s-old anchor and never against any single
-      push. The lane emitted nothing and is completely current. `_still_owed`
+      push. The lane emitted nothing and is completely current. `_lane_memory`
       asks the lane's own memory, and a lane that agrees with reality missed
       nothing — this is the benign divergence class #158's 2026-08-02 comment
       names, and it must be classified as expected rather than as a lane error.
@@ -571,7 +620,22 @@ async def _reconcile(
     doubt that had to wait for its confirm (the transfer-tick pass skipped this
     wallet; the hold landed a standby interval late) is reclassified benign and
     swallowed. Every other coin keeps the ordinary window: one cursor for the
-    whole wallet would widen the lookback for coins that never earned it."""
+    whole wallet would widen the lookback for coins that never earned it.
+
+    **A lane that has not baselined a wallet yet is joining, not drifting.** A
+    wallet followed while the websocket owns production is invisible to that
+    lane until its next tracked-set refresh, and its baseline is a REST read
+    that pacing can defer. `_lane_memory` reports an unbaselined wallet as owing
+    everything — correctly, since absence of memory is absence of watching — so
+    with no guard the wallet's first change is doubted, confirmed one look
+    later, and escalates GLOBALLY: production leaves the websocket for every
+    wallet because of the one it had not reached yet, with an incident attached.
+    Inside `WS_BASELINE_GRACE` of the poller's OWN baseline the doubt is
+    re-held instead, keeping the window it was raised in, so nothing is lost —
+    the change is judged later, by which time the lane has usually caught up.
+    The grace expires, and a lane that never baselines still escalates; what it
+    costs is latency on the first change of a brand-new wallet, and what it buys
+    is not calling a lane that is merely still joining a lane that has drifted."""
 
     def lookback(coin: str) -> datetime:
         return (doubted_since if coin in pending else since) - RECONCILE_GRACE
@@ -595,9 +659,11 @@ async def _reconcile(
 
     ws_rows, unvouched = await unproduced()
     held: set[str] = set()
+    held_since = since
     drifted = False
     if unvouched and not await owns(conn, POLL_SOURCE):
-        owed = await _still_owed(conn, address, positions, now)
+        memory = await _lane_memory(conn, address, positions, now)
+        owed = memory.owed
         # Two ways a change can still be somebody's to produce, and the anchor
         # alone only sees the first:
         #
@@ -620,10 +686,22 @@ async def _reconcile(
         unvouched = [event for event in unvouched if event.coin in missed | stranded]
         doubted = missed | stranded
         confirmed = doubted & pending
+        if confirmed and memory.still_joining(poller_baselined_at, now):
+            # The lane has never baselined this wallet and has not yet had the
+            # time a baseline honestly takes. That is not drift, and escalating
+            # on it moves production for every OTHER wallet too (see the
+            # docstring). Withdraw the confirmation and hold again.
+            log.info(
+                "reconciliation: %s %s still unproduced, but the websocket lane has "
+                "not baselined this wallet yet; holding rather than escalating",
+                address,
+                ", ".join(sorted(confirmed)),
+            )
+            confirmed = set()
         if doubted and not confirmed:
-            # Every doubt is new. Withhold the verdict AND the memory advance,
-            # so the next pass asks the same question about the same change
-            # rather than about a change it has already forgotten.
+            # Withhold the verdict AND the memory advance, so the next pass asks
+            # the same question about the same change rather than about a change
+            # it has already forgotten.
             log.info(
                 "reconciliation: %s %s not yet produced by the websocket lane; "
                 "holding for one more look",
@@ -631,6 +709,13 @@ async def _reconcile(
                 ", ".join(sorted(doubted)),
             )
             held, unvouched = doubted, []
+            # A doubt that was ALREADY pending keeps the window it was raised in
+            # rather than taking this pass's (#200): re-holding must not walk the
+            # window forward past the evidence any more than confirming may. When
+            # a re-held doubt sits beside a fresh one, the earlier window covers
+            # both — reaching back further than a fresh doubt needs is the safe
+            # direction, and `doubted_since` is never later than `since`.
+            held_since = doubted_since if held & pending else since
         elif confirmed:
             drifted = True
             reason = _drift_reason(address, missed & confirmed, stranded & confirmed)
@@ -647,11 +732,31 @@ async def _reconcile(
             # the database.
             ws_rows, unvouched = await unproduced()
     published: list[PositionEvent] = []
-    if unvouched and await publish(conn, address, unvouched, now, source=POLL_SOURCE):
+    if unvouched:
+        authoritative = await publish(conn, address, unvouched, now, source=POLL_SOURCE)
+        # `publish` RECORDS either way and only produces when this lane owns
+        # production, so a False here would mean these events are already in the
+        # table — and the shadow list below, which counts anything not published
+        # as unrecorded, would write every one of them a second time. The
+        # invariant that rules it out is a lock, not a coincidence: this line is
+        # reached only when the poller already owned production when it read the
+        # row FOR SHARE, or when it took ownership FOR UPDATE a few lines above
+        # and still holds that lock. Nobody can have taken it back in between.
+        # Asserted rather than handled because a branch handling the impossible
+        # is a branch no test can reach and no reader can trust (#199).
+        assert authoritative, "the poll lane published without owning production"
         published = unvouched
     # Everything this pass saw that it did not produce, written down for the
     # comparison — except a held coin, whose change has not been judged yet and
     # which the next pass will re-diff and record identically.
+    #
+    # So a held change is recorded at the instant it was JUDGED, never at the
+    # instant it was first seen, and the comparison dataset's poll-side latency
+    # is that much pessimistic for exactly the changes the websocket was slowest
+    # on (issue #198). Recording the first sighting too would fix the statistic
+    # and break the thing the rows are for: two rows for one change, and the
+    # earlier one indistinguishable from a change the lane genuinely told twice.
+    # The dataset is a comparison, not a metric, and it keeps one row per change.
     produced = {id(event) for event in published}
     shadow = [
         event for event in events if event.coin not in held and id(event) not in produced
@@ -663,13 +768,46 @@ async def _reconcile(
         produced=len(published),
         drifted=drifted,
         held=held,
+        held_since=held_since,
         deferred=bool(held),
     )
 
 
-async def _still_owed(
+@dataclass(frozen=True)
+class _LaneMemory:
+    """What the websocket lane's own memory says about one wallet: whether it is
+    watching the wallet at all, and which coins it still owes an event on.
+
+    The two travel together because the second is read off the first, and
+    because they mean different things when `owed` is everything: a lane that is
+    watching and owes every coin has fallen behind reality, while a lane that is
+    not watching at all has not arrived yet (#199). The escalation path tells
+    those apart; nothing else needs to."""
+
+    watching: bool
+    owed: set[str]
+
+    def still_joining(self, poller_baselined_at: datetime, now: datetime) -> bool:
+        """Whether this lane's silence about the wallet is it still ARRIVING
+        rather than it having drifted (#199).
+
+        Two conditions, and the second is what keeps the grace from becoming a
+        licence: the lane has no memory of the wallet at all, and the wallet is
+        new enough that a lane doing everything right might legitimately not
+        have reached it — it learns about a new wallet on its next tracked-set
+        refresh and baselines it with a REST read that pacing can defer.
+
+        Measured from the POLLER's baseline because that is when this wallet
+        entered the poll set, as closely as the poller can know it, and it is
+        already in the row. A wallet the lane merely lost track of keeps its
+        `ws_lane_state` row and so is never joining; a wallet whose baseline
+        never lands leaves the grace and escalates like any other drift."""
+        return not self.watching and (now - poller_baselined_at) < WS_BASELINE_GRACE
+
+
+async def _lane_memory(
     conn: asyncpg.Connection, address: str, positions: list[Position], now: datetime
-) -> set[str]:
+) -> _LaneMemory:
     """The coins on which the websocket lane's OWN memory says it still owes an
     event — reality diffed against the lane's anchor, by the lane's own rules.
 
@@ -691,18 +829,25 @@ async def _still_owed(
         "SELECT 1 FROM ws_lane_state WHERE trader_address = $1", address
     )
     if not watching:
-        return {position.coin for position in positions} | {
-            row["coin"]
-            for row in await conn.fetch(
-                "SELECT coin FROM position_snapshots WHERE trader_address = $1", address
-            )
-        }
+        return _LaneMemory(
+            watching=False,
+            owed={position.coin for position in positions}
+            | {
+                row["coin"]
+                for row in await conn.fetch(
+                    "SELECT coin FROM position_snapshots WHERE trader_address = $1", address
+                )
+            },
+        )
     anchor = await read_snapshots(conn, WS_SNAPSHOTS, address)
-    return {
-        change.coin
-        for change in diff_positions(anchor, positions, now)
-        if change.event is not None
-    }
+    return _LaneMemory(
+        watching=True,
+        owed={
+            change.coin
+            for change in diff_positions(anchor, positions, now)
+            if change.event is not None
+        },
+    )
 
 
 # Which way a change moves the position. `flip` is both legs at once (ADR-0006
@@ -779,15 +924,6 @@ def _left_a_row(
     complete account earns silence. Here, a row is evidence the lane saw
     something nobody produced, and half a flip is still evidence."""
     return bool(_legs_covered(event, observed, no_earlier_than))
-
-
-async def _remember_doubt(conn: asyncpg.Connection, address: str, coins: set[str]) -> None:
-    """Record (or clear) the coins whose verdict this pass withheld."""
-    await conn.execute(
-        "UPDATE position_poll_state SET reconcile_pending = $2 WHERE trader_address = $1",
-        address,
-        sorted(coins) or None,
-    )
 
 
 @dataclass(frozen=True)

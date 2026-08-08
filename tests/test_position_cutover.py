@@ -18,7 +18,7 @@ These tests drive the poller seam through that whole life:
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
@@ -29,6 +29,7 @@ from epigone.gateway import GatewayError, Position, RateLimitedError, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.lane_authority import (
     POLL_OWNER,
+    RECONCILE_GRACE,
     RECONCILE_GRACE_SECONDS,
     WS_HEARTBEAT_STALE_SECONDS,
     WS_OWNER,
@@ -49,6 +50,8 @@ from epigone.stream.main import (
 from epigone.stream.poller import (
     MAX_CONSECUTIVE_FAILURES,
     POLL_INTERVAL_SECONDS,
+    WS_BASELINE_GRACE,
+    WS_BASELINE_GRACE_SECONDS,
     run_poll_pass,
 )
 from epigone.ws import MAX_SUBSCRIBED_TRADERS, WS_LANE_PROCESS
@@ -136,6 +139,42 @@ async def pending_coins(pool: asyncpg.Pool, address: str) -> list[str]:
     return sorted(held or ())
 
 
+async def pending_window(pool: asyncpg.Pool, address: str) -> datetime | None:
+    """The look the wallet's held doubt was raised against — the start of the
+    window its confirm must be judged in (#200)."""
+    window: datetime | None = await pool.fetchval(
+        "SELECT reconcile_since FROM position_poll_state WHERE trader_address = $1", address
+    )
+    return window
+
+
+async def long_followed(pool: asyncpg.Pool, clock: FakeClock, address: str) -> None:
+    """Age a wallet past the websocket lane's baseline grace (#199) without
+    moving the clock.
+
+    Inside that grace a lane with no memory of a wallet is treated as still
+    ARRIVING at it rather than as having drifted, so its doubts are re-held
+    instead of escalated. Every test about drift wants the far side of it: a
+    wallet followed minutes ago, not seconds ago, which is what a wallet in a
+    running deployment nearly always is. The tests that are about the grace
+    itself set the age themselves."""
+    await pool.execute(
+        "UPDATE position_poll_state SET baselined_at = $2 WHERE trader_address = $1",
+        address,
+        clock.now() - WS_BASELINE_GRACE - timedelta(seconds=1),
+    )
+
+
+async def just_followed(pool: asyncpg.Pool, clock: FakeClock, address: str) -> None:
+    """The opposite of `long_followed`: a wallet the poller itself has only just
+    baselined, so the websocket lane's baseline grace (#199) is still running."""
+    await pool.execute(
+        "UPDATE position_poll_state SET baselined_at = $2 WHERE trader_address = $1",
+        address,
+        clock.now(),
+    )
+
+
 @pytest.fixture
 async def baselined(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
@@ -145,6 +184,7 @@ async def baselined(
     await track(pool, clock, TRADER, FOLLOWER)
     gateway.set_positions(TRADER, [position()])
     await poll(pool, gateway, clock)
+    await long_followed(pool, clock, TRADER)
     await websocket_owns(pool, clock)
 
 
@@ -284,36 +324,114 @@ async def test_a_websocket_shadow_row_never_suppresses_the_poller(
     assert [row["kind"] for row in await alerts(pool)] == ["close"]
 
 
-async def test_two_producers_racing_one_trader_produce_exactly_one_event(
+async def waiting_for_the_authority_row(pool: asyncpg.Pool) -> None:
+    """Block until a backend is parked on a lock while running the authority
+    row's `FOR UPDATE` — the transfer, waiting.
+
+    Read off `pg_stat_activity` rather than timed out, so the test asserts the
+    thing itself instead of inferring it from a task that has not finished yet.
+    Matched on the statement as well as the wait, so an unrelated waiter
+    elsewhere in the suite's database cannot satisfy it."""
+    for _ in range(500):
+        waiting = await pool.fetchval(
+            """
+            SELECT count(*) FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND wait_event_type = 'Lock'
+              AND query ILIKE '%lane_authority FOR UPDATE%'
+            """
+        )
+        if waiting:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("the transfer never waited for the authority row")
+
+
+async def test_a_transfer_waits_for_the_websocket_write_it_races(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
 ) -> None:
-    """The rule the whole cutover rests on, demonstrated rather than asserted:
-    a websocket write and a poller escalation for the same (Trader, coin),
-    committed concurrently, leave exactly one authoritative event.
+    """The rule the whole cutover rests on, exercised rather than asserted
+    (issue #197): a websocket write and a poller escalation for the same
+    (Trader, coin), in two real concurrent transactions, leave exactly one
+    authoritative event.
 
-    The websocket's write takes the authority row FOR SHARE and holds it for
-    the length of its transaction; the poller's transfer needs it FOR UPDATE
-    and therefore cannot interleave. Whichever order they land in, the loser
-    sees the ownership it no longer has (or never had) and writes a shadow row.
-    """
+    This is the schedule that carries the weight, and it is the one only the
+    locks survive. The websocket is mid-write — `publish` has read the authority
+    row FOR SHARE and its transaction has not committed — when the poller
+    confirms a doubt on that same coin and moves to take production back. The
+    transfer needs the row FOR UPDATE, which share locks hold off, so it WAITS.
+    Only when the websocket commits does the transfer land; and because the
+    poller then re-asks its question under the exclusive lock, the row that was
+    invisible a moment ago is now the answer, and the poller produces nothing.
+
+    Delete either half and the copy doubles. Without the lock the transfer
+    interleaves with the write; without the re-read the poller escalates on
+    evidence it gathered before it had the right to trust it. What is asserted
+    here is both: that the transfer blocked, and that the change was told once.
+
+    (The pass still ESCALATES — the doubt was real when it was raised, and a
+    websocket that produces a change only once the poller has already confirmed
+    a miss on it has earned the incident. What it must not do is produce the
+    change a second time.)"""
+    # First look: the lane has told nobody about the close, so the poller doubts
+    # it and holds. It is the SECOND look that escalates, which is the one that
+    # has to race.
     clock.advance(60)
     gateway.set_positions(TRADER, [])
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+    assert (await read_authority(pool)).owner == WS_OWNER
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    holding_the_share_lock = asyncio.Event()
+    may_commit = asyncio.Event()
 
     async def websocket_write() -> None:
         async with pool.acquire() as conn, conn.transaction():
-            await publish(
+            # The real seam: `publish` takes the authority row FOR SHARE, finds
+            # the websocket still owns production, and writes authoritatively.
+            told = await publish(
                 conn,
                 TRADER,
                 [PositionEvent(kind="close", coin="BTC", prev_side="long")],
                 clock.now(),
                 source=WS_SOURCE,
             )
+            assert told
+            holding_the_share_lock.set()
+            await may_commit.wait()
 
-    await asyncio.gather(websocket_write(), poll(pool, gateway, clock))
+    writer = asyncio.create_task(websocket_write())
+    poller: asyncio.Task[None] | None = None
+    try:
+        await holding_the_share_lock.wait()
 
+        poller = asyncio.create_task(poll(pool, gateway, clock))
+        await waiting_for_the_authority_row(pool)
+        assert not poller.done()  # the transfer is parked behind the write
+        assert (await read_authority(pool)).owner == WS_OWNER  # and has not landed
+    finally:
+        # Whatever happened above, the writer must not be left parked on
+        # `may_commit` — it is holding an open transaction, and the next test's
+        # TRUNCATE would queue behind it forever, turning one failed assertion
+        # into a wedged suite.
+        may_commit.set()
+        await asyncio.gather(*(t for t in (writer, poller) if t), return_exceptions=True)
+
+    assert not writer.cancelled() and writer.exception() is None
+    assert poller is not None and poller.exception() is None
+
+    # One producer, one event, one alert — decided by the database rather than
+    # by which coroutine happened to run first.
     authoritative = [row for row in await events(pool) if row["authoritative"]]
-    assert [row["coin"] for row in authoritative] == ["BTC"]
-    assert len(await alerts(pool)) == 1
+    assert [(row["source"], row["coin"]) for row in authoritative] == [(WS_SOURCE, "BTC")]
+    assert [row["kind"] for row in await alerts(pool)] == ["close"]
+    # The poller still recorded what it saw, unconsumed, for the comparison.
+    assert [(row["source"], row["authoritative"]) for row in await events(pool)] == [
+        (WS_SOURCE, True),
+        (POLL_SOURCE, False),
+    ]
+    assert (await read_authority(pool)).owner == POLL_OWNER
 
 
 async def test_copy_enabled_leaders_are_polled_first_in_degraded_mode(
@@ -942,7 +1060,11 @@ async def test_a_wallet_the_websocket_is_not_watching_vouches_for_nothing(
     """A lane with no memory of a Trader agrees with reality about a flat
     wallet the way an empty room agrees with an empty room. Absence of memory
     is absence of watching, never evidence of currency — so it vouches for
-    nothing and an unproduced change stays drift."""
+    nothing and an unproduced change stays drift.
+
+    The wallet has been followed since well before the lane's baseline grace
+    (#199) ran out, which is what makes an empty memory a fault here rather
+    than a lane still on its way — the two tests below draw that line."""
     clock.advance(60)
     gateway.set_positions(TRADER, [])  # the position closed; the lane never said so
 
@@ -952,6 +1074,65 @@ async def test_a_wallet_the_websocket_is_not_watching_vouches_for_nothing(
 
     assert (await read_authority(pool)).owner == POLL_OWNER
     assert [row["kind"] for row in await alerts(pool)] == ["close"]
+
+
+async def test_a_wallet_the_websocket_has_not_reached_yet_is_joining_not_drifting(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The other reading of an empty memory, and the reason it needs its own
+    (issue #199).
+
+    A wallet followed while the websocket owns production is invisible to that
+    lane until its next tracked-set refresh, and the REST read that baselines it
+    can be deferred again and again by pacing. Until it lands, the lane's memory
+    is empty for exactly the reason above — and escalating on it would move
+    production away from the websocket for EVERY OTHER WALLET too, and file an
+    incident against a lane that has done nothing wrong.
+
+    So inside the grace the doubt is re-held rather than confirmed. Nothing is
+    lost by that: the anchor stays put, the change is re-diffed every pass, and
+    the doubt keeps the window it was raised in — a re-hold that took this
+    pass's window instead would walk the lookback forward past the evidence,
+    which is the swallow #200 closed."""
+    await just_followed(pool, clock, TRADER)
+    clock.advance(60)
+    gateway.set_positions(TRADER, [])  # the position closed; the lane never said so
+
+    await poll(pool, gateway, clock)
+    raised_against = await pending_window(pool, TRADER)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+    assert await pending_window(pool, TRADER) == raised_against
+    assert await alerts(pool) == []
+
+
+async def test_a_lane_that_never_arrives_escalates_once_the_grace_runs_out(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The grace is patience, not permission.
+
+    A lane with still no memory of the wallet once the grace has run out is not
+    a lane on its way — it is a lane that is not covering the poll set, which is
+    a silent hole in alerting and in the copy path. The change it never produced
+    is drift like any other: held for as long as the doubt stood, so nothing was
+    lost, and produced the moment the doubt is finally confirmed."""
+    await just_followed(pool, clock, TRADER)
+    clock.advance(60)
+    gateway.set_positions(TRADER, [])
+
+    await poll(pool, gateway, clock)
+    clock.advance(WS_BASELINE_GRACE_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "BTC" in authority.reason
+    assert [row["kind"] for row in await alerts(pool)] == ["close"]
+    assert [(row["source"], row["kind"]) for row in await events(pool)
+            if row["authoritative"]] == [(POLL_SOURCE, "close")]
 
 
 async def test_a_pass_with_nothing_to_report_clears_a_held_doubt(
@@ -1038,9 +1219,21 @@ async def test_a_change_stranded_by_an_ownership_transfer_is_produced_not_swallo
         pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
     )
     await websocket_watching(pool, clock, TRADER, [])  # the lane's anchor moved on
+    stranded_at = clock.now()
 
     clock.advance(30)
     await poll(pool, gateway, clock)
+    # The doubt keeps the window it was raised in (#200), and that window starts
+    # a clear margin BEFORE the stranded row rather than on top of it: the
+    # confirm judges the row from the interior of its window, not from the edge.
+    # Worth pinning, because the edge is where it used to sit — before #202 the
+    # confirm re-derived the window from its own previous look, which landed
+    # exactly on the row and survived only through the inclusive comparison in
+    # `_legs_covered`. A window that walks forward again fails here first.
+    window = await pending_window(pool, TRADER)
+    assert window is not None
+    assert stranded_at - (window - RECONCILE_GRACE) >= RECONCILE_GRACE
+
     clock.advance(POLL_INTERVAL_SECONDS)
     await poll(pool, gateway, clock)
 
@@ -1191,7 +1384,14 @@ async def test_the_reached_back_window_belongs_to_the_doubt_not_to_the_wallet(
 
     Here BTC's doubt reaches back a whole standby interval while ETH is judged
     from this pass's own previous look, which the lane's old ETH entry falls
-    outside of. One wallet, one pass, two windows."""
+    outside of. One wallet, one pass, two windows.
+
+    And the window a doubt is stored WITH belongs to that doubt too. BTC's
+    resolves and ETH's replaces it in the same pass, so the row's window must
+    move to the new pass's look; keeping the old one — the shape a COALESCE onto
+    the stored value would give it — would hand ETH's confirm a minute of reach
+    it never earned, land the lane's stale ETH entry inside it, and swallow the
+    scale-in the lane still owes. The last look here is that confirm."""
     # The Leader opens ETH and the websocket produces it. The poller does not
     # look until a standby interval later, by which time BTC has grown too and
     # the lane's memory still owes that one.
@@ -1202,10 +1402,12 @@ async def test_the_reached_back_window_belongs_to_the_doubt_not_to_the_wallet(
     )
 
     clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    second_look = clock.now()
     gateway.set_positions(TRADER, [position(size_usd="20000"), position(coin="ETH")])
     await websocket_watching(pool, clock, TRADER, [position(), position(coin="ETH")])
     await poll(pool, gateway, clock)
     assert await pending_coins(pool, TRADER) == ["BTC"]
+    btc_doubt_raised_against = await pending_window(pool, TRADER)
 
     # The lane was simply late on BTC and produces it. ETH scales in at the
     # same moment and the lane owes THAT — its only ETH row is the entry from
@@ -1230,6 +1432,26 @@ async def test_the_reached_back_window_belongs_to_the_doubt_not_to_the_wallet(
     assert (await read_authority(pool)).owner == WS_OWNER
     assert [row for row in await events(pool) if row["authoritative"]
             and row["source"] == POLL_SOURCE] == []
+    # ETH's doubt is a fresh one, so it is stored against THIS pass's previous
+    # look — not against the window BTC's resolved doubt left behind.
+    assert await pending_window(pool, TRADER) == second_look
+    assert btc_doubt_raised_against is not None
+    assert btc_doubt_raised_against < second_look
+
+    # And the confirm proves it, which is the failure mode rather than the
+    # bookkeeping: the lane still owes the ETH scale-in and its only ETH row is
+    # the minute-old entry. Judged from ETH's own window that row is out of
+    # reach and the drift escalates; judged from BTC's inherited one it would
+    # vouch for the scale-in and the change would be swallowed for good.
+    clock.advance(POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, grown)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "ETH" in authority.reason
+    assert [(row["coin"], row["kind"]) for row in await events(pool)
+            if row["authoritative"] and row["source"] == POLL_SOURCE] == [("ETH", "scale_in")]
 
 
 async def test_every_ownership_transfer_is_followed_by_a_pass_at_once(

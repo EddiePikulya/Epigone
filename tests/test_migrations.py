@@ -1,12 +1,13 @@
 """The migration runner (issue #16): numbered SQL migrations applied in order
 at process startup, tracked in schema_migrations.
 
-These tests run against their own scratch database (not the shared epigone_test
+These tests run against their own scratch databases (not the shared epigone_test
 one) because they exercise database states the shared fixtures deliberately
 erase: a fresh empty database and a pre-migration-era database with data.
 """
 
 import asyncio
+import hashlib
 import os
 from collections.abc import AsyncGenerator
 from decimal import Decimal
@@ -16,19 +17,43 @@ import pytest
 
 from epigone.db import Migration, load_migrations, migrate
 from epigone.execute.pricing import open_size, round_size
+from epigone.lane_authority import POLL_OWNER, PRE_CUTOVER_REASON
 from tests.conftest import DEFAULT_TEST_DATABASE_URL
 from tests.support.db import reset_database
 
-SCRATCH_DBNAME = "epigone_test_migrations"
-# The live-vs-fresh convergence check (issue #37) needs two independent DBs side
-# by side, so it gets its own pair on top of the shared scratch one.
-FRESH_DBNAME = "epigone_test_migrations_fresh"
-LIVE_DBNAME = "epigone_test_migrations_live"
+# The roles the scratch databases play. "scratch" is the shared one; the
+# live-vs-fresh convergence check (issue #37) needs two independent DBs side by
+# side, so it gets its own pair on top of it.
+SCRATCH_ROLE = "scratch"
+FRESH_ROLE = "fresh"
+LIVE_ROLE = "live"
 
 
-async def _make_pool(dbname: str) -> asyncpg.Pool:
+def _server_url_and_dbname() -> tuple[str, str]:
     base = os.environ.get("TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
-    server_url, _, _ = base.rpartition("/")
+    server_url, _, dbname = base.rpartition("/")
+    return server_url, dbname
+
+
+def scratch_dbname(role: str, run_dbname: str) -> str:
+    """The name of this suite run's scratch database for `role`.
+
+    This file takes only the *server* half of TEST_DATABASE_URL and picks its own
+    dbnames, so hardcoded names would make it the one place the env var fails to
+    isolate: two suites running concurrently would drop each other's scratch
+    schemas mid-test (issue #189). Fingerprinting the dbname the env var chose
+    gives every run a disjoint scratch set. A fingerprint rather than the dbname
+    itself because Postgres caps identifiers at 63 bytes and branch-derived test
+    dbnames are already long; the `epigone_test_` prefix survives so the usual
+    `epigone_test_*` cleanup still sweeps them up.
+    """
+    fingerprint = hashlib.blake2s(run_dbname.encode(), digest_size=4).hexdigest()
+    return f"epigone_test_migrations_{role}_{fingerprint}"
+
+
+async def _make_pool(role: str) -> asyncpg.Pool:
+    server_url, run_dbname = _server_url_and_dbname()
+    dbname = scratch_dbname(role, run_dbname)
     await reset_database(server_url, dbname)
     pool = await asyncpg.create_pool(f"{server_url}/{dbname}")
     assert pool is not None
@@ -37,21 +62,21 @@ async def _make_pool(dbname: str) -> asyncpg.Pool:
 
 @pytest.fixture
 async def scratch_pool() -> AsyncGenerator[asyncpg.Pool, None]:
-    pool = await _make_pool(SCRATCH_DBNAME)
+    pool = await _make_pool(SCRATCH_ROLE)
     yield pool
     await pool.close()
 
 
 @pytest.fixture
 async def fresh_pool() -> AsyncGenerator[asyncpg.Pool, None]:
-    pool = await _make_pool(FRESH_DBNAME)
+    pool = await _make_pool(FRESH_ROLE)
     yield pool
     await pool.close()
 
 
 @pytest.fixture
 async def live_pool() -> AsyncGenerator[asyncpg.Pool, None]:
-    pool = await _make_pool(LIVE_DBNAME)
+    pool = await _make_pool(LIVE_ROLE)
     yield pool
     await pool.close()
 
@@ -104,6 +129,34 @@ def counting_migration(version: int = 1) -> Migration:
             "INSERT INTO runs DEFAULT VALUES;"
         ),
     )
+
+
+def test_scratch_databases_follow_the_isolation_test_database_url_provides() -> None:
+    """Issue #189: TEST_DATABASE_URL is what keeps one suite run out of another's
+    way, so the scratch DBs this file invents have to follow it. Two runs pointed
+    at different test databases must not share a scratch name in any role, and a
+    single run's three roles must not collide with each other."""
+    roles = (SCRATCH_ROLE, FRESH_ROLE, LIVE_ROLE)
+    mine = {scratch_dbname(role, "epigone_test_branch_a") for role in roles}
+    theirs = {scratch_dbname(role, "epigone_test_branch_b") for role in roles}
+
+    assert len(mine) == len(roles)
+    assert not mine & theirs
+    # And the name is derived, not random: the same test database gets the same
+    # scratch set every run, so they are reused rather than piling up one trio
+    # per invocation. Spelled out rather than round-tripped through the function,
+    # which would pass however it was computed.
+    assert scratch_dbname(SCRATCH_ROLE, "epigone_test_branch_a") == (
+        "epigone_test_migrations_scratch_abf2e74a"
+    )
+
+
+def test_scratch_database_names_fit_the_postgres_identifier_limit() -> None:
+    """A long branch-derived dbname must not push a scratch name past 63 bytes,
+    where Postgres would truncate two runs back into the collision #189 fixes."""
+    longest = "epigone_test_" + "x" * 50
+    for role in (SCRATCH_ROLE, FRESH_ROLE, LIVE_ROLE):
+        assert len(scratch_dbname(role, longest).encode()) <= 63
 
 
 async def test_fresh_database_gets_full_schema_and_bookkeeping(
@@ -398,7 +451,10 @@ async def test_0037_leaves_a_writer_that_forgets_the_column_unconsumed(
             "INSERT INTO traders (address, first_seen_at, last_seen_at) "
             f"VALUES ('0xaaa', '{now}', '{now}')"
         )
-        # Exactly the column list the pre-cutover lane writes.
+        # A pre-cutover writer names its columns and has never heard of
+        # `authoritative`. The list below is a representative subset of the
+        # sixteen such a writer names, not all of them: what the property turns
+        # on is the column that is absent, not the ones that are present.
         await conn.execute(
             "INSERT INTO position_events (trader_address, coin, kind, side, size_usd, "
             f"observed_at, source) VALUES ('0xaaa', 'BTC', 'open', 'long', 1000, '{now}', 'ws')"
@@ -406,3 +462,24 @@ async def test_0037_leaves_a_writer_that_forgets_the_column_unconsumed(
         authoritative = await conn.fetchval("SELECT authoritative FROM position_events")
 
     assert authoritative is False
+
+
+async def test_0037_seeds_the_reason_the_health_monitor_stays_quiet_about(
+    scratch_pool: asyncpg.Pool,
+) -> None:
+    """`PRE_CUTOVER_REASON` is a copy of a literal inside a shipped migration,
+    which means the two can drift apart and nothing would say so (issue #198).
+
+    What breaks if they do is quiet rather than loud: the monitor stops
+    recognising the seeded row, and every deployment spends the window between
+    the migration and the websocket's first promotion reporting a DEGRADED
+    position lane nobody chose. The migration is the frozen side, so it is the
+    constant that has to follow it."""
+    await migrate(scratch_pool)
+
+    async with scratch_pool.acquire() as conn:
+        seeded = await conn.fetchrow("SELECT owner, reason FROM lane_authority")
+
+    assert seeded is not None
+    assert seeded["owner"] == POLL_OWNER
+    assert seeded["reason"] == PRE_CUTOVER_REASON
