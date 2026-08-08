@@ -829,7 +829,11 @@ async def test_a_flip_the_websocket_told_in_two_legs_is_still_told(
     decomposes some flips into a close and an open (ADR-0006 keeps the poller's
     one event one event, and the shadow dataset measured the disagreement);
     between them they account for both directions, so the change is told, and
-    this pass stays quiet about a flip nobody is missing."""
+    this pass stays quiet about a flip nobody is missing.
+
+    The lane's anchor is part of the account since #208 — a lane publishes and
+    remembers in one transaction, so a lane that told both legs is anchored on
+    the position they left behind and owes nothing."""
     clock.advance(60)
     gateway.set_positions(TRADER, [position(side=Side.SHORT)])
     await websocket_produced(
@@ -838,6 +842,7 @@ async def test_a_flip_the_websocket_told_in_two_legs_is_still_told(
     await websocket_produced(
         pool, clock, TRADER, PositionEvent(kind="open", coin="BTC", side="short")
     )
+    await websocket_watching(pool, clock, TRADER, [position(side=Side.SHORT)])
 
     await poll(pool, gateway, clock)
 
@@ -858,12 +863,17 @@ async def test_a_flips_second_leg_landing_late_is_absorbed_by_the_hold(
     websocket's two legs: only the close exists, so the flip is not yet told and
     the coin is held — no incident, nothing produced. The open leg lands within
     the lane's ~5s push cadence, long before the second look, and the flip is
-    told after all."""
+    told after all.
+
+    The lane's anchor moves with its legs (#208): flat after the close, short
+    once the open lands — so mid-stride it still owes the entry, and only the
+    second look finds a lane that owes nothing."""
     clock.advance(60)
     gateway.set_positions(TRADER, [position(side=Side.SHORT)])
     await websocket_produced(
         pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
     )
+    await websocket_watching(pool, clock, TRADER, [])
 
     await poll(pool, gateway, clock)
     assert await pending_coins(pool, TRADER) == ["BTC"]
@@ -873,6 +883,7 @@ async def test_a_flips_second_leg_landing_late_is_absorbed_by_the_hold(
     await websocket_produced(
         pool, clock, TRADER, PositionEvent(kind="open", coin="BTC", side="short")
     )
+    await websocket_watching(pool, clock, TRADER, [position(side=Side.SHORT)])
     await poll(pool, gateway, clock)
 
     assert (await read_authority(pool)).owner == WS_OWNER
@@ -881,6 +892,101 @@ async def test_a_flips_second_leg_landing_late_is_absorbed_by_the_hold(
         (WS_SOURCE, True),
         (WS_SOURCE, True),
         (POLL_SOURCE, False),
+    ]
+
+
+async def test_two_stale_legs_from_unrelated_changes_never_add_up_to_a_flip(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """Both directions vouched, by two rows that describe neither of them —
+    the residual wrong-side class #196's fix left open (issue #208).
+
+    Requiring both legs is necessary and not sufficient, because nothing paired
+    the rows that answer for them: `_legs_covered` asks each direction its own
+    question against the latest row of that direction anywhere in the ~90s
+    lookback. So a genuine scale-in and, fifteen seconds later, a genuine
+    scale-out cover entry and exit between them; the subscription then goes
+    silently deaf (`allMids` keeps the heartbeat fresh), the Leader flips
+    long→short, and the flip is vouched by a complete account of a change that
+    never happened. Shadow-recorded, anchor advanced past it, produced by
+    nobody, and the copy holds a long against a short Leader.
+
+    Ordering cannot break the tie — a decomposed flip is exit-before-entry too.
+    The lane's own ANCHOR can: it still says long where the poller has just read
+    short, so by the lane's own rules it is owed a flip on this coin, which is
+    direct evidence that the flip it appears to have told, it never told."""
+    clock.advance(5)
+    await websocket_produced(
+        pool,
+        clock,
+        TRADER,
+        PositionEvent(kind="scale_in", coin="BTC", side="long",
+                      size_usd=Decimal("20000"), prev_size_usd=Decimal("10000")),
+    )
+    clock.advance(15)
+    await websocket_produced(
+        pool,
+        clock,
+        TRADER,
+        PositionEvent(kind="scale_out", coin="BTC", side="long",
+                      size_usd=Decimal("10000"), prev_size_usd=Decimal("20000")),
+    )
+    # Both legs told, both anchored — and the subscription goes deaf here.
+    await websocket_watching(pool, clock, TRADER, [position()])
+
+    clock.advance(40)
+    gateway.set_positions(TRADER, [position(side=Side.SHORT)])
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "BTC" in authority.reason
+    authoritative = [row for row in await events(pool) if row["authoritative"]]
+    assert [(row["source"], row["kind"]) for row in authoritative] == [
+        (WS_SOURCE, "scale_in"),
+        (WS_SOURCE, "scale_out"),
+        (POLL_SOURCE, "flip"),
+    ]
+    assert [(row["kind"], row["side"]) for row in await alerts(pool)] == [("flip", "short")]
+
+
+async def test_a_close_and_a_much_later_reopen_are_still_a_told_flip(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The case that ruled out pairing the vouching legs by time (issue #208).
+
+    Requiring the two legs within one push cadence would reject the stale-rows
+    interleaving above — and would also reject this: a Leader who closes a long
+    and, half a minute later, opens a short. Two separate changes, both told,
+    both authoritative, and one poll window wide, so the poller diffs them as a
+    single flip. Under a pairing window the legs are 30s apart, the flip is
+    de-vouched, the lane is blamed for a change it delivered, and the poller
+    produces a duplicate. The anchor test passes it for the right reason: the
+    lane is anchored where the poller just read, so it owes nothing."""
+    clock.advance(20)
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+    clock.advance(30)
+    gateway.set_positions(TRADER, [position(side=Side.SHORT)])
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="open", coin="BTC", side="short")
+    )
+    await websocket_watching(pool, clock, TRADER, [position(side=Side.SHORT)])
+
+    clock.advance(10)
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert await pending_coins(pool, TRADER) == []
+    assert [(row["source"], row["kind"], row["authoritative"]) for row in await events(pool)] == [
+        (WS_SOURCE, "close", True),
+        (WS_SOURCE, "open", True),
+        (POLL_SOURCE, "flip", False),
     ]
 
 

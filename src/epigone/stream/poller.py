@@ -605,7 +605,13 @@ async def _reconcile(
     other way: an entry the websocket did produce would vouch for an exit it did
     not, and an exit nobody produces is a copy position that never closes. A
     flip moves BOTH directions and so needs both of them vouched (issue #196),
-    or the same substitution creeps back in through the flip's exit leg.
+    or the same substitution creeps back in through the flip's exit leg — and
+    it needs the lane's own anchor to agree that it told them (issue #208),
+    because two rows from unrelated prior changes can otherwise supply one
+    direction each and vouch for a flip that neither describes. `_vouched_for`
+    holds the reasoning; what it costs here is that a coin whose flip the lane
+    is merely LATE on is held for a look rather than passed, which is the hold
+    doing the job it already does for every other change.
 
     The lookback reaches `RECONCILE_GRACE_SECONDS` before the poll a change is
     measured from, because the websocket can also see a change slightly BEFORE
@@ -646,23 +652,54 @@ async def _reconcile(
     # the min says that rather than leaving it to be worked out.
     earliest = min(since, doubted_since) - RECONCILE_GRACE
 
-    async def unproduced() -> tuple[_WsRows, list[PositionEvent]]:
+    async def unproduced() -> tuple[_WsRows, list[PositionEvent], _LaneMemory | None]:
         """The websocket's rows, and what this pass saw that they do not vouch
         for. Asked here, and asked again under the exclusive lock after a
-        transfer — the same question, so the same code."""
-        rows = await _websocket_rows(conn, address, earliest)
-        return rows, [
-            event
-            for event in events
-            if not _vouched_for(event, rows.produced, lookback(event.coin))
-        ]
+        transfer — the same question, so the same code.
 
-    ws_rows, unvouched = await unproduced()
+        The lane's memory rides along because a flip's vouch now depends on it
+        (#208) and the classification below asks the same question of the same
+        anchor: diffed once per call, used for both.
+
+        It is diffed only when a flip's rows already cover both directions,
+        which is the only question that consults it here — so `owed` being
+        empty below never means "not asked", it means there was no flip to ask
+        about."""
+        rows = await _websocket_rows(conn, address, earliest)
+        memory = (
+            await _lane_memory(conn, address, positions, now)
+            if any(
+                event.kind == "flip"
+                and _every_leg_covered(event, rows.produced, lookback(event.coin))
+                for event in events
+            )
+            else None
+        )
+        owed: set[str] = memory.owed if memory is not None else set()
+        return (
+            rows,
+            [
+                event
+                for event in events
+                if not _vouched_for(event, rows.produced, lookback(event.coin), owed=owed)
+            ],
+            memory,
+        )
+
+    ws_rows, unvouched, lane_memory = await unproduced()
     held: set[str] = set()
     held_since = since
     drifted = False
     if unvouched and not await owns(conn, POLL_SOURCE):
-        memory = await _lane_memory(conn, address, positions, now)
+        # Already diffed if a flip's vouch needed it (#208), and that same
+        # answer settles missed-versus-benign, so the quiet path asks the anchor
+        # once. The escalation path below re-runs `unproduced` under the lock
+        # and so re-diffs it, deliberately: there, recent is not good enough.
+        memory = (
+            lane_memory
+            if lane_memory is not None
+            else await _lane_memory(conn, address, positions, now)
+        )
         owed = memory.owed
         # Two ways a change can still be somebody's to produce, and the anchor
         # alone only sees the first:
@@ -730,7 +767,7 @@ async def _reconcile(
             # answer is final rather than merely recent, which is what makes
             # "two writers never produce for one (Trader, coin)" a property of
             # the database.
-            ws_rows, unvouched = await unproduced()
+            ws_rows, unvouched, _ = await unproduced()
     published: list[PositionEvent] = []
     if unvouched:
         authoritative = await publish(conn, address, unvouched, now, source=POLL_SOURCE)
@@ -888,13 +925,29 @@ def _legs_covered(
     )
 
 
-def _vouched_for(
+def _every_leg_covered(
     event: PositionEvent,
     produced: dict[tuple[str, str], datetime],
     no_earlier_than: datetime,
 ) -> bool:
+    """Whether the websocket's rows account for EVERY direction this change
+    moves — the leg half of the vouch, on its own because `_reconcile` asks it
+    on its own too, to decide whether a flip's vouch needs the lane's anchor
+    read at all (#208). One rule, one place: a change to what counts as covered
+    must not have to be made twice."""
+    return _legs_covered(event, produced, no_earlier_than) == _DIRECTIONS[event.kind]
+
+
+def _vouched_for(
+    event: PositionEvent,
+    produced: dict[tuple[str, str], datetime],
+    no_earlier_than: datetime,
+    *,
+    owed: set[str],
+) -> bool:
     """Whether the websocket already told this change — EVERY direction it
-    moves, not merely one of them (issue #196).
+    moves, not merely one of them (issue #196), and for a flip, told by a lane
+    whose own anchor agrees it was told (issue #208).
 
     For the four one-legged kinds that is the same question asked once. For a
     flip it is the whole point: a flip contains an exit, so an entry the lane
@@ -907,8 +960,51 @@ def _vouched_for(
 
     A lane that legitimately decomposes a flip into two events pays nothing for
     this: it emits both legs within its ~5s push cadence, so by the time the
-    hold's second look comes round both directions are on the table."""
-    return _legs_covered(event, produced, no_earlier_than) == _DIRECTIONS[event.kind]
+    hold's second look comes round both directions are on the table.
+
+    **Both directions is necessary and not sufficient** (issue #208), because
+    the rows that supply them are not required to describe one change. Each
+    direction is answered by the latest row of that direction anywhere in the
+    coin's lookback (~90s at standby cadence), so a scale-in and, seconds
+    later, an unrelated scale-out cover entry and exit between them and vouch
+    for a flip that neither of them is. It takes a third websocket event and
+    deafness onset inside one lookback, which is rarer than the interleaving
+    above and no less wrong-sided when it lands.
+
+    So a flip asks the lane's own memory as well: the coin must not be one the
+    lane still OWES an event on (`_lane_memory`). That is not a second opinion
+    about the rows, it is the lane's anchor contradicting them — an anchor
+    still reading long where the poller has just read short is the lane saying,
+    in its own bookkeeping, that it never saw the change its rows appear to
+    account for. A lane that genuinely told the flip advanced its anchor in the
+    same transaction it published from, so it owes nothing on that flip's
+    account. It can still owe something ELSE on the coin — a later scale-in the
+    lane is coalescing holds its anchor back on purpose — and then the told
+    flip is de-vouched and held for a look. Ordinarily that costs the look and
+    nothing else: the coalesce window closes long before the next pass, so the
+    second look finds a lane that owes nothing. It costs an ESCALATION when the
+    coin was ALREADY under a held doubt, because a doubt landing on a pending
+    coin is a confirmed one (`confirmed = doubted & pending`) and there is no
+    second look left to be patient with. That needs a doubt and a coalescing
+    entry and a flip on one coin inside one window; it is the worst case, not
+    the usual one, and it is stated because a "never" here would not be true.
+
+    Ordering was the other candidate and does not work: a decomposed flip is
+    exit-before-entry exactly like the two stale rows. A pairing window (both
+    legs within one push cadence) does work on this interleaving, but it also
+    rejects a Leader who closes at T and re-opens the other way 30s later —
+    two changes both genuinely told, which the anchor test passes and a pairing
+    window would escalate on. ADR-0009 records the comparison.
+
+    Kept to `flip` deliberately. The same substitution reaches the one-legged
+    kinds (a stale `scale_out` row vouching for a later `close`), but there it
+    costs lateness rather than reversal, and de-vouching every kind on a
+    momentarily-behind anchor would hold coins on the lane's ordinary latency —
+    the benign divergence the whole `_lane_memory` discriminator exists to
+    stop escalating on."""
+    if not _every_leg_covered(event, produced, no_earlier_than):
+        return False
+    return not (event.kind == "flip" and event.coin in owed)
 
 
 def _left_a_row(

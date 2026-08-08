@@ -228,15 +228,87 @@ different flip decompositions.
 **Every direction the change moves, not merely one of them** (issue #196). A
 `flip` counting as both directions was first read as "either will do", and that
 left the coin-alone hole open through the one kind that spans both: an entry the
-lane did produce answering for the exit inside a flip the lane missed. It is the
-only known interleaving that leaves a copy on the WRONG SIDE of its Leader
-rather than merely late, so the vouch has to be a complete account — a poll-side
-flip is told only when both directions are. A lane that decomposes flips pays
-nothing for it: it emits both legs inside its ~5s push cadence, well within the
-one-look hold that every doubt serves anyway. The **stranded** question takes the
-opposite quantifier deliberately, because it is the opposite question: there a
-row earns silence and only a complete account should; here a row is evidence the
-lane saw a change nobody produced, and half a flip is still evidence.
+lane did produce answering for the exit inside a flip the lane missed. Leaving a
+copy on the WRONG SIDE of its Leader rather than merely late is the outcome this
+vouch exists to prevent, and this interleaving was written up here as the only
+known way to reach it. That claim did not survive the next review: #208 found a
+second, below, and the honest statement is that these are the interleavings
+found so far, not the ones that exist. What holds regardless is the direction —
+wrong-sided outcomes come from an exit nobody accounts for — so the vouch has to
+be a complete account, and a poll-side flip is told only when both directions
+are. A lane that decomposes flips pays nothing for it: it emits both legs inside
+its ~5s push cadence, well within the one-look hold that every doubt serves
+anyway. The **stranded** question takes the opposite quantifier deliberately,
+because it is the opposite question: there a row earns silence and only a
+complete account should; here a row is evidence the lane saw a change nobody
+produced, and half a flip is still evidence.
+
+**And told by a lane whose own anchor agrees it told them** (issue #208). Both
+directions is necessary and not sufficient, because the two rows that supply
+them are not required to describe one change: each direction is answered by the
+latest row of that direction anywhere in the coin's lookback (~90s at standby
+cadence). A genuine scale-in and, fifteen seconds later, a genuine scale-out
+therefore cover entry and exit between them and vouch for a flip that is
+neither of them — the same wrong-sided outcome as #196's, reached with three
+websocket events plus deafness onset inside one window instead of one event.
+Compound-rarer, and no less reversed when it lands.
+
+So a flip asks the lane's own memory as well as its rows: the coin must not be
+one the lane still OWES an event on (`_lane_memory`, the same anchor diff that
+already discriminates the benign class). This is not a second opinion about the
+rows, it is the lane contradicting them — an anchor still reading long where the
+poller has just read short is the lane's own bookkeeping saying it never saw the
+change its rows appear to account for. A lane that genuinely told the flip
+advanced its anchor in the transaction it published from, so it owes nothing on
+that flip's account. It can still owe something ELSE on the coin — a later
+scale-in it is coalescing holds the anchor back on purpose — and then a told
+flip is de-vouched and held for a look. Ordinarily that costs the look and
+nothing else, because the coalesce window closes long before the next pass. It
+costs an escalation when the coin was ALREADY under a held doubt: a doubt
+landing on a pending coin is a confirmed one, and there is no second look left
+to spend on patience. A doubt, a coalescing entry and a flip on one coin inside
+one window — the worst case rather than the usual one, recorded because a
+"never" here would not be true.
+
+Two alternatives were weighed, and are recorded because both look reasonable.
+ORDERING (exit before entry) cannot separate the cases at all: a decomposed flip
+is exit-before-entry exactly like the two stale rows. A PAIRING WINDOW (the two
+vouching legs within one coalesce-plus-push cadence, ~8s) does reject this
+interleaving — but it also rejects a Leader who closes at T and re-opens the
+other way 30s later, two changes both genuinely told, inside one standby poll
+window; it would escalate on them and produce a duplicate flip, where the anchor
+test passes them because the lane owes nothing. The two do not compose, they
+disagree, and only one of them has no false-positive class of its own. The
+anchor test ships alone.
+
+**What this does not close**, stated rather than glossed. The rule is scoped to
+`flip`, so the same substitution still reaches the one-legged kinds — a stale
+`scale_out` row can vouch for a later `close` — where it costs LATENESS rather
+than reversal; extending the anchor test to every kind would hold coins on the
+lane's ordinary latency, escalating exactly the benign divergence `_lane_memory`
+exists to tell apart. And the test is only as good as the anchor: a lane whose
+anchor agreed with reality without having produced the change would vouch
+wrongly still. The one path to that is a lane that loses its `ws_lane_state` row
+and silently re-baselines mid-window, and a re-follow prunes both lanes' memory
+together and re-baselines the poller too, so the poller has no flip to diff
+across the gap.
+
+A wider one is neither closed nor made worse here, and is written down because
+this fix walks past it — **issue #218** carries it. **The vouch never asks
+whether the rows are from the current ownership era.** For roughly one lookback
+(previous poll − `RECONCILE_GRACE_SECONDS`) after production moves to the
+poller, pre-transfer AUTHORITATIVE websocket rows are still in the window, while
+the websocket — healthy, merely not producing — keeps observing and advancing
+its anchor, so it owes nothing and the anchor test passes. A change the poller
+diffs in that window can therefore be vouched by rows describing an earlier one
+and produced by neither lane. It is the substitution above with the ownership
+transfer supplying the staleness instead of a deaf subscription, it reaches the
+one-legged kinds as well as `flip`, and it predates both #196 and #208 — it
+needs no third event and no fault, only a transfer. The straddle grace that
+makes the window wide (`RECONCILE_GRACE_SECONDS`) is deliberate and
+load-bearing, so narrowing it is not the answer; era-tagging the vouch would be.
+Not attempted here — it belongs to its own change, with its own tests, and #218
+grades it a mainnet gate on #208's own reasoning.
 
 **This is the disposition of the comparison's third condition** ("flip-boundary
 kind normalization so the two producers' vocabularies match during any ownership
