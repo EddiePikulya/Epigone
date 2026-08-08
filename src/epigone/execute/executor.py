@@ -96,6 +96,7 @@ from epigone.execute.policy import (
     LeverageUnknownError,
     RiskPolicy,
     budget_loss,
+    budget_spent_of,
     budget_stage,
     committed_stake,
     resolve_leverage,
@@ -126,6 +127,7 @@ from epigone.gateway import (
 )
 from epigone.gateway.execution import (
     ActionRejectedError,
+    CancelSpec,
     ExecutionError,
     Grouping,
     OrderFilled,
@@ -337,16 +339,11 @@ class CopyExecutor:
         # Leaving a disabled sub unreconciled would also strand a live episode
         # that a later /copy would then read as "already in a copy episode".
         all_subs = await subs_store.all_subs(self._pool, self._operator_id)
-        # The enabled set is taken AFTER reconciliation, not before, because
-        # reconciliation is now a step that can DISABLE a sub: a wound-down
-        # Loss Budget disables its mapping the cycle it goes flat (issue
-        # #181), and everything below — provisioning, brackets, the drain —
-        # must see that in the same cycle rather than act once more on a
-        # mapping the executor has just ended. `_reconcile` hands back the
-        # mappings as they stand after its own writes for the same reason: a
-        # sub that BREACHED this cycle has to refuse this cycle's opens.
+        # `_reconcile` hands the mappings back AS THEY STAND AFTERWARDS, because
+        # judging a Loss Budget is part of it and its verdicts land on the row:
+        # a sub that BREACHED this cycle has to refuse this cycle's opens
+        # (issue #181).
         states, all_subs = await self._reconcile(all_subs, now)
-        subs = [sub for sub in all_subs if sub.enabled]
         if await is_halted(self._pool):
             # Halted: reconciliation has run (it signs nothing), and every
             # step below signs something. The backlog is NOT drained — an
@@ -355,6 +352,14 @@ class CopyExecutor:
             # backlog under the already-locked rules.
             log.info("copy executor: halted — reconciled only, nothing signed")
             return
+        # The wind-down's terminal step, and it is BELOW the halt gate rather
+        # than beside the measurement above because it CANCELS: a flat sub's
+        # leftover triggers come off the book before the mapping is disabled,
+        # and cancelling is signing. The enabled set is therefore taken after
+        # it — a mapping the executor has just ended must not be provisioned,
+        # bracketed or drained one more time in the same cycle.
+        all_subs = await self._disable_wound_down_subs(all_subs, states, now)
+        subs = [sub for sub in all_subs if sub.enabled]
         await self._provision(subs, now)
         await self._maintain_brackets(subs, states, now)
         await self._drain_backlog(subs, states)
@@ -936,12 +941,12 @@ class CopyExecutor:
                     sub,
                     action="copy_budget_breached",
                     reason=(
-                        f"loss budget spent: {_spent_of(loss, sub.loss_budget_usd)} since "
+                        f"loss budget spent: {budget_spent_of(loss, sub.loss_budget_usd)} since "
                         f"the budget was set — wind-down begins"
                     ),
                     body=(
                         f"🛑 Loss budget SPENT on {_short(sub.leader_address)} — "
-                        f"{_spent_of(loss, sub.loss_budget_usd)}.\n"
+                        f"{budget_spent_of(loss, sub.loss_budget_usd)}.\n"
                         f"Winding down: opens, scale-ins and flip open-legs are refused "
                         f"from now on. Exits keep copying and brackets stay maintained, so "
                         f"the copy still follows them out. The sub is disabled once it is "
@@ -956,27 +961,24 @@ class CopyExecutor:
                     action="copy_budget_warned",
                     reason=(
                         f"loss budget {int(BUDGET_WARNING_FRACTION * 100)}% spent: "
-                        f"{_spent_of(loss, sub.loss_budget_usd)}"
+                        f"{budget_spent_of(loss, sub.loss_budget_usd)}"
                     ),
                     body=(
                         f"⚠️ Loss budget {int(BUDGET_WARNING_FRACTION * 100)}% spent on "
                         f"{_short(sub.leader_address)} — "
-                        f"{_spent_of(loss, sub.loss_budget_usd)} since the budget was "
+                        f"{budget_spent_of(loss, sub.loss_budget_usd)} since the budget was "
                         f"set.\n"
                         f"At the full budget this copy winds down and the sub is disabled "
                         f"once flat. /copy changes the number; /uncopy stops now."
                     ),
                     now=now,
                 )
-        judged = replace(
+        return replace(
             sub,
             budget_spent_usd=loss,
             budget_warned_at=sub.budget_warned_at or warned_at,
             budget_breached_at=sub.budget_breached_at or breached_at,
         )
-        if not judged.winding_down:
-            return judged
-        return await self._disable_if_flat(judged, state, loss, now)
 
     async def _arm_loss_budget(self, sub: CopySub, state: SubState, now: datetime) -> CopySub:
         """Snapshot the equity a new budget is measured from.
@@ -1024,17 +1026,45 @@ class CopyExecutor:
             )
         return replace(sub, budget_baseline_usd=state.account_value, budget_armed_at=now)
 
+    async def _disable_wound_down_subs(
+        self, subs: list[CopySub], states: dict[int, SubState], now: datetime
+    ) -> list[CopySub]:
+        """Every breached sub that has gone flat, disabled — the wind-down's
+        terminal step, run once per cycle after the halt gate because it
+        CANCELS resting orders and cancelling is signing.
+
+        A sub this cycle could not read is left alone: flatness is a claim
+        about the exchange's state, and the honest answer to an unreadable one
+        is next cycle."""
+        return [
+            await self._disable_if_flat(sub, states[sub.id], now)
+            if sub.winding_down and sub.enabled and sub.id in states
+            else sub
+            for sub in subs
+        ]
+
     async def _disable_if_flat(
-        self, sub: CopySub, state: SubState, loss: Decimal, now: datetime
+        self, sub: CopySub, state: SubState, now: datetime
     ) -> CopySub:
-        """The wind-down's terminal step: a breached sub with nothing left open
-        stops being a copy relationship.
+        """A breached sub with nothing left open stops being a copy
+        relationship.
 
         FLAT IS BOTH HALVES — no position the exchange reports in the sub, and
         no live Copy Episode. The exchange's answer alone would disable a sub
         whose close filled but whose episode this cycle has not ended yet; the
         episode's alone would disable one holding a position the operator
         opened by hand in the same sub.
+
+        THE BOOK IS EMPTIED OF OUR TRIGGERS FIRST. Ordinarily there is nothing
+        to empty: every bracket is placed POSITION_TPSL, so the venue takes the
+        pair down with the position it was sized against. But a STRAY is
+        exactly what `BRACKET_VERIFY_INTERVAL` exists to catch — a leg that
+        outlived its position, an episode that ended while one rested — and a
+        disabled mapping leaves `_maintain_brackets`' scope for good, so a
+        stray that survived this moment would rest until the operator or a
+        /kill sweep found it. Cancelled BEFORE the flag flips, in that order,
+        so a failure anywhere leaves the sub enabled and the next cycle tries
+        again rather than leaving an order behind a mapping nothing looks at.
 
         THE SAME TERMINAL STATE /uncopy PRODUCES, through the same flag and the
         same never-auto-flatten rule — there is nothing left to flatten by
@@ -1044,6 +1074,9 @@ class CopyExecutor:
         assert sub.budget_breached_at is not None  # `winding_down` is exactly that
         if state.positions or await ep.live_episodes(self._pool, sub.id):
             return sub
+        if not await self._cancel_stray_brackets(sub, now):
+            return sub
+        loss = sub.budget_spent_usd or Decimal(0)
         async with self._pool.acquire() as conn, conn.transaction():
             # Conditional on the sub still being enabled and still carrying THIS
             # breach, so the announcement happens exactly once and a wind-down
@@ -1057,18 +1090,89 @@ class CopyExecutor:
                 sub,
                 action="copy_budget_disabled",
                 reason=(
-                    f"wound down and flat: {_spent_of(loss, sub.loss_budget_usd)} — "
+                    f"wound down and flat: {budget_spent_of(loss, sub.loss_budget_usd)} — "
                     f"mapping disabled"
                 ),
                 body=(
                     f"⏹ Copy of {_short(sub.leader_address)} is DISABLED — its loss budget "
                     f"is spent and the sub is now flat. Final "
-                    f"{_spent_of(loss, sub.loss_budget_usd)}. Nothing further is "
+                    f"{budget_spent_of(loss, sub.loss_budget_usd)}. Nothing further is "
                     f"copied; copying this leader again is a fresh /copy."
                 ),
                 now=now,
             )
         return replace(sub, enabled=False)
+
+    async def _cancel_stray_brackets(self, sub: CopySub, now: datetime) -> bool:
+        """Take this sub's own resting triggers off the book. Returns whether
+        the book is now known to be clear of them — False means "could not
+        tell, or could not act", and the caller defers the disable.
+
+        OURS ONLY, intersected against the bracket ids Epigone recorded for
+        this sub. Cancelling everything resting would be simpler and would
+        break decision 10's never-touch rule: a limit order the operator placed
+        by hand in that sub is theirs, and a Loss Budget is not a mandate to
+        clear someone else's book.
+
+        THE HALT GATE, as late as it can be, and the same one `_place_brackets`
+        carries: a cancel is a signature. A halt here defers the disable —
+        which costs nothing, since a halt's own sweep enumerates and cancels
+        per sub anyway (decision 1) and the mapping stays in wind-down
+        meanwhile, refusing every entry."""
+        known = await ep.sub_bracket_orders(self._pool, sub.id)
+        if not known:
+            return True
+        try:
+            resting = [order for order in await self._open_orders(sub) if order.order_id in known]
+        except Exception:
+            log.warning(
+                "copy executor: order book unreadable for %s; deferring its budget disable",
+                sub.sub_name,
+                exc_info=True,
+            )
+            return False
+        if not resting:
+            return True
+        specs: list[CancelSpec] = []
+        for order in resting:
+            spec = await self._spec(order.coin)
+            if spec is None:
+                # The one order shape that cannot be cancelled by oid is one
+                # whose coin has no asset id. Defer rather than disable around
+                # it: this is the stray the whole step exists for.
+                log.warning(
+                    "copy executor: %s has no asset id; deferring %s's budget disable",
+                    order.coin,
+                    sub.sub_name,
+                )
+                return False
+            specs.append(CancelSpec(asset=spec.asset_id, oid=order.order_id))
+        if await is_halted(self._pool):
+            log.warning(
+                "copy executor: halted before clearing %s's brackets — disable deferred",
+                sub.sub_name,
+            )
+            return False
+        self._exec.decision = (
+            f"loss budget spent and the sub is flat: cancelling {len(specs)} resting "
+            f"bracket leg(s) before disabling the mapping"
+        )
+        try:
+            await self._exec.cancel_orders(specs, vault_address=sub.require_address())
+        except ExecutionError:
+            # Already on the trail via the audited gateway. The mapping stays
+            # enabled and wound down; the next cycle tries again.
+            log.exception("copy executor: could not clear %s's brackets", sub.sub_name)
+            return False
+        await self._notify(
+            kind=ACTION,
+            body=(
+                f"🧹 Cancelled {len(specs)} leftover bracket order(s) in "
+                f"{_short(sub.leader_address)}'s sub before disabling it."
+            ),
+            now=now,
+        )
+        return True
 
     async def _loss_budget_event(
         self,
@@ -1098,8 +1202,11 @@ class CopyExecutor:
             detail={
                 "sub_id": sub.id,
                 "leader": sub.leader_address,
-                "budget_usd": str(sub.loss_budget_usd),
-                "baseline_usd": str(sub.budget_baseline_usd),
+                # Through `fixed_point`, not `str`: a NUMERIC read back from
+                # Postgres can carry an exponent, and `5E+2` on the trail is
+                # the #185 lesson said in a place nobody would look twice at.
+                "budget_usd": _figure(sub.loss_budget_usd),
+                "baseline_usd": _figure(sub.budget_baseline_usd),
             },
             master_address=self._master,
             conn=conn,
@@ -2684,16 +2791,12 @@ def _money(value: Decimal) -> str:
     return f"{value:.2f}"
 
 
-def _spent_of(loss: Decimal, budget: Decimal) -> str:
-    """A Loss Budget's spend as the operator reads it, in one phrase.
-
-    One function because FOUR surfaces say it — the warning, the breach, the
-    disable, and each one's audit row — and four hand-built copies of "$X lost
-    of $Y" is four places for the figures to start disagreeing about how they
-    are rounded. The loss is COMPUTED so it goes through `_money`; the budget
-    is the operator's own number, so it goes through `fixed_point` and never
-    grows cents they did not type."""
-    return f"${_money(loss)} lost of ${fixed_point(budget)}"
+def _figure(value: Decimal | None) -> str | None:
+    """One dollar figure for an audit detail payload. `fixed_point` rather than
+    `str`, for the reason `_round`'s docstring in the policy gives: a round
+    NUMERIC from Postgres stringifies as `5E+2`, and the trail is read by the
+    same human the chat is."""
+    return None if value is None else fixed_point(value)
 
 
 __all__ = ["EXECUTOR_CONSUMER", "CopyExecutor", "SubState"]

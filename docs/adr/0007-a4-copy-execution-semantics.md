@@ -852,6 +852,15 @@ re-fire the 80% notice and re-stamp a wind-down already announced, which is
 story 21's "once per arming" in reverse. The change is audited old → new in the
 same transaction as the mapping write, the way `/limits` audits a knob.
 
+**RATIFIED BY THE OPERATOR 2026-08-08.** #181's own re-arm bullet said the
+marks clear on "a higher budget or `loss off`". Taken literally that leaves a
+hole: a budget RAISED after a breach would carry its warned mark forward, so
+the 80% notice against the new, larger number would never fire — the operator
+would be told nothing again until the wind-down. Every new number therefore
+deserves its own fresh warning, and the marks reset on ANY change of amount.
+The cost, accepted knowingly: a budget LOWERED below what is already lost
+breaches again on the next cycle and says so a second time.
+
 **One notice beyond the three the spec listed.** The arming notice (`🎯 Loss
 budget armed … measured from what the sub is worth right now`) exists because
 this design moved the baseline snapshot from `/copy` to the executor: the
@@ -865,6 +874,17 @@ chain — so the skip digest coalesces it and the audit row carries it.
 exits-never-decline contract, and bracket placement are exactly as they were. A
 flip during wind-down copies its close leg and refuses its open leg, ending
 flat on that coin — the same shape the Liquidity Floor's flip semantics have.
+
+**"Flat" is both halves, and the book is cleared first.** No position the
+exchange reports in the sub, and no live Copy Episode. Brackets are placed
+POSITION_TPSL, so the venue normally takes the pair down with the position —
+but a STRAY is exactly what the per-cycle bracket invariant exists to catch,
+and a disabled mapping leaves that invariant's scope for good. So the sub's own
+recorded bracket legs are cancelled before the flag flips, intersected against
+what is actually resting so nothing the operator placed by hand is touched. The
+cancel is a SIGNATURE, which puts the terminal step below the halt gate rather
+than beside the measurement: a halted or unreadable cycle defers the disable
+and the mapping stays wound down, refusing entries, until the next one.
 
 **Chat only, never the pager.** The pager action tuple is unchanged. A page
 means something is BROKEN, and a budget doing what it was set to do is not

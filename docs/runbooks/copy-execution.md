@@ -338,7 +338,14 @@ arguments and does not disturb the positional ones.
 | --- | --- |
 | ≥ 80% of the budget | one chat notice, once per arming |
 | ≥ the budget | **wind-down**: opens, scale-ins and flip open-legs are refused with a `copy_skipped` row; exits keep copying; brackets stay maintained |
-| wound down AND flat | the mapping is **disabled** — the same terminal state `/uncopy` produces — with a notice and a `copy_budget_disabled` row |
+| wound down AND flat | any leftover bracket legs of ours are cancelled, then the mapping is **disabled** — the same terminal state `/uncopy` produces — with a notice and a `copy_budget_disabled` row |
+
+Flat means both halves: no position the exchange reports in that sub, and no
+live Copy Episode. The cancel comes **before** the flag flips, and only for
+orders Epigone itself placed — an order you placed by hand in that sub is
+yours. If the book cannot be read (or the executor is halted), the disable
+waits for the next cycle rather than leaving an order behind a mapping nothing
+watches; the sub stays wound down meanwhile, refusing every entry.
 
 **It is a TRIGGER, NOT A FLOOR.** After the breach, whatever is still open
 rides until the Leader exits it or a bracket fires, so the realised loss can

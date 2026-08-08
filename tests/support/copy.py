@@ -63,6 +63,15 @@ class CopyHarness:
         """Every place_orders call's payload, in submission order."""
         return [payload for method, payload in self.exec_fake.actions if method == "place_orders"]
 
+    def cancelled(self) -> list[int]:
+        """Every order id this executor asked the exchange to cancel."""
+        return [
+            spec.oid
+            for method, payload in self.exec_fake.actions
+            if method == "cancel_orders"
+            for spec in payload[0]  # type: ignore[index]
+        ]
+
     async def sub(self, sub_id: int) -> CopySub:
         """The mapping as it stands NOW — the enabled flag and the budget
         ledger are what a cycle writes, so a test asserting either has to

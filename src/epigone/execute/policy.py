@@ -325,6 +325,18 @@ def budget_loss(
     return baseline_usd + deposits_usd - equity_usd
 
 
+def budget_spent_of(loss_usd: Decimal, budget_usd: Decimal) -> str:
+    """A Loss Budget's spend as the operator reads it, in one phrase.
+
+    Here rather than in the executor because FIVE surfaces say it — the 80%
+    warning, the breach, the disable, each one's audit row, and this module's
+    own wind-down denial — and the two modules must not each keep their own
+    idea of how the pair is rounded. The loss is COMPUTED (`_round`); the
+    budget is the operator's own number (`fixed_point`), so it never grows
+    cents they did not type."""
+    return f"${_round(loss_usd)} lost of ${fixed_point(budget_usd)}"
+
+
 def budget_stage(*, loss_usd: Decimal, budget_usd: Decimal) -> str:
     """Where a measured loss stands against its budget: within it, past the
     warning fraction, or past the budget itself.
@@ -564,7 +576,7 @@ class RiskPolicy:
         return RiskVerdict(
             False,
             f"DECLINED: the loss budget for this leader is spent — "
-            f"${_round(loss_usd)} lost of ${fixed_point(budget_usd)} since the budget was "
+            f"{budget_spent_of(loss_usd, budget_usd)} since the budget was "
             f"set — so this copy is winding down: {coin} did not enter. Exits keep "
             f"copying and the brackets stay maintained; the sub is disabled once it is "
             f"flat. /copy with a higher budget resumes it",
@@ -618,6 +630,7 @@ __all__ = [
     "RiskPolicy",
     "RiskVerdict",
     "budget_loss",
+    "budget_spent_of",
     "budget_stage",
     "clears_liquidity_floor",
     "committed_stake",

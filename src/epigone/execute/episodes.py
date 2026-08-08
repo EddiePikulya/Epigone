@@ -220,6 +220,33 @@ async def bracket_orders(
     ]
 
 
+async def sub_bracket_orders(
+    conn: asyncpg.Pool | asyncpg.Connection, sub_id: int
+) -> set[int]:
+    """Every bracket order id Epigone has recorded for one sub, across every
+    episode of it, live or ended.
+
+    ACROSS ENDED EPISODES on purpose (issue #181): the question this answers is
+    "which of the orders resting in this sub are OURS", asked when a wound-down
+    sub is about to be disabled — and a trigger that outlived the episode that
+    placed it is exactly the stray the question is looking for. Ending an
+    episode does not delete its bracket rows, so they are still here to be
+    recognised.
+
+    A SET of ids rather than rows, because the caller intersects it with what
+    the exchange says is actually resting; nothing downstream cares which leg
+    or which episode a stray belonged to."""
+    rows = await conn.fetch(
+        """
+        SELECT b.order_id FROM copy_bracket_orders AS b
+        JOIN copy_episodes AS e ON e.id = b.episode_id
+        WHERE e.sub_id = $1
+        """,
+        sub_id,
+    )
+    return {row["order_id"] for row in rows}
+
+
 async def forget_brackets(conn: asyncpg.Pool | asyncpg.Connection, episode_id: int) -> None:
     """Drop this episode's bracket rows — used when the legs are cancelled or
     replaced, so the table never claims a trigger that is no longer on the
