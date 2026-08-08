@@ -412,7 +412,10 @@ gets re-armed or runs out, and the reject's own message is on the audit trail.
 inside that 95s window wedges for its full 30s ceiling — up to four of them —
 the schedule still lapses; that needs an exchange that cannot accept a
 `scheduleCancel` at all across the window, rather than a push that was merely
-deprioritised. The pre-sign budget's pacing sleep is also deliberately
+deprioritised. That is true of the cancel pass as well as the enumeration:
+attempts continue until the window is dealt with, so committing to a cancel
+POST (which nothing can cut once sent) never costs the schedule its remaining
+attempts. The pre-sign budget's pacing sleep is also deliberately
 un-ceilinged, so a token-deficit wait longer than the window outlasts
 everything above — that is the one gap in "a step is never the reason an
 attempt was skipped", and "every await is bounded" is still not literally

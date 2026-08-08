@@ -126,6 +126,28 @@ def watchdog(
     )
 
 
+def _seconds_per_read(
+    monkeypatch: pytest.MonkeyPatch,
+    read_gateway: FakeHyperliquidGateway,
+    clock: FakeClock,
+    seconds: float,
+) -> None:
+    """Make every enumeration read cost `seconds` of the sweep's own clock.
+
+    The knob the deadline tests (issue #212) turn, because what decides
+    whether an armed horizon comes into view mid-sweep is how long one step
+    takes — 65s being a saturated cancel POST's self-bound. The older pulse
+    tests spell this closure out inline; these turn it often enough, and mean
+    something specific enough by it, to name it."""
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(seconds)
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+
 def _cancels(exec_gateway: FakeExecutionGateway) -> list[CancelSpec]:
     """Every cancelled (asset, oid), flattened across accounts. The sweep
     issues one cancel action PER ACCOUNT now (issue #136), so the fake's
@@ -1869,13 +1891,8 @@ async def test_a_lapsing_schedule_is_pushed_even_when_the_leg_is_spent(
     # horizon, which is what a real account-wide one does.
     read_gateway.sub_accounts[MASTER] = ["0x" + "11" * 20]
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
-    inner = read_gateway.get_open_orders
-
-    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
-        clock.advance(65)  # a saturated cancel POST's own bound, per step
-        return await inner(address, dex)
-
-    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+    # A saturated cancel POST's own bound, per step.
+    _seconds_per_read(monkeypatch, read_gateway, clock, 65)
 
     await watchdog.run_cycle()
 
@@ -1890,6 +1907,90 @@ async def test_a_lapsing_schedule_is_pushed_even_when_the_leg_is_spent(
     else:
         assert len(armed) == 1  # the spent leg never pushes again
         assert latest < clock.now()  # …so it fired mid-halt: the #212 residual
+
+
+async def test_the_cancel_pass_re_checks_the_deadline_before_it_writes(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gap the read path never had, on the path that matters most.
+
+    Enumeration pulses TWICE per step (`_walk_scope`, then `_safety_read`), so
+    a wedged attempt there is always followed by another boundary before the
+    read starts. The CANCEL loop pulses once per account and then commits to a
+    POST that cannot be cut from outside — so the last attempt before a write
+    used to be the only one, and one wedge plus one saturated 65s cancel POST
+    reproduced the issue's own 65+30+65 = 160 > 150 composition on precisely
+    the path a saturated exchange makes most likely.
+
+    Two accounts, because that is the shape with no boundary of any kind
+    between one account's POST and the next account's attempt. The master's
+    POST carries the clock to 85s from the horizon; the sub's boundary attempt
+    wedges to its ceiling; and what must happen next is another attempt, not a
+    65s write."""
+    from epigone.safety import watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "KEEPALIVE_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_REFILL_SECONDS", 3600.0)
+    sub = "0x" + "11" * 20
+    read_gateway.sub_accounts[MASTER] = [sub]
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 212)])
+    read_gateway.set_open_orders(sub, [open_order("BTC", 213)])
+    # Outside the window for the whole enumeration; inside it only once the
+    # master's cancel POST has run, which is the sub's boundary.
+    armed_until = clock.now() + timedelta(seconds=150)
+    seen: list[datetime] = []
+
+    async def wedges_once() -> None:
+        nonlocal armed_until
+        seen.append(clock.now())
+        if len(seen) == 1:
+            clock.advance(30)  # the ceiling this attempt is about to be cut at
+            await asyncio.sleep(3600)  # real seconds: never returns
+        armed_until = clock.now() + timedelta(seconds=300)
+
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=wedges_once,
+        keepalive_deadline=lambda: armed_until,
+    )
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    started = clock.now()
+    inner = exec_gateway.cancel_orders
+
+    async def saturated(
+        cancels: list[CancelSpec], *, vault_address: str | None = None
+    ) -> list[object]:
+        clock.advance(65)  # a cancel POST at its self-bound, per account
+        return await inner(cancels, vault_address=vault_address)  # type: ignore[return-value]
+
+    monkeypatch.setattr(exec_gateway, "cancel_orders", saturated)
+
+    await watchdog.run_cycle()
+
+    # 85s left at the sub's boundary: the wedge, then a SECOND attempt with its
+    # whole ceiling still ahead of the horizon — before the 65s POST, not after
+    # it. Without the re-check the schedule lapses at started+150 with the
+    # sweep mid-write.
+    assert seen == [started + timedelta(seconds=65), started + timedelta(seconds=95)]
+    assert armed_until > clock.now()
+    assert len(_cancels_by_account(exec_gateway)) == 2  # and both books were swept
 
 
 async def test_a_wedged_exempt_attempt_does_not_spend_the_window(
@@ -1948,13 +2049,7 @@ async def test_a_wedged_exempt_attempt_does_not_spend_the_window(
     )
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
     started = clock.now()
-    inner = read_gateway.get_open_orders
-
-    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
-        clock.advance(65)
-        return await inner(address, dex)
-
-    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+    _seconds_per_read(monkeypatch, read_gateway, clock, 65)
 
     await watchdog.run_cycle()
 
@@ -2020,13 +2115,8 @@ async def test_the_exempt_push_is_paced_not_issued_at_every_step(
     )
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
     started = clock.now()
-    inner = read_gateway.get_open_orders
-
-    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
-        clock.advance(2)  # inside SWEEP_PULSE_INTERVAL: the throttle would bite
-        return await inner(address, dex)
-
-    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+    # Inside SWEEP_PULSE_INTERVAL: the pulse throttle would bite.
+    _seconds_per_read(monkeypatch, read_gateway, clock, 2)
 
     await watchdog.run_cycle()
 
@@ -2081,13 +2171,7 @@ async def test_each_newly_armed_schedule_gets_its_own_exempt_push(
     )
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
     started = clock.now()
-    inner = read_gateway.get_open_orders
-
-    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
-        clock.advance(65)
-        return await inner(address, dex)
-
-    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+    _seconds_per_read(monkeypatch, read_gateway, clock, 65)
 
     await watchdog.run_cycle()
 

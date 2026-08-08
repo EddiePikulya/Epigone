@@ -430,6 +430,12 @@ STEP_BOUND_SECONDS = 65.0
 # a step bound between two boundaries breaks it, and one exists on purpose (the
 # pacing sleep, below).
 #
+# The attempts are made until the window is dealt with rather than one per
+# boundary (`_pulse`), and that is load-bearing rather than tidy: the cancel
+# pass pulses ONCE per account and then commits to a POST nothing can cut, so
+# a per-boundary rule gave the last attempt before a write no successor and
+# reproduced 65+30+65 = 160 > 150 on the write path exactly.
+#
 # PACED LIKE AN ORDINARY PULSE (SWEEP_PULSE_INTERVAL, on the injected clock —
 # the same clock the deadline is on) so the exemption can never become a hot
 # loop: a push that fails in milliseconds costs the sweep nothing but must not
@@ -473,8 +479,9 @@ STEP_BOUND_SECONDS = 65.0
 #   outcome by the belt-and-braces route;
 # - and none of this touches R4 from the same review — a watchdog whose
 #   cancels fail while its pushes succeed keeps the exchange-side net
-#   postponed indefinitely. That is inherent to any keepalive design and
-#   belongs to the mainnet risk register, not here.
+#   postponed indefinitely. Inherent to any keepalive design, and made
+#   sharper rather than softer by everything above: issue #219, the mainnet
+#   risk register, holds it.
 #
 # The window assumes the deadman's own push cadence leaves more slack than the
 # window is wide (half of the 300s default horizon: 150s > 95s). Under a
@@ -863,7 +870,26 @@ class Watchdog:
         if not self._pulse_allowed():
             return
         self._refill_leg_budgets()
-        pushed = await self._priority_push(self._clock.now())
+        # UNTIL THE WINDOW IS DEALT WITH, not once per boundary (round 1 of the
+        # main-session gate on PR #215). An attempt that WEDGED spent a whole
+        # ceiling and the horizon is that much nearer, so the deadline has to
+        # be re-read before this pulse hands control back — because what the
+        # caller does next may be a cancel POST, which pulses ONCE per account
+        # and then commits to a write that cannot be cut from outside. On the
+        # enumeration path the re-check falls out of the structure (`_walk_scope`
+        # pulses, `_safety_read` pulses again); on the write path it does not,
+        # and one wedge plus one saturated POST reproduced the very 65+30+65
+        # composition issue #212 was opened about. Putting the retry HERE
+        # rather than at the write site is the same choice `_safety_read`
+        # embodies: one seam, so no call site can forget it.
+        #
+        # It terminates and is bounded by the same three facts the single
+        # attempt was: a landed push moves the horizon out of the window, a
+        # FAST failure fails the SWEEP_PULSE_INTERVAL pace on the very next
+        # turn, and every attempt needs the horizon still ahead of it.
+        pushed = False
+        while await self._priority_push(self._clock.now()):
+            pushed = True
         # Re-read: the attempt above can have spent a whole KEEPALIVE_CEILING,
         # and both the throttle below and the beat it gates want the time it
         # is NOW, not the time the pulse was entered.
@@ -942,6 +968,12 @@ class Watchdog:
         # to be about attempts rather than successes or a fast-failing push
         # would be re-issued at every step of a fast sweep.
         self._priority_pushed_at = now
+        # ERROR deliberately, for an event the runbook calls expected and
+        # self-healing: this module's levels say what CHANGED on the safety
+        # path, not how alarmed to be (`_report_if_spent` and the swept-halt
+        # line are ERROR on the same principle), and "the last-resort net came
+        # within a step of discharging" is the most operator-visible posture
+        # change a sweep can make. The runbook reads it back as expected.
         log.error(
             "dead-man's schedule is %.0fs from its horizon and the next sweep step "
             "could outlive it — a budget-exempt push attempt now (issue #212)",
