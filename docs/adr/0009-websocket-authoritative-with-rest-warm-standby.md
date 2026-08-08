@@ -159,6 +159,63 @@ that fell between two owners is a transfer doing what transfers do. And the tick
 that moves ownership always polls, whatever the cadence says, so a straddler is
 found within a tick rather than a standby interval.
 
+**A held doubt is judged in the window that raised it** *(issue #200)*.
+Withholding the verdict is only patience if the second look asks the same
+question, and it did not, quite. The lookback was re-derived on every pass from
+`last_polled_at − RECONCILE_GRACE` — and the pass that HOLDS a doubt advances
+`last_polled_at` itself, so the window walked forward while the doubt stood
+still. The transfer-tick poll above keeps that walk to one tick on the happy
+path, but the pass that catches a straddler is exactly the pass that can skip a
+wallet: one `RateLimitedError`, or a five-failure abort cutting the tail of
+`leaders_first`, costs that wallet its look. The doubt is then raised a standby
+interval later and confirmed ten seconds after that, against a window starting
+well past the unconsumed row that proved the straddle — reclassified benign,
+shadow-recorded, swallowed. The round-2 hole again, reached by a different
+route, and for an exit that is a copy position that never closes.
+
+So the doubt carries its own window: `position_poll_state.reconcile_since`
+(migration 0038) records the look the doubt was raised against, written and
+cleared by the same statement as `reconcile_pending` so neither can outlive the
+other. The evidence cannot age out of it, and not merely by a margin — a change
+is a change *because* it was observed after that look, so a window starting
+there contains what raised it however late the confirm arrives.
+
+**Per coin, not per wallet.** A wallet holding a doubt is usually holding other
+positions too, and one cursor for all of them would let a minute-old websocket
+row vouch for a brand-new change on a different coin: the same swallow, arriving
+through the repair. Each change is judged from the window that begins at the
+observation it is measured from — which for a held coin is where its anchor was
+deliberately left, and for every other coin is this pass's previous look.
+
+*Rejected: freezing `last_polled_at` while a doubt stands* — removing the
+coupling rather than pinning it, as #158's round-3 note proposed. It produces
+the same window for the doubted coin and costs no migration, and it was rejected
+for two reasons. One cursor cannot say that one coin's evidence is older than
+another's, so it buys the per-wallet widening above. And it turns a column that
+states a fact — when this pass last read this wallet — into a claim about
+judgement, inherited by every reading of it, present and future.
+
+That second reason is what the note itself flagged, and the code answers it more
+narrowly than the note assumed: **the Withdrawal Alert staleness gate does not
+read `last_polled_at`.** It measures from the equity observation's own timestamp
+(`trader_equity.observed_at`, against `MAX_OBSERVATION_GAP_INTERVALS` × the
+interval in force), and that observation lands unconditionally on every pass,
+held doubt or not. So freezing the cursor would not have widened withdrawal
+detection today; it would have left a second freshness timestamp beside one that
+stayed honest, with nothing in the code saying which readings must use which.
+`test_a_held_doubt_keeps_its_window_without_holding_the_wallets_freshness` pins both
+halves — the doubt keeps its window, the wallet keeps its freshness, and the
+withdrawal is detected across the hold exactly as it would have been without it.
+
+One consequence, stated because it reverses a claim this document's own
+implementation notes made: the transfer-tick poll is no longer a correctness
+precondition of the stranded repair. The confirm window no longer moves, so a
+late hold is late and nothing more. It stays, as the latency property it looks
+like — a straddler found within a tick beats one found within a standby
+interval — and the margin it spends is now pinned as a relation
+(`RECONCILE_GRACE` against one straddle plus one confirm tick, with a push
+cadence left over) rather than asserted in a comment.
+
 Compared on **direction**, not on kind or size, and not on the coin alone. The
 lanes legitimately describe the same reality with different kinds (the
 granularity difference above; the flip-boundary decomposition), so comparing

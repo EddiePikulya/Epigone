@@ -106,23 +106,25 @@ async def run_position_cycle(
         # outgoing lane had already stopped producing. So the tick that moves
         # ownership always polls, whatever the cadence says.
         #
-        # ⚠️ This is a CORRECTNESS precondition of the stranded-change repair
-        # (ADR-0009 §4), not a latency optimisation, and the constraint is
-        # invisible from either side of it. The evidence that a straddler was
-        # produced by neither lane is an UNCONSUMED websocket row, and
-        # reconciliation only looks for it back to `last_polled_at` minus the
-        # grace — while the pass that HOLDS the doubt advances `last_polled_at`
-        # itself. So a first post-handback pass arriving a standby interval late
-        # would hold the straddler at t+50s and then confirm it at t+60s against
-        # a window starting at t+20s, which no longer reaches the row written at
-        # t−5s. The change would be reclassified benign, shadow-recorded, and
-        # swallowed for good — the exact hole the repair exists to close, at
-        # every deploy.
+        # It buys LATENCY, and it used to buy correctness too — a distinction
+        # worth keeping straight, because the correctness half is now bought
+        # somewhere better. The evidence that a straddler was produced by
+        # neither lane is an UNCONSUMED websocket row, and reconciliation looks
+        # for it back to the poll the change is measured from, minus the grace.
+        # Until #200 that poll was re-read on every pass, and the pass that
+        # HOLDS the doubt advanced it — so a first post-handback pass arriving a
+        # standby interval late would hold the straddler at t+50s and confirm it
+        # at t+60s against a window starting at t+20s, which no longer reached
+        # the row written at t−5s: reclassified benign, shadow-recorded, and
+        # swallowed for good, at every deploy. A doubt now keeps the window it
+        # was raised in (`position_poll_state.reconcile_since`, ADR-0009 §4), so
+        # a late hold costs latency and nothing else.
         #
-        # Polling on the transfer keeps the hold within one tick of the handover,
-        # so the confirm's window still contains the row by a comfortable margin
-        # (grace 30s against a worst case of one poll interval plus one tick).
-        # tests/test_position_cutover.py's transfer test fails if this goes.
+        # What this still buys is the latency: the hold lands within one tick of
+        # the handover rather than within a standby interval, so a straddler is
+        # produced ~10s late rather than ~70s late. The margin it spends out of
+        # the grace is pinned as a relation in tests/test_position_cutover.py,
+        # whose transfer test fails if this reset goes.
         state.last_pass_at = None
         state.owner = authority.owner
     now = clock.now()

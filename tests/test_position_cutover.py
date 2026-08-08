@@ -25,7 +25,7 @@ import asyncpg
 import pytest
 
 from epigone.budget import WeightBudget
-from epigone.gateway import Position, Side
+from epigone.gateway import GatewayError, Position, RateLimitedError, Side
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.lane_authority import (
     POLL_OWNER,
@@ -46,7 +46,11 @@ from epigone.stream.main import (
     StandbyState,
     run_position_cycle,
 )
-from epigone.stream.poller import POLL_INTERVAL_SECONDS, run_poll_pass
+from epigone.stream.poller import (
+    MAX_CONSECUTIVE_FAILURES,
+    POLL_INTERVAL_SECONDS,
+    run_poll_pass,
+)
 from epigone.ws import MAX_SUBSCRIBED_TRADERS, WS_LANE_PROCESS
 from epigone.ws.lane import POSITIONS_PUSH_INTERVAL_SECONDS, WS_COALESCE_WINDOW_SECONDS
 from tests.support.clock import FakeClock
@@ -429,6 +433,33 @@ async def test_the_reconciliation_grace_outlasts_a_coalesced_entry(
     )
 
 
+async def test_the_reconciliation_grace_outlasts_a_straddled_handover(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """The grace's other relation, and the one the swallow hole was measured in
+    (issue #200). The coalescing relation above says the grace outlasts a
+    change the websocket is deliberately holding; this one says it outlasts a
+    change an ownership TRANSFER caught mid-flight.
+
+    The arithmetic the handover presents: the websocket observes a straddler up
+    to one poll interval before the poller's next look — the poller polls every
+    tick while it owns production, so that is how long a change can sit
+    unlooked-at — and the doubt it raises is confirmed one tick after that.
+    Both are spent out of the grace, and what is left over is the margin. It
+    was never written down, so nothing said how much of it there was.
+
+    A relation, not a number: any of the three may be retuned, and this fails
+    only when the retune eats the margin."""
+    straddle = POLL_INTERVAL_SECONDS  # a change can sit one look unnoticed...
+    confirm = POLL_INTERVAL_SECONDS  # ...and the doubt is judged a tick later
+    assert RECONCILE_GRACE_SECONDS > straddle + confirm
+    # And the leftover is not a rounding error: a whole feed cadence still
+    # fits, which is the smallest unit any of this is observed in.
+    assert (
+        RECONCILE_GRACE_SECONDS - (straddle + confirm) >= POSITIONS_PUSH_INTERVAL_SECONDS
+    )
+
+
 async def test_a_poll_set_outgrowing_the_websocket_takes_production_back(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
@@ -473,6 +504,59 @@ async def test_withdrawal_detection_survives_the_standby_cadence(
 
     alerted = await pool.fetch("SELECT * FROM withdrawal_alerts")
     assert [row["amount_usd"] for row in alerted] == [Decimal("60000")]
+
+
+async def test_a_held_doubt_keeps_its_window_without_holding_the_wallets_freshness(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
+) -> None:
+    """What a pass that WITHHOLDS a verdict still records (issue #200).
+
+    Reconciliation withholds two things on a doubt — the verdict and the
+    anchor — and #200 adds a third, the window the doubt is judged in. It
+    deliberately does not withhold a fourth. `last_polled_at` goes on meaning
+    when this pass last READ this wallet, and the freshness the Withdrawal
+    Alert's staleness gate is measured in goes on being the equity
+    observation's own (`trader_equity.observed_at`), which lands
+    unconditionally on every pass.
+
+    That distinction is the reason the doubt gets its own column instead of
+    freezing the poll cursor: a frozen cursor would be a poll pass claiming not
+    to have polled, and every reading of "how long since we looked at this
+    wallet" would quietly change with it. Withdrawal detection is the reading
+    that matters — it refuses to judge across a gap it did not watch, so
+    widening the apparent gap turns the alert off with nothing failing."""
+    await track(pool, clock, TRADER, FOLLOWER)
+    gateway.set_positions(TRADER, [position()])
+    gateway.set_account_value(TRADER, Decimal("100000"))
+    await healthy_websocket(pool, clock)
+    await poll(pool, gateway, clock)
+    baselined_at = clock.now()
+
+    # A doubt is raised and held: the lane's anchor is where the position used
+    # to be, so by its own account it owes an event it has not produced.
+    clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    await websocket_watching(pool, clock, TRADER, [position()])
+    gateway.set_positions(TRADER, [position(size_usd="20000")])
+    await poll(pool, gateway, clock)
+    held_at = clock.now()
+
+    state = await pool.fetchrow(
+        "SELECT * FROM position_poll_state WHERE trader_address = $1", TRADER
+    )
+    assert state is not None
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+    assert state["reconcile_since"] == baselined_at  # the doubt keeps its window
+    assert state["last_polled_at"] == held_at  # the wallet was still read
+
+    # $60k walks out while the doubt stands. The pass that confirms the doubt
+    # is an ordinary look at the account, and says so.
+    clock.advance(POLL_INTERVAL_SECONDS)
+    gateway.set_account_value(TRADER, Decimal("40000"))
+    await poll(pool, gateway, clock)
+
+    alerted = await pool.fetch("SELECT * FROM withdrawal_alerts")
+    assert [row["amount_usd"] for row in alerted] == [Decimal("60000")]
+    assert (await read_authority(pool)).owner == POLL_OWNER  # and the doubt confirmed
 
 
 # --- crying wolf, and not crying at all (issue #158) ---------------------------
@@ -877,18 +961,158 @@ async def test_a_lane_that_still_owes_the_change_is_named_as_the_miss_it_is(
     assert "never arrived on the websocket" in reason and "ownership" not in reason
 
 
+async def test_a_doubt_is_confirmed_against_the_window_that_raised_it(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The straddler whose hold lands late, and the last remnant of the swallow
+    hole (issue #200).
+
+    Every other guard here bounds how LONG the hold takes to arrive. This one
+    says it does not matter. The transfer-tick pass — the one thing keeping the
+    hold within a tick of the handover — is exactly the pass that can skip a
+    wallet: a `RateLimitedError` costs that wallet its look and nothing else,
+    and the wallet then waits out a whole standby interval. If the confirm
+    look's window were re-derived from the pass that HELD the doubt, it would
+    by then start after the unconsumed row that proved the change was
+    stranded, the coin would be reclassified benign, the anchor would advance,
+    and an exit nobody produced would be swallowed for good.
+
+    The doubt's window is the doubt's own, so the evidence cannot age out of
+    it — however late the hold arrives, and however long the confirm waits."""
+    # The Leader closes in the seconds before a handback. The websocket sees it
+    # while it does not yet own production: the row lands unconsumed and its
+    # anchor moves on regardless.
+    clock.advance(5)
+    gateway.set_positions(TRADER, [])
+    await websocket_shadow_wrote(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+    await websocket_watching(pool, clock, TRADER, [])
+
+    # The pass that would have caught it within a tick is rate limited on this
+    # wallet — pacing, not an outage, so the pass carries on and this wallet
+    # simply keeps its `since` and polls again next time.
+    clock.advance(POLL_INTERVAL_SECONDS)
+    gateway.positions_errors[TRADER] = RateLimitedError("still 429 after retries")
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == []
+
+    # Next time is a whole standby interval later. The doubt is raised there...
+    clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    del gateway.positions_errors[TRADER]
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+
+    # ...and confirmed on the next tick, against the evidence that raised it.
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "BTC" in authority.reason and "ownership" in authority.reason
+    assert [row["kind"] for row in await alerts(pool)] == ["close"]
+    authoritative = [row for row in await events(pool) if row["authoritative"]]
+    assert [(row["source"], row["kind"]) for row in authoritative] == [(POLL_SOURCE, "close")]
+
+
+async def test_a_pass_that_aborts_leaves_the_tail_of_the_set_where_it_was(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The other way the pass above can skip a wallet, and the reason the fix
+    is the same one (issue #200). A sustained failure streak means Hyperliquid
+    is down, so the pass gives up and resumes next cycle — and every wallet in
+    the tail of `leaders_first` keeps its `since` untouched, exactly as a rate
+    limited one does.
+
+    Which is what makes the repair complete rather than route-specific: a
+    wallet is skipped by having no `_apply_poll` at all, so a doubt raised on
+    it later is still raised against the last look that actually happened."""
+    baselined_at = clock.now()
+    for index in range(MAX_CONSECUTIVE_FAILURES):
+        # Sorted ahead of TRADER ("0xaaa"), so the abort lands before it: ties
+        # in the poll set break alphabetically (`epigone.poll_set`).
+        down = f"0x1{index:039x}"
+        await track(pool, clock, down, FOLLOWER)
+        gateway.positions_errors[down] = GatewayError("hyperliquid is down")
+
+    clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, [])
+    await poll(pool, gateway, clock)
+
+    polled_at = await pool.fetchval(
+        "SELECT last_polled_at FROM position_poll_state WHERE trader_address = $1", TRADER
+    )
+    assert polled_at == baselined_at
+
+
+async def test_the_reached_back_window_belongs_to_the_doubt_not_to_the_wallet(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The other half of #200: reaching back is a privilege of the coin that
+    earned it.
+
+    A doubt's window reaches back to the look the doubt was raised against, and
+    a wallet holding one is usually holding other positions too. If that reach
+    were the WALLET's — one cursor for every coin on it — an old websocket row
+    would vouch for a brand new change on a different coin, which is the same
+    swallow this ticket exists to close, arriving through the repair itself.
+
+    Here BTC's doubt reaches back a whole standby interval while ETH is judged
+    from this pass's own previous look, which the lane's old ETH entry falls
+    outside of. One wallet, one pass, two windows."""
+    # The Leader opens ETH and the websocket produces it. The poller does not
+    # look until a standby interval later, by which time BTC has grown too and
+    # the lane's memory still owes that one.
+    clock.advance(5)
+    gateway.set_positions(TRADER, [position(), position(coin="ETH")])
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="open", coin="ETH", side="long")
+    )
+
+    clock.advance(STANDBY_POLL_INTERVAL_SECONDS)
+    gateway.set_positions(TRADER, [position(size_usd="20000"), position(coin="ETH")])
+    await websocket_watching(pool, clock, TRADER, [position(), position(coin="ETH")])
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+
+    # The lane was simply late on BTC and produces it. ETH scales in at the
+    # same moment and the lane owes THAT — its only ETH row is the entry from
+    # a minute ago, which is inside BTC's window and nowhere near ETH's.
+    clock.advance(5)
+    await websocket_produced(
+        pool,
+        clock,
+        TRADER,
+        PositionEvent(kind="scale_in", coin="BTC", side="long",
+                      size_usd=Decimal("20000"), prev_size_usd=Decimal("10000")),
+    )
+    clock.advance(5)
+    grown = [position(size_usd="20000"), position(coin="ETH", size_usd="20000")]
+    gateway.set_positions(TRADER, grown)
+    await websocket_watching(
+        pool, clock, TRADER, [position(size_usd="20000"), position(coin="ETH")]
+    )
+    await poll(pool, gateway, clock)
+
+    assert await pending_coins(pool, TRADER) == ["ETH"]
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert [row for row in await events(pool) if row["authoritative"]
+            and row["source"] == POLL_SOURCE] == []
+
+
 async def test_every_ownership_transfer_is_followed_by_a_pass_at_once(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
     """The tick that moves ownership polls, however recently the last pass ran.
 
-    This is a CORRECTNESS precondition of the stranded-change repair, not a
-    latency nicety — see the comment at the reset in `epigone.stream.main`. The
-    hold pass advances `last_polled_at`, which is where the confirm look's
-    lookback starts; a first post-handback pass arriving a standby interval
-    late would hold the straddler and then confirm against a window that no
-    longer reaches back to the unconsumed row that proved it. It would be
-    reclassified benign and swallowed — the exact hole round 2 closed.
+    A latency property with a correctness history. Until #200 the confirm
+    look's lookback was re-derived from the pass that HELD the doubt, so a
+    first post-handback pass arriving a standby interval late would confirm
+    against a window that no longer reached the unconsumed row proving the
+    straddle — reclassified benign, and swallowed. The window is now the
+    doubt's own (`position_poll_state.reconcile_since`), so this pass is back
+    to buying what it looks like it buys: a straddler is found within a tick
+    of the handover rather than within a standby interval.
 
     Staged so the assertion can only pass because of the transfer: the poller
     polls, ownership moves ten seconds later, and ten seconds is nothing like

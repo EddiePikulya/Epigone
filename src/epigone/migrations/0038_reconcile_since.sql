@@ -1,0 +1,40 @@
+-- Migration 0038: the window a held doubt is judged in (issue #200, ADR-0009 §4).
+--
+-- Reconciliation gives a change one look of patience: a change the websocket
+-- has not produced is HELD — its anchor is not advanced — and the next pass
+-- re-diffs the identical change and decides for real. The evidence that
+-- decides it is a websocket row inside the lookback window, and until now that
+-- window was re-derived on every pass from `last_polled_at − RECONCILE_GRACE`
+-- — including on the pass that holds the doubt, which advances `last_polled_at`
+-- itself.
+--
+-- So the evidence could age out from under the doubt. The hold pass is the one
+-- that can arrive late: the transfer-tick pass that normally catches a
+-- straddler within a tick can skip a wallet (a `RateLimitedError`, or a
+-- 5-failure abort cutting the tail of the pass), and the wallet then waits out
+-- a whole standby interval. The doubt is raised at t+60 against a window that
+-- still reaches the unconsumed row at t−5; the confirm ten seconds later looks
+-- from t+30 and no longer sees it; the change is reclassified benign, the
+-- anchor advances, and an exit nobody produced is swallowed for good.
+--
+-- `reconcile_since` is the poll instant the held doubt was raised AGAINST —
+-- the wallet's own previous look, which is the start of the window that
+-- produced the doubt. The confirm look uses it for the coins under doubt and
+-- `last_polled_at` for every other coin, so each change is judged against the
+-- window that begins at the observation it is measured from. That is the same
+-- rule the hold itself follows, applied to the lookback instead of the anchor:
+-- when in doubt, do not advance.
+--
+-- NULL exactly when `reconcile_pending` is NULL — both are written by the same
+-- statement at the end of every completed pass, so a doubt cannot outlive its
+-- window or vice versa. A row carrying a pending doubt from before this
+-- migration has a NULL here and falls back to the old behaviour for that one
+-- confirm; the alternative would be inventing a timestamp for a doubt whose
+-- origin nobody recorded.
+--
+-- Nothing else moves: `last_polled_at` still means what it has always meant,
+-- when this pass last read this wallet. It is deliberately not frozen while a
+-- doubt stands (the alternative weighed in ADR-0009 §4) — one cursor cannot
+-- say that one coin's evidence is older than another's, and freezing it would
+-- widen every co-resident coin's lookback on the same wallet.
+ALTER TABLE position_poll_state ADD COLUMN reconcile_since TIMESTAMPTZ;
