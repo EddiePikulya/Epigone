@@ -46,8 +46,8 @@ dependency instead of bounding another leg:
   losing it to a crash-after-cancel would be a hole nothing else covers.
   Issue #201 extends that SAME carve-out, and only it, to the liveness
   pulse: a real-stall trip's own cancel pass is a multi-minute enumeration
-  and beats through it, at a bounded one ceiling per leg per cycle (see
-  "A SWEEP PULSES" below); a DB-blind window still runs entirely dark;
+  and beats through it, under a bounded per-leg time budget (see "A SWEEP
+  PULSES" below); a DB-blind window still runs entirely dark;
 - everything durable — halt row, audit events, sweep verification — runs
   AFTER the cancel attempt, best-effort, under a hard real-time ceiling
   (DB_BLOCK_CEILING_SECONDS; safe because Pool.release is shielded, so a
@@ -126,16 +126,21 @@ properties are load-bearing:
   multi-minute enumeration that would otherwise read as death. The
   reconcile's verify enumeration always pulses: by then the incident is
   cleared;
-- its two legs are INDEPENDENT, and each may spend ONE CEILING PER CYCLE.
-  Independent because coupling them recreates the incident: a refused
-  Postgres connection fails in milliseconds, so a beat failure that
+- its two legs are INDEPENDENT, and each runs on its own PER-CYCLE TIME
+  BUDGET. Independent because coupling them recreates the incident: a
+  refused Postgres connection fails in milliseconds, so a beat failure that
   short-circuited the push would leave a full-speed-looking sweep with an
-  unrefreshed schedule. One strike because the throttle cannot bound a SLOW
-  leg — a wedged database or exchange would otherwise charge a full ceiling
-  at every enumeration step, an hour and more on a real sweep. On SLOWNESS
-  and not on failure, because a leg that fails fast costs the sweep nothing
-  and one blip must not silence a signal for a ten-minute grind. `_pulse`
-  carries the full argument;
+  unrefreshed schedule. Budgeted because the throttle cannot bound a SLOW
+  leg — it spaces pulses from their START, so anything slower than the
+  interval is charged again at the very next enumeration step, and a wedged
+  database or a slow-failing exchange endpoint adds tens of minutes to a
+  real sweep. Budgeted on MEASURED WALL CLOCK rather than on error type,
+  because the slow shapes are typed every which way (an exchange POST that
+  502s at 25s raises AmbiguousExecutionError, and the deadman re-queues an
+  ambiguous push at once) — and measuring time keeps for free the property
+  that makes going quiet safe at all: a leg that fails FAST keeps retrying,
+  so one blip never silences a signal for a ten-minute grind.
+  PULSE_LEG_BUDGET_SECONDS states the bound; `_pulse` carries the argument;
 - the keepalive runs on THIS task, not a sibling one. Deliverable 2 of
   issue #201 asked for an independent dead-man task; it is deliberately not
   one, because the deadman shares this process's single AuditedExecution-
@@ -160,6 +165,7 @@ landing only at the very end.
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -228,6 +234,26 @@ SWEEP_PULSE_INTERVAL = timedelta(seconds=5)
 # the default 300s horizon), so a slow exchange costs retries, not a lapsed
 # schedule. Real time, not the injected clock, like every other ceiling here.
 KEEPALIVE_CEILING_SECONDS = 30.0
+
+# How much of a sweep's own wall clock each pulse LEG may spend per cycle
+# (review round 2 of PR #203). A ceiling bounds ONE attempt; this bounds
+# what the attempts add up to, which is the number that decides whether a
+# sweep finishes in minutes or in an hour — SWEEP_PULSE_INTERVAL spaces
+# pulses from their start, so anything slower than the interval is charged
+# again at the very next enumeration step.
+#
+# Measured, never inferred from the exception: the slow shapes are typed
+# every which way (an exchange POST that 502s at 25s raises
+# AmbiguousExecutionError, and the deadman re-queues an ambiguous push
+# immediately), so only the clock tells the truth about what a leg costs.
+#
+# One pulse interval's worth. A healthy beat is milliseconds, so this is
+# hundreds of healthy pulses and no working system ever reaches it, while a
+# single wedged attempt spends it outright. The bound it buys: a leg costs
+# a sweep at most this budget plus the one attempt that overran it — so at
+# most PULSE_LEG_BUDGET_SECONDS + KEEPALIVE_CEILING_SECONDS per leg, per
+# cycle, whatever the exchange and the database are doing.
+PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
 
 # A failed capability probe (network blip, info outage, unwritable verdict)
 # retries on this short fuse instead of waiting out the full check interval —
@@ -315,11 +341,11 @@ class Watchdog:
         self._keepalive = keepalive
         # When this process last emitted a liveness pulse (issue #201) —
         # the cycle-top beat counts, so a short cycle adds no extra writes —
-        # and, per leg, whether it has already spent its one ceiling THIS
-        # cycle and gone quiet (`_pulse`; both re-arm at every cycle top).
+        # and, per leg, how much of this cycle's wall clock it has already
+        # spent (`_pulse`; both budgets refill at every cycle top).
         self._pulsed_at: datetime | None = None
-        self._beat_struck = False
-        self._keepalive_struck = False
+        self._beat_spent = 0.0
+        self._keepalive_spent = 0.0
         self._capable: bool | None = None  # last on-chain verdict; None = unchecked
         self._next_capability_at: datetime | None = None  # None → due now
         # Postgres-independence state (module docstring): the onset of the
@@ -347,18 +373,18 @@ class Watchdog:
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
-        # Each cycle re-arms both pulse legs (issue #201, `_pulse`): a leg
-        # that wedged during the last one gets exactly one more chance here,
-        # so the strike is a per-cycle bound and never a permanent give-up.
-        self._beat_struck = False
-        self._keepalive_struck = False
+        # Each cycle refills both pulse-leg budgets (issue #201, `_pulse`):
+        # a leg that wedged during the last one gets a fresh one here, so
+        # the strike is a per-cycle bound and never a permanent give-up.
+        self._beat_spent = 0.0
+        self._keepalive_spent = 0.0
         # INCIDENT-FIRST (round 5, the structural rule): an open incident
         # reaches the wire before this cycle touches Postgres AT ALL — no
         # beat, no reads, no state. Durable catch-up comes after the cancel.
         if self._blind is not None:
             await self._incident_cycle(now)
             return
-        self._beat_struck = not await self._beat(now)
+        self._beat_spent += await self._beat(now)
         try:
             halt, stall_reason = await asyncio.wait_for(
                 self._read_liveness(now), DB_BLOCK_CEILING_SECONDS
@@ -399,17 +425,18 @@ class Watchdog:
 
     # --- liveness (issue #201) ---
 
-    async def _beat(self, now: datetime) -> bool:
+    async def _beat(self, now: datetime) -> float:
         """Say ALIVE, best-effort (round 2 item 1c): losing the liveness
         signal is bad; skipping the cycle's protective work over it is
         worse. Bounded by the same real-time ceiling as every other state
         block, and it stamps the pulse clock.
 
-        Answers whether this leg is WORTH ATTEMPTING AGAIN this cycle — see
-        `_pulse` for the rule. A fast failure answers yes: it costs the
-        sweep nothing, and one dropped connection must not silence the
-        heartbeat for a ten-minute grind. A CEILING HIT answers no."""
+        Answers what the attempt COST THE SWEEP, in real seconds: the strike
+        is a time budget and not an error taxonomy (`_pulse`), so every exit
+        — landed, refused, cancelled at the ceiling — is measured the same
+        way and the caller needs to know nothing about which happened."""
         self._pulsed_at = now
+        started = time.monotonic()
         try:
             await asyncio.wait_for(
                 heartbeat.beat(self._pool, heartbeat.WATCHDOG_PROCESS, now),
@@ -417,41 +444,38 @@ class Watchdog:
             )
         except TimeoutError:
             log.error(
-                "heartbeat write hit its %.0fs ceiling — no further beats this cycle; "
-                "the protective work continues",
-                DB_BLOCK_CEILING_SECONDS,
+                "heartbeat write hit its %.0fs ceiling", DB_BLOCK_CEILING_SECONDS
             )
-            return False
         except Exception:
             log.exception("heartbeat write failed — continuing the protective cycle")
-        return True
+        return time.monotonic() - started
 
-    async def _push_keepalive(self) -> bool:
+    async def _push_keepalive(self) -> float:
         """The pulse's other leg: whatever else must not go stale while a
-        sweep grinds — in production the dead-man's schedule. Same answer
-        contract as `_beat`, same reasoning: a rejected push is free to
-        retry five seconds later and the schedule must not be abandoned
-        over one 429; a push WEDGED on the exchange costs a ceiling and is
-        not paid twice in one cycle."""
+        sweep grinds — in production the dead-man's schedule. Same contract
+        as `_beat` — it answers what it cost, and the budget decides.
+
+        A rejected push is free to retry five seconds later and the schedule
+        must not be abandoned over one 429; the audited gateway is
+        best-effort, so this leg keeps working through a Postgres outage,
+        which is exactly when the exchange-side net matters most."""
         assert self._keepalive is not None
+        started = time.monotonic()
         try:
             await asyncio.wait_for(self._keepalive(), KEEPALIVE_CEILING_SECONDS)
         except TimeoutError:
             log.error(
-                "sweep keepalive (dead-man's push) hit its %.0fs ceiling — no further "
-                "pushes this cycle; the schedule is re-pushed from the next one",
+                "sweep keepalive (dead-man's push) hit its %.0fs ceiling",
                 KEEPALIVE_CEILING_SECONDS,
             )
-            return False
         except Exception:
             # The sweep is the protective work and nothing advisory may stop
-            # it. The next pulse retries, and the deadman's own state
-            # machine is self-reconciling (a repeated set REPLACES).
+            # it. The deadman's own state machine is self-reconciling (a
+            # repeated set REPLACES), so a cheap failure just retries.
             log.warning(
-                "sweep keepalive (dead-man's push) failed — retrying at the next pulse",
-                exc_info=True,
+                "sweep keepalive (dead-man's push) failed", exc_info=True
             )
-        return True
+        return time.monotonic() - started
 
     def _pulse_allowed(self) -> bool:
         """Whether a sweep in the CURRENT posture may say it is alive.
@@ -475,33 +499,51 @@ class Watchdog:
         grinds. Silent in the postures `_pulse_allowed` refuses, and silent
         within SWEEP_PULSE_INTERVAL of the last pulse.
 
-        TWO INDEPENDENT LEGS, EACH WITH ONE SLOW STRIKE PER CYCLE (review of
-        PR #203). Independent, because coupling them recreates the very
-        incident: a refused Postgres connection fails in milliseconds, so a
-        beat failure that short-circuited the push would leave a
-        full-speed-looking sweep with an unrefreshed schedule — and the
-        audited gateway is best-effort exactly so a protective EXCHANGE
-        action survives a database outage. One strike, because the throttle
-        cannot bound a SLOW leg: DB_BLOCK_CEILING_SECONDS is four times
-        SWEEP_PULSE_INTERVAL, so a wedged database would charge a full
-        ceiling at every enumeration step — an hour and more on a real
-        sweep, heartbeat frozen and schedule lapsed the whole time. On
-        SLOWNESS and not on failure, because a leg that fails fast costs the
-        sweep nothing and giving up on it would silence a signal over one
-        blip. The strike lasts the CYCLE, not the process: the next cycle
-        gives each leg one more chance."""
+        TWO INDEPENDENT LEGS, EACH ON ITS OWN PER-CYCLE TIME BUDGET (review
+        of PR #203, rounds 1–2).
+
+        Independent, because coupling them recreates the very incident: a
+        refused Postgres connection fails in milliseconds, so a beat failure
+        that short-circuited the push would leave a full-speed-looking sweep
+        with an unrefreshed schedule — and the audited gateway is
+        best-effort exactly so a protective EXCHANGE action survives a
+        database outage.
+
+        Budgeted, because the throttle cannot bound a SLOW leg:
+        SWEEP_PULSE_INTERVAL spaces pulses from their START, so an attempt
+        that takes longer than the interval is charged at every enumeration
+        step — a wedged database or a slow-failing exchange endpoint adds
+        tens of minutes to a real sweep, which is round 1's bug at a
+        different scale.
+
+        On MEASURED TIME and not on error type, because the cost is wall
+        clock and the failures that burn it are typed every which way: an
+        exchange POST that 502s at 25s raises AmbiguousExecutionError, and
+        the deadman deliberately re-queues an ambiguous push at once rather
+        than advancing its due time, so a TimeoutError-keyed strike would
+        never fire on the single most likely slow shape. Measuring time
+        keeps the property that makes a strike safe at all — a leg that
+        fails FAST keeps retrying, because it costs the sweep nothing and
+        one blip must not silence a signal for a ten-minute grind — and it
+        gets that for free rather than by another rule.
+
+        The budget lasts the CYCLE, not the process: the next cycle gives
+        each leg a fresh one. The bound it buys is stated in
+        PULSE_LEG_BUDGET_SECONDS."""
         if not self._pulse_allowed():
             return
         now = self._clock.now()
         if self._pulsed_at is not None and now - self._pulsed_at < SWEEP_PULSE_INTERVAL:
             return
-        # The pulse clock advances even when both legs are struck, so a
-        # quiet sweep does not re-enter this body at every step.
+        # The pulse clock advances even when both legs are spent, so a quiet
+        # sweep does not re-enter this body at every step.
         self._pulsed_at = now
-        if not self._beat_struck:
-            self._beat_struck = not await self._beat(now)
-        if self._keepalive is not None and not self._keepalive_struck:
-            self._keepalive_struck = not await self._push_keepalive()
+        if self._beat_spent < PULSE_LEG_BUDGET_SECONDS:
+            self._beat_spent += await self._beat(now)
+            _report_if_spent("heartbeat", self._beat_spent)
+        if self._keepalive is not None and self._keepalive_spent < PULSE_LEG_BUDGET_SECONDS:
+            self._keepalive_spent += await self._push_keepalive()
+            _report_if_spent("dead-man's push", self._keepalive_spent)
 
     async def _read_liveness(self, now: datetime) -> tuple[Halt | None, str | None]:
         halt = await active_halt(self._pool)
@@ -1050,6 +1092,21 @@ class Watchdog:
             exc_info=True,
         )
         self._next_capability_at = now + CAPABILITY_RETRY
+
+
+def _report_if_spent(leg: str, spent: float) -> None:
+    """A pulse leg that has just gone over its per-cycle budget says so
+    once, where a reader of the sweep's own progress lines will see it: the
+    signal it carries is about to stop, and the reason is that it was
+    costing the sweep more than the sweep can pay."""
+    if spent >= PULSE_LEG_BUDGET_SECONDS:
+        log.error(
+            "sweep pulse: the %s leg has spent %.1fs of this sweep (budget %.1fs) — "
+            "quiet until the next cycle; the protective work continues",
+            leg,
+            spent,
+            PULSE_LEG_BUDGET_SECONDS,
+        )
 
 
 def _scope_steps(dexs: list[str], accounts: list[str | None]) -> int:

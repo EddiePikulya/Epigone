@@ -1243,6 +1243,7 @@ async def test_a_wedged_keepalive_never_stalls_the_sweep(
     from epigone.safety import watchdog as watchdog_module
 
     monkeypatch.setattr(watchdog_module, "KEEPALIVE_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.01)
     attempts = 0
     seen: list[datetime | None] = []
 
@@ -1336,6 +1337,7 @@ async def test_a_wedged_pulse_leg_stops_competing_with_the_wire(
     from epigone.safety import watchdog as watchdog_module
 
     monkeypatch.setattr(watchdog_module, "DB_BLOCK_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.01)
     await heartbeat.beat(pool, heartbeat.EXECUTOR_PROCESS, clock.now())
     clock.advance(120)
     read_gateway.set_open_orders(MASTER, [open_order("ETH", 203)])
@@ -1438,10 +1440,10 @@ async def test_a_dead_database_never_silences_the_dead_mans_push(
 
 
 async def test_a_hanging_database_costs_one_ceiling_per_cycle_not_one_per_step(
-    watchdog: Watchdog,
     pool: asyncpg.Pool,
     clock: FakeClock,
     read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
     audit: ExecutionAudit,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1450,18 +1452,42 @@ async def test_a_hanging_database_costs_one_ceiling_per_cycle_not_one_per_step(
     SWEEP_PULSE_INTERVAL, so the pulse throttle can never suppress the next
     attempt — every enumeration step of a multi-minute sweep would pay a
     full ceiling, adding more than an hour to a real one and voiding all
-    three deliverables at once. A leg that hits its ceiling goes quiet for
-    the rest of the cycle; the next cycle gives it one more chance."""
+    three deliverables at once. A leg over its budget goes quiet for the
+    rest of the cycle; the next cycle gives it a fresh one.
+
+    A keepalive IS wired here on purpose: the beat leg going quiet must not
+    take the push leg with it, and with the bare `watchdog` fixture (which
+    has no keepalive) a coupling regression would pass unnoticed."""
     from epigone.safety import watchdog as watchdog_module
 
     monkeypatch.setattr(watchdog_module, "DB_BLOCK_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.01)
     attempts: list[object] = []
+    pushes = 0
 
     async def hanging_beat(*args: object) -> None:
         attempts.append(args)
         await asyncio.sleep(3600)  # real seconds: wedged past every ceiling
 
+    async def push() -> None:
+        nonlocal pushes
+        pushes += 1
+
     monkeypatch.setattr(heartbeat, "beat", hanging_beat)
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=push,
+    )
     await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
     inner = read_gateway.get_open_orders
 
@@ -1473,12 +1499,70 @@ async def test_a_hanging_database_costs_one_ceiling_per_cycle_not_one_per_step(
 
     await watchdog.run_cycle()
 
-    # The cycle-top beat wedged and struck the leg: eight enumeration steps
-    # (orders then positions) added no further ceilings.
+    # The cycle-top beat wedged and spent the leg's budget: eight
+    # enumeration steps (orders then positions) added no further ceilings.
     assert len(attempts) == 1
+    assert pushes >= 3  # …and the healthy leg pulsed right through it
     halt = await active_halt(pool)
     assert halt is not None and halt.swept_at is not None  # the sweep still finished
 
-    # A fresh cycle re-arms the leg — the strike is per-cycle, not terminal.
+    # A fresh cycle refills the budget — the strike is per-cycle, not terminal.
     await watchdog.run_cycle()
     assert len(attempts) == 2
+
+
+async def test_a_slow_failing_pulse_leg_strikes_on_the_time_it_burned(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The strike keys on WALL CLOCK, not on how the attempt ended (round-2
+    review of PR #203). The production shape it exists for: an exchange POST
+    that fails slowly after send — a load balancer 502 at 25s, a post-send
+    reset — surfaces as AmbiguousExecutionError, not TimeoutError, and
+    `DeadMansSwitch.maintain` deliberately re-queues an ambiguous push
+    immediately rather than advancing its due time. Keyed on exception type
+    that combination never strikes and taxes every enumeration step of the
+    sweep; keyed on time it strikes after the first attempt."""
+    from epigone.safety import watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.01)
+    attempts = 0
+
+    async def slow_and_ambiguous() -> None:
+        nonlocal attempts
+        attempts += 1
+        await asyncio.sleep(0.05)  # real seconds: under the ceiling, over budget
+        raise AmbiguousExecutionError("504 from the load balancer after send")
+
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=slow_and_ambiguous,
+    )
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(30)  # far past SWEEP_PULSE_INTERVAL: no throttling here
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert attempts == 1  # over budget on its first attempt, then quiet
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None
