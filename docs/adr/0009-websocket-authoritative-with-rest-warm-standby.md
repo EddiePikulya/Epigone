@@ -259,8 +259,11 @@ already discriminates the benign class). This is not a second opinion about the
 rows, it is the lane contradicting them — an anchor still reading long where the
 poller has just read short is the lane's own bookkeeping saying it never saw the
 change its rows appear to account for. A lane that genuinely told the flip
-advanced its anchor in the transaction it published from, so it owes nothing and
-pays nothing.
+advanced its anchor in the transaction it published from, so it owes nothing on
+that flip's account. It can still owe something ELSE on the coin — a later
+scale-in it is coalescing holds the anchor back on purpose — and then a told
+flip is de-vouched and held for a look. That costs one look and never an
+escalation: the coalesce window closes long before the next pass.
 
 Two alternatives were weighed, and are recorded because both look reasonable.
 ORDERING (exit before entry) cannot separate the cases at all: a decomposed flip
@@ -284,6 +287,20 @@ wrongly still. The one path to that is a lane that loses its `ws_lane_state` row
 and silently re-baselines mid-window, and a re-follow prunes both lanes' memory
 together and re-baselines the poller too, so the poller has no flip to diff
 across the gap.
+
+A wider one is neither closed nor made worse here, and is written down because
+this fix walks past it. **The vouch never asks whether the rows are from the
+current ownership era.** For roughly one lookback after production moves to the
+poller, pre-transfer AUTHORITATIVE websocket rows are still in the window, while
+the websocket — healthy, merely not producing — keeps observing and advancing
+its anchor, so it owes nothing and the anchor test passes. A change the poller
+diffs in that window can therefore be vouched by rows describing an earlier one
+and produced by neither lane. It is the substitution above with the ownership
+transfer supplying the staleness instead of a deaf subscription, it reaches the
+one-legged kinds as well as `flip`, and it predates both #196 and #208. The
+straddle grace that makes the window wide (`RECONCILE_GRACE`) is deliberate and
+load-bearing, so narrowing it is not the answer; era-tagging the vouch would be.
+Not attempted here — it belongs to its own change, with its own tests.
 
 **This is the disposition of the comparison's third condition** ("flip-boundary
 kind normalization so the two producers' vocabularies match during any ownership
