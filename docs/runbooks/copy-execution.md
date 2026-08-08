@@ -347,6 +347,15 @@ yours. If the book cannot be read (or the executor is halted), the disable
 waits for the next cycle rather than leaving an order behind a mapping nothing
 watches; the sub stays wound down meanwhile, refusing every entry.
 
+**A disable that keeps failing tells you, once.** Most deferrals clear on the
+next cycle and you never hear about them. One does not: a resting bracket on a
+coin the venue has DELISTED cannot be cancelled by order id, so the mapping
+would sit enabled-but-wound-down with a live order behind it indefinitely. The
+first cycle that hits any deferral writes a `copy_budget_disable_deferred`
+audit row and sends one chat line naming the reason — once per reason, not once
+per cycle. If it does not clear: `/uncopy` the leader and cancel what is
+resting in that sub from the master wallet.
+
 **It is a TRIGGER, NOT A FLOOR.** After the breach, whatever is still open
 rides until the Leader exits it or a bracket fires, so the realised loss can
 end up past the number — sometimes well past, if the last position is a large

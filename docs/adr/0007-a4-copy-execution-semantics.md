@@ -886,6 +886,17 @@ cancel is a SIGNATURE, which puts the terminal step below the halt gate rather
 than beside the measurement: a halted or unreadable cycle defers the disable
 and the mapping stays wound down, refusing entries, until the next one.
 
+**A deferred disable is reported, once per reason.** Most deferrals resolve on
+the next cycle and deserve no word; one does not — a resting bracket on a
+DELISTED coin cannot be cancelled by order id, and leaves the mapping
+enabled-but-wound-down with a live order behind it indefinitely. That is a
+silent unbounded state, which this repo does not leave untracked, so the first
+cycle to hit any deferral writes `copy_budget_disable_deferred` and one chat
+line. Once per REASON rather than once per cycle, because the loop runs in
+seconds; it fires again if the reason changes, and a restart re-says it once.
+Not a pager case, like everything else here: the sub is flat, it refuses every
+entry, and the stray is a reduce-only trigger with no position under it.
+
 **Chat only, never the pager.** The pager action tuple is unchanged. A page
 means something is BROKEN, and a budget doing what it was set to do is not
 that. Breach and disable audit rows are written in the executor's transaction,

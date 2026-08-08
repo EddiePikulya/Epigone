@@ -1756,12 +1756,23 @@ async def test_a_disable_waits_rather_than_leaving_a_bracket_behind(
     gateway.set_account_value(SUB, Decimal("400"))
     gateway.open_orders_errors[SUB] = GatewayError("order book unreachable")
 
-    await h.executor.run_cycle()
+    for _ in range(3):
+        await h.executor.run_cycle()
+        clock.advance(seconds=5)
 
     judged = await h.sub(sub.id)
     assert judged.enabled is True  # not disabled around an order it cannot see
     assert judged.winding_down is True  # and still refusing new risk meanwhile
     assert h.cancelled() == []
+    # A deferral has no natural end, so it leaves a trace — ONCE per reason,
+    # because the executor loops in seconds and a sub wedged on a delisted
+    # coin's trigger would otherwise write a row every few seconds forever.
+    actions = [action for action, _ in await h.audit_actions()]
+    assert actions.count("copy_budget_disable_deferred") == 1
+    stuck = [body for body in await h.notices() if "could NOT be closed out" in body]
+    assert len(stuck) == 1
+    assert "order book could not be read" in stuck[0]
+    assert "/uncopy" in stuck[0]  # what to do if it never clears
 
     gateway.open_orders_errors.pop(SUB)
     gateway.set_open_orders(SUB, [open_order("ETH", 555)])
@@ -1770,6 +1781,55 @@ async def test_a_disable_waits_rather_than_leaving_a_bracket_behind(
 
     assert h.cancelled() == [555]
     assert (await h.sub(sub.id)).enabled is False
+
+
+async def test_a_delisted_coins_stray_trigger_says_so_rather_than_wedging_quietly(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The one deferral that does not resolve itself: a resting bracket on a
+    coin the venue no longer lists cannot be cancelled by oid, so the mapping
+    would sit enabled-but-wound-down with a live order behind it indefinitely.
+    Every other deferral clears on the next cycle and would never be worth a
+    word; this one is why any of them are reported at all."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(
+        pool,
+        clock,
+        mode="bracket",
+        take_profit_pct="10",
+        stop_loss_pct="5",
+        loss_budget="500",
+        baseline="1000",
+    )
+    episode = await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="GONE",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    await ep.record_bracket(
+        pool, episode_id=episode.id, order_id=777, tpsl="sl", placed_at=clock.now()
+    )
+    await ep.end_episode(pool, episode.id, reason=ep.ENDED_LEADER_CLOSE, ended_at=clock.now())
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("400"))
+    gateway.set_open_orders(SUB, [open_order("GONE", 777)])  # no asset id anywhere
+
+    await h.executor.run_cycle()
+
+    assert h.cancelled() == []
+    assert (await h.sub(sub.id)).enabled is True
+    reason = next(
+        decision
+        for action, decision in await h.audit_actions()
+        if action == "copy_budget_disable_deferred"
+    )
+    assert "GONE has no asset id" in reason
+    assert any("could NOT be closed out" in body for body in await h.notices())
 
 
 async def test_a_halt_defers_the_disable_rather_than_signing_a_cancel(

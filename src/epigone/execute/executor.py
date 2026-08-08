@@ -319,6 +319,11 @@ class CopyExecutor:
         # and flushes it inside one cycle — nothing survives across cycles,
         # because "this many at once" is the only question it answers.
         self._skips = SkipDigest()
+        # Wound-down subs whose disable could not complete, and the reason last
+        # reported for each (issue #181). In memory, like `_flagged` and for the
+        # same reason: it answers "have I already said this", and a restart
+        # saying it once more is the safe direction.
+        self._deferred_disables: dict[int, str] = {}
 
     # --- the cycle ------------------------------------------------------------
 
@@ -1074,8 +1079,13 @@ class CopyExecutor:
         assert sub.budget_breached_at is not None  # `winding_down` is exactly that
         if state.positions or await ep.live_episodes(self._pool, sub.id):
             return sub
-        if not await self._cancel_stray_brackets(sub, now):
+        deferred = await self._cancel_stray_brackets(sub, now)
+        if deferred is not None:
+            await self._report_deferred_disable(sub, deferred, now)
             return sub
+        # Cleared: the next time this sub wedges, the operator hears about it
+        # afresh rather than being silenced by a reason that no longer holds.
+        self._deferred_disables.pop(sub.id, None)
         loss = sub.budget_spent_usd or Decimal(0)
         async with self._pool.acquire() as conn, conn.transaction():
             # Conditional on the sub still being enabled and still carrying THIS
@@ -1103,10 +1113,10 @@ class CopyExecutor:
             )
         return replace(sub, enabled=False)
 
-    async def _cancel_stray_brackets(self, sub: CopySub, now: datetime) -> bool:
-        """Take this sub's own resting triggers off the book. Returns whether
-        the book is now known to be clear of them — False means "could not
-        tell, or could not act", and the caller defers the disable.
+    async def _cancel_stray_brackets(self, sub: CopySub, now: datetime) -> str | None:
+        """Take this sub's own resting triggers off the book. Returns None when
+        the book is now known to be clear of them, or the SENTENCE saying why
+        it could not be — which the caller reports and then defers the disable.
 
         OURS ONLY, intersected against the bracket ids Epigone recorded for
         this sub. Cancelling everything resting would be simpler and would
@@ -1121,7 +1131,7 @@ class CopyExecutor:
         meanwhile, refusing every entry."""
         known = await ep.sub_bracket_orders(self._pool, sub.id)
         if not known:
-            return True
+            return None
         try:
             resting = [order for order in await self._open_orders(sub) if order.order_id in known]
         except Exception:
@@ -1130,29 +1140,34 @@ class CopyExecutor:
                 sub.sub_name,
                 exc_info=True,
             )
-            return False
+            return "this sub's order book could not be read"
         if not resting:
-            return True
+            return None
         specs: list[CancelSpec] = []
         for order in resting:
             spec = await self._spec(order.coin)
             if spec is None:
                 # The one order shape that cannot be cancelled by oid is one
                 # whose coin has no asset id. Defer rather than disable around
-                # it: this is the stray the whole step exists for.
+                # it: this is the stray the whole step exists for — and it is
+                # the one deferral that does NOT resolve itself, which is why
+                # the caller has to say so out loud.
                 log.warning(
                     "copy executor: %s has no asset id; deferring %s's budget disable",
                     order.coin,
                     sub.sub_name,
                 )
-                return False
+                return (
+                    f"{order.coin} has no asset id in the universe — a delisted coin's "
+                    f"resting bracket cannot be cancelled by this executor"
+                )
             specs.append(CancelSpec(asset=spec.asset_id, oid=order.order_id))
         if await is_halted(self._pool):
             log.warning(
                 "copy executor: halted before clearing %s's brackets — disable deferred",
                 sub.sub_name,
             )
-            return False
+            return "execution is halted, and a cancel is a signature"
         self._exec.decision = (
             f"loss budget spent and the sub is flat: cancelling {len(specs)} resting "
             f"bracket leg(s) before disabling the mapping"
@@ -1163,7 +1178,7 @@ class CopyExecutor:
             # Already on the trail via the audited gateway. The mapping stays
             # enabled and wound down; the next cycle tries again.
             log.exception("copy executor: could not clear %s's brackets", sub.sub_name)
-            return False
+            return "the cancel did not reach the exchange"
         await self._notify(
             kind=ACTION,
             body=(
@@ -1172,7 +1187,60 @@ class CopyExecutor:
             ),
             now=now,
         )
-        return True
+        return None
+
+    async def _report_deferred_disable(
+        self, sub: CopySub, reason: str, now: datetime
+    ) -> None:
+        """A wound-down sub that should have been disabled and could not be.
+
+        SAID ONCE PER REASON, not once per cycle: the executor loops in
+        seconds, and a sub wedged on a delisted coin's stray trigger would
+        otherwise write a row and a chat line every few seconds for as long as
+        it took anyone to notice. Once per reason still fires again when the
+        reason CHANGES — an unreadable book that becomes a missing asset id is
+        a different problem — and a restart re-says it once, which is the right
+        side of that trade for a state whose whole failing is being quiet.
+
+        IT NEEDS A TRACE AT ALL because the deferral has no natural end. Most
+        of these resolve themselves on the next cycle (a blipped read, a halt
+        the operator lifts) and would never be worth a word; a delisted coin's
+        resting trigger does not, and leaves the mapping enabled-but-wound-down
+        with a live order behind it indefinitely. `/copies` shows the sub as
+        winding down either way — what only this can say is that it was
+        SUPPOSED to be finished and is stuck.
+
+        NOT A PAGER CASE, like everything else this feature does: the sub is
+        flat, it refuses every entry, and the stray is a reduce-only trigger
+        with no position under it. It wants a human eventually, not now."""
+        if self._deferred_disables.get(sub.id) == reason:
+            return
+        self._deferred_disables[sub.id] = reason
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._audit.record_event(
+                actor=EXECUTOR_ACTOR,
+                action="copy_budget_disable_deferred",
+                risk_decision=(
+                    f"loss budget spent and the sub is flat, but the mapping was NOT "
+                    f"disabled: {reason}"
+                ),
+                detail={"sub_id": sub.id, "leader": sub.leader_address, "reason": reason},
+                master_address=self._master,
+                conn=conn,
+            )
+            await notify(
+                conn,
+                operator_id=self._operator_id,
+                kind=SKIP,
+                body=(
+                    f"⏳ {_short(sub.leader_address)}'s copy is spent and flat but could "
+                    f"NOT be closed out: {reason}.\n"
+                    f"It stays wound down — no new positions, exits still copied — and the "
+                    f"executor retries every cycle. If this does not clear, /uncopy it and "
+                    f"cancel what is resting in that sub from the master wallet."
+                ),
+                now=now,
+            )
 
     async def _loss_budget_event(
         self,
