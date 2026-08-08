@@ -548,13 +548,15 @@ async def _reconcile(
     LATENCY difference resolves itself on the next look, a THRESHOLD difference
     never resolves and never should.
 
-    **Direction, not kind or size.** The lanes legitimately describe the same
-    reality with different kinds — a burst of fills the poller sees as one
-    scale-in, a flip one lane decomposes and the other does not (both measured
-    on the shadow dataset) — so comparing kinds would escalate on lanes that
-    agree. Comparing the COIN alone goes wrong the other way: an entry the
-    websocket did produce would vouch for an exit it did not, and an exit
-    nobody produces is a copy position that never closes.
+    **Direction, not kind or size — and every direction the change moves.** The
+    lanes legitimately describe the same reality with different kinds — a burst
+    of fills the poller sees as one scale-in, a flip one lane decomposes and the
+    other does not (both measured on the shadow dataset) — so comparing kinds
+    would escalate on lanes that agree. Comparing the COIN alone goes wrong the
+    other way: an entry the websocket did produce would vouch for an exit it did
+    not, and an exit nobody produces is a copy position that never closes. A
+    flip moves BOTH directions and so needs both of them vouched (issue #196),
+    or the same substitution creeps back in through the flip's exit leg.
 
     The lookback reaches `RECONCILE_GRACE_SECONDS` before the poll a change is
     measured from, because the websocket can also see a change slightly BEFORE
@@ -613,7 +615,7 @@ async def _reconcile(
             event.coin
             for event in unvouched
             if event.coin not in owed
-            and _vouched_for(event, ws_rows.observed, lookback(event.coin))
+            and _left_a_row(event, ws_rows.observed, lookback(event.coin))
         }
         unvouched = [event for event in unvouched if event.coin in missed | stranded]
         doubted = missed | stranded
@@ -704,9 +706,10 @@ async def _still_owed(
 
 
 # Which way a change moves the position. `flip` is both legs at once (ADR-0006
-# keeps it one event), so it vouches for — and is vouched for by — either
-# direction; that is what absorbs the two lanes' different flip decompositions
-# without letting an entry stand in for a missing exit.
+# keeps it one event), so it MOVES both directions: a websocket flip vouches for
+# a poll-side entry or exit, and a poll-side flip needs both of them back. That
+# is what absorbs the two lanes' different flip decompositions without letting
+# an entry stand in for a missing exit.
 ENTRY = "entry"
 EXIT = "exit"
 _DIRECTIONS = {
@@ -718,25 +721,64 @@ _DIRECTIONS = {
 }
 
 
-def _vouched_for(
+def _legs_covered(
     event: PositionEvent,
     covered: dict[tuple[str, str], datetime],
     no_earlier_than: datetime,
-) -> bool:
-    """Whether the websocket already wrote something on this coin moving the
-    same way, inside this coin's lookback — see `_reconcile` for why direction
-    is the comparison, and why the lookback is per coin rather than per pass
-    (#200).
+) -> frozenset[str]:
+    """Which of the directions this change moves the websocket wrote a row for
+    on this coin, inside this coin's lookback — see `_reconcile` for why
+    direction is the comparison, and why the lookback is per coin rather than
+    per pass (#200).
 
     `covered` holds the LATEST such row per (coin, direction), which answers
     "is there one at or after this instant?" for every cutoff at once — the
     rows are fetched from the earliest cutoff any coin needs, and each coin
     then applies its own."""
-    return any(
-        (latest := covered.get((event.coin, direction))) is not None
-        and latest >= no_earlier_than
+    return frozenset(
+        direction
         for direction in _DIRECTIONS[event.kind]
+        if (latest := covered.get((event.coin, direction))) is not None
+        and latest >= no_earlier_than
     )
+
+
+def _vouched_for(
+    event: PositionEvent,
+    produced: dict[tuple[str, str], datetime],
+    no_earlier_than: datetime,
+) -> bool:
+    """Whether the websocket already told this change — EVERY direction it
+    moves, not merely one of them (issue #196).
+
+    For the four one-legged kinds that is the same question asked once. For a
+    flip it is the whole point: a flip contains an exit, so an entry the lane
+    did produce must not stand in for it. The lane that produced a `scale_in`
+    on BTC at T and then went silently deaf on that subscription would
+    otherwise have that entry vouch for the Leader's later long→short flip —
+    the flip is shadow-recorded, the poll anchor advances past it, nobody ever
+    produces it, and the copy sits on the WRONG SIDE of the Leader until some
+    later change escalates. Late is survivable; reversed is not.
+
+    A lane that legitimately decomposes a flip into two events pays nothing for
+    this: it emits both legs within its ~5s push cadence, so by the time the
+    hold's second look comes round both directions are on the table."""
+    return _legs_covered(event, produced, no_earlier_than) == _DIRECTIONS[event.kind]
+
+
+def _left_a_row(
+    event: PositionEvent,
+    observed: dict[tuple[str, str], datetime],
+    no_earlier_than: datetime,
+) -> bool:
+    """Whether the websocket wrote a row moving ANY of this change's directions
+    — the fingerprint of a change stranded by an ownership transfer.
+
+    Deliberately the opposite quantifier to `_vouched_for`, because it is the
+    opposite question. There, a row is a reason to stay SILENT and only a
+    complete account earns silence. Here, a row is evidence the lane saw
+    something nobody produced, and half a flip is still evidence."""
+    return bool(_legs_covered(event, observed, no_earlier_than))
 
 
 async def _remember_doubt(conn: asyncpg.Connection, address: str, coins: set[str]) -> None:

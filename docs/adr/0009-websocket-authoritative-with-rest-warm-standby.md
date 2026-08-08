@@ -225,6 +225,19 @@ not, and an exit nobody produces is a copy position that never closes. `flip`
 counts as both directions, which is exactly what absorbs the two lanes'
 different flip decompositions.
 
+**Every direction the change moves, not merely one of them** (issue #196). A
+`flip` counting as both directions was first read as "either will do", and that
+left the coin-alone hole open through the one kind that spans both: an entry the
+lane did produce answering for the exit inside a flip the lane missed. It is the
+only known interleaving that leaves a copy on the WRONG SIDE of its Leader
+rather than merely late, so the vouch has to be a complete account — a poll-side
+flip is told only when both directions are. A lane that decomposes flips pays
+nothing for it: it emits both legs inside its ~5s push cadence, well within the
+one-look hold that every doubt serves anyway. The **stranded** question takes the
+opposite quantifier deliberately, because it is the opposite question: there a
+row earns silence and only a complete account should; here a row is evidence the
+lane saw a change nobody produced, and half a flip is still evidence.
+
 **This is the disposition of the comparison's third condition** ("flip-boundary
 kind normalization so the two producers' vocabularies match during any ownership
 transfer"). The vocabularies already match — both lanes call the same
