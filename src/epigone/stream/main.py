@@ -140,8 +140,16 @@ async def run_position_cycle(
         # poller stops trusting the standby cadence and looks again on the next
         # tick: whatever the answer turns out to be — the lane was simply a few
         # seconds behind, or it genuinely missed something — knowing it 10s from
-        # now beats knowing it a minute from now, and the extra pass costs one
-        # wallet's weight.
+        # now beats knowing it a minute from now.
+        #
+        # The extra look is a WHOLE pass, not the one doubted wallet: clearing
+        # `last_pass_at` re-runs the cadence decision, and the pass has no notion
+        # of a partial poll set. So a single held coin costs one full pass's
+        # weight (the poll set × POSITIONS_WEIGHT × POSITION_VENUES), spent at
+        # the escalated cadence until the doubt resolves. At the poll-set sizes
+        # this deployment has that is affordable and the latency is worth it; a
+        # much larger poll set would want a re-look narrowed to the wallets that
+        # deferred.
         state.last_pass_at = None
     if result.drifted:
         log.error(

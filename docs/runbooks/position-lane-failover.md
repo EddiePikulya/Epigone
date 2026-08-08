@@ -19,20 +19,60 @@ finer view of scale-ins, and — because the poller is back at 10s — the share
 the REST weight budget that had been going to ingest, so fine metrics refresh
 more slowly.
 
+## What the HEALTHY state costs (read this once, before an incident)
+
+Everything the poll pass reads is REST-derived, and after the cutover the poll
+pass runs at 60s rather than 10s. The websocket carries position events, so
+alert latency improves — but the figures that ride on the POLL pass rather than
+on the stream got six times staler, and this is the only place that is written
+down:
+
+| Figure | Pre-cutover | Standby (normal, post-cutover) |
+| --- | --- | --- |
+| Withdrawal detection latency | up to 10s | up to 60s |
+| The unwatched round-trip window in withdrawal attribution | 60s | 360s (`withdrawals.py`) |
+| `trader_equity` freshness — what the Leader liveness gate (#184, #193) reads | up to 10s | up to 60s |
+
+None of these is a defect at the poll-set sizes this deployment runs, and all
+three are the price of the budget dividend the cutover was taken for. They
+matter in two concrete places:
+
+- **A liveness decision can act on a figure a minute old.** A wallet that
+  crossed the floor 45 seconds ago still reads as above it. Point-in-time was
+  always the contract; the window is simply wider now.
+- **A wider unwatched window makes a leveraged round trip that opens and closes
+  entirely inside it read as an outflow.** The 25% AND $1,000 thresholds are
+  what keep that rare, and the alert is a notification rather than an action.
+
+One more, on the failover itself: the first pass after a transfer can see an
+observation gap of ~60s, and the withdrawal staleness gate is measured in the
+cadence in force at that moment (6 × the escalated 10s). So exactly one pass
+after a failover can skip withdrawal judgement entirely. Safe direction — a
+withdrawal is missed, never invented — and the next pass judges normally.
+
 ## Read the reason
 
 ```sql
 SELECT owner, since, reason, healthy_since FROM lane_authority;
 ```
 
-The `reason` is the diagnosis and there are only three shapes:
+The `reason` is the diagnosis. Every reason the code can write has one of the
+shapes below — deliberately not counted here, because the list has grown twice
+and a number in this sentence goes stale silently:
 
 | Reason | What it means |
 | --- | --- |
 | `websocket heartbeat stale (…s > 45s)` | The lane stopped receiving market data, or the process is gone. The ordinary case. |
+| `websocket lane has never beaten its heartbeat` | Same class, at the other end: the ws service has not started, or has never got as far as its first beat. Check it is running at all. |
 | `reconciliation drift: 0x… COIN never arrived on the websocket` | **The important one.** The lane was connected and delivering, and a change still never reached it. This is the failure mode nothing else detects — see below. |
 | `reconciliation drift: 0x… COIN was seen by the websocket while the poller owned production …` | A change caught mid-handover and produced by neither lane, which the poller has now produced. Expected occasionally around deploys; not a lane fault. |
+| `the poll set is N wallets and one IP may stream 15` | The poll set outgrew what one source IP can subscribe (ADR-0008). Not a lane fault and it will not clear on its own — either the poll set has to come back under the cap or the deployment needs more source IPs (#29). Ownership stays with the poller until then. |
 | `websocket authority disabled by configuration` | Somebody set `WS_AUTHORITATIVE=0`. Not an incident; the monitor does not alert on it. |
+| `pre-cutover: the REST poll pass has always owned production` | The row as migration 0037 seeded it: the websocket has never been promoted on this deployment. Normal for the first ~5 minutes after a fresh deploy, and not an incident — the monitor stays quiet about it. Still standing an hour later means handback is blocked; read `healthy_since` and the ws logs. |
+
+One drift incident can carry BOTH diagnoses at once, joined by `; ` — a pass
+that confirmed a missed coin and a stranded coin on the same wallet in the same
+look. Read each half against its own row above.
 
 ## If it is a stale heartbeat
 

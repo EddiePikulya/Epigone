@@ -31,7 +31,7 @@ import asyncpg
 from epigone.bot.alerts import MAX_DELIVERY_ATTEMPTS
 from epigone.clock import Clock
 from epigone.ingest.fine import count_due_traders
-from epigone.lane_authority import DISABLED_REASON, WS_OWNER
+from epigone.lane_authority import DISABLED_REASON, PRE_CUTOVER_REASON, WS_OWNER
 from epigone.metrics.library import format_duration
 
 # Machine names, stable across a check's lifetime so the alerting state machine
@@ -676,11 +676,20 @@ def _position_lane_check(snapshot: HealthSnapshot) -> CheckResult:
     is a WARNING rather than a page. What it must not do is pass silently: a
     system quietly running on its fallback is a system with no fallback left.
 
-    Two states are deliberately NOT incidents: the operator having switched the
-    cutover off (a decision, not a failure), and no authority recorded at all
-    (pre-cutover, where the poller owning production is what has always been
-    true). Paging about states someone chose is how a monitor teaches people to
-    ignore it."""
+    Three states are deliberately NOT incidents, and they share one shape: the
+    poller owns production for a reason that is not a failure.
+
+    - the operator having switched the cutover off — a decision;
+    - the row migration 0037 SEEDED (`PRE_CUTOVER_REASON`) — a lane that has not
+      been promoted yet rather than one that lost the job. It stands from the
+      deploy until the first handback (five minutes of health plus a full
+      re-anchor, #158), and warning for that whole window about a state nobody
+      chose is exactly how a monitor teaches people to ignore it;
+    - no authority row at all, which migration 0037 makes unreachable but the
+      absence-is-never-permission contract (`_UNRECORDED`) still answers for.
+
+    Paging about states someone chose is how a monitor teaches people to ignore
+    it."""
     owner = snapshot.position_lane_owner
     reason = snapshot.position_lane_reason
     if owner is None or owner == WS_OWNER:
@@ -698,6 +707,14 @@ def _position_lane_check(snapshot: HealthSnapshot) -> CheckResult:
             ok=True,
             severity=WARNING,
             detail="Websocket authority switched off by the operator",
+        )
+    if reason == PRE_CUTOVER_REASON:
+        return CheckResult(
+            POSITION_LANE,
+            "Position lane",
+            ok=True,
+            severity=WARNING,
+            detail="Websocket has not taken position events over yet (pre-cutover)",
         )
     return CheckResult(
         POSITION_LANE,

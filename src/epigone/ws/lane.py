@@ -646,7 +646,17 @@ def _coalesce_entries(
     A coin whose held scale falls back below the significance threshold ends up
     a silent update: the anchor advances, the window closes, and nothing is
     emitted. That is the correct reading — the Trader added and removed, and
-    the position ended where it started."""
+    the position ended where it started.
+
+    **A close that lands mid-burst carries the PRE-burst size**, and that is
+    left alone deliberately (issue #198). The exit is diffed from the frozen
+    anchor like everything else on that coin, so its `size_usd` describes the
+    position as it stood when the burst began rather than as it stood the
+    instant before it closed. Nothing acts on that number: the copy path exits
+    by the size the exchange reports it is holding, never by the event's, and
+    the alert layer's min-size floor is a coarse filter where the difference is
+    one burst of scale-ins wide. Advancing the anchor to make the figure exact
+    would mean emitting the entry the debounce exists to withhold."""
     kept: list[CoinChange] = []
     held: set[str] = set()
     for change in changes:

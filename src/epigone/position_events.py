@@ -120,7 +120,7 @@ async def record_events(
     observed_at: datetime,
     *,
     source: str = POLL_SOURCE,
-    authoritative: bool = True,
+    authoritative: bool,
 ) -> None:
     """Persist one Trader's events **inside the caller's open transaction**.
 
@@ -134,6 +134,12 @@ async def record_events(
     survives the cutover instead of ending at it. Producers do not decide this
     for themselves: `epigone.position_publish.publish` reads it off the
     authority row under a lock, and is the seam both lanes write through.
+
+    It has no default, deliberately (issue #199). Every value it could default
+    to is a wrong answer for some caller, and the wrong answer in the TRUE
+    direction is the dangerous one: rows the copy executor drains. A caller that
+    has not thought about ownership must be made to, and the type checker is
+    where that happens.
 
     Retention is applied here, in the pass that wrote, rather than by a sweeper
     — the `record_rate_limit` precedent (`epigone.budget` prunes stale
