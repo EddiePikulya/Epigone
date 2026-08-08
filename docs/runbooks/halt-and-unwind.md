@@ -261,6 +261,65 @@ withheld. So a halt alert that keeps saying "sweep PENDING" for more than a
 cycle or two means either orders that won't die or degraded coverage; the
 watchdog log says which axis.
 
+**A sweep takes MINUTES, and that is not a wedge (issue #201).** Coverage on
+two axes means one enumeration per (account, dex) pair at 20 weight each,
+paced through the 900/min bucket shared with the stream and ingest — eleven
+accounts across four venues is 44 enumerations, 880 weight per pass, and the
+sweep does up to two passes (cancel, then a fresh verify) for ~1760 weight
+all told plus the scope and asset-id reads. Two to ten minutes of wall
+clock inside a single watchdog cycle is normal. What that used to look like
+from outside was indistinguishable from a hang, so the sweep now says what
+it is doing:
+
+- `sweep scope: N venue(s) × M account(s) = K enumeration(s) per pass, ~W
+  weight (~Ts …)` — logged before the grind starts. That `~Ts` is the ETA;
+  if the wall clock passes it by a wide margin, something else is wrong.
+- `sweep progress: <phase> i/K — <address> on <dex>: n resting order(s)` —
+  one line per enumeration, for both the cancel pass and the verify pass,
+  plus a line per account whose orders were actually cancelled and one per
+  position-snapshot read.
+- the watchdog's `process_heartbeats` row keeps beating THROUGHOUT (every
+  few seconds), so the #52 monitor no longer reads a sweeping watchdog as a
+  dead one, and the dead-man's `scheduleCancel` schedule is pushed forward
+  from inside the same loop rather than being allowed to fire mid-halt.
+
+So: heartbeat fresh + progress lines advancing = working, wait. Heartbeat
+fresh + progress lines stopped = stuck on one REST call or on budget
+pacing. Heartbeat stale = the process itself is in trouble; that is the
+monitor's watchdog check, and it means what it says again.
+
+Note the monitor's own limit here, unchanged by #201: its staleness
+THRESHOLD is 300s (`HEALTHCHECK_WATCHDOG_STALE_SECONDS`) but it only runs
+every 15 minutes (`HEALTHCHECK_INTERVAL_MINUTES`), so a genuinely dead
+watchdog can go up to a check cadence unreported — long enough for the
+dead-man's 300s schedule to fire first. Tightening the cadence to inside
+one dead-man period is issue #201's sixth candidate and is NOT done;
+until it is, do not treat "the monitor has not paged" as "the watchdog is
+alive" during an incident you are already watching.
+
+A DB-BLIND window is deliberately silent on all of these: that path reaches
+the wire with zero Postgres behind it by construction, so it neither beats
+nor pushes the dead-man until it reconciles. A blind watchdog looks dead to
+the monitor because it cannot reach the database to say otherwise — which
+is the correct reading, and the reason the DB-blind alert exists. A trip
+whose halt row could not be confirmed is the other kind of incident and
+DOES beat through its cancel pass: its liveness reads answered that cycle,
+so the database is healthy.
+
+In every posture, each leg of the pulse — the heartbeat and the dead-man's
+push — runs on its own small per-cycle TIME budget: a leg whose attempts add
+up past it goes quiet for the rest of that cycle and is retried by the next
+one, because reaching the wire outranks saying so. The budget is spent on
+measured wall clock, not on how an attempt failed, so a leg that is merely
+SLOW (a wedged database, an endpoint that 502s after twenty seconds) stops
+taxing the sweep, while a leg that fails FAST keeps trying — a refused
+connection or a single 429 costs the sweep nothing and must not silence a
+signal for the whole grind. The two legs never gate each other: a dead
+database still lets the schedule be pushed, a wedged exchange still lets the
+heartbeat beat. So `sweep progress` lines advancing with a heartbeat that
+has stopped means the heartbeat's own leg is down — a wedged or failing
+database — not that the watchdog died.
+
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are
 resting orders, so a halt CANCELS a bracket-mode sub's stops. The executor

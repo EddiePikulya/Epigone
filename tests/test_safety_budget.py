@@ -7,6 +7,7 @@ import asyncpg
 from epigone.budget import SharedWeightBudget
 from epigone.safety.budget import FallbackBudget
 from tests.support.clock import FakeClock
+from tests.test_shared_budget import _seed_bucket
 
 
 async def test_spend_survives_a_dead_shared_bucket(
@@ -66,3 +67,33 @@ async def test_incident_mode_never_touches_the_shared_bucket(clock: FakeClock) -
     budget.incident_mode = False
     await budget.spend(20)  # attempted, failed, degraded — the normal shape
     assert primary.calls == 1
+
+
+async def test_the_safety_lane_outranks_ingest_at_the_shared_bucket(
+    pool: asyncpg.Pool, clock: FakeClock
+) -> None:
+    """Issue #201 deliverable 3, pinned at the seam: the kill path spends at
+    the EXECUTION lane's priority — reserve 0, the floor every other spender
+    leaves untouched (issue #133) — so a sweep never queues behind ingest's
+    backfill for tokens. With the bucket drained to exactly the execution
+    floor the sweep's enumeration is granted instantly while ingest, which
+    must leave both floors intact, waits out a refill."""
+    from epigone.budget import (
+        EXECUTION_RESERVE_WEIGHT,
+        SHARED_WEIGHT_PER_MINUTE,
+        STREAM_RESERVE_WEIGHT,
+    )
+    from epigone.safety.budget import safety_budget
+    from epigone.safety.watchdog import ORDERS_WEIGHT
+
+    await _seed_bucket(pool, clock.now(), available=EXECUTION_RESERVE_WEIGHT)
+    safety = safety_budget(pool, clock)
+    ingest = SharedWeightBudget(
+        pool, clock, reserve=EXECUTION_RESERVE_WEIGHT + STREAM_RESERVE_WEIGHT
+    )
+
+    await safety.spend(ORDERS_WEIGHT)  # one sweep enumeration
+    assert clock.slept == []  # granted without waiting on anyone
+
+    await ingest.spend(20)
+    assert sum(clock.slept) >= STREAM_RESERVE_WEIGHT / (SHARED_WEIGHT_PER_MINUTE / 60)
