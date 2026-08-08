@@ -195,6 +195,19 @@ Progress is also LOGGED per (account, dex), so a long sweep is legible in
 the container logs while it runs — "sweeping, 60% done" was previously
 indistinguishable from "wedged", `swept_at` being the only signal and
 landing only at the very end.
+
+AND ONE SIGNAL LEAVES THE FAILURE DOMAIN ENTIRELY (issue #213). Everything
+above is a liveness signal written to Postgres and read by a monitor process
+on the same host — so the likeliest single cause of a dead watchdog, that
+host or its database going away, is also what stops anyone being told. The
+pulse therefore carries a THIRD leg, `_say_alive`, which pings an external
+dead-man service (epigone.safety.ping) that pages the operator from its own
+infrastructure when the pings stop. It is unlike the other two in every way
+that matters: synchronous and self-throttled, so it cannot cost the kill path
+time; ungated by `_pulse_allowed`, because the posture that silences the
+in-band legs is precisely when an outside observer most needs to know this
+process is alive; and OPTIONAL, because the URL is operator-provided and a
+watchdog without one runs exactly as it did before.
 """
 
 import asyncio
@@ -553,6 +566,19 @@ Keepalive = Callable[[], Awaitable[None]]
 # caller — the tests that pulse something trivially observable included —
 # passing a plain function rather than an object satisfying a protocol.
 KeepaliveDeadline = Callable[[], datetime | None]
+# The OUT-OF-BAND liveness signal (issue #213): "this process's cycle loop is
+# still turning", said to something that is not us. One implementation in
+# production — `ExternalPing.ping`, wired in safety/main.py — kept as a
+# callable seam so the watchdog does not have to know about HTTP, and
+# OPTIONAL because the URL is operator-provided and unset is a supported
+# configuration.
+#
+# SYNCHRONOUS, and that is the contract rather than an implementation detail:
+# this is called from the kill path, including from inside a sweep that is
+# cancelling a real book, and a signature with no await is a signature that
+# cannot stall it. Everything about rate, timeouts and failure belongs behind
+# it — the watchdog's job is only to say so, as often as it likes.
+Alive = Callable[[], None]
 
 # `Watchdog._safety_read` as a value, so a collaborator can be handed the
 # seam without being handed the watchdog (`_PulsedUniverseReads`). Generic in
@@ -618,6 +644,7 @@ class Watchdog:
         capability_interval: timedelta,
         keepalive: Keepalive | None = None,
         keepalive_deadline: KeepaliveDeadline | None = None,
+        alive: Alive | None = None,
     ) -> None:
         self._pool = pool
         self._clock = clock
@@ -637,6 +664,7 @@ class Watchdog:
         # deadline that is on that same clock — the leg budgets' monotonic
         # seconds measure something else, what an attempt COST.
         self._priority_pushed_at: datetime | None = None
+        self._alive = alive
         # When this process last emitted a liveness pulse (issue #201) —
         # the cycle-top beat counts, so a short cycle adds no extra writes —
         # and, per leg, how much wall clock it has spent since the budgets
@@ -673,6 +701,11 @@ class Watchdog:
 
     async def run_cycle(self) -> None:
         now = self._clock.now()
+        # BEFORE the incident branch, deliberately (issue #213): the
+        # out-of-band signal is the only one that survives a database this
+        # cycle may be about to declare unreachable, so it is emitted where
+        # no posture can gate it and no Postgres touch precedes it.
+        self._say_alive()
         # Each cycle refills both pulse-leg budgets (issue #201, `_pulse`):
         # a leg that wedged during the last one gets a fresh one here, so
         # the strike is never a permanent give-up. A long sweep refills them
@@ -729,6 +762,35 @@ class Watchdog:
             log.exception("capability probe failed; retrying next cycle")
 
     # --- liveness (issue #201) ---
+
+    def _say_alive(self) -> None:
+        """Emit the OUT-OF-BAND liveness signal (issue #213), if one is
+        configured. Called from the two places the other pulse legs are —
+        every cycle top and every enumeration step — but ungated by
+        `_pulse_allowed`, and that difference is the whole point.
+
+        The two in-band legs are gated because both WRITE TO POSTGRES, and a
+        watchdog blind because the database is unreachable cannot truthfully
+        beat to that database. This leg writes to something else entirely, so
+        the posture that silences them is exactly the posture in which it is
+        most worth having: a DB-blind incident is a watchdog cancelling a real
+        book with every in-band signal it has deliberately switched off, and
+        before this it looked identical, from outside, to a dead one.
+
+        Which fixes the shape of the page rather than only its existence. A
+        Postgres outage now reads as "watchdog alive, monitor says DB-down"
+        instead of as external silence the operator would have to interpret;
+        the corollary, stated plainly in the runbook because it is the honest
+        half, is that this signal alone can never page for a database — a
+        watchdog pinging happily through an outage is telling the truth about
+        itself and nothing at all about the database.
+
+        Never raises, never awaits: `Alive` is sync by contract, and a
+        try/except here would be guarding against an implementation that has
+        already promised not to need it. `ExternalPing.ping` keeps that
+        promise; a seam that broke it would be a bug in the seam."""
+        if self._alive is not None:
+            self._alive()
 
     async def _beat(self, now: datetime) -> float:
         """Say ALIVE, best-effort (round 2 item 1c): losing the liveness
@@ -866,7 +928,16 @@ class Watchdog:
         the step there may be no schedule left to push — for as long as the
         step is the longest thing between two boundaries, which the pacing
         sleep is not. PRIORITY_PUSH_WINDOW_SECONDS states when, what the
-        exemption guarantees, and what it does not close."""
+        exemption guarantees, and what it does not close.
+
+        A THIRD LEG OUTRANKS EVERY GATE, including that one (issue #213): the
+        out-of-band ping is emitted before the posture check, the throttle,
+        the refill and the priority window alike. It is not competing for the
+        sweep's wall clock the way the other two are — it does its own
+        throttling and cannot cost this path time by construction — and it is
+        the one signal that does not go through the database whose silence
+        the gates below are reasoning about (`_say_alive`)."""
+        self._say_alive()
         if not self._pulse_allowed():
             return
         self._refill_leg_budgets()

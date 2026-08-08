@@ -42,6 +42,15 @@ Wiring notes, each load-bearing:
   PRIORITY_PUSH_WINDOW_SECONDS of the armed horizon, one attempt jumps the
   pulse throttle and the leg budget both, because after the next step there
   may be no schedule left to push.
+- THE OUT-OF-BAND PAGE PATH is wired here too (issue #213), and it is the
+  one piece of this process that reports to something outside our own
+  infrastructure: when `WATCHDOG_DEADMAN_PING_URL` names an external
+  dead-man check, `ExternalPing.ping` becomes the watchdog's `alive` seam
+  and the external service pages the operator when the pings stop. Unset is
+  a supported configuration and changes nothing else — but it means the only
+  thing that would notice this process dying is the #52 monitor, which reads
+  the same database on the same host, so the startup log says which of the
+  two we are in at 🚨 volume. Setting it is a mainnet gate.
 - Mainnet is refused by construction in HttpExecutionGateway (the A5 gate);
   this process never passes allow_mainnet.
 """
@@ -66,6 +75,7 @@ from epigone.safety.coldstart import open_startup
 from epigone.safety.config import WatchdogConfig
 from epigone.safety.deadman import DeadMansSwitch
 from epigone.safety.keycache import WatchdogKeyCache
+from epigone.safety.ping import ExternalPing
 from epigone.safety.watchdog import Watchdog
 
 log = logging.getLogger(__name__)
@@ -166,6 +176,27 @@ async def main() -> None:
     audit = ExecutionAudit(pool, clock)
     budget = safety_budget(pool, clock)
     async with aiohttp.ClientSession() as session:
+        # The out-of-band page path (issue #213), or the loud absence of one.
+        # Constructed before anything else that could fail, so the operator
+        # sees which world this process is in in the first lines of its log.
+        ping: ExternalPing | None = None
+        if config.deadman_ping_url is not None:
+            ping = ExternalPing(
+                session,
+                config.deadman_ping_url,
+                interval_seconds=config.deadman_ping_interval.total_seconds(),
+            )
+            log.info(
+                "watchdog: out-of-band dead-man ping ARMED — %s every %ss",
+                ping.target,
+                int(config.deadman_ping_interval.total_seconds()),
+            )
+        else:
+            log.warning(
+                "watchdog: NO out-of-band page path — WATCHDOG_DEADMAN_PING_URL is unset, "
+                "so if this process dies the only thing that would notice is the monitor, "
+                "which reads the same database on the same host (issue #213, a mainnet gate)"
+            )
         read_gateway = HttpHyperliquidGateway(session, clock, info_url=config.info_url)
         exec_gateway = safety_gateway(
             HttpExecutionGateway(
@@ -212,6 +243,9 @@ async def main() -> None:
             # whose own bound would outlive the armed schedule is preceded by
             # one budget-exempt attempt instead of following a lapse.
             keepalive_deadline=deadman.armed_until,
+            # The third pulse leg (issue #213): sync and self-throttled, so
+            # handing it to the kill path costs the kill path nothing.
+            alive=ping.ping if ping is not None else None,
         )
         if startup.cold_start_reason is not None:
             # The incident opens HERE, not after a threshold: the startup
@@ -248,7 +282,12 @@ async def main() -> None:
             int(config.executor_stale.total_seconds()),
             config.exchange_url,
         )
-        await watchdog_loop(watchdog, deadman, clock, config.interval.total_seconds())
+        try:
+            await watchdog_loop(watchdog, deadman, clock, config.interval.total_seconds())
+        finally:
+            # A ping still in flight must not outlive the session it borrows.
+            if ping is not None:
+                await ping.aclose()
 
 
 if __name__ == "__main__":

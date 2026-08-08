@@ -2318,3 +2318,140 @@ async def test_a_wedged_cycle_top_beat_reports_that_it_has_gone_quiet(
 
     quiet = [r.getMessage() for r in caplog.records if "sweep pulse" in r.getMessage()]
     assert any("heartbeat" in line and "quiet" in line for line in quiet)
+
+
+# --- the out-of-band liveness signal (issue #213) ---
+#
+# The third pulse leg. Unlike the heartbeat and the dead-man's push it does
+# not go through Postgres, so what these tests pin down is exactly where it
+# differs from the two: it is emitted in the posture that silences them, and
+# it rides a grinding sweep the same way they do.
+
+
+def _pinging_watchdog(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    alive: list[int],
+) -> Watchdog:
+    return Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        alive=lambda: alive.append(1),
+    )
+
+
+async def test_the_out_of_band_signal_is_emitted_every_cycle(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """A quiet, healthy watchdog with nothing to sweep still says it is alive
+    to the outside world — the external service's whole job is noticing when
+    an IDLE process stops, which is what a dead one looks like."""
+    alive: list[int] = []
+    watchdog = _pinging_watchdog(pool, clock, read_gateway, audited, audit, alive)
+
+    await watchdog.run_cycle()
+    assert len(alive) >= 1
+    before = len(alive)
+    await watchdog.run_cycle()
+    assert len(alive) > before
+
+
+async def test_the_out_of_band_signal_rides_a_grinding_sweep(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+) -> None:
+    """A real sweep is MINUTES inside one cycle (issue #201), so a signal
+    emitted only at cycle boundaries would go quiet for exactly as long as the
+    watchdog is busiest. It rides the enumeration like the other two legs."""
+    alive: list[int] = []
+    watchdog = _pinging_watchdog(pool, clock, read_gateway, audited, audit, alive)
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+
+    await watchdog.run_cycle()
+
+    # Four venues × one account × two passes, plus the cycle top: many more
+    # signals than the one a per-cycle emission would have produced.
+    assert len(alive) > 4
+
+
+async def test_the_out_of_band_signal_survives_the_db_blind_posture(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE case this leg exists for (issue #213).
+
+    A DB-blind incident deliberately silences both in-band legs — that path
+    reaches the wire with zero Postgres behind it, and a watchdog blind
+    because the database is unreachable cannot truthfully beat to it. The
+    consequence was that a watchdog cancelling a real book through an outage
+    was, from outside, indistinguishable from a dead one. This leg writes to
+    something else entirely, so `_pulse_allowed` does not gate it: the
+    heartbeat stays frozen at its single cycle-top write while the out-of-band
+    signal keeps going out through the whole blind enumeration."""
+    from epigone.safety import watchdog as watchdog_module
+
+    alive: list[int] = []
+    watchdog = _pinging_watchdog(pool, clock, read_gateway, audited, audit, alive)
+
+    async def db_down(_pool: asyncpg.Pool) -> None:
+        raise ConnectionError("postgres unreachable")
+
+    monkeypatch.setattr(watchdog_module, "active_halt", db_down)
+    read_gateway.set_open_orders(MASTER, [open_order("ETH", 213)])
+    await watchdog.run_cycle()  # the failure streak opens
+    clock.advance(DB_BLIND.total_seconds() + 1)
+
+    beats: list[object] = []
+    real_beat = heartbeat.beat
+
+    async def counting_beat(*args: object) -> None:
+        beats.append(args)
+        await real_beat(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(heartbeat, "beat", counting_beat)
+    alive.clear()
+    inner = read_gateway.get_open_orders
+    during: list[int] = []
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(30)
+        during.append(len(alive))
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()  # blind trip: the cancel pass runs dark
+
+    assert len(_cancels(exec_gateway)) == 1  # the wire still works
+    # Exactly one beat: the cycle-top one that ran BEFORE the reads failed and
+    # the incident was declared. The enumeration itself stayed dark.
+    assert len(beats) == 1
+    # The out-of-band leg did not: it was emitted at the cycle top and again
+    # at every enumeration step, so an observer outside this host saw a live
+    # watchdog throughout the window the database could say nothing about.
+    assert len(alive) > 1
+    assert during == sorted(during) and during[-1] > during[0]

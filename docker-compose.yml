@@ -135,6 +135,17 @@ services:
       # for BOTH services or neither.
       EXECUTOR_ALLOW_MAINNET: ${EXECUTOR_ALLOW_MAINNET:-}
       WATCHDOG_EXCHANGE_URL: ${WATCHDOG_EXCHANGE_URL:-}
+      # The OUT-OF-BAND page path (issue #213), and a mainnet gate. Every
+      # other alarm runs through Epigone — the #52 monitor reads Postgres on
+      # this host and DMs from the container beside this one — so losing the
+      # host loses the alarm too. Set this to an external dead-man check's
+      # ping URL (healthchecks.io-style) and that service pages the operator
+      # from its own infrastructure when the pings stop. A SECRET: the path
+      # is the credential. Unset is supported and the watchdog says so loudly
+      # at startup; see docs/runbooks/halt-and-unwind.md for setup and for
+      # what it does and does not cover.
+      WATCHDOG_DEADMAN_PING_URL: ${WATCHDOG_DEADMAN_PING_URL:-}
+      WATCHDOG_DEADMAN_PING_SECONDS: ${WATCHDOG_DEADMAN_PING_SECONDS:-60}
     volumes:
       # The KEK file (outside git, outside the DB — keystore invariant),
       # mounted read-only where KEYSTORE_KEK_FILE points.

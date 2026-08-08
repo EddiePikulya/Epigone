@@ -93,6 +93,24 @@ ADMIN_TELEGRAM_ID=370818090
 # HEALTHCHECK_COARSE_STALE_MINUTES=      # default = 2× SEED_INTERVAL_MINUTES
 # HEALTHCHECK_ALERT_BACKLOG_MINUTES=5    # undelivered Position Alerts older than this → alert
 # HEALTHCHECK_DISK_PERCENT=85            # host disk used-% that trips the disk check
+#
+# THE OUT-OF-BAND PAGE PATH (issue #213) — a MAINNET GATE, and the only alarm
+# that survives losing this host. Every check above runs through Epigone: the
+# monitor reads Postgres here and DMs you from a container beside it, so the
+# likeliest cause of a dead watchdog is also what stops anyone being told.
+# With this set, the watchdog pings an external dead-man service every 60s and
+# THAT service pages you from its own infrastructure when the pings stop.
+# Unset is supported and changes nothing else — the watchdog logs "NO
+# out-of-band page path" at startup and you have no page path.
+#
+# Create the check (period 1 min, grace 5 min), point its notifications at
+# something that is not this host and not the Epigone bot, then paste its ping
+# URL here. TREAT IT AS A SECRET: the path is the credential, and anyone
+# holding it can forge this watchdog's liveness. Full setup and the honest
+# list of what this does and does not cover:
+# docs/runbooks/halt-and-unwind.md § "The out-of-band page path".
+# WATCHDOG_DEADMAN_PING_URL=https://hc-ping.com/<your-check-uuid>
+# WATCHDOG_DEADMAN_PING_SECONDS=60       # ping cadence; keep it well under the grace
 EOF
 chmod 600 .env
 ```

@@ -281,7 +281,10 @@ it is doing:
 - the watchdog's `process_heartbeats` row keeps beating THROUGHOUT (every
   few seconds), so the #52 monitor no longer reads a sweeping watchdog as a
   dead one, and the dead-man's `scheduleCancel` schedule is pushed forward
-  from inside the same loop rather than being allowed to fire mid-halt.
+  from inside the same loop rather than being allowed to fire mid-halt;
+- and, if configured, the external dead-man ping goes out from the same
+  enumeration steps (issue #213), so a grinding sweep does not read as a
+  dead process from outside the host either.
 
 So: heartbeat fresh + progress lines advancing = working, wait. Heartbeat
 fresh + progress lines stopped = stuck on one REST call or on budget
@@ -310,17 +313,34 @@ beats and there is a lot of room; the reason it is not lower by default is
 that it must also survive a deploy restart and a cold start's grace window
 without paging.
 
-**And the 360s holds only while Postgres answers.** The monitor's pool is
-opened with no `command_timeout` and no acquire bound — unlike the watchdog's
-(`epigone.safety.db`), which was hardened for exactly this — so a black-holed
-database host does not make the monitor report DB-down, it makes the monitor
-loop hang: no fast tick, no slow cycle, no page, silently. That is not an
-exotic case. A dead database host is among the likeliest reasons the watchdog
-is dead in the first place, so the monitor's blind spot is CORRELATED with the
-thing it watches: the two share a failure domain, and a single host taking
-both out produces perfect silence. Issue #213 tracks the real fix — an
-out-of-band path that does not depend on the database it is reporting on — and
-is a mainnet gate.
+**That 360s is now 390s, and it no longer silently becomes infinity (issue
+#213).** The monitor's pool used to be opened with no `command_timeout` and no
+acquire bound — unlike the watchdog's — so a black-holed database host did not
+make the monitor report DB-down, it made the monitor loop *hang*: no fast
+tick, no slow cycle, no page, silently, for as long as kernel TCP
+retransmission took to give up. That was never exotic. A dead database host is
+among the likeliest reasons the watchdog is dead in the first place, so the
+blind spot was CORRELATED with the thing being watched.
+
+The monitor's runtime pool now carries the same four bounds the watchdog's
+does (connect, per-query, lock waits, the release budget —
+`epigone.db.create_pool`, at 10s for this lane), and each gather additionally
+runs under a hard 30s real-time ceiling because asyncpg's own timeouts cannot
+reach a transaction exit. A hang is therefore an exception, and an exception
+was already the DB-down page. Migrations still run on a plain unbounded pool
+that closes before the bounded one takes over — a migration legitimately runs
+long — which is the same startup shape the watchdog uses.
+
+What that costs: a fully hung liveness tick spends 30s before being cut, so
+the tick after it is *late* rather than skipped, and the worst case from a
+watchdog freezing to the operator holding a 🚨 DM becomes **390s** (staleness
+threshold + liveness cadence + one ceiling). Still longer than the dead-man's
+300s horizon; see the honest reading above.
+
+What it does NOT fix, and cannot: the monitor still reaches you through its
+own process, its own Postgres reads, and its own Telegram session, all on this
+host. A host that takes the database and the monitor out together still pages
+nobody *from here*. That is what the next section is for.
 
 **So keep the old rule, in its stronger form: do not treat "the monitor has
 not paged" as "the watchdog is alive."** What #205 bought is narrower and
@@ -333,6 +353,93 @@ read the `process_heartbeats` row and the sweep's progress lines directly;
 they are the primary signal, and an ad-hoc query against the database is still
 the check that does not go through the monitor.
 
+### The out-of-band page path (issue #213)
+
+Every alarm above runs through Epigone. The watchdog writes a heartbeat to
+Postgres, the monitor reads it from the same host and DMs you from a container
+beside it — so the single most likely cause of a genuinely dead watchdog is
+also the thing that stops anyone being told. A checker inside the failure
+domain cannot report the domain failing, however well bounded it is.
+
+So the watchdog also pings **outward**, on the inverted logic a dead man's
+switch needs. You create a check on an external dead-man service
+(healthchecks.io and friends), set its ping URL in
+`WATCHDOG_DEADMAN_PING_URL`, and the watchdog says "still here" every 60s from
+the same pulse that beats its heartbeat — at every cycle top and at every
+enumeration step of a sweep, so a multi-minute grind keeps pinging. **When the
+pings stop, the external service pages you from its own infrastructure.**
+Nothing of ours has to be alive for that page to happen.
+
+**What it covers.** The watchdog process ceasing to run cycles, for any reason
+it cannot survive: a crash loop, an OOM kill, a container stopped and not
+restarted, a kernel panic, the host powered off, the host's network gone, the
+Hetzner box gone. Also a watchdog *wedged* — stuck inside a single await
+between two pulses — because a wedged process stops pinging just as a dead one
+does. This is the only alarm Epigone has that survives losing the host.
+
+**What it does NOT cover.** Read this list before treating a green check as
+reassurance:
+
+- **A watchdog that is alive but impotent.** A revoked or expired agent key,
+  a pool of orders on a network it cannot reach — none of that stops the
+  pings. That is the monitor's on-chain capability check, and it is still
+  inside the failure domain.
+- **Postgres being down.** The watchdog deliberately KEEPS pinging while
+  DB-blind: it is alive, it is cancelling, and it is telling the truth about
+  itself. So external silence never means "the database is down", and a
+  database outage produces **no external page at all** — DB-down remains the
+  monitor's job, bounded now but still in-domain. This is a deliberate
+  trade: the alternative (stop pinging when blind) would page "watchdog
+  dead" for a watchdog that is working, which is the wrong sentence at 3am.
+- **Anything but the watchdog.** One check, one process. The executor, the
+  bot, ingest and the websocket lane are not in it.
+- **The external service itself.** It is a third-party dependency with its
+  own uptime and its own delivery path (email, SMS, push). If *it* is down,
+  most such services do not page — silence there is ambiguous, not safe.
+  Point its notifications at something that is not this host and not the
+  Epigone bot.
+- **False pages, in the safe direction.** Our egress failing — an outbound
+  firewall rule, DNS, the service rate-limiting us — reads exactly like a
+  dead watchdog. That is the direction a dead-man's switch is supposed to
+  fail, and it is the reason the ping interval (60s) is a small fraction of
+  the grace period you set on the check.
+
+**And it is not faster than the horizon either.** The page arrives no sooner
+than the grace period you configure, so at a 5-minute grace it lands 5–6
+minutes after the watchdog stops — longer than the dead-man's 300s horizon,
+exactly like the monitor's 390s. Both alarms tell you what happened; neither
+outruns the exchange-side net, and that net firing is the fail-safe outcome
+anyway.
+
+**Operator setup — do this before the mainnet switch; it is a gate.**
+
+1. Create a check on the dead-man service. Period **1 minute**, grace **5
+   minutes** (a handful of dropped pings must be absorbed; five minutes of
+   silence is thirty missed pings).
+2. Point its notifications somewhere that does not depend on this host or on
+   the Epigone bot — a personal email and an SMS/push channel.
+3. Put the ping URL in the server's `.env` as `WATCHDOG_DEADMAN_PING_URL`.
+   **Treat it as a secret:** on healthchecks.io and services like it the path
+   IS the credential, and anyone holding it can forge this watchdog's
+   liveness. Epigone never logs the path — only the host.
+4. `docker compose --profile execution up -d watchdog` and confirm the first
+   log line reads `out-of-band dead-man ping ARMED`. If it reads `NO
+   out-of-band page path`, the variable did not reach the container.
+5. Confirm the check went green on the service's own dashboard, then stop the
+   watchdog for six minutes and confirm you are actually paged. An untested
+   page path is not a page path.
+
+**Unset is a supported configuration, and the watchdog says so at 🚨 volume in
+its first log line.** Everything else runs identically without it — this leg
+cannot slow the kill path even in principle (the ping is fire-and-forget with
+a 5s hard timeout, and its call site has no `await` to inherit a stall) — but
+"unset" means the only thing that would notice this process dying is the
+monitor, which reads the same database on the same host. That is the state
+this issue exists to end.
+
+**The #188 floating-IP secondary is not this and does not replace it.** It
+stays parked.
+
 A DB-BLIND window is deliberately silent on all of these: that path reaches
 the wire with zero Postgres behind it by construction, so it neither beats
 nor pushes the dead-man until it reconciles. A blind watchdog looks dead to
@@ -342,8 +449,14 @@ whose halt row could not be confirmed is the other kind of incident and
 DOES beat through its cancel pass: its liveness reads answered that cycle,
 so the database is healthy.
 
-In every posture, each leg of the pulse — the heartbeat and the dead-man's
-push — runs on its own small TIME budget: a leg whose attempts add up past it
+**The one signal a DB-blind window does NOT silence is the external ping**
+(issue #213, the section above): it goes to something that is not the
+database, so it keeps going out through the whole blind window. That is
+deliberate — the watchdog is alive and cancelling, and saying so is true —
+and it is why external silence never means "the database is down".
+
+In every posture, each of the two IN-BAND legs of the pulse — the heartbeat
+and the dead-man's push — runs on its own small TIME budget: a leg whose attempts add up past it
 goes quiet, because reaching the wire outranks saying so, and gets the budget
 back every 45 seconds of sweep (and at every cycle top), so going quiet is
 under a minute and never the rest of a grind. The budget is spent on

@@ -12,6 +12,16 @@ OUTLIVES the container — the whole point is surviving a restart during a
 Postgres outage — so the compose service points it at a named volume; the
 default is a path under the operator's home for local runs.
 
+`WATCHDOG_DEADMAN_PING_URL` is the other one, and it is the only knob here
+that is a SECRET (issue #213): the operator creates a check on an external
+dead-man service and pastes its ping URL, whose path is the credential. It
+has no default and cannot have one — nobody but the operator can create that
+check — so unset is a legitimate, fully supported configuration in which the
+watchdog runs exactly as before and the out-of-band page path simply does not
+exist. `epigone.safety.main` says which of the two the process is in at
+startup, loudly, because that is the assumption an operator is most likely to
+make wrongly. Setting it is a MAINNET GATE, not a testnet one.
+
 The exchange URL defaults to TESTNET. The info URL is derived from the exchange
 URL so the watchdog can never read one network's book while cancelling on the
 other — which is also why a malformed WATCHDOG_EXCHANGE_URL degrades BOTH urls
@@ -84,6 +94,13 @@ DEFAULT_DEADMAN_REPROBE_HOURS = 6
 # at ceremony speed (rotations, revocations), so a few checks a day bounds
 # the beating-but-impotent window to hours while costing almost nothing.
 DEFAULT_CAPABILITY_CHECK_HOURS = 6
+# How often the external dead-man service is told this process is alive
+# (issue #213). A minute is a small fraction of any sane grace period on the
+# operator's check, so a handful of dropped pings is absorbed while a dead
+# watchdog trips the check on the operator's own schedule rather than a
+# multiple of ours. Tunable mostly for the free tiers of ping services that
+# meter by request count.
+DEFAULT_DEADMAN_PING_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -99,6 +116,11 @@ class WatchdogConfig:
     info_url: str
     allow_mainnet: bool
     key_cache_path: Path
+    # None = no out-of-band page path configured (module docstring). The
+    # interval is still parsed and carried, so setting the URL later is the
+    # only change an operator has to make.
+    deadman_ping_url: str | None
+    deadman_ping_interval: timedelta
 
     @classmethod
     def from_env(cls) -> "WatchdogConfig":
@@ -162,7 +184,41 @@ class WatchdogConfig:
             # right.
             allow_mainnet=parse_allow_mainnet(os.environ.get("EXECUTOR_ALLOW_MAINNET")),
             key_cache_path=Path(cache_file) if cache_file else default_cache_path(),
+            deadman_ping_url=_parse_ping_url(os.environ.get("WATCHDOG_DEADMAN_PING_URL")),
+            deadman_ping_interval=timedelta(
+                seconds=parse_positive_int(
+                    os.environ.get("WATCHDOG_DEADMAN_PING_SECONDS"),
+                    default=DEFAULT_DEADMAN_PING_SECONDS,
+                    name="WATCHDOG_DEADMAN_PING_SECONDS",
+                )
+            ),
         )
+
+
+def _parse_ping_url(raw: str | None) -> str | None:
+    """The external dead-man ping URL, or None for "not configured".
+
+    The house convention for a bad value is a safe default, and here the safe
+    default is OFF: a URL we cannot ping is not a page path, and pretending it
+    is would be worse than admitting there is none — an operator who believes
+    the out-of-band path is armed stops looking for the fact that it isn't.
+    So a malformed value degrades to unconfigured, and the startup log the
+    unconfigured case already prints is what carries it.
+
+    Scheme-checked and nothing more. The path is opaque on purpose (it is the
+    credential), the host is the operator's choice of service, and a URL that
+    is well-formed but wrong still announces itself the first time it is
+    pinged — `ExternalPing` logs a 4xx as "the operator will NOT be paged"."""
+    if not raw or not raw.strip():
+        return None
+    url = raw.strip()
+    if not url.startswith(("http://", "https://")):
+        log.warning(
+            "WATCHDOG_DEADMAN_PING_URL is not an http(s) URL; the watchdog will run "
+            "with NO out-of-band page path"
+        )
+        return None
+    return url
 
 
 def _parse_exchange_url(raw: str | None) -> str:

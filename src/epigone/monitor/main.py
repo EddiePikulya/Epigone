@@ -15,12 +15,27 @@ enough for the schedule to fire before anyone is told the watchdog is gone —
 which is what happened on 2026-08-07. Both cadences feed the same `Monitor`,
 so a failure is paged once by whichever saw it first.
 
-What that does NOT buy, and the runbook says so at length: this pool is opened
-with no command_timeout and no acquire bound, so a black-holed database host
-hangs the loop rather than tripping the DB-down check — no tick, no page,
-silently — and a dead database host is among the likeliest reasons the
-watchdog is dead too. The monitor shares a failure domain with the thing it
-watches; mainnet wants an out-of-band path (issue #213).
+EVERY DB TOUCH IS BOUNDED (issue #213). This loop used to run on
+`epigone.db.create_pool`'s unbounded defaults, and the failure that exposed
+was not a slow page but NO page: a black-holed database host does not refuse
+a query, it swallows it, so `gather_snapshot` HUNG rather than raising, the
+DB-down check never evaluated, the fast tick never came round again, and the
+monitor went perfectly silent — for the ~15 minutes it takes kernel TCP
+retransmission to give up, or forever. A dead database host being among the
+likeliest reasons the watchdog is dead too, that silence was CORRELATED with
+the thing this process exists to check. So the runtime pool now carries the
+watchdog's bounds (`epigone.db.create_pool`'s optional timeouts, at this
+lane's numbers below) and each gather additionally sits under a hard
+real-time ceiling, because asyncpg's own timeouts cannot reach every leg. A
+hang is now an exception, and this module already knew what to do with one:
+report DB-down.
+
+That closes the SILENCE, not the failure domain — the monitor still reaches
+the operator through its own process and its own Postgres reads, so a host
+that takes both out still pages nobody from here. The path that does not
+share the domain is the watchdog's external dead-man ping
+(epigone.safety.ping, issue #213), which reports from outside; the runbook
+states which failure each of the two actually covers.
 
 Notify-first, no auto-remediation: Docker's restart policy already recovers hard
 crashes; this catches the silent-but-alive failures and tells a human.
@@ -52,6 +67,37 @@ from epigone.monitor.config import MonitorConfig
 
 log = logging.getLogger(__name__)
 
+# The monitor's per-touch DB bound (issue #213): connect, per-query, and the
+# acquire/release budget alike, exactly as the watchdog's pool does it.
+#
+# Deliberately LOOSER than the safety lane's 5s, because the two lanes are
+# priced against different mistakes. The watchdog's touches are single-row
+# reads on a path where being late is being useless. The monitor's expensive
+# gather is one fetchrow of ~18 correlated subqueries across five tables,
+# including a count over the ~40k-row Universe, and its mistake is a FALSE
+# 🚨 DB-down page — an operator woken by a database that was merely busy
+# learns to distrust the pager, which is the one thing a pager cannot afford.
+# 10s is two orders of magnitude above what these queries cost healthy and
+# two orders below the hang timescales (asyncpg's 60s connect default, ~15min
+# TCP retransmission) it replaces.
+MONITOR_DB_TIMEOUT_SECONDS = 10.0
+# The hard REAL-TIME ceiling on a whole gather, because the pool's bounds
+# cannot reach every leg: asyncpg awaits an UNTIMED cancel_waiter before a
+# per-op timeout arms, so a transaction exit outlives them (the round-5
+# finding in epigone.safety.watchdog). Three times the per-touch bound is the
+# worst legal composition of one gather's own touches — acquire, query,
+# release, each bounded above — so a healthy-but-slow read is never cut by
+# this, and a hung one is. Safe to compose because Pool.release is shielded:
+# a cancelled gather still terminates its connection within the acquire
+# budget rather than leaking it.
+#
+# It must also stay well under the fast tick's own cadence (60s), and does:
+# a fully hung liveness tick costs 30s, so the tick after it is late rather
+# than skipped, and the worst case from a watchdog freezing to the operator
+# holding a page grows from 360s to 390s. That is the honest number the
+# runbook now quotes.
+MONITOR_DB_CEILING_SECONDS = 3 * MONITOR_DB_TIMEOUT_SECONDS
+
 
 class SystemDiskProbe:
     """Real host disk usage. In the container the host filesystem is mounted at
@@ -80,9 +126,18 @@ async def run_monitor_cycle(
 ) -> list[str]:
     """One check cycle: gather → evaluate → decide → send. A failed gather is
     reported as the critical DB-down check (the monitor can still DM). Returns
-    the messages sent, for tests and logging."""
+    the messages sent, for tests and logging.
+
+    A gather that HANGS is the same signal as one that fails (issue #213):
+    the ceiling turns it into the TimeoutError this `except` already catches,
+    so a black-holed host pages DB-down instead of stopping the loop where it
+    stands. `Exception` deliberately, not `TimeoutError` — a monitor that
+    cannot answer "is the database there" is reporting the same thing
+    whatever the cause."""
     try:
-        snapshot = await gather_snapshot(pool, clock, disk, config.thresholds)
+        snapshot = await asyncio.wait_for(
+            gather_snapshot(pool, clock, disk, config.thresholds), MONITOR_DB_CEILING_SECONDS
+        )
     except Exception:
         log.warning("monitor: snapshot gather failed; reporting DB unreachable", exc_info=True)
         snapshot = db_down_snapshot(clock.now())
@@ -113,9 +168,16 @@ async def run_watchdog_liveness_cycle(
     A read failure is logged and dropped rather than reported as DB-down: the
     database check belongs to the full cycle, which gathers enough to say so
     with its numbers, and duplicating it here would page from a snapshot that
-    knows one table."""
+    knows one table.
+
+    Which is exactly why this tick must not HANG on that read (issue #213):
+    dropping a tick costs one minute of latency, but hanging on it costs the
+    whole loop — including the full cycle that owns the DB-down page. The
+    ceiling is what keeps a black-holed host to the first cost."""
     try:
-        snapshot = await gather_watchdog_snapshot(pool, clock)
+        snapshot = await asyncio.wait_for(
+            gather_watchdog_snapshot(pool, clock), MONITOR_DB_CEILING_SECONDS
+        )
     except Exception:
         log.warning(
             "monitor: watchdog liveness read failed; the full cycle owns the "
@@ -190,12 +252,30 @@ async def monitor_loop(
         cycles += 1
 
 
+async def open_monitor_pool(database_url: str) -> asyncpg.Pool:
+    """Migrations on a plain unbounded pool, then the bounded pool the loop
+    runs on (issue #213) — the shape `epigone.safety.coldstart` already uses
+    for the watchdog, for the same reason: a migration legitimately runs long
+    and must not inherit a timeout tuned for a process with a deadline, while
+    everything after startup must.
+
+    Every process calls `migrate` at startup (ADR-0002), so the monitor's
+    usually applies nothing at all — but "usually" is not a bound, and this
+    process is the one that has to survive being pointed at a database that
+    just took a schema change."""
+    startup_pool = await create_pool(database_url)
+    try:
+        await migrate(startup_pool)
+    finally:
+        await startup_pool.close()
+    return await create_pool(database_url, timeout_seconds=MONITOR_DB_TIMEOUT_SECONDS)
+
+
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = Settings.from_env()
     config = MonitorConfig.from_env(seed_interval_minutes=settings.seed_interval_minutes)
-    pool = await create_pool(settings.database_url)
-    await migrate(pool)
+    pool = await open_monitor_pool(settings.database_url)
     bot = Bot(settings.require_bot_token())
     admin_id = settings.require_admin_telegram_id()
     clock = SystemClock()
