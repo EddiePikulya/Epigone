@@ -20,23 +20,26 @@ from epigone.execute import episodes as ep
 from epigone.execute import subs as subs_store
 from epigone.execute.config import ExecutorConfig
 from epigone.execute.executor import EXECUTOR_CONSUMER
-from epigone.execute.notices import SKIP_DIGEST_THRESHOLD
+from epigone.execute.notices import PAGER, SKIP_DIGEST_THRESHOLD
 from epigone.execute.policy import ENTRY_STALENESS_GUARD, LEADER_EQUITY_FLOOR, RiskPolicy
 from epigone.gateway import GatewayError, MarketStats, Position, Side
 from epigone.gateway.execution import (
     ActionRejectedError,
+    Grouping,
     OrderFilled,
     OrderRejected,
+    OrderResting,
     RejectReason,
     Tif,
 )
 from epigone.gateway.execution_http import MAINNET_EXCHANGE_URL, TESTNET_EXCHANGE_URL
 from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.gateway.http import INFO_URL, TESTNET_INFO_URL
+from epigone.monitor.checks import COPY_PAGER_ACTIONS
 from epigone.position_events import ClaimableEvent, PositionEvent, outstanding_events
 from epigone.safety.audit import ExecutionAudit
 from epigone.safety.config import WatchdogConfig
-from epigone.safety.halt import KILL_SOURCE, request_halt, resume
+from epigone.safety.halt import KILL_SOURCE, is_halted, request_halt, resume
 from tests.support.clock import FakeClock
 from tests.support.copy import (
     LEADER,
@@ -50,6 +53,7 @@ from tests.support.copy import (
     seed_trader,
     set_limits,
 )
+from tests.support.orders import open_order
 
 
 def opened(
@@ -1489,6 +1493,652 @@ async def test_every_cycle_records_each_subs_equity(
     assert [row["account_value"] for row in rows] == [Decimal("980"), Decimal("940")]
 
 
+# --- the Loss Budget (issue #181, amendment D-9) ------------------------------
+
+
+async def test_a_breached_sub_refuses_an_open_and_copies_an_exit_in_the_same_cycle(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """THE HEADLINE. The budget is spent, so the book may only shrink: new
+    risk is refused and the copy still follows the leader OUT of what is
+    already open — and both answers are given in the one cycle that noticed
+    the breach, not the one after it.
+
+    A wind-down that stopped exits too would be the worst of both: no new
+    positions and no way out of the old ones."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("400"))  # $600 down on a $500 budget
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=2, total_size=Decimal("0.1"), avg_price=Decimal("1800"))]
+    )
+
+    await emit(pool, opened(coin="BTC"), clock.now())  # new risk: refused
+    await emit(pool, closed(coin="ETH"), clock.now())  # leaving risk: copied
+    await h.executor.run_cycle()
+
+    (orders, _g, _b, _v), = h.placed()
+    (order,) = orders
+    assert order.reduce_only is True  # the exit, and nothing else, was signed
+
+    notices = await h.notices()
+    assert any("loss budget" in body.lower() and "BTC" in body for body in notices)
+    assert any("Copied close" in body for body in notices)
+    actions = await h.audit_actions()
+    assert any(
+        action == "copy_skipped" and "loss budget for this leader is spent" in reason
+        for action, reason in actions
+    )
+    # Both events are off the backlog: a refusal is a decision, not a deferral.
+    assert await outstanding(pool) == []
+
+
+async def test_a_flip_during_wind_down_closes_and_refuses_its_open_leg(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The same shape the Liquidity Floor's flip semantics have: the close leg
+    runs, the open leg is refused, and the sub sits out that coin FLAT — which
+    is decision 3's chosen failure direction, not a half-mirrored position."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("380"))
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=3, total_size=Decimal("0.1"), avg_price=Decimal("1800"))]
+    )
+
+    await emit(
+        pool,
+        PositionEvent(
+            kind="flip",
+            coin="ETH",
+            side="short",
+            prev_side="long",
+            size_usd=Decimal("10000"),
+            size_coin=Decimal("5"),
+            entry_price=Decimal("2000"),
+            leverage=Decimal("1"),
+            realized_pnl=Decimal("-50"),
+        ),
+        clock.now(),
+    )
+    await h.executor.run_cycle()
+
+    (close_leg,) = h.placed()  # one order, not two
+    assert close_leg[0][0].reduce_only is True
+    assert any(
+        "loss budget" in body.lower() and "ETH" in body for body in await h.notices()
+    )
+    assert await outstanding(pool) == []
+
+
+async def test_brackets_are_still_maintained_while_a_sub_winds_down(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The protective side of execution never lapses. A wind-down refuses NEW
+    risk; a position left open without its stop would be new risk of the worst
+    kind — the kind nobody chose."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(
+        pool,
+        clock,
+        mode="bracket",
+        take_profit_pct="10",
+        stop_loss_pct="5",
+        loss_budget="500",
+        baseline="1000",
+    )
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("300"))  # far past the budget
+    h.exec_fake.place_results.append(
+        [OrderResting(oid=7), OrderResting(oid=8)]
+    )
+
+    await h.executor.run_cycle()
+
+    (legs, grouping, _b, _v), = h.placed()
+    assert [leg.reduce_only for leg in legs] == [True, True]
+    assert grouping is Grouping.POSITION_TPSL
+    assert (await h.sub(sub.id)).winding_down is True
+
+
+async def test_a_wound_down_sub_is_disabled_once_flat_and_only_once(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The terminal state, and it is the same one /uncopy produces. Flat is
+    both halves — no exchange position AND no live episode — and the disable
+    happens once: a later cycle over the same rows must not re-announce the end
+    of a copy relationship that already ended."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("400"))
+
+    await h.executor.run_cycle()  # breached, but still holding: not disabled
+    assert (await h.sub(sub.id)).enabled is True
+
+    # The leader is out and reconciliation adopts it: no position, no episode.
+    gateway.set_positions(SUB, [])
+    clock.advance(seconds=5)
+    await h.executor.run_cycle()
+    clock.advance(seconds=5)
+    await h.executor.run_cycle()
+
+    assert (await h.sub(sub.id)).enabled is False
+    actions = [action for action, _ in await h.audit_actions()]
+    assert actions.count("copy_budget_disabled") == 1
+    assert actions.count("copy_budget_breached") == 1
+    disables = [body for body in await h.notices() if "is DISABLED" in body]
+    assert len(disables) == 1
+    assert "$600.00" in disables[0] and "$500" in disables[0]
+
+
+async def test_a_stray_bracket_leg_is_cancelled_before_the_disable(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A disabled mapping leaves the bracket-maintenance invariant's scope for
+    good, so a leg that outlived its position would rest there until a human or
+    a /kill sweep found it. It comes off the book BEFORE the flag flips — and
+    only OUR legs do: an order the operator placed by hand in that sub is
+    theirs, and a spent budget is not a mandate to clear someone else's book."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(
+        pool,
+        clock,
+        mode="bracket",
+        take_profit_pct="10",
+        stop_loss_pct="5",
+        loss_budget="500",
+        baseline="1000",
+    )
+    episode = await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    await ep.record_bracket(
+        pool, episode_id=episode.id, order_id=555, tpsl="sl", placed_at=clock.now()
+    )
+    await ep.end_episode(pool, episode.id, reason=ep.ENDED_LEADER_CLOSE, ended_at=clock.now())
+    # Flat by both halves — and yet a stop is still on the book, which is the
+    # exact case the periodic bracket verification exists for.
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("400"))
+    gateway.set_open_orders(SUB, [open_order("ETH", 555), open_order("BTC", 999)])
+
+    await h.executor.run_cycle()
+
+    assert h.cancelled() == [555]  # ours only: 999 is the operator's own
+    assert (await h.sub(sub.id)).enabled is False
+    notices = await h.notices()
+    assert any("leftover bracket order" in body for body in notices)
+    assert any("is DISABLED" in body for body in notices)
+
+
+async def test_a_disable_waits_rather_than_leaving_a_bracket_behind(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The order of the two acts is the safety property: cancel, then disable.
+    If the book cannot be read, the mapping stays enabled and wound down —
+    still refusing every entry — and the next cycle tries again, because a
+    disabled mapping is one nothing looks at."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(
+        pool,
+        clock,
+        mode="bracket",
+        take_profit_pct="10",
+        stop_loss_pct="5",
+        loss_budget="500",
+        baseline="1000",
+    )
+    episode = await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    await ep.record_bracket(
+        pool, episode_id=episode.id, order_id=555, tpsl="sl", placed_at=clock.now()
+    )
+    await ep.end_episode(pool, episode.id, reason=ep.ENDED_LEADER_CLOSE, ended_at=clock.now())
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("400"))
+    gateway.open_orders_errors[SUB] = GatewayError("order book unreachable")
+
+    for _ in range(3):
+        await h.executor.run_cycle()
+        clock.advance(seconds=5)
+
+    judged = await h.sub(sub.id)
+    assert judged.enabled is True  # not disabled around an order it cannot see
+    assert judged.winding_down is True  # and still refusing new risk meanwhile
+    assert h.cancelled() == []
+    # A deferral has no natural end, so it leaves a trace — ONCE per reason,
+    # because the executor loops in seconds and a sub wedged on a delisted
+    # coin's trigger would otherwise write a row every few seconds forever.
+    actions = [action for action, _ in await h.audit_actions()]
+    assert actions.count("copy_budget_disable_deferred") == 1
+    stuck = [body for body in await h.notices() if "could NOT be closed out" in body]
+    assert len(stuck) == 1
+    assert "order book could not be read" in stuck[0]
+    assert "/uncopy" in stuck[0]  # what to do if it never clears
+
+    gateway.open_orders_errors.pop(SUB)
+    gateway.set_open_orders(SUB, [open_order("ETH", 555)])
+    clock.advance(seconds=5)
+    await h.executor.run_cycle()
+
+    assert h.cancelled() == [555]
+    assert (await h.sub(sub.id)).enabled is False
+
+
+async def test_a_delisted_coins_stray_trigger_says_so_rather_than_wedging_quietly(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The one deferral that does not resolve itself: a resting bracket on a
+    coin the venue no longer lists cannot be cancelled by oid, so the mapping
+    would sit enabled-but-wound-down with a live order behind it indefinitely.
+    Every other deferral clears on the next cycle and would never be worth a
+    word; this one is why any of them are reported at all."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(
+        pool,
+        clock,
+        mode="bracket",
+        take_profit_pct="10",
+        stop_loss_pct="5",
+        loss_budget="500",
+        baseline="1000",
+    )
+    episode = await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="GONE",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    await ep.record_bracket(
+        pool, episode_id=episode.id, order_id=777, tpsl="sl", placed_at=clock.now()
+    )
+    await ep.end_episode(pool, episode.id, reason=ep.ENDED_LEADER_CLOSE, ended_at=clock.now())
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("400"))
+    gateway.set_open_orders(SUB, [open_order("GONE", 777)])  # no asset id anywhere
+
+    await h.executor.run_cycle()
+
+    assert h.cancelled() == []
+    assert (await h.sub(sub.id)).enabled is True
+    reason = next(
+        decision
+        for action, decision in await h.audit_actions()
+        if action == "copy_budget_disable_deferred"
+    )
+    assert "GONE has no asset id" in reason
+    assert any("could NOT be closed out" in body for body in await h.notices())
+
+
+async def test_a_halt_defers_the_disable_rather_than_signing_a_cancel(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The terminal step signs, so it lives below the halt gate: halted still
+    means Epigone signs nothing, and the sub simply stays wound down until
+    /resume. Nothing is lost by waiting — a halt's own sweep enumerates and
+    cancels per sub anyway."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    gateway.set_positions(SUB, [])
+    gateway.set_open_orders(SUB, [])
+    gateway.set_account_value(SUB, Decimal("400"))
+    await request_halt(
+        pool,
+        clock,
+        ExecutionAudit(pool, clock),
+        source=KILL_SOURCE,
+        reason="operator /kill",
+        requested_by=OPERATOR,
+    )
+
+    await h.executor.run_cycle()
+
+    judged = await h.sub(sub.id)
+    assert judged.winding_down is True  # measured while halted
+    assert judged.enabled is True  # but not acted on
+    assert h.cancelled() == [] and h.placed() == []
+
+
+async def test_the_eighty_percent_warning_fires_once_not_every_cycle(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A signal repeated every cycle it stays true is not a signal. The mark is
+    persisted, so the "once" is a property of the row rather than of a process
+    that happens to still be running."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("580"))  # $420 of $500
+
+    for _ in range(3):
+        await h.executor.run_cycle()
+        clock.advance(seconds=5)
+
+    warnings = [body for body in await h.notices() if "80% spent" in body]
+    assert len(warnings) == 1
+    assert "$420.00" in warnings[0]
+    # and it is a warning, not a wind-down: nothing is refused yet
+    assert [action for action, _ in await h.audit_actions()].count(
+        "copy_budget_breached"
+    ) == 0
+
+
+async def test_a_restart_mid_wind_down_neither_re_arms_nor_forgets(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A deploy or a crash must not silently re-arm a breached sub back into
+    copying opens, nor announce the breach a second time. Every mark is on the
+    row, so a brand-new executor over the same database inherits the wind-down
+    exactly as it stood."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("400"))
+    await h.executor.run_cycle()
+    assert (await h.sub(sub.id)).winding_down is True
+
+    clock.advance(seconds=5)
+    fresh = await build_harness(pool, clock, gateway)  # a new process, same DB
+    await emit(pool, opened(coin="BTC"), clock.now())
+    await fresh.executor.run_cycle()
+
+    assert fresh.placed() == []  # still refusing new risk
+    assert (await fresh.sub(sub.id)).budget_baseline_usd == Decimal("1000")
+    assert [action for action, _ in await fresh.audit_actions()].count(
+        "copy_budget_breached"
+    ) == 1
+
+
+async def test_raising_the_budget_resumes_copying_on_the_next_cycle(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The override this feature promises, seen from the executor's side: the
+    operator raises their own threshold and opens are signed again — no
+    restart, no second command, and the loss already booked still counts
+    against the new number."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    # Still holding an ETH copy — so the wind-down stands rather than reaching
+    # its flat-and-disabled terminus, which is the state an override is FOR.
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("400"))
+    await h.executor.run_cycle()
+    assert (await h.sub(sub.id)).winding_down is True
+
+    clock.advance(seconds=5)
+    await subs_store.reenable_sub(
+        pool,
+        operator_id=OPERATOR,
+        leader_address=LEADER,
+        allocation_usd=Decimal("1000"),
+        base_stake_usd=Decimal("200"),
+        leverage_mode="mirror",
+        fixed_leverage=None,
+        copy_mode="default",
+        take_profit_pct=None,
+        stop_loss_pct=None,
+        loss_budget_usd=Decimal("900"),
+    )
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+    await h.executor.run_cycle()  # re-funds the sub the re-issue re-opened
+    gateway.set_account_value(SUB, Decimal("1000"))
+    clock.advance(seconds=5)
+    await emit(pool, opened(coin="BTC"), clock.now())
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1  # copying again
+    judged = await h.sub(sub.id)
+    assert judged.winding_down is False
+    assert judged.budget_baseline_usd == Decimal("1000")  # the ledger survived
+    assert judged.budget_spent_usd == Decimal("600")  # and so did the loss
+
+
+async def test_a_top_up_between_cycles_is_not_mistaken_for_profit(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """The btcgod lesson through the real provisioning path: the sub loses
+    $600, Epigone funds it back up to its allocation, and the budget still
+    knows the $600 is gone. Read as profit instead, the top-up would hand the
+    leader back exactly the runway they just lost."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, allocation="1000", loss_budget="500")
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("1000"))
+    await h.executor.run_cycle()  # arms the baseline at $1,000
+    assert (await h.sub(sub.id)).budget_baseline_usd == Decimal("1000")
+
+    # A re-issued /copy re-opens the funding leg, which is the only way money
+    # moves INTO a live sub. The sub is down $600 by the time it runs.
+    clock.advance(seconds=60)
+    gateway.set_account_value(SUB, Decimal("400"))
+    await subs_store.reenable_sub(
+        pool,
+        operator_id=OPERATOR,
+        leader_address=LEADER,
+        allocation_usd=Decimal("1000"),
+        base_stake_usd=Decimal("200"),
+        leverage_mode="mirror",
+        fixed_leverage=None,
+        copy_mode="default",
+        take_profit_pct=None,
+        stop_loss_pct=None,
+        loss_budget_usd=Decimal("500"),
+    )
+    await h.executor.run_cycle()  # tops the sub back up to $1,000
+    gateway.set_account_value(SUB, Decimal("1000"))
+
+    clock.advance(seconds=60)
+    await h.executor.run_cycle()
+
+    judged = await h.sub(sub.id)
+    assert judged.budget_baseline_usd == Decimal("1000")  # kept: same budget
+    assert judged.budget_spent_usd == Decimal("600")  # not $0
+    assert judged.winding_down is True
+
+
+async def test_a_sub_that_arrives_holding_money_is_judged_from_that_baseline(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """An adopted orphan or a re-copy comes back holding whatever last time
+    left in it. The operator's number is about what happens NEXT, so the
+    baseline is what the sub is worth when the budget is armed — never the
+    allocation, and never zero."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, allocation="1000", loss_budget="500")
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("1400"))  # inherited more than it asked for
+
+    await h.executor.run_cycle()
+    assert (await h.sub(sub.id)).budget_baseline_usd == Decimal("1400")
+
+    clock.advance(seconds=5)
+    gateway.set_account_value(SUB, Decimal("1000"))  # down $400 from ITS baseline
+    await h.executor.run_cycle()
+    judged = await h.sub(sub.id)
+    assert judged.budget_spent_usd == Decimal("400")
+    assert judged.winding_down is False  # a naive read from $1,000 would have breached
+
+
+async def test_the_budget_sees_collateral_on_every_venue_the_executor_trades(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """A position's margin sitting on a builder DEX is not money lost. The
+    core venue's accountValue alone would read this sub as $600 down and wind
+    a perfectly healthy copy down on the strength of a venue it forgot to
+    look at."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("400"))  # core
+    gateway.set_account_value(SUB, Decimal("300"), dex="xyz")  # the builder DEX
+
+    await h.executor.run_cycle()
+
+    judged = await h.sub(sub.id)
+    assert judged.budget_spent_usd == Decimal("300")
+    assert judged.winding_down is False
+
+
+async def test_a_sub_without_a_budget_is_untouched_by_any_of_this(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Opt-in, and the absence of the feature is the old behaviour exactly: a
+    sub that has lost most of its allocation still copies, because nobody said
+    otherwise."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock)
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("40"))  # 96% of the allocation gone
+    h.exec_fake.place_results.append(
+        [OrderFilled(oid=1, total_size=Decimal("0.1"), avg_price=Decimal("2000"))]
+    )
+
+    await emit(pool, opened(), clock.now())
+    await h.executor.run_cycle()
+
+    assert len(h.placed()) == 1  # copied, as it always was
+    judged = await h.sub(sub.id)
+    assert judged.loss_budget_usd is None and judged.budget_armed_at is None
+    assert not any("budget" in body.lower() for body in await h.notices())
+
+
+async def test_the_halt_outranks_everything_a_budget_does(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """"Halted means Epigone signs nothing" keeps meaning exactly that. A
+    budget adds a per-sub state the halt outranks everywhere: a halted cycle
+    still MEASURES (reconciliation signs nothing and runs anyway) but nothing
+    it decides can produce an order — not even the exits a wind-down would
+    otherwise copy — and nothing about a budget can clear a halt."""
+    h = await build_harness(pool, clock, gateway)
+    sub = await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    await ep.open_episode(
+        pool,
+        sub_id=sub.id,
+        coin="ETH",
+        side="long",
+        entry_price=Decimal("2000"),
+        size_coin=Decimal("0.1"),
+        opened_at=clock.now(),
+        opened_event_id=None,
+    )
+    gateway.set_positions(SUB, [position(coin="ETH", size_coin="0.1")])
+    gateway.set_account_value(SUB, Decimal("400"))
+    await request_halt(
+        pool,
+        clock,
+        ExecutionAudit(pool, clock),
+        source=KILL_SOURCE,
+        reason="operator /kill",
+        requested_by=OPERATOR,
+    )
+
+    await emit(pool, closed(coin="ETH"), clock.now())
+    await h.executor.run_cycle()
+
+    assert h.placed() == []  # nothing signed, in either direction
+    assert await outstanding(pool) != []  # nothing claimed either
+    judged = await h.sub(sub.id)
+    assert judged.winding_down is True  # the breach was still measured and recorded
+    assert await is_halted(pool) is True  # and the halt stands, untouched
+
+
+async def test_budget_events_never_page(
+    pool: asyncpg.Pool, clock: FakeClock, gateway: FakeHyperliquidGateway
+) -> None:
+    """Operator decision: a page means something is BROKEN, and a budget doing
+    exactly what it was set to do is not that. Asserted by absence — the
+    monitor's action tuple gains nothing, and no notice rides the pager kind."""
+    h = await build_harness(pool, clock, gateway)
+    await copy_sub(pool, clock, loss_budget="500", baseline="1000")
+    gateway.set_positions(SUB, [])
+    gateway.set_account_value(SUB, Decimal("300"))
+
+    await h.executor.run_cycle()
+
+    budget_actions = {
+        action for action, _ in await h.audit_actions() if action.startswith("copy_budget")
+    }
+    assert budget_actions  # the cycle really did decide something
+    assert budget_actions.isdisjoint(COPY_PAGER_ACTIONS)
+    kinds = await pool.fetch("SELECT DISTINCT kind FROM copy_notices")
+    assert PAGER not in {row["kind"] for row in kinds}
+
+
 # --- reconciliation (decision 10) ---------------------------------------------
 
 
@@ -1879,6 +2529,7 @@ async def test_a_recopied_sub_is_topped_up_to_its_allocation(
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
+        loss_budget_usd=None,
     )
     assert reenabled is not None and reenabled.provisioned_at is None  # funding reopened
 
@@ -1911,6 +2562,7 @@ async def test_a_sub_already_holding_its_allocation_is_not_funded_again(
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
+        loss_budget_usd=None,
     )
 
     await h.executor.run_cycle()
@@ -2052,6 +2704,7 @@ async def test_a_sub_mapped_to_any_leader_is_never_adopted(
         take_profit_pct=None,
         stop_loss_pct=None,
         now=clock.now(),
+        loss_budget_usd=None,
     )
     await subs_store.record_sub_address(pool, foreign.id, held[2])
     sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")

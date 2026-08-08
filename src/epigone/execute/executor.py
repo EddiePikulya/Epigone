@@ -61,7 +61,7 @@ obligation, as it always was.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 
@@ -69,6 +69,7 @@ import asyncpg
 
 from epigone.budget import Budget
 from epigone.clock import Clock
+from epigone.decimals import fixed_point
 from epigone.execute import episodes as ep
 from epigone.execute import limits as risk_limits
 from epigone.execute import subs as subs_store
@@ -82,6 +83,10 @@ from epigone.execute.notices import (
 )
 from epigone.execute.policy import (
     BRACKET_VERIFY_INTERVAL,
+    BUDGET_BREACHED,
+    BUDGET_WARNING,
+    BUDGET_WARNING_FRACTION,
+    BUDGET_WITHIN,
     ENTRY_STALENESS_GUARD,
     EXIT_RETRY_ATTEMPTS,
     EXIT_RETRY_DELAY_SECONDS,
@@ -90,6 +95,9 @@ from epigone.execute.policy import (
     LeverageChoice,
     LeverageUnknownError,
     RiskPolicy,
+    budget_loss,
+    budget_spent_of,
+    budget_stage,
     committed_stake,
     resolve_leverage,
 )
@@ -103,7 +111,7 @@ from epigone.execute.pricing import (
     scale_fraction,
     trigger_price,
 )
-from epigone.execute.subs import CopySub
+from epigone.execute.subs import USD_MICRO, CopySub
 from epigone.gateway import (
     POSITION_VENUES,
     AssetSpec,
@@ -113,11 +121,13 @@ from epigone.gateway import (
     OpenOrder,
     Position,
     Side,
+    fetch_account_state,
     fetch_asset_specs,
     fetch_market_stats,
 )
 from epigone.gateway.execution import (
     ActionRejectedError,
+    CancelSpec,
     ExecutionError,
     Grouping,
     OrderFilled,
@@ -165,14 +175,19 @@ SUBS_WEIGHT = 20  # subAccounts — the rate the watchdog bills this listing at
 _HALTED_LEG = {"create": "created", "rename": "renamed", "fund": "funded"}
 FILLS_WEIGHT = 20  # userFills, per endpoint
 
-# Micro-USD is subAccountTransfer's unit (finding 6, measured).
-USD_MICRO = 1_000_000
-
 
 @dataclass(frozen=True)
 class SubState:
-    """One sub's live truth for this cycle: equity from the core venue, and
-    positions across every venue Epigone covers."""
+    """One sub's live truth for this cycle: its equity and its positions, both
+    across every venue Epigone covers.
+
+    THE EQUITY IS A SUM, not the core venue's figure (issue #181). Each venue
+    collateralises itself — a HIP-3 builder DEX holds its own margin — so a
+    copy holding xyz:META has real money on a venue the core `accountValue`
+    knows nothing about. Reading the core alone was harmless while this figure
+    only fed a history table; it stopped being harmless the moment a Loss
+    Budget started measuring a sub against it, where the missing venue reads
+    as money LOST and would wind a healthy copy down."""
 
     account_value: Decimal
     positions: dict[str, Position]
@@ -226,6 +241,7 @@ REASON_LIQUIDITY_FLOOR = "below the liquidity floor"
 REASON_LIVENESS_FLOOR = "leader below the liveness floor"
 REASON_BELOW_MINIMUM = "under the exchange minimum"
 REASON_UNREADABLE = "unreadable"
+REASON_LOSS_BUDGET = "loss budget spent"
 
 
 @dataclass(frozen=True)
@@ -303,6 +319,11 @@ class CopyExecutor:
         # and flushes it inside one cycle — nothing survives across cycles,
         # because "this many at once" is the only question it answers.
         self._skips = SkipDigest()
+        # Wound-down subs whose disable could not complete, and the reason last
+        # reported for each (issue #181). In memory, like `_flagged` and for the
+        # same reason: it answers "have I already said this", and a restart
+        # saying it once more is the safe direction.
+        self._deferred_disables: dict[int, str] = {}
 
     # --- the cycle ------------------------------------------------------------
 
@@ -323,8 +344,11 @@ class CopyExecutor:
         # Leaving a disabled sub unreconciled would also strand a live episode
         # that a later /copy would then read as "already in a copy episode".
         all_subs = await subs_store.all_subs(self._pool, self._operator_id)
-        subs = [sub for sub in all_subs if sub.enabled]
-        states = await self._reconcile(all_subs, now)
+        # `_reconcile` hands the mappings back AS THEY STAND AFTERWARDS, because
+        # judging a Loss Budget is part of it and its verdicts land on the row:
+        # a sub that BREACHED this cycle has to refuse this cycle's opens
+        # (issue #181).
+        states, all_subs = await self._reconcile(all_subs, now)
         if await is_halted(self._pool):
             # Halted: reconciliation has run (it signs nothing), and every
             # step below signs something. The backlog is NOT drained — an
@@ -333,6 +357,14 @@ class CopyExecutor:
             # backlog under the already-locked rules.
             log.info("copy executor: halted — reconciled only, nothing signed")
             return
+        # The wind-down's terminal step, and it is BELOW the halt gate rather
+        # than beside the measurement above because it CANCELS: a flat sub's
+        # leftover triggers come off the book before the mapping is disabled,
+        # and cancelling is signing. The enabled set is therefore taken after
+        # it — a mapping the executor has just ended must not be provisioned,
+        # bracketed or drained one more time in the same cycle.
+        all_subs = await self._disable_wound_down_subs(all_subs, states, now)
+        subs = [sub for sub in all_subs if sub.enabled]
         await self._provision(subs, now)
         await self._maintain_brackets(subs, states, now)
         await self._drain_backlog(subs, states)
@@ -775,37 +807,479 @@ class CopyExecutor:
 
     # --- reconciliation (decision 10) -----------------------------------------
 
-    async def _reconcile(self, subs: list[CopySub], now: datetime) -> dict[int, SubState]:
+    async def _reconcile(
+        self, subs: list[CopySub], now: datetime
+    ) -> tuple[dict[int, SubState], list[CopySub]]:
         """Compare every sub's live state against its episodes, classify each
         divergence, adopt the actual state as the new baseline, and page only
         what warrants it. It NEVER places an order to close a gap: auto-
         correcting would fight the operator (they close, we re-open), fight
-        liquidations, and turn bookkeeping bugs into live orders."""
+        liquidations, and turn bookkeeping bugs into live orders.
+
+        Hands back the mappings AS THEY STAND AFTERWARDS beside the states,
+        because judging a Loss Budget is part of this step and its verdicts
+        land on the mapping row: a sub that breached or was disabled here must
+        be the sub the rest of the cycle acts on, not the snapshot taken before
+        anything was measured."""
         states: dict[int, SubState] = {}
+        judged: list[CopySub] = []
         for sub in subs:
-            if not sub.is_provisioned:
-                continue
-            try:
-                state = await self._sub_state(sub)
-            except Exception:
-                # A read failure is not a divergence. Skipping this sub for
-                # one cycle costs latency; guessing would cost money.
-                log.warning(
-                    "copy executor: could not read sub %s this cycle", sub.sub_name, exc_info=True
-                )
+            state = await self._readable_state(sub)
+            if state is None:
+                # Unprovisioned, or unreadable this cycle. Either way the sub
+                # goes back UNJUDGED — carrying whatever the row already said,
+                # so a breach recorded on an earlier cycle still binds.
+                judged.append(sub)
                 continue
             states[sub.id] = state
             # The equity this read already carried, written down before any
             # episode work: a sub with no live episodes still has a curve, and
             # a sub whose reconcile then fails still had a readable equity
-            # (issue #137 §6 — the enabler the deferred daily-loss pause will
-            # be calibrated from).
+            # (issue #137 §6).
             await subs_store.record_sub_equity(
                 self._pool, sub.id, state.account_value, now
             )
             for episode in await ep.live_episodes(self._pool, sub.id):
                 await self._reconcile_episode(sub, episode, state, now)
-        return states
+            # LAST, so "flat" counts the episodes this cycle just ended: a
+            # bracket that fired ends its episode above, and the sub it leaves
+            # behind is exactly the flat, wound-down sub the budget disables.
+            judged.append(await self._judge_loss_budget(sub, state, now))
+        return states, judged
+
+    async def _readable_state(self, sub: CopySub) -> SubState | None:
+        """This cycle's live state for one sub, or None when there is not one
+        to be had: the mapping is not provisioned yet, or the read failed.
+
+        A read failure is not a divergence. Skipping this sub for one cycle
+        costs latency; guessing would cost money."""
+        if not sub.is_provisioned:
+            return None
+        try:
+            return await self._sub_state(sub)
+        except Exception:
+            log.warning(
+                "copy executor: could not read sub %s this cycle", sub.sub_name, exc_info=True
+            )
+            return None
+
+    # --- the Loss Budget (issue #181, amendment D-9) --------------------------
+
+    async def _judge_loss_budget(
+        self, sub: CopySub, state: SubState, now: datetime
+    ) -> CopySub:
+        """One sub's Loss Budget, judged once per cycle from the state this
+        cycle already read, and the state machine it drives:
+
+            armed → warned (first cycle ≥80%) → breached (first cycle ≥100%,
+            wind-down begins) → disabled (first cycle breached AND flat)
+
+        NO EXTRA READ. The equity is the reconcile's own, and the deposit
+        adjustment is a query against the audit trail — so a budget costs the
+        exchange nothing, which is what lets it be judged every cycle instead
+        of on a timer nobody would trust.
+
+        EVERY MARK IS PERSISTED, which is what makes the machine survive a
+        restart: a fresh executor over the same database re-reads a warned sub
+        as warned (it does not warn twice) and a breached sub as breached (it
+        does not re-arm into copying opens). Nothing here is held in memory
+        between cycles.
+
+        SKIPPED ENTIRELY FOR A DISABLED MAPPING. A budget governs COPYING, and
+        a mapping that is not copying has nothing to govern — measuring one
+        would fire a breach notice about a Leader the operator already stopped.
+        A later /copy re-arms it with a fresh baseline anyway (`reenable_sub`).
+
+        The halt is nowhere in here, deliberately: a halt outranks everything
+        this decides, and it does so structurally — `run_cycle` returns before
+        anything below this point signs — so there is no branch to write.
+        Reconciliation runs while halted, which means a halted executor still
+        MEASURES budgets and still records a breach; what it cannot do is act
+        on one, because it cannot act at all."""
+        if sub.loss_budget_usd is None or not sub.enabled:
+            return sub
+        if sub.budget_baseline_usd is None:
+            return await self._arm_loss_budget(sub, state, now)
+        assert sub.budget_armed_at is not None  # paired by the schema's CHECK
+        loss = budget_loss(
+            baseline_usd=sub.budget_baseline_usd,
+            deposits_usd=await subs_store.deposits_since(
+                self._pool, sub_address=sub.require_address(), since=sub.budget_armed_at
+            ),
+            equity_usd=state.account_value,
+        )
+        stage = budget_stage(loss_usd=loss, budget_usd=sub.loss_budget_usd)
+        # The warning mark is set by a BREACH too, not only by the warning
+        # stage. Without that, a sub that jumped straight past its budget and
+        # then recovered to 90% would announce "80% spent" AFTER the operator
+        # had already been told the budget was gone.
+        warned_at = (
+            now if stage != BUDGET_WITHIN and sub.budget_warned_at is None else None
+        )
+        breached_at = (
+            now if stage == BUDGET_BREACHED and sub.budget_breached_at is None else None
+        )
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Compare-and-set on the terms this verdict was reached against: a
+            # /copy that raised the budget while this cycle was measuring wins,
+            # and its wind-down cancellation is not undone by a verdict about
+            # the number it replaced. A lost write means no marks and no
+            # notices — the next cycle judges the sub the operator now has.
+            if not await subs_store.record_budget_spend(
+                conn,
+                sub.id,
+                spent_usd=loss,
+                warned_at=warned_at,
+                breached_at=breached_at,
+                judged_budget_usd=sub.loss_budget_usd,
+                judged_armed_at=sub.budget_armed_at,
+            ):
+                log.info(
+                    "copy executor: sub %s changed under its budget verdict; "
+                    "re-judging next cycle",
+                    sub.sub_name,
+                )
+                return sub
+            if breached_at is not None:
+                await self._loss_budget_event(
+                    conn,
+                    sub,
+                    action="copy_budget_breached",
+                    reason=(
+                        f"loss budget spent: {budget_spent_of(loss, sub.loss_budget_usd)} since "
+                        f"the budget was set — wind-down begins"
+                    ),
+                    body=(
+                        f"🛑 Loss budget SPENT on {_short(sub.leader_address)} — "
+                        f"{budget_spent_of(loss, sub.loss_budget_usd)}.\n"
+                        f"Winding down: opens, scale-ins and flip open-legs are refused "
+                        f"from now on. Exits keep copying and brackets stay maintained, so "
+                        f"the copy still follows them out. The sub is disabled once it is "
+                        f"flat. /copy with a higher budget resumes it."
+                    ),
+                    now=now,
+                )
+            elif warned_at is not None and stage == BUDGET_WARNING:
+                await self._loss_budget_event(
+                    conn,
+                    sub,
+                    action="copy_budget_warned",
+                    reason=(
+                        f"loss budget {int(BUDGET_WARNING_FRACTION * 100)}% spent: "
+                        f"{budget_spent_of(loss, sub.loss_budget_usd)}"
+                    ),
+                    body=(
+                        f"⚠️ Loss budget {int(BUDGET_WARNING_FRACTION * 100)}% spent on "
+                        f"{_short(sub.leader_address)} — "
+                        f"{budget_spent_of(loss, sub.loss_budget_usd)} since the budget was "
+                        f"set.\n"
+                        f"At the full budget this copy winds down and the sub is disabled "
+                        f"once flat. /copy changes the number; /uncopy stops now."
+                    ),
+                    now=now,
+                )
+        return replace(
+            sub,
+            budget_spent_usd=loss,
+            budget_warned_at=sub.budget_warned_at or warned_at,
+            budget_breached_at=sub.budget_breached_at or breached_at,
+        )
+
+    async def _arm_loss_budget(self, sub: CopySub, state: SubState, now: datetime) -> CopySub:
+        """Snapshot the equity a new budget is measured from.
+
+        HERE AND NOT IN /copy, because the baseline is a covered-venue equity
+        read and the bot process holds no gateway (migration 0039's header).
+        The instant recorded is THIS one, not the instant the operator typed
+        the command, and that is what keeps the arithmetic honest across
+        provisioning: the transfer that funded the sub landed before this read
+        and is therefore already inside the baseline, while every top-up after
+        it is added back by the deposit adjustment. Baselining at the command
+        would count that funding twice and show the whole allocation as lost on
+        the first cycle.
+
+        MEASURED FROM WHAT IS THERE, whatever put it there. An adopted orphan
+        or a re-copied sub arrives holding money; the operator's number is
+        about what happens NEXT, so a sub that starts at $1,400 is judged from
+        $1,400 and not from its allocation."""
+        assert sub.loss_budget_usd is not None  # only a budgeted sub is baselined
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Announced only if the snapshot LANDED: `arm_budget` refuses to
+            # re-baseline a budget that already has one, and a notice naming a
+            # baseline the budget is not measured from would be worse than
+            # silence.
+            if not await subs_store.arm_budget(
+                conn, sub.id, baseline_usd=state.account_value, now=now
+            ):
+                return sub
+            await self._loss_budget_event(
+                conn,
+                sub,
+                action="copy_budget_armed",
+                reason=(
+                    f"loss budget ${fixed_point(sub.loss_budget_usd)} armed from a "
+                    f"${_money(state.account_value)} baseline across every covered venue"
+                ),
+                body=(
+                    f"🎯 Loss budget armed for {_short(sub.leader_address)}: "
+                    f"${fixed_point(sub.loss_budget_usd)}, measured from what the sub is "
+                    f"worth right now (${_money(state.account_value)}). It is a trigger, "
+                    f"not a floor — at the number the copy winds down, and the last open "
+                    f"position rides until the leader exits it."
+                ),
+                now=now,
+            )
+        return replace(sub, budget_baseline_usd=state.account_value, budget_armed_at=now)
+
+    async def _disable_wound_down_subs(
+        self, subs: list[CopySub], states: dict[int, SubState], now: datetime
+    ) -> list[CopySub]:
+        """Every breached sub that has gone flat, disabled — the wind-down's
+        terminal step, run once per cycle after the halt gate because it
+        CANCELS resting orders and cancelling is signing.
+
+        A sub this cycle could not read is left alone: flatness is a claim
+        about the exchange's state, and the honest answer to an unreadable one
+        is next cycle."""
+        return [
+            await self._disable_if_flat(sub, states[sub.id], now)
+            if sub.winding_down and sub.enabled and sub.id in states
+            else sub
+            for sub in subs
+        ]
+
+    async def _disable_if_flat(
+        self, sub: CopySub, state: SubState, now: datetime
+    ) -> CopySub:
+        """A breached sub with nothing left open stops being a copy
+        relationship.
+
+        FLAT IS BOTH HALVES — no position the exchange reports in the sub, and
+        no live Copy Episode. The exchange's answer alone would disable a sub
+        whose close filled but whose episode this cycle has not ended yet; the
+        episode's alone would disable one holding a position the operator
+        opened by hand in the same sub.
+
+        THE BOOK IS EMPTIED OF OUR TRIGGERS FIRST. Ordinarily there is nothing
+        to empty: every bracket is placed POSITION_TPSL, so the venue takes the
+        pair down with the position it was sized against. But a STRAY is
+        exactly what `BRACKET_VERIFY_INTERVAL` exists to catch — a leg that
+        outlived its position, an episode that ended while one rested — and a
+        disabled mapping leaves `_maintain_brackets`' scope for good, so a
+        stray that survived this moment would rest until the operator or a
+        /kill sweep found it. Cancelled BEFORE the flag flips, in that order,
+        so a failure anywhere leaves the sub enabled and the next cycle tries
+        again rather than leaving an order behind a mapping nothing looks at.
+
+        THE SAME TERMINAL STATE /uncopy PRODUCES, through the same flag and the
+        same never-auto-flatten rule — there is nothing left to flatten by
+        construction. Copying this Leader again is a fresh, explicit /copy,
+        which starts a clean budget on a fresh baseline."""
+        assert sub.loss_budget_usd is not None  # only a breached budget winds down
+        assert sub.budget_breached_at is not None  # `winding_down` is exactly that
+        if state.positions or await ep.live_episodes(self._pool, sub.id):
+            return sub
+        deferred = await self._cancel_stray_brackets(sub, now)
+        if deferred is not None:
+            await self._report_deferred_disable(sub, deferred, now)
+            return sub
+        # Cleared: the next time this sub wedges, the operator hears about it
+        # afresh rather than being silenced by a reason that no longer holds.
+        self._deferred_disables.pop(sub.id, None)
+        loss = sub.budget_spent_usd or Decimal(0)
+        async with self._pool.acquire() as conn, conn.transaction():
+            # Conditional on the sub still being enabled and still carrying THIS
+            # breach, so the announcement happens exactly once and a wind-down
+            # the operator cancelled a moment ago is not disabled anyway.
+            if not await subs_store.disable_for_spent_budget(
+                conn, sub.id, breached_at=sub.budget_breached_at
+            ):
+                return sub
+            await self._loss_budget_event(
+                conn,
+                sub,
+                action="copy_budget_disabled",
+                reason=(
+                    f"wound down and flat: {budget_spent_of(loss, sub.loss_budget_usd)} — "
+                    f"mapping disabled"
+                ),
+                body=(
+                    f"⏹ Copy of {_short(sub.leader_address)} is DISABLED — its loss budget "
+                    f"is spent and the sub is now flat. Final "
+                    f"{budget_spent_of(loss, sub.loss_budget_usd)}. Nothing further is "
+                    f"copied; copying this leader again is a fresh /copy."
+                ),
+                now=now,
+            )
+        return replace(sub, enabled=False)
+
+    async def _cancel_stray_brackets(self, sub: CopySub, now: datetime) -> str | None:
+        """Take this sub's own resting triggers off the book. Returns None when
+        the book is now known to be clear of them, or the SENTENCE saying why
+        it could not be — which the caller reports and then defers the disable.
+
+        OURS ONLY, intersected against the bracket ids Epigone recorded for
+        this sub. Cancelling everything resting would be simpler and would
+        break decision 10's never-touch rule: a limit order the operator placed
+        by hand in that sub is theirs, and a Loss Budget is not a mandate to
+        clear someone else's book.
+
+        THE HALT GATE, as late as it can be, and the same one `_place_brackets`
+        carries: a cancel is a signature. A halt here defers the disable —
+        which costs nothing, since a halt's own sweep enumerates and cancels
+        per sub anyway (decision 1) and the mapping stays in wind-down
+        meanwhile, refusing every entry."""
+        known = await ep.sub_bracket_orders(self._pool, sub.id)
+        if not known:
+            return None
+        try:
+            resting = [order for order in await self._open_orders(sub) if order.order_id in known]
+        except Exception:
+            log.warning(
+                "copy executor: order book unreadable for %s; deferring its budget disable",
+                sub.sub_name,
+                exc_info=True,
+            )
+            return "this sub's order book could not be read"
+        if not resting:
+            return None
+        specs: list[CancelSpec] = []
+        for order in resting:
+            spec = await self._spec(order.coin)
+            if spec is None:
+                # The one order shape that cannot be cancelled by oid is one
+                # whose coin has no asset id. Defer rather than disable around
+                # it: this is the stray the whole step exists for — and it is
+                # the one deferral that does NOT resolve itself, which is why
+                # the caller has to say so out loud.
+                log.warning(
+                    "copy executor: %s has no asset id; deferring %s's budget disable",
+                    order.coin,
+                    sub.sub_name,
+                )
+                return (
+                    f"{order.coin} has no asset id in the universe — a delisted coin's "
+                    f"resting bracket cannot be cancelled by this executor"
+                )
+            specs.append(CancelSpec(asset=spec.asset_id, oid=order.order_id))
+        if await is_halted(self._pool):
+            log.warning(
+                "copy executor: halted before clearing %s's brackets — disable deferred",
+                sub.sub_name,
+            )
+            return "execution is halted, and a cancel is a signature"
+        self._exec.decision = (
+            f"loss budget spent and the sub is flat: cancelling {len(specs)} resting "
+            f"bracket leg(s) before disabling the mapping"
+        )
+        try:
+            await self._exec.cancel_orders(specs, vault_address=sub.require_address())
+        except ExecutionError:
+            # Already on the trail via the audited gateway. The mapping stays
+            # enabled and wound down; the next cycle tries again.
+            log.exception("copy executor: could not clear %s's brackets", sub.sub_name)
+            return "the cancel did not reach the exchange"
+        await self._notify(
+            kind=ACTION,
+            body=(
+                f"🧹 Cancelled {len(specs)} leftover bracket order(s) in "
+                f"{_short(sub.leader_address)}'s sub before disabling it."
+            ),
+            now=now,
+        )
+        return None
+
+    async def _report_deferred_disable(
+        self, sub: CopySub, reason: str, now: datetime
+    ) -> None:
+        """A wound-down sub that should have been disabled and could not be.
+
+        SAID ONCE PER REASON, not once per cycle: the executor loops in
+        seconds, and a sub wedged on a delisted coin's stray trigger would
+        otherwise write a row and a chat line every few seconds for as long as
+        it took anyone to notice. Once per reason still fires again when the
+        reason CHANGES — an unreadable book that becomes a missing asset id is
+        a different problem — and a restart re-says it once, which is the right
+        side of that trade for a state whose whole failing is being quiet.
+
+        IT NEEDS A TRACE AT ALL because the deferral has no natural end. Most
+        of these resolve themselves on the next cycle (a blipped read, a halt
+        the operator lifts) and would never be worth a word; a delisted coin's
+        resting trigger does not, and leaves the mapping enabled-but-wound-down
+        with a live order behind it indefinitely. `/copies` shows the sub as
+        winding down either way — what only this can say is that it was
+        SUPPOSED to be finished and is stuck.
+
+        NOT A PAGER CASE, like everything else this feature does: the sub is
+        flat, it refuses every entry, and the stray is a reduce-only trigger
+        with no position under it. It wants a human eventually, not now."""
+        if self._deferred_disables.get(sub.id) == reason:
+            return
+        self._deferred_disables[sub.id] = reason
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._audit.record_event(
+                actor=EXECUTOR_ACTOR,
+                action="copy_budget_disable_deferred",
+                risk_decision=(
+                    f"loss budget spent and the sub is flat, but the mapping was NOT "
+                    f"disabled: {reason}"
+                ),
+                detail={"sub_id": sub.id, "leader": sub.leader_address, "reason": reason},
+                master_address=self._master,
+                conn=conn,
+            )
+            await notify(
+                conn,
+                operator_id=self._operator_id,
+                kind=SKIP,
+                body=(
+                    f"⏳ {_short(sub.leader_address)}'s copy is spent and flat but could "
+                    f"NOT be closed out: {reason}.\n"
+                    f"It stays wound down — no new positions, exits still copied — and the "
+                    f"executor retries every cycle. If this does not clear, /uncopy it and "
+                    f"cancel what is resting in that sub from the master wallet."
+                ),
+                now=now,
+            )
+
+    async def _loss_budget_event(
+        self,
+        conn: asyncpg.Connection,
+        sub: CopySub,
+        *,
+        action: str,
+        reason: str,
+        body: str,
+        now: datetime,
+    ) -> None:
+        """One budget state change, recorded and announced in the CALLER'S
+        transaction.
+
+        The audit row is written with the state change it describes and is
+        independent of chat delivery: a Telegram outage can delay the
+        operator's notice but must never erase the record of a wind-down.
+
+        NOT A PAGER CASE, and that is an operator decision rather than an
+        oversight (issue #181): a page means something is BROKEN, and a budget
+        doing exactly what it was set to do is not that. The monitor's action
+        tuple is deliberately unchanged."""
+        await self._audit.record_event(
+            actor=EXECUTOR_ACTOR,
+            action=action,
+            risk_decision=reason,
+            detail={
+                "sub_id": sub.id,
+                "leader": sub.leader_address,
+                # Through `fixed_point`, not `str`: a NUMERIC read back from
+                # Postgres can carry an exponent, and `5E+2` on the trail is
+                # the #185 lesson said in a place nobody would look twice at.
+                "budget_usd": _figure(sub.loss_budget_usd),
+                "baseline_usd": _figure(sub.budget_baseline_usd),
+            },
+            master_address=self._master,
+            conn=conn,
+        )
+        await notify(conn, operator_id=self._operator_id, kind=ACTION, body=body, now=now)
 
     async def _reconcile_episode(
         self, sub: CopySub, episode: ep.CopyEpisode, state: SubState, now: datetime
@@ -1537,6 +2011,22 @@ class CopyExecutor:
         """Every reason an entry does not happen, in the order that answers
         cheapest first. All of them CLAIM the event (claim-means-handled)."""
         coin = event.event.coin
+        if sub.winding_down:
+            # FIRST, because it is free — the verdict was reached during this
+            # cycle's reconcile, from state already in hand — and because it is
+            # the bluntest of the reasons: the operator has said they are done
+            # losing money on this Leader, and no later question can change
+            # that answer. Every leg that reaches `_entry` is risk-increasing
+            # by construction (open, scale_in, flip_open), which is exactly the
+            # set the wind-down refuses; exits never come through here, and the
+            # exits-never-decline contract is untouched.
+            assert sub.loss_budget_usd is not None  # a breach implies a budget
+            verdict = self._policy.judge_wind_down(
+                coin=coin,
+                loss_usd=sub.budget_spent_usd or Decimal(0),
+                budget_usd=sub.loss_budget_usd,
+            )
+            return _Skip(REASON_LOSS_BUDGET, verdict.decision, {"coin": coin, "leg": leg})
         age = now - event.observed_at
         if age > ENTRY_STALENESS_GUARD:
             # Decision 8: risk-increasing actions only. Five minutes never
@@ -2240,25 +2730,27 @@ class CopyExecutor:
         )
 
     async def _sub_state(self, sub: CopySub) -> SubState:
-        """One sub's equity and positions across every covered venue.
+        """One sub's equity and positions across every covered venue, from the
+        one clearinghouseState per venue the reconcile already pays for.
 
-        Equity comes from the CORE venue: the allocation was funded there and
-        that is where margin is measured. Positions walk POSITION_VENUES like
-        every other position read in the system, so a copy on the xyz builder
-        DEX reconciles like a core one."""
+        Through the shared `fetch_account_state` rather than a walk of its own
+        (issue #181), because the equity is now a SUM and the sum has an
+        all-or-raise rule that must not be re-implemented here: a venue that
+        failed to answer contributes zero, which is indistinguishable from a
+        sub that moved that balance out — and a budget measuring against a
+        silently-short equity would wind a healthy copy down. Raising leaves
+        the sub unreconciled for one cycle, which the caller already handles.
+
+        The weight is billed here, per venue, because the budget is this
+        module's to spend and the helper takes no view on it."""
         address = sub.require_address()
-        positions: dict[str, Position] = {}
-        await self._budget.spend(POSITIONS_WEIGHT)
-        core = await self._read.get_account_state(address, dex=None)
-        for position in core.positions:
-            positions[position.coin] = position
-        for dex in POSITION_VENUES:
-            if dex is None:
-                continue
+        for _ in POSITION_VENUES:
             await self._budget.spend(POSITIONS_WEIGHT)
-            for position in await self._read.get_open_positions(address, dex=dex):
-                positions[position.coin] = position
-        return SubState(account_value=core.account_value, positions=positions)
+        state = await fetch_account_state(self._read, address)
+        return SubState(
+            account_value=state.account_value,
+            positions={position.coin: position for position in state.positions},
+        )
 
     async def _open_orders(self, sub: CopySub) -> list[OpenOrder]:
         address = sub.require_address()
@@ -2365,6 +2857,14 @@ def _held(state: SubState, coin: str) -> Decimal:
 
 def _money(value: Decimal) -> str:
     return f"{value:.2f}"
+
+
+def _figure(value: Decimal | None) -> str | None:
+    """One dollar figure for an audit detail payload. `fixed_point` rather than
+    `str`, for the reason `_round`'s docstring in the policy gives: a round
+    NUMERIC from Postgres stringifies as `5E+2`, and the trail is read by the
+    same human the chat is."""
+    return None if value is None else fixed_point(value)
 
 
 __all__ = ["EXECUTOR_CONSUMER", "CopyExecutor", "SubState"]

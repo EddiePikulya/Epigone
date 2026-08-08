@@ -63,6 +63,22 @@ class CopyHarness:
         """Every place_orders call's payload, in submission order."""
         return [payload for method, payload in self.exec_fake.actions if method == "place_orders"]
 
+    def cancelled(self) -> list[int]:
+        """Every order id this executor asked the exchange to cancel."""
+        return [
+            spec.oid
+            for method, payload in self.exec_fake.actions
+            if method == "cancel_orders"
+            for spec in payload[0]  # type: ignore[index]
+        ]
+
+    async def sub(self, sub_id: int) -> CopySub:
+        """The mapping as it stands NOW — the enabled flag and the budget
+        ledger are what a cycle writes, so a test asserting either has to
+        re-read rather than trust the handle it started with."""
+        rows = await subs_store.all_subs(self.pool, OPERATOR)
+        return next(sub for sub in rows if sub.id == sub_id)
+
     async def episodes(self, sub_id: int) -> list[asyncpg.Record]:
         return list(
             await self.pool.fetch(
@@ -195,10 +211,20 @@ async def copy_sub(
     stop_loss_pct: str | None = None,
     leader: str = LEADER,
     sub_address: str = SUB,
+    loss_budget: str | None = None,
+    baseline: str | None = None,
+    operator: int = OPERATOR,
 ) -> CopySub:
+    """One Leader→sub mapping, as /copy would have written it.
+
+    `loss_budget` arms it the way the operator does — the number alone, with no
+    baseline — so a test that wants the executor's own arming to happen just
+    passes it. `baseline` additionally stands in for a budget the executor has
+    ALREADY armed, which is what a test about a mid-run breach or a restart
+    needs: the ledger it inherits, not the one it creates."""
     sub = await subs_store.register_sub(
         pool,
-        operator_id=OPERATOR,
+        operator_id=operator,
         leader_address=leader,
         sub_name=f"epicopy-{leader[-4:]}",
         allocation_usd=Decimal(allocation),
@@ -209,13 +235,43 @@ async def copy_sub(
         take_profit_pct=Decimal(take_profit_pct) if take_profit_pct else None,
         stop_loss_pct=Decimal(stop_loss_pct) if stop_loss_pct else None,
         now=clock.now(),
+        loss_budget_usd=Decimal(loss_budget) if loss_budget else None,
     )
+    if baseline is not None:
+        await subs_store.arm_budget(
+            pool, sub.id, baseline_usd=Decimal(baseline), now=clock.now()
+        )
     if provisioned:
         await subs_store.record_sub_address(pool, sub.id, sub_address)
         await subs_store.mark_funded(pool, sub.id, clock.now())
-        rows = await subs_store.enabled_subs(pool, OPERATOR)
-        return next(s for s in rows if s.id == sub.id)
-    return sub
+    rows = await subs_store.all_subs(pool, operator)
+    return next(s for s in rows if s.id == sub.id)
+
+
+async def record_spend(
+    pool: asyncpg.Pool,
+    sub: CopySub,
+    spent: str,
+    *,
+    warned_at: datetime | None = None,
+    breached_at: datetime | None = None,
+) -> None:
+    """Put a sub's budget ledger where a test needs it, through the same setter
+    the executor uses — so a test can never reach a budget state by a route the
+    executor does not have.
+
+    It passes the sub's OWN terms as the compare-and-set, which is exactly what
+    the executor passes when nothing changed under it."""
+    assert sub.loss_budget_usd is not None and sub.budget_armed_at is not None
+    await subs_store.record_budget_spend(
+        pool,
+        sub.id,
+        spent_usd=Decimal(spent),
+        warned_at=warned_at,
+        breached_at=breached_at,
+        judged_budget_usd=sub.loss_budget_usd,
+        judged_armed_at=sub.budget_armed_at,
+    )
 
 
 async def set_limits(pool: asyncpg.Pool, clock: FakeClock, **knobs: str) -> None:
