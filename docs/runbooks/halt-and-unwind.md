@@ -503,7 +503,9 @@ deliberate — the watchdog is alive and cancelling, and saying so is true —
 and it is why external silence never means "the database is down".
 
 In every posture, each of the two IN-BAND legs of the pulse — the heartbeat
-and the dead-man's push — runs on its own small TIME budget: a leg whose attempts add up past it
+and the dead-man's push — runs on its own small TIME budget (with one
+exception, below: a push whose schedule is about to lapse jumps that budget,
+issue #212): a leg whose attempts add up past it
 goes quiet, because reaching the wire outranks saying so, and gets the budget
 back every 45 seconds of sweep (and at every cycle top), so going quiet is
 under a minute and never the rest of a grind. The budget is spent on
