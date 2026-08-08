@@ -664,6 +664,138 @@ async def test_an_exit_the_websocket_missed_is_drift_even_on_a_coin_it_reported(
     ]
 
 
+async def test_an_entry_the_websocket_produced_never_vouches_for_a_flips_exit(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The same substitution, reached through the one kind that moves both ways
+    (issue #196), and the only interleaving known to yield a copy on the WRONG
+    SIDE rather than merely a late one.
+
+    The websocket produces a genuine scale-in on BTC and its subscription then
+    goes silently deaf — `allMids` keeps the heartbeat fresh, so nothing else
+    notices. The Leader flips long→short. If either direction vouched for the
+    poller's flip, that scale-in's entry would answer for the flip's exit leg:
+    shadow-recorded, anchor advanced past it, produced by nobody, and the copy
+    holds a long against a short Leader until some later change escalates."""
+    clock.advance(30)
+    await websocket_produced(
+        pool,
+        clock,
+        TRADER,
+        PositionEvent(kind="scale_in", coin="BTC", side="long",
+                      size_usd=Decimal("20000"), prev_size_usd=Decimal("10000")),
+    )
+    await websocket_watching(pool, clock, TRADER, [position(size_usd="20000")])
+
+    clock.advance(30)
+    gateway.set_positions(TRADER, [position(side=Side.SHORT)])  # and the lane never says so
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "BTC" in authority.reason
+    authoritative = [row for row in await events(pool) if row["authoritative"]]
+    assert [(row["source"], row["kind"]) for row in authoritative] == [
+        (WS_SOURCE, "scale_in"),
+        (POLL_SOURCE, "flip"),
+    ]
+    assert [(row["kind"], row["side"]) for row in await alerts(pool)] == [("flip", "short")]
+
+
+async def test_a_flip_the_websocket_told_in_two_legs_is_still_told(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """...and demanding both legs costs the honest lane nothing. The websocket
+    decomposes some flips into a close and an open (ADR-0006 keeps the poller's
+    one event one event, and the shadow dataset measured the disagreement);
+    between them they account for both directions, so the change is told, and
+    this pass stays quiet about a flip nobody is missing."""
+    clock.advance(60)
+    gateway.set_positions(TRADER, [position(side=Side.SHORT)])
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="open", coin="BTC", side="short")
+    )
+
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert await pending_coins(pool, TRADER) == []
+    assert [(row["source"], row["kind"], row["authoritative"]) for row in await events(pool)] == [
+        (WS_SOURCE, "close", True),
+        (WS_SOURCE, "open", True),
+        (POLL_SOURCE, "flip", False),
+    ]
+
+
+async def test_a_flips_second_leg_landing_late_is_absorbed_by_the_hold(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The decomposition caught mid-stride, which is what makes requiring both
+    legs safe rather than merely strict. The poller's read falls between the
+    websocket's two legs: only the close exists, so the flip is not yet told and
+    the coin is held — no incident, nothing produced. The open leg lands within
+    the lane's ~5s push cadence, long before the second look, and the flip is
+    told after all."""
+    clock.advance(60)
+    gateway.set_positions(TRADER, [position(side=Side.SHORT)])
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+
+    await poll(pool, gateway, clock)
+    assert await pending_coins(pool, TRADER) == ["BTC"]
+    assert [row for row in await events(pool) if row["source"] == POLL_SOURCE] == []
+
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await websocket_produced(
+        pool, clock, TRADER, PositionEvent(kind="open", coin="BTC", side="short")
+    )
+    await poll(pool, gateway, clock)
+
+    assert (await read_authority(pool)).owner == WS_OWNER
+    assert await pending_coins(pool, TRADER) == []
+    assert [(row["source"], row["authoritative"]) for row in await events(pool)] == [
+        (WS_SOURCE, True),
+        (WS_SOURCE, True),
+        (POLL_SOURCE, False),
+    ]
+
+
+async def test_half_a_flip_is_still_evidence_that_ownership_stranded_it(
+    pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock, baselined: None
+) -> None:
+    """The other question about the same flip takes the opposite quantifier, and
+    conflating the two would reopen the swallow hole from the other side.
+
+    "Has this change been told?" earns silence and needs a complete account.
+    "Did the lane see a change nobody produced?" is evidence of a stranding, and
+    half a flip is evidence: here the websocket wrote only the close leg
+    unconsumed before the handback, its anchor moved on regardless, and no
+    complete account of the flip will ever exist to find."""
+    clock.advance(30)
+    gateway.set_positions(TRADER, [position(side=Side.SHORT)])
+    await websocket_shadow_wrote(
+        pool, clock, TRADER, PositionEvent(kind="close", coin="BTC", prev_side="long")
+    )
+    await websocket_watching(pool, clock, TRADER, [position(side=Side.SHORT)])
+
+    clock.advance(30)
+    await poll(pool, gateway, clock)
+    clock.advance(POLL_INTERVAL_SECONDS)
+    await poll(pool, gateway, clock)
+
+    authority = await read_authority(pool)
+    assert authority.owner == POLL_OWNER
+    assert "ownership" in authority.reason
+    authoritative = [row for row in await events(pool) if row["authoritative"]]
+    assert [(row["source"], row["kind"]) for row in authoritative] == [(POLL_SOURCE, "flip")]
+
+
 async def test_alerts_survive_a_cutover_a_failover_and_a_recovery(
     pool: asyncpg.Pool, gateway: FakeHyperliquidGateway, clock: FakeClock
 ) -> None:
