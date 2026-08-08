@@ -641,8 +641,25 @@ class AssetSpec:
     sz_decimals: int
 
 
+class PerpUniverseReader(Protocol):
+    """The two reads the asset-map fetch makes, stated as its own contract
+    rather than borrowing the whole gateway's (issue #204).
+
+    Narrow on purpose: a caller that must stay LIVE across those reads — the
+    watchdog's sweep, where `_asset_ids_for` was 2+N back-to-back HTTP reads
+    with no liveness pulse between them and no ceiling on any of them — can
+    now pass a wrapper over its gateway that pulses and bounds each read,
+    instead of having to satisfy every method a HyperliquidGateway has.
+    HyperliquidGateway itself satisfies this structurally, so every ordinary
+    caller passes its gateway exactly as before."""
+
+    async def get_perp_assets(self, dex: str | None = None) -> list[PerpAsset]: ...
+
+    async def get_perp_dexs(self) -> list[str]: ...
+
+
 async def fetch_asset_specs(
-    gateway: HyperliquidGateway, *, dexs: Sequence[str] | None = None
+    gateway: PerpUniverseReader, *, dexs: Sequence[str] | None = None
 ) -> dict[str, AssetSpec]:
     """Coin name → its AssetSpec across the core universe and `dexs`.
 
@@ -699,7 +716,7 @@ async def fetch_market_stats(gateway: HyperliquidGateway) -> dict[str, MarketSta
 
 
 async def fetch_asset_ids(
-    gateway: HyperliquidGateway, *, dexs: Sequence[str] | None = None
+    gateway: PerpUniverseReader, *, dexs: Sequence[str] | None = None
 ) -> dict[str, int]:
     """Coin name → the integer asset id `/exchange` actions take — the mapping
     a cancel-by-oid needs to name an OpenOrder's asset (issue #135; the read

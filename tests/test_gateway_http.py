@@ -20,6 +20,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from epigone.gateway import GatewayError, RateLimitedError, Side
+from epigone.gateway.backoff import RETRY_AFTER_CAP_SECONDS
 from epigone.gateway.http import (
     COVERAGE_HORIZON_MARGIN,
     RATE_LIMIT_MAX_TRIES,
@@ -235,6 +236,35 @@ async def test_backoff_jitter_scales_the_window_but_never_to_zero() -> None:
         await gateway.get_open_positions(WHALE)
 
     assert clock.slept == [0.5, 1.0]  # rng()=0.0 bottoms out at half the window
+
+
+async def test_an_absurd_retry_after_is_capped_at_our_own_backoff_maximum() -> None:
+    """Issue #204: the header is the SERVER's number and this process sleeps on
+    it, so uncapped it is a remote party's hand on our wall clock — one
+    `Retry-After: 100000` parks a single read for over a day. The kill path's
+    liveness argument (every await between two watchdog sweep pulses bounded
+    well under one dead-man period) is load-bearing on this bound."""
+    clock = FakeClock()
+    async with replaying_gateway(
+        RECORDED, clock=clock, rate_limited=1, retry_after="100000"
+    ) as (gateway, received):
+        positions = await gateway.get_open_positions(WHALE)
+
+    assert positions[0].coin == "ETH"  # still retried and parsed normally
+    assert len(received) == 2
+    assert clock.slept == [RETRY_AFTER_CAP_SECONDS]
+
+
+async def test_a_negative_retry_after_is_still_clamped_to_zero() -> None:
+    # Both ends of the clamp are the same rule; the floor predates the cap.
+    clock = FakeClock()
+    async with replaying_gateway(RECORDED, clock=clock, rate_limited=1, retry_after="-5") as (
+        gateway,
+        _,
+    ):
+        await gateway.get_open_positions(WHALE)
+
+    assert clock.slept == [0.0]
 
 
 async def test_an_unparseable_retry_after_falls_back_to_backoff() -> None:

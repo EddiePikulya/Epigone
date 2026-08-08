@@ -24,6 +24,7 @@ from eth_account import Account
 from hyperliquid.utils.signing import recover_agent_or_user_from_l1_action
 
 import epigone.gateway.execution_http as execution_http
+from epigone.gateway.backoff import RETRY_AFTER_CAP_SECONDS
 from epigone.gateway.execution import (
     ActionRejectedError,
     AmbiguousExecutionError,
@@ -518,6 +519,19 @@ async def test_a_429_retry_reposts_the_identical_signed_payload(replaying: Any) 
     assert len(h.received) == 2
     assert h.received[0] == h.received[1]
     assert h.clock.slept  # backed off between tries
+
+
+async def test_an_absurd_retry_after_is_capped_on_the_write_side_too(
+    replaying: Any,
+) -> None:
+    """Issue #204: both directions sleep on `parse_retry_after`, so both are
+    bounded by it. The write side is where it bites hardest — a cancel POST is
+    on the watchdog's kill path, and a schedule pushed 100000s from now is a
+    dead-man's switch discharged by a header."""
+    h = await replaying(429, OK_DEFAULT, retry_after="100000")
+    await h.gateway.schedule_cancel(None)
+    assert len(h.received) == 2
+    assert h.clock.slept == [RETRY_AFTER_CAP_SECONDS]
 
 
 async def test_a_429_streak_escapes_as_rate_limited(replaying: Any) -> None:

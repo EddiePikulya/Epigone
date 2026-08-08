@@ -288,14 +288,31 @@ fresh + progress lines stopped = stuck on one REST call or on budget
 pacing. Heartbeat stale = the process itself is in trouble; that is the
 monitor's watchdog check, and it means what it says again.
 
-Note the monitor's own limit here, unchanged by #201: its staleness
-THRESHOLD is 300s (`HEALTHCHECK_WATCHDOG_STALE_SECONDS`) but it only runs
-every 15 minutes (`HEALTHCHECK_INTERVAL_MINUTES`), so a genuinely dead
-watchdog can go up to a check cadence unreported — long enough for the
-dead-man's 300s schedule to fire first. Tightening the cadence to inside
-one dead-man period is issue #201's sixth candidate and is NOT done;
-until it is, do not treat "the monitor has not paged" as "the watchdog is
-alive" during an incident you are already watching.
+The monitor now looks at watchdog liveness on ITS OWN TIMER (issue #205),
+every 60s (`HEALTHCHECK_WATCHDOG_CHECK_SECONDS`) rather than only on the
+15-minute check cycle (`HEALTHCHECK_INTERVAL_MINUTES`); the expensive checks
+keep the slow cycle. So the worst case from a watchdog freezing to the
+operator holding a 🚨 DM is one staleness threshold plus one liveness
+cadence — 360s at the defaults — instead of the threshold plus a quarter of
+an hour. That is what closes the 2026-08-07 shape, where the watchdog froze
+at 18:20:15, the 18:24 pass saw four minutes of staleness (under threshold),
+the next look would have been 18:39, and the operator found the freeze with
+an ad-hoc DB query instead.
+
+Read that number honestly: 360s is longer than the dead-man's 300s horizon,
+so a watchdog that dies with an armed schedule can still have that schedule
+fire before the page lands. What has changed is that the page now arrives in
+the same minutes as the incident rather than after it, and that the gap is
+made of the STALENESS THRESHOLD, which is a knob. If you want the page ahead
+of the fire, lower `HEALTHCHECK_WATCHDOG_STALE_SECONDS` — the watchdog beats
+every cycle (~10s) and every ~5s inside a sweep, so 300s is thirty missed
+beats and there is a lot of room; the reason it is not lower by default is
+that it must also survive a deploy restart and a cold start's grace window
+without paging. So: "the monitor has not paged in the last minute" is now
+real evidence that the watchdog was alive a minute ago — which it was not
+before — but it is still not evidence that the dead-man's schedule has not
+fired. During an incident you are already watching, the heartbeat row and
+the sweep's progress lines remain the primary signal.
 
 A DB-BLIND window is deliberately silent on all of these: that path reaches
 the wire with zero Postgres behind it by construction, so it neither beats
@@ -307,18 +324,38 @@ DOES beat through its cancel pass: its liveness reads answered that cycle,
 so the database is healthy.
 
 In every posture, each leg of the pulse — the heartbeat and the dead-man's
-push — runs on its own small per-cycle TIME budget: a leg whose attempts add
-up past it goes quiet for the rest of that cycle and is retried by the next
-one, because reaching the wire outranks saying so. The budget is spent on
+push — runs on its own small TIME budget: a leg whose attempts add up past it
+goes quiet, because reaching the wire outranks saying so, and gets the budget
+back every minute of sweep (and at every cycle top), so going quiet is
+minutes at worst and never the rest of a grind. The budget is spent on
 measured wall clock, not on how an attempt failed, so a leg that is merely
 SLOW (a wedged database, an endpoint that 502s after twenty seconds) stops
 taxing the sweep, while a leg that fails FAST keeps trying — a refused
 connection or a single 429 costs the sweep nothing and must not silence a
 signal for the whole grind. The two legs never gate each other: a dead
 database still lets the schedule be pushed, a wedged exchange still lets the
-heartbeat beat. So `sweep progress` lines advancing with a heartbeat that
-has stopped means the heartbeat's own leg is down — a wedged or failing
-database — not that the watchdog died.
+heartbeat beat.
+
+So `sweep progress` lines advancing with a heartbeat that has stopped means
+the heartbeat's own leg is down, not that the watchdog died. Two readings fit
+that, and the log line says which: if the last `sweep pulse: the heartbeat
+leg has spent …` line is recent, the leg is being SLOW right now — a wedged
+or failing database. If there is no such line, or the last one is a minute or
+more old and the beats have not resumed, the beat is not slow but failing
+outright and the log will carry the `heartbeat write failed` warnings to
+match. A leg that was slow earlier in the cycle and is healthy again resumes
+on its own at the next refill; that shape looks like a gap in the heartbeat
+followed by beats, and needs no action.
+
+Every READ the watchdog makes is also individually ceilinged (issue #204),
+at 45s, and the exchange's `Retry-After` is capped at 30s wherever we sleep
+on it. Both exist so that no single await between two liveness pulses can
+outlive the dead-man's slack — a 429-saturated enumeration read used to be
+able to run for minutes and straddle the moment the push fell due. A read cut
+at its ceiling shows up as a sweep that did not finish: the halt stays
+unswept, the watchdog logs the failure, and the next cycle re-enumerates.
+Repeated cuts on the same venue mean that endpoint is saturated or down, not
+that the watchdog is broken.
 
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are
@@ -337,7 +374,8 @@ a funding transfer cannot be un-sent and a sub-account cannot be un-minted,
 so both legs carry the same late halt re-check the order legs do.
 
 The watchdog's own health is a 🚨 health-monitor check on two axes: liveness
-(`HEALTHCHECK_WATCHDOG_STALE_SECONDS`, default 300) and CAPABILITY — every
+(`HEALTHCHECK_WATCHDOG_STALE_SECONDS`, default 300, re-evaluated every
+`HEALTHCHECK_WATCHDOG_CHECK_SECONDS`, default 60) and CAPABILITY — every
 ~6h (`WATCHDOG_CAPABILITY_CHECK_HOURS`) it verifies on-chain, via the public
 `extraAgents` readback, that its agent key is still approved and unexpired,
 so a beating-but-impotent watchdog (mid-run deregistration, an unrestarted

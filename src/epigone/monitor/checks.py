@@ -304,6 +304,62 @@ async def gather_snapshot(
     )
 
 
+async def gather_watchdog_snapshot(pool: asyncpg.Pool, clock: Clock) -> HealthSnapshot:
+    """The LIVENESS-ONLY snapshot (issue #205): the execution processes' own
+    heartbeat row and nothing else.
+
+    Why a second gather rather than the full one on a faster timer: the full
+    one counts wallets, due Traders, undelivered alerts, rate events and copy
+    pagers across five tables, and running that every minute would trade a
+    monitoring gap for a load problem. What the dead-man's timing actually
+    needs is one indexed single-row read, so that is what this is — the
+    expensive checks keep the 15-minute cycle.
+
+    Every field here is one `_watchdog_check` reads, and it is the SAME check
+    function both cadences evaluate: a fast tick that judged watchdog liveness
+    by its own rules would flap against the slow cycle's verdict in the shared
+    alerting state machine."""
+    row = await pool.fetchrow(
+        """
+        SELECT
+            (SELECT beaten_at FROM process_heartbeats WHERE process = 'executor')
+                AS executor_beaten_at,
+            (SELECT beaten_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_beaten_at,
+            (SELECT capable FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capable,
+            (SELECT capability_detail FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_detail,
+            (SELECT capability_checked_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_checked_at,
+            (SELECT started_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_started_at
+        """
+    )
+    assert row is not None
+    return HealthSnapshot(
+        now=clock.now(),
+        db_reachable=True,
+        executor_beaten_at=row["executor_beaten_at"],
+        watchdog_beaten_at=row["watchdog_beaten_at"],
+        watchdog_capable=row["watchdog_capable"],
+        watchdog_capability_detail=row["watchdog_capability_detail"],
+        watchdog_capability_checked_at=row["watchdog_capability_checked_at"],
+        watchdog_started_at=row["watchdog_started_at"],
+    )
+
+
+def evaluate_watchdog_liveness(
+    snapshot: HealthSnapshot, thresholds: CheckThresholds
+) -> list[CheckResult]:
+    """The one check the fast tick evaluates (issue #205), in list form so it
+    feeds the alerting state machine exactly like `evaluate_checks` does.
+
+    Deliberately the same `_watchdog_check` the full cycle runs, over the same
+    fields: one verdict for one check name, whichever cadence produced it."""
+    return [_watchdog_check(snapshot, thresholds.watchdog_stale)]
+
+
 def db_down(now: datetime) -> HealthSnapshot:
     """The snapshot to report when the monitor's own query fails — DB-down is a
     critical signal, and the monitor can still DM (token + admin come from env,

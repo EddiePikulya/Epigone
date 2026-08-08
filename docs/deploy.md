@@ -81,7 +81,10 @@ ADMIN_TELEGRAM_ID=370818090
 # Optional. Health-check (issue #52), all with safe defaults — a bad value falls
 # back with a logged warning. The monitor reuses the token/admin above (send-only)
 # and DMs the admin on problems, recoveries, and a daily heartbeat.
-# HEALTHCHECK_INTERVAL_MINUTES=15        # how often the checks run
+# HEALTHCHECK_INTERVAL_MINUTES=15        # how often the EXPENSIVE checks run
+# HEALTHCHECK_WATCHDOG_CHECK_SECONDS=60  # how often watchdog liveness alone is re-checked
+#                                        # (issue #205); clamped to the interval above
+# HEALTHCHECK_WATCHDOG_STALE_SECONDS=300 # watchdog silence past this → 🚨 the switch is down
 # HEALTHCHECK_HEARTBEAT_HOUR=9           # UTC hour for the daily "all good" digest
 # HEALTHCHECK_REMINDER_HOURS=6           # cadence of reminders while a check stays failing
 # HEALTHCHECK_INGEST_STALL_MINUTES=30    # no fine refresh in this window (with traders due) → alert

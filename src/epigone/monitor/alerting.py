@@ -45,11 +45,23 @@ class Monitor:
     ) -> list[str]:
         """The messages to send this cycle: failing-transitions, throttled
         reminders, recoveries, and — at its hour — the daily heartbeat."""
-        messages = [m for r in results if (m := self._transition(r, now)) is not None]
+        messages = self.transitions(results, now)
         heartbeat = self._heartbeat(snapshot, now)
         if heartbeat is not None:
             messages.append(heartbeat)
         return messages
+
+    def transitions(self, results: list[CheckResult], now: datetime) -> list[str]:
+        """The transition/reminder/recovery messages for SOME checks, without
+        the daily digest — what a cadence that evaluates only part of the
+        board can honestly produce (issue #205: the fast watchdog-liveness
+        tick reads one row, so it has no snapshot to digest from and must not
+        pretend otherwise).
+
+        The state lives on this instance, so both cadences share it: whichever
+        one first sees the watchdog go stale pages, and the other stays quiet
+        rather than paging again for the same failure."""
+        return [m for r in results if (m := self._transition(r, now)) is not None]
 
     def _transition(self, result: CheckResult, now: datetime) -> str | None:
         state = self._states.setdefault(result.name, _CheckState())
