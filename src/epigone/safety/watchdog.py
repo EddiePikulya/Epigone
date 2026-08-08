@@ -158,8 +158,11 @@ properties are load-bearing:
   atomic counter and the exchange accepts out-of-order landing at this
   concurrency; the shared audit state is the real constraint.) Pulsing on
   the sweep's own task removes the emergent race — the schedule is pushed
-  every few seconds of the grind, never left to lapse — while keeping every
-  action on the lane strictly ordered.
+  every few seconds of a HEALTHY grind rather than once at the end of it —
+  while keeping every action on the lane strictly ordered. Not "never left to
+  lapse": under a saturated exchange the worst gap between two push attempts
+  still exceeds the half-horizon of slack, and PULSE_LEG_REFILL_SECONDS walks
+  that residual out step by step (issue #212).
 
 AND EVERY READ BETWEEN TWO PULSES IS BOUNDED (issue #204). Pulsing at every
 enumeration step only bounds the liveness gap if the step itself is bounded,
@@ -293,26 +296,53 @@ PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
 #
 # The window is chosen against the number that matters — the half-horizon of
 # slack (150s at the default 300s horizon) between the dead-man's push falling
-# due and the schedule lapsing — by writing down the worst gap between two
-# push ATTEMPTS and keeping it under that. Three terms, each its own ceiling:
+# due and the schedule lapsing. THE RESIDUAL IS NARROWED, NOT CLOSED, and the
+# honest composition says why (merge-gate review of PR #209; an earlier
+# revision of this comment claimed 140s < 150s by counting one in-flight step
+# instead of two and by forgetting that the push falls due asynchronously to
+# the sweep). Walk it from the moment D at which a push becomes due:
 #
-#   KEEPALIVE_CEILING_SECONDS  30s  the attempt that spent the budget
-# + PULSE_LEG_REFILL_SECONDS   45s  the quiet until the leg is eligible again
-# + one in-flight sweep step   65s  the longest thing standing between the
-#                                   refill and the next pulse point: a cancel
-#                                   POST, bounded by the gateway's own 429
-#                                   loop at RATE_LIMIT_TOTAL_BUDGET_SECONDS +
-#                                   REQUEST_TIMEOUT (a read is shorter — its
-#                                   SAFETY_READ_CEILING_SECONDS binds first)
-#   ------------------------------
-#                             140s  against 150s of slack.
+#   D        the sweep is mid-step. That step is ALREADY IN FLIGHT and is not
+#            interruptible: up to 65s (a cancel POST, self-bounded by the
+#            gateway's 429 loop at RATE_LIMIT_TOTAL_BUDGET_SECONDS +
+#            REQUEST_TIMEOUT; a read is shorter, SAFETY_READ_CEILING_SECONDS
+#            binding first)
+#   D+65     pulse. The refill grants the leg its budget, the push attempt
+#            wedges, and it is cut at KEEPALIVE_CEILING_SECONDS — plus the
+#            drain the cut cannot itself cancel (the F5 correction, stated at
+#            PULSE_LEG_BUDGET_SECONDS, applies to THIS term too)
+#   D+95     budget spent; the next step is another saturated 65s cancel POST
+#   D+160    pulse, refill, attempt two. Even an INSTANT success lands after
+#            D+150 — the schedule has already lapsed. A push that itself
+#            needs its ceiling lands nearer D+190.
 #
-# Ten seconds is not much margin, and the term to shrink if it ever needs
-# shrinking is the cancel POST's own bound, not this one. What the window
-# buys is the difference between "narrowed" and "closed": at a per-CYCLE
-# budget the quiet term was the REST OF THE SWEEP — minutes — and one 30s
-# slow-fail of a due push early in a grind could still let the schedule reach
-# its horizon mid-halt.
+# So ~190s against 150s of slack under transient exchange saturation, and
+# larger under correlated failure: the pre-sign budget PACING SLEEP is
+# deliberately un-ceilinged (SharedWeightBudget's docstring — a token-deficit
+# wait may honestly run long and must not degrade the lane), the audited
+# gateway's attempt/outcome rows go to a database that may itself be wedged
+# to its 5s timeouts, and each cut leaves a shielded drain. ~250s when the
+# exchange and the database are both bad at once — which is the correlated
+# case this whole module exists for. "Every await between two pulses is
+# bounded" is therefore not literally true; the pacing sleep is the exception,
+# on purpose.
+#
+# WHY THIS IS SHIPPED ANYWAY, and what it costs when it fires: the residual
+# discharges in the FAIL-SAFE direction. The dead-man firing cancels every
+# resting order on the exchange, during a halt whose whole job was cancelling
+# resting orders — so the outcome is the intended one arriving by the
+# belt-and-braces route. It costs one of the account's 10 daily triggers and
+# an operator moment of "why did that fire", which the runbook now names so a
+# responder reads it as expected-rare rather than as a second incident.
+#
+# And what the window DOES buy is large: the quiet term used to be the REST OF
+# THE SWEEP — minutes, because a per-CYCLE budget lasts a whole sweep — and is
+# now at most this window. Minutes-to-45s is the difference between a residual
+# that needs conjunctive bad luck and one that the 2026-08-07 incident hit on
+# its first try. Closing it properly wants a deadline-aware priority push (one
+# attempt exempted from the budget when the armed schedule is within ~60s of
+# its horizon), which needs the deadman's armed-until time across the opaque
+# Keepalive seam: issue #212, a mainnet gate.
 #
 # The price is bounded and paid only when a leg is genuinely wedged: at worst
 # one budget plus one overrunning attempt per window, so a wedged keepalive
@@ -576,6 +606,25 @@ class Watchdog:
         assert self._keepalive is not None
         started = time.monotonic()
         try:
+            # THE ONE PLACE THIS PROCESS CANCELS AN AUDITED WRITE FROM OUTSIDE,
+            # and it is worth naming because three other docstrings here (the
+            # module's #204 section, SAFETY_READ_CEILING_SECONDS, and
+            # HttpExecutionGateway._post) argue that a write must bound ITSELF
+            # rather than be cut, precisely so no attempt row is left without
+            # an outcome. In production this keepalive IS an audited write — the
+            # deadman's scheduleCancel — so a push cut here can orphan its
+            # attempt row (AuditedExecutionGateway._audited catches Exception,
+            # and the CancelledError wait_for raises is not one).
+            #
+            # Accepted, not overlooked, and the trade runs the other way than
+            # it does for the cancel POST. The cancel is the protective action
+            # itself, so its evidence is the trail's most valuable row. This is
+            # ADVISORY work riding the protective path, and the thing being
+            # protected is the pulse loop's own liveness: an un-cut push wedges
+            # the sweep, which is the failure PR #203 exists to prevent. A
+            # repeated scheduleCancel set REPLACES, so nothing is lost but the
+            # row — an orphaned attempt with no outcome, which reads correctly
+            # as "we tried and never learned whether it landed".
             await asyncio.wait_for(self._keepalive(), KEEPALIVE_CEILING_SECONDS)
         except TimeoutError:
             log.error(

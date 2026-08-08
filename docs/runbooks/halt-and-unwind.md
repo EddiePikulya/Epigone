@@ -294,7 +294,7 @@ every 60s (`HEALTHCHECK_WATCHDOG_CHECK_SECONDS`) rather than only on the
 keep the slow cycle. So the worst case from a watchdog freezing to the
 operator holding a 🚨 DM is one staleness threshold plus one liveness
 cadence — 360s at the defaults — instead of the threshold plus a quarter of
-an hour. That is what closes the 2026-08-07 shape, where the watchdog froze
+an hour. That is what the 2026-08-07 shape needed, where the watchdog froze
 at 18:20:15, the 18:24 pass saw four minutes of staleness (under threshold),
 the next look would have been 18:39, and the operator found the freeze with
 an ad-hoc DB query instead.
@@ -308,11 +308,30 @@ of the fire, lower `HEALTHCHECK_WATCHDOG_STALE_SECONDS` — the watchdog beats
 every cycle (~10s) and every ~5s inside a sweep, so 300s is thirty missed
 beats and there is a lot of room; the reason it is not lower by default is
 that it must also survive a deploy restart and a cold start's grace window
-without paging. So: "the monitor has not paged in the last minute" is now
-real evidence that the watchdog was alive a minute ago — which it was not
-before — but it is still not evidence that the dead-man's schedule has not
-fired. During an incident you are already watching, the heartbeat row and
-the sweep's progress lines remain the primary signal.
+without paging.
+
+**And the 360s holds only while Postgres answers.** The monitor's pool is
+opened with no `command_timeout` and no acquire bound — unlike the watchdog's
+(`epigone.safety.db`), which was hardened for exactly this — so a black-holed
+database host does not make the monitor report DB-down, it makes the monitor
+loop hang: no fast tick, no slow cycle, no page, silently. That is not an
+exotic case. A dead database host is among the likeliest reasons the watchdog
+is dead in the first place, so the monitor's blind spot is CORRELATED with the
+thing it watches: the two share a failure domain, and a single host taking
+both out produces perfect silence. Issue #213 tracks the real fix — an
+out-of-band path that does not depend on the database it is reporting on — and
+is a mainnet gate.
+
+**So keep the old rule, in its stronger form: do not treat "the monitor has
+not paged" as "the watchdog is alive."** What #205 bought is narrower and
+worth having — *if* the monitor is running and Postgres is answering, silence
+now means the watchdog beat within the last minute or so, where before it
+meant nothing for up to a quarter of an hour. What it does not buy: evidence
+that the dead-man's schedule has not fired, or evidence of anything at all
+when the database is unreachable. During an incident you are already watching,
+read the `process_heartbeats` row and the sweep's progress lines directly;
+they are the primary signal, and an ad-hoc query against the database is still
+the check that does not go through the monitor.
 
 A DB-BLIND window is deliberately silent on all of these: that path reaches
 the wire with zero Postgres behind it by construction, so it neither beats
@@ -347,11 +366,7 @@ match. A leg that was slow earlier in the cycle and is healthy again resumes
 on its own at the next refill; that shape looks like a gap in the heartbeat
 followed by beats, and needs no action.
 
-Every await between two pulses is bounded (issue #204), so the arithmetic
-actually closes. Three bounds, and the worst gap between two dead-man push
-ATTEMPTS is their sum — 30s (the attempt that spent the budget) + 45s (the
-quiet until it refills) + 65s (the longest single step in between) = 140s,
-against the 150s of half-horizon slack:
+Nearly every await between two pulses is now bounded (issue #204):
 
 - every READ the watchdog makes is ceilinged at 45s;
 - the exchange's `Retry-After` is capped at 30s wherever we sleep on it, and
@@ -363,9 +378,30 @@ against the 150s of half-horizon slack:
   evidence matters most;
 - the pulse-leg refill above is the third.
 
-Ten seconds of margin is not much, and the term to shrink first is the 429
-budget. A read cut at its ceiling shows up as a sweep that did not finish:
-the halt stays unswept, the watchdog logs the failure, and the next cycle
+**The dead-man residual is NARROWED, NOT CLOSED, and you should expect to see
+it fire.** The push falls due asynchronously to the sweep, so the arithmetic
+is: the step already in flight when it falls due (up to 65s) + a wedged push
+cut at its 30s ceiling + the next saturated step (another 65s) before the leg
+refills and can try again. That is ~190s against 150s of slack under a
+saturated exchange, and nearer ~250s when the database is simultaneously
+wedged — the pre-sign budget's pacing sleep is deliberately un-ceilinged, so
+"every await is bounded" is not literally true either. What changed is the
+size of the quiet window, from *the rest of the sweep* (minutes) to at most
+45s: the residual now needs bad luck, where the 2026-08-07 incident hit it
+first try. Issue #212 tracks closing it properly with a deadline-aware
+priority push; it is a mainnet gate.
+
+**So: a `scheduleCancel` that fires mid-halt is expected-rare, not a second
+incident.** It discharges in the fail-safe direction — it cancels every
+resting order on the exchange, during a halt whose whole job was cancelling
+resting orders, so the intended outcome arrives by the belt-and-braces route.
+The cost is one of the account's **10 daily triggers** and a confusing line in
+the trail. If you see one during a sweep that was otherwise progressing: note
+it, check the trigger budget, and keep reading the sweep's own progress lines.
+Do not go looking for a separate fault.
+
+A read cut at its ceiling shows up as a sweep that did not finish: the halt
+stays unswept, the watchdog logs the failure, and the next cycle
 re-enumerates. Repeated cuts on the same venue mean that endpoint is
 saturated or down, not that the watchdog is broken. A cancel that runs out
 its 429 budget surfaces as the usual rate-limited streak, which the sweep

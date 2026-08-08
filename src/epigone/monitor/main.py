@@ -15,6 +15,13 @@ enough for the schedule to fire before anyone is told the watchdog is gone —
 which is what happened on 2026-08-07. Both cadences feed the same `Monitor`,
 so a failure is paged once by whichever saw it first.
 
+What that does NOT buy, and the runbook says so at length: this pool is opened
+with no command_timeout and no acquire bound, so a black-holed database host
+hangs the loop rather than tripping the DB-down check — no tick, no page,
+silently — and a dead database host is among the likeliest reasons the
+watchdog is dead too. The monitor shares a failure domain with the thing it
+watches; mainnet wants an out-of-band path (issue #213).
+
 Notify-first, no auto-remediation: Docker's restart policy already recovers hard
 crashes; this catches the silent-but-alive failures and tells a human.
 """
