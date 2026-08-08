@@ -50,7 +50,12 @@ from epigone.gateway import (
     Side,
     Window,
 )
-from epigone.gateway.backoff import RATE_LIMIT_MAX_TRIES, backoff_delay, parse_retry_after
+from epigone.gateway.backoff import (
+    RATE_LIMIT_MAX_TRIES,
+    backoff_delay,
+    parse_retry_after,
+    retry_fits_budget,
+)
 
 log = logging.getLogger(__name__)
 
@@ -252,8 +257,17 @@ class HttpHyperliquidGateway:
         self, method: str, url: str, *, json_body: dict[str, Any] | None = None
     ) -> Any:
         """One request with 429 backoff-and-retry; other failures raise untouched
-        (aiohttp errors and timeouts, wrapped per-endpoint by the callers)."""
+        (aiohttp errors and timeouts, wrapped per-endpoint by the callers).
+
+        Bounded in TRIES and in WALL CLOCK (issue #204): a retry is taken only
+        while both budgets allow, so a slow-answering or Retry-After-abusive
+        server cannot make one read outlive its caller's own timing — the
+        watchdog's sweep pulses between reads, and a read that outruns the
+        dead-man's push cadence discharges the last-resort net."""
+        started = self._clock.now()
+        tries = 0
         for attempt in range(RATE_LIMIT_MAX_TRIES):
+            tries = attempt + 1
             async with self._session.request(
                 method, url, json=json_body, timeout=REQUEST_TIMEOUT
             ) as response:
@@ -263,10 +277,16 @@ class HttpHyperliquidGateway:
                 delay = parse_retry_after(response.headers.get("Retry-After"))
                 if delay is None:
                     delay = backoff_delay(attempt, self._rng)
-            if attempt + 1 < RATE_LIMIT_MAX_TRIES:
-                log.warning("429 from %s: backing off %.1fs (try %d)", url, delay, attempt + 1)
-                await self._clock.sleep(delay)
-        raise RateLimitedError(f"still 429 from {url} after {RATE_LIMIT_MAX_TRIES} tries")
+            if attempt + 1 >= RATE_LIMIT_MAX_TRIES or not retry_fits_budget(
+                started, self._clock.now(), delay
+            ):
+                break
+            log.warning("429 from %s: backing off %.1fs (try %d)", url, delay, attempt + 1)
+            await self._clock.sleep(delay)
+        raise RateLimitedError(
+            f"still 429 from {url} after {tries} tries in "
+            f"{(self._clock.now() - started).total_seconds():.0f}s"
+        )
 
 def parse_leaderboard(payload: Any) -> list[LeaderboardEntry]:
     known = {window.value: window for window in Window}

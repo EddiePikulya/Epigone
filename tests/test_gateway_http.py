@@ -20,7 +20,10 @@ from aiohttp import web
 from aiohttp.test_utils import TestServer
 
 from epigone.gateway import GatewayError, RateLimitedError, Side
-from epigone.gateway.backoff import RETRY_AFTER_CAP_SECONDS
+from epigone.gateway.backoff import (
+    RATE_LIMIT_TOTAL_BUDGET_SECONDS,
+    RETRY_AFTER_CAP_SECONDS,
+)
 from epigone.gateway.http import (
     COVERAGE_HORIZON_MARGIN,
     RATE_LIMIT_MAX_TRIES,
@@ -499,3 +502,36 @@ async def test_a_timed_out_request_surfaces_as_gateway_error(
     async with hanging_gateway(monkeypatch) as gateway:
         with pytest.raises(GatewayError):
             await call(gateway)
+
+
+async def test_a_retry_ladder_of_capped_retry_afters_stops_on_the_clock() -> None:
+    """Issue #204: capping one Retry-After bounds one sleep, not the call.
+    Six of them at the cap is minutes on a single read — and RATE_LIMIT_MAX_TRIES
+    cannot express "be over by then", so the loop is bounded in wall clock too.
+    One capped sleep fits the budget; a second would not, so the streak surfaces
+    as RateLimitedError immediately rather than after five more."""
+    clock = FakeClock()
+    async with replaying_gateway(
+        RECORDED, clock=clock, rate_limited=99, retry_after="100000"
+    ) as (gateway, received):
+        with pytest.raises(RateLimitedError):
+            await gateway.get_open_positions(WHALE)
+
+    assert clock.slept == [RETRY_AFTER_CAP_SECONDS]
+    assert len(received) == 2  # not RATE_LIMIT_MAX_TRIES
+    assert sum(clock.slept) <= RATE_LIMIT_TOTAL_BUDGET_SECONDS
+
+
+async def test_the_jittered_ladder_still_gets_all_its_tries() -> None:
+    # The budget is sized so our OWN pacing is unaffected: the full-jitter
+    # ladder tops out at 1+2+4+8+16 = 31s, inside it.
+    clock = FakeClock()
+    async with replaying_gateway(RECORDED, clock=clock, rate_limited=99, rng=lambda: 1.0) as (
+        gateway,
+        received,
+    ):
+        with pytest.raises(RateLimitedError):
+            await gateway.get_open_positions(WHALE)
+
+    assert len(received) == RATE_LIMIT_MAX_TRIES
+    assert clock.slept == [1.0, 2.0, 4.0, 8.0, 16.0]

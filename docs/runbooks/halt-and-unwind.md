@@ -326,8 +326,8 @@ so the database is healthy.
 In every posture, each leg of the pulse — the heartbeat and the dead-man's
 push — runs on its own small TIME budget: a leg whose attempts add up past it
 goes quiet, because reaching the wire outranks saying so, and gets the budget
-back every minute of sweep (and at every cycle top), so going quiet is
-minutes at worst and never the rest of a grind. The budget is spent on
+back every 45 seconds of sweep (and at every cycle top), so going quiet is
+under a minute and never the rest of a grind. The budget is spent on
 measured wall clock, not on how an attempt failed, so a leg that is merely
 SLOW (a wedged database, an endpoint that 502s after twenty seconds) stops
 taxing the sweep, while a leg that fails FAST keeps trying — a refused
@@ -347,15 +347,29 @@ match. A leg that was slow earlier in the cycle and is healthy again resumes
 on its own at the next refill; that shape looks like a gap in the heartbeat
 followed by beats, and needs no action.
 
-Every READ the watchdog makes is also individually ceilinged (issue #204),
-at 45s, and the exchange's `Retry-After` is capped at 30s wherever we sleep
-on it. Both exist so that no single await between two liveness pulses can
-outlive the dead-man's slack — a 429-saturated enumeration read used to be
-able to run for minutes and straddle the moment the push fell due. A read cut
-at its ceiling shows up as a sweep that did not finish: the halt stays
-unswept, the watchdog logs the failure, and the next cycle re-enumerates.
-Repeated cuts on the same venue mean that endpoint is saturated or down, not
-that the watchdog is broken.
+Every await between two pulses is bounded (issue #204), so the arithmetic
+actually closes. Three bounds, and the worst gap between two dead-man push
+ATTEMPTS is their sum — 30s (the attempt that spent the budget) + 45s (the
+quiet until it refills) + 65s (the longest single step in between) = 140s,
+against the 150s of half-horizon slack:
+
+- every READ the watchdog makes is ceilinged at 45s;
+- the exchange's `Retry-After` is capped at 30s wherever we sleep on it, and
+  the whole 429 retry loop is bounded at 35s of wall clock in BOTH gateway
+  directions — which is what bounds a CANCEL POST at ~65s (that budget plus
+  one 30s request timeout). A cancel is bounded from inside rather than
+  cancelled from outside on purpose: cancelling a write mid-flight would
+  leave the audit trail's attempt row with no outcome, on the one path whose
+  evidence matters most;
+- the pulse-leg refill above is the third.
+
+Ten seconds of margin is not much, and the term to shrink first is the 429
+budget. A read cut at its ceiling shows up as a sweep that did not finish:
+the halt stays unswept, the watchdog logs the failure, and the next cycle
+re-enumerates. Repeated cuts on the same venue mean that endpoint is
+saturated or down, not that the watchdog is broken. A cancel that runs out
+its 429 budget surfaces as the usual rate-limited streak, which the sweep
+already treats as "not swept, retry next cycle".
 
 One thing a sweep still does NOT do: close positions. A Copy Sub-account's
 positions are HELD exactly like the master's, and bracket triggers are

@@ -188,7 +188,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 import asyncpg
 
@@ -291,19 +291,35 @@ PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
 # rest of it, and the armed schedule could still reach its horizon mid-halt —
 # the 2026-08-07 incident, narrowed but not closed.
 #
-# Sixty seconds is chosen against the number that matters: the dead-man's
-# push cadence leaves a HALF-HORIZON of slack (150s at the default 300s
-# horizon) between a push falling due and the schedule lapsing. Refilling
-# every 60s of sweep means a spent leg is eligible again — and, the sweep
-# pulsing at every enumeration step, actually retried — at least twice inside
-# that slack, so no arrangement of slow failures can carry a lapse across it.
+# The window is chosen against the number that matters — the half-horizon of
+# slack (150s at the default 300s horizon) between the dead-man's push falling
+# due and the schedule lapsing — by writing down the worst gap between two
+# push ATTEMPTS and keeping it under that. Three terms, each its own ceiling:
+#
+#   KEEPALIVE_CEILING_SECONDS  30s  the attempt that spent the budget
+# + PULSE_LEG_REFILL_SECONDS   45s  the quiet until the leg is eligible again
+# + one in-flight sweep step   65s  the longest thing standing between the
+#                                   refill and the next pulse point: a cancel
+#                                   POST, bounded by the gateway's own 429
+#                                   loop at RATE_LIMIT_TOTAL_BUDGET_SECONDS +
+#                                   REQUEST_TIMEOUT (a read is shorter — its
+#                                   SAFETY_READ_CEILING_SECONDS binds first)
+#   ------------------------------
+#                             140s  against 150s of slack.
+#
+# Ten seconds is not much margin, and the term to shrink if it ever needs
+# shrinking is the cancel POST's own bound, not this one. What the window
+# buys is the difference between "narrowed" and "closed": at a per-CYCLE
+# budget the quiet term was the REST OF THE SWEEP — minutes — and one 30s
+# slow-fail of a due push early in a grind could still let the schedule reach
+# its horizon mid-halt.
 #
 # The price is bounded and paid only when a leg is genuinely wedged: at worst
 # one budget plus one overrunning attempt per window, so a wedged keepalive
-# makes a sweep take longer but cannot tax it per enumeration step, which is
-# the failure PR #203's budget existed to stop. Real time like every other
+# roughly halves a sweep's pace but cannot tax it per enumeration step, which
+# is the failure PR #203's budget existed to stop. Real time like every other
 # ceiling here — this measures actual awaits, and the fakes finish instantly.
-PULSE_LEG_REFILL_SECONDS = 60.0
+PULSE_LEG_REFILL_SECONDS = 45.0
 
 # The hard REAL-TIME ceiling on ONE read of the safety path (issue #204).
 #
@@ -321,10 +337,19 @@ PULSE_LEG_REFILL_SECONDS = 60.0
 # cut. Cutting is safe because enumeration is idempotent and unverified — the
 # sweep leaves the halt unswept, says so, and the next cycle re-enumerates —
 # whereas NOT cutting it is how a single read straddles a push-due boundary.
-# Composed with the pulse legs' own bounds, the widest gap between two
-# pulses of a working sweep is this ceiling plus the budget pacing before the
-# read, and at most once per refill window the overrun of a wedged leg on top
-# — all of it well inside the 150s of half-horizon slack.
+#
+# DELIBERATELY TIGHTER than the gateway's own bound on the same call
+# (RATE_LIMIT_TOTAL_BUDGET_SECONDS + REQUEST_TIMEOUT ≈ 65s), and that is the
+# point rather than a redundancy: this module's whole history is bounds that
+# turned out to have one more layer underneath them (the round 2–5 asyncpg
+# chase in the docstring above), so the safety path states its own number
+# instead of inheriting one. A read cut here that the gateway would have
+# completed at 50s costs one cycle's retry.
+#
+# The composed gap this participates in is written out in full at
+# PULSE_LEG_REFILL_SECONDS; on this axis a read is not the binding term,
+# because the cancel POST — which cannot be cut from outside without
+# orphaning its audit row — is longer.
 SAFETY_READ_CEILING_SECONDS = 45.0
 
 # A failed capability probe (network blip, info outage, unwritable verdict)
@@ -345,7 +370,15 @@ CAPABILITY_RETRY = timedelta(minutes=5)
 # path, ineligible below the $1M volume gate), not just a test shortcut.
 Keepalive = Callable[[], Awaitable[None]]
 
+# `Watchdog._safety_read` as a value, so a collaborator can be handed the
+# seam without being handed the watchdog (`_PulsedUniverseReads`). Generic in
+# the read's own result type: the seam changes WHEN a read is awaited, never
+# what it answers.
 T = TypeVar("T")
+
+
+class _SafetyRead(Protocol):
+    async def __call__(self, read: Awaitable[T]) -> T: ...
 
 
 @dataclass(frozen=True)
@@ -624,12 +657,19 @@ class Watchdog:
         # The pulse clock advances even when both legs are spent, so a quiet
         # sweep does not re-enter this body at every step.
         self._pulsed_at = now
-        if self._beat_spent < PULSE_LEG_BUDGET_SECONDS:
-            self._beat_spent += await self._beat(now)
-            _report_if_spent("heartbeat", self._beat_spent)
+        # THE KEEPALIVE GOES FIRST. Both legs are advisory to the sweep, but
+        # only one has a deadline it can miss: the dead-man's schedule lapses
+        # a half-horizon after its push falls due (150s), while the beat's
+        # consumer — the monitor's staleness check — allows 300s. Beating
+        # first would put a wedged database's ceiling in front of the push on
+        # every pulse, which is the one term the gap arithmetic at
+        # PULSE_LEG_REFILL_SECONDS cannot afford.
         if self._keepalive is not None and self._keepalive_spent < PULSE_LEG_BUDGET_SECONDS:
             self._keepalive_spent += await self._push_keepalive()
             _report_if_spent("dead-man's push", self._keepalive_spent)
+        if self._beat_spent < PULSE_LEG_BUDGET_SECONDS:
+            self._beat_spent += await self._beat(now)
+            _report_if_spent("heartbeat", self._beat_spent)
 
     def _refill_leg_budgets(self, *, force: bool = False) -> None:
         """Give both pulse legs their budgets back — at every cycle top
@@ -1089,7 +1129,9 @@ class Watchdog:
         for _ in range(spends):
             await self._pulse()
             await self._budget.spend(META_WEIGHT)
-        return await fetch_asset_ids(_PulsedUniverseReads(self), dexs=needed)
+        return await fetch_asset_ids(
+            _PulsedUniverseReads(self._read, self._safety_read), dexs=needed
+        )
 
     async def _walk_scope(
         self, dexs: list[str], accounts: list[str | None], weight: int
@@ -1244,16 +1286,21 @@ class _PulsedUniverseReads:
     (gateway.fetch_asset_specs) and must keep living there; what the sweep
     needs to change is how each read is AWAITED, which is precisely what a
     wrapper can say and a parameter cannot. Satisfies gateway's narrow
-    PerpUniverseReader — the two methods that fetch actually makes."""
+    PerpUniverseReader — the two methods that fetch actually makes.
 
-    def __init__(self, watchdog: "Watchdog") -> None:
-        self._watchdog = watchdog
+    Handed the gateway and the seam rather than the watchdog: what it needs
+    is a way to read and a way to read SAFELY, and naming exactly those two
+    keeps it from being a second door into the watchdog's internals."""
+
+    def __init__(self, read: HyperliquidGateway, through: "_SafetyRead") -> None:
+        self._read = read
+        self._through = through
 
     async def get_perp_assets(self, dex: str | None = None) -> list[PerpAsset]:
-        return await self._watchdog._safety_read(self._watchdog._read.get_perp_assets(dex))
+        return await self._through(self._read.get_perp_assets(dex))
 
     async def get_perp_dexs(self) -> list[str]:
-        return await self._watchdog._safety_read(self._watchdog._read.get_perp_dexs())
+        return await self._through(self._read.get_perp_dexs())
 
 
 def _report_if_spent(leg: str, spent: float) -> None:
