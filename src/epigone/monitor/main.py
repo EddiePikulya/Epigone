@@ -81,22 +81,35 @@ log = logging.getLogger(__name__)
 # two orders below the hang timescales (asyncpg's 60s connect default, ~15min
 # TCP retransmission) it replaces.
 MONITOR_DB_TIMEOUT_SECONDS = 10.0
-# The hard REAL-TIME ceiling on a whole gather, because the pool's bounds
-# cannot reach every leg: asyncpg awaits an UNTIMED cancel_waiter before a
-# per-op timeout arms, so a transaction exit outlives them (the round-5
-# finding in epigone.safety.watchdog). Three times the per-touch bound is the
-# worst legal composition of one gather's own touches — acquire, query,
-# release, each bounded above — so a healthy-but-slow read is never cut by
-# this, and a hung one is. Safe to compose because Pool.release is shielded:
-# a cancelled gather still terminates its connection within the acquire
-# budget rather than leaking it.
+# The hard REAL-TIME ceiling on a whole gather. Three times the per-touch
+# bound is the worst legal composition of one gather's own touches — acquire,
+# query, release, each bounded above — so a healthy-but-slow read is never cut
+# by this, and a hung one is. Safe to compose because Pool.release is
+# shielded: a cancelled gather still terminates its connection within the
+# acquire budget rather than leaking it.
 #
-# It must also stay well under the fast tick's own cadence (60s), and does:
-# a fully hung liveness tick costs 30s, so the tick after it is late rather
-# than skipped, and the worst case from a watchdog freezing to the operator
-# holding a page grows from 360s to 390s. That is the honest number the
-# runbook now quotes.
+# HONESTLY (review of this change), this is DEFENCE IN DEPTH rather than a leg
+# the pool demonstrably cannot reach. The watchdog's equivalent ceiling exists
+# for a specific hole — asyncpg awaits an UNTIMED cancel_waiter before a
+# per-op timeout arms, so a transaction exit outlives every pool bound (the
+# round-5 finding in epigone.safety.watchdog) — and BOTH gathers here are a
+# bare `pool.fetchrow` with no transaction, so today the pool bounds should
+# suffice on their own. It is kept anyway because this codebase's whole
+# history on this axis is bounds that turned out to have one more layer
+# underneath them, and because the cost of being wrong is not a slow page but
+# no page: a ceiling that never fires costs nothing, and the day a gather
+# grows a transaction it costs one dropped tick instead of the loop.
+#
+# It must also stay well under the fast tick's own cadence (60s), and does.
 MONITOR_DB_CEILING_SECONDS = 3 * MONITOR_DB_TIMEOUT_SECONDS
+
+# No `lock_timeout`, unlike the safety pool — a deliberate omission, not an
+# oversight. That bound exists there for `SELECT … FOR UPDATE` behind a holder
+# that died mid-transaction; the monitor takes no row locks at all, and its
+# reads' realistic lock wait is an ACCESS EXCLUSIVE held by a migration during
+# a deploy — which `command_timeout` already bounds client-side, and which a
+# server-side error would turn into a FALSE 🚨 DB-down page on every deploy
+# that alters a table the gather reads. Three bounds here, four there.
 
 
 class SystemDiskProbe:

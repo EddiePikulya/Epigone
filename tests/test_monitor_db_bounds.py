@@ -111,6 +111,36 @@ async def test_the_default_pool_stays_unbounded_for_the_scanners(
         await pool.close()
 
 
+async def test_the_default_pool_keeps_asyncpgs_own_connect_bound(
+    database_url: str,
+) -> None:
+    """"Unbounded" must mean asyncpg's defaults, NOT looser than them — the
+    trap in making the bounds optional (review of this change).
+
+    `create_pool` forwards **connect_kwargs straight into `connect`, whose
+    default is `timeout=60`, so passing `timeout=None` to say "no override"
+    actually says `asyncio.timeout(None)`: no connect bound at all. Every
+    scanner would then hang FOREVER on a black-holed host where it used to
+    fail in a minute — a regression in the exact direction this issue exists
+    to close, and invisible to any test that only exercises queries.
+
+    Asserted on the kwargs rather than by waiting out 60s against a black hole,
+    which is the only other way to see it."""
+    pool = await create_pool(database_url)
+    try:
+        assert "timeout" not in pool._connect_kwargs
+        assert "command_timeout" not in pool._connect_kwargs
+    finally:
+        await pool.close()
+
+    bounded = await create_pool(database_url, timeout_seconds=BOUND)
+    try:
+        assert bounded._connect_kwargs["timeout"] == BOUND
+        assert bounded._connect_kwargs["command_timeout"] == BOUND
+    finally:
+        await bounded.close()
+
+
 # --- what the loop does with the error ---
 
 

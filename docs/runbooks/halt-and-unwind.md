@@ -313,8 +313,8 @@ beats and there is a lot of room; the reason it is not lower by default is
 that it must also survive a deploy restart and a cold start's grace window
 without paging.
 
-**That 360s is now 390s, and it no longer silently becomes infinity (issue
-#213).** The monitor's pool used to be opened with no `command_timeout` and no
+**That 360s no longer silently becomes infinity (issue #213).** The
+monitor's pool used to be opened with no `command_timeout` and no
 acquire bound — unlike the watchdog's — so a black-holed database host did not
 make the monitor report DB-down, it made the monitor loop *hang*: no fast
 tick, no slow cycle, no page, silently, for as long as kernel TCP
@@ -322,20 +322,37 @@ retransmission took to give up. That was never exotic. A dead database host is
 among the likeliest reasons the watchdog is dead in the first place, so the
 blind spot was CORRELATED with the thing being watched.
 
-The monitor's runtime pool now carries the same four bounds the watchdog's
-does (connect, per-query, lock waits, the release budget —
-`epigone.db.create_pool`, at 10s for this lane), and each gather additionally
-runs under a hard 30s real-time ceiling because asyncpg's own timeouts cannot
-reach a transaction exit. A hang is therefore an exception, and an exception
-was already the DB-down page. Migrations still run on a plain unbounded pool
-that closes before the bounded one takes over — a migration legitimately runs
-long — which is the same startup shape the watchdog uses.
+The monitor's runtime pool now carries **three** of the four bounds the
+watchdog's has — connect, per-query, and the acquire/release budget
+(`epigone.db.create_pool`, at 10s for this lane). Not the fourth: the
+watchdog's server-side `lock_timeout` guards `SELECT … FOR UPDATE` behind a
+dead holder, the monitor takes no row locks, and its realistic lock wait is a
+migration's ACCESS EXCLUSIVE during a deploy — already bounded client-side,
+and a server-side error there would be a *false* 🚨 on every schema-changing
+deploy. Each gather additionally runs under a hard 30s real-time ceiling;
+that one is defence in depth rather than a hole the pool provably cannot
+reach (both gathers are a bare `fetchrow` with no transaction, so the pool
+bounds should suffice on their own — it is kept because a ceiling that never
+fires costs nothing and this axis keeps growing new layers). Migrations still
+run on a plain unbounded pool that closes before the bounded one takes over —
+a migration legitimately runs long — the same startup shape the watchdog uses.
 
-What that costs: a fully hung liveness tick spends 30s before being cut, so
-the tick after it is *late* rather than skipped, and the worst case from a
-watchdog freezing to the operator holding a 🚨 DM becomes **390s** (staleness
-threshold + liveness cadence + one ceiling). Still longer than the dead-man's
-300s horizon; see the honest reading above.
+**Read the latencies honestly, because they did not all improve.**
+
+- The **watchdog-stale** page is unchanged at **360s** worst case. It can only
+  fire when Postgres is answering, and when Postgres answers nothing here
+  spends a ceiling. The bounds bought no speed on this path — they bought the
+  path *existing* on the other one.
+- The **DB-down** page belongs to the SLOW cycle, deliberately (the fast tick
+  refuses to page from a snapshot that knows one table). So a black-holed
+  database is reported within one `HEALTHCHECK_INTERVAL_MINUTES` — **up to
+  ~15 minutes**, plus a ceiling — where before it was reported *never*. If
+  fifteen minutes is too long for the mainnet posture, that interval is the
+  knob, and lowering it is what raises the cost of the expensive checks.
+- Every touch against a black-holed host spends its bound, so ticks during
+  such an outage come roughly every 90s rather than 60s. Nothing pages off
+  those ticks while the database is down, so this costs latency on the
+  *recovery* signal, not on an alarm.
 
 What it does NOT fix, and cannot: the monitor still reaches you through its
 own process, its own Postgres reads, and its own Telegram session, all on this
@@ -421,7 +438,11 @@ anyway.
 3. Put the ping URL in the server's `.env` as `WATCHDOG_DEADMAN_PING_URL`.
    **Treat it as a secret:** on healthchecks.io and services like it the path
    IS the credential, and anyone holding it can forge this watchdog's
-   liveness. Epigone never logs the path — only the host.
+   liveness. Epigone logs the host and never the path — including on the
+   failure line, which reports the exception's type rather than its text
+   precisely because several aiohttp errors quote the whole URL. Use `https`;
+   a plain-`http` URL is accepted (a self-hosted checker is legitimate) but
+   warned about at startup, because it puts the credential on the wire.
 4. `docker compose --profile execution up -d watchdog` and confirm the first
    log line reads `out-of-band dead-man ping ARMED`. If it reads `NO
    out-of-band page path`, the variable did not reach the container.
@@ -431,8 +452,10 @@ anyway.
 
 **Unset is a supported configuration, and the watchdog says so at 🚨 volume in
 its first log line.** Everything else runs identically without it — this leg
-cannot slow the kill path even in principle (the ping is fire-and-forget with
-a 5s hard timeout, and its call site has no `await` to inherit a stall) — but
+cannot slow the kill path even in principle, because `ping()` is a synchronous
+call with no `await` for a stall to be inherited through; the request runs as
+its own task under a 5s aiohttp timeout and a 10s outer ceiling, and those
+bounds protect the ping's own health, not the caller's — but
 "unset" means the only thing that would notice this process dying is the
 monitor, which reads the same database on the same host. That is the state
 this issue exists to end.

@@ -69,7 +69,9 @@ async def test_a_ping_reaches_the_external_service(
     server = TestServer(app)
     await server.start_server()
     try:
-        ping = ExternalPing(http_session, str(server.make_url("/ping/abc123")))
+        ping = ExternalPing(
+            http_session, str(server.make_url("/ping/abc123")), interval_seconds=60.0
+        )
         ping.ping()
         await _until(lambda: hits == ["/ping/abc123"], "the ping to land")
         await ping.aclose()
@@ -131,7 +133,10 @@ async def test_a_ping_never_costs_its_caller_time(
     await server.start_server()
     try:
         ping = ExternalPing(
-            http_session, str(server.make_url("/ping")), timeout_seconds=TIMEOUT
+            http_session,
+            str(server.make_url("/ping")),
+            interval_seconds=60.0,
+            timeout_seconds=TIMEOUT,
         )
         started = time.monotonic()
         ping.ping()
@@ -212,7 +217,9 @@ async def test_a_ping_the_service_rejects_says_nobody_will_be_paged(
     server = TestServer(app)
     await server.start_server()
     try:
-        ping = ExternalPing(http_session, str(server.make_url("/ping")))
+        ping = ExternalPing(
+            http_session, str(server.make_url("/ping")), interval_seconds=60.0
+        )
         with caplog.at_level(logging.WARNING, logger="epigone.safety.ping"):
             ping.ping()
             await _until(
@@ -238,7 +245,7 @@ async def test_a_refused_ping_is_logged_and_never_raises(
     probe.close()
     await probe.wait_closed()
 
-    ping = ExternalPing(http_session, f"http://127.0.0.1:{port}/ping")
+    ping = ExternalPing(http_session, f"http://127.0.0.1:{port}/ping", interval_seconds=60.0)
     with caplog.at_level(logging.WARNING, logger="epigone.safety.ping"):
         ping.ping()  # must not raise
         await _until(
@@ -261,7 +268,9 @@ async def test_the_ping_url_is_a_credential_and_never_reaches_a_log(
     probe.close()
     await probe.wait_closed()
 
-    ping = ExternalPing(http_session, f"http://127.0.0.1:{port}/{secret}")
+    ping = ExternalPing(
+        http_session, f"http://127.0.0.1:{port}/{secret}", interval_seconds=60.0
+    )
     assert secret not in ping.target
     with caplog.at_level(logging.WARNING, logger="epigone.safety.ping"):
         ping.ping()
@@ -270,6 +279,35 @@ async def test_the_ping_url_is_a_credential_and_never_reaches_a_log(
             "the refused ping to be logged",
         )
     assert not any(secret in r.getMessage() for r in caplog.records)
+    await ping.aclose()
+
+
+async def test_an_aiohttp_error_that_quotes_the_url_still_does_not_leak_it(
+    http_session: aiohttp.ClientSession, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The case the obvious implementation gets wrong (found in review).
+
+    A refused connection names only host:port, so logging the traceback LOOKS
+    safe. Several aiohttp errors are not like that: `InvalidUrlClientError`
+    puts the whole URL — credential path and all — in its message, and the
+    config parser only checks the scheme, so a malformed value reaches the
+    request and raises exactly that. An `exc_info=True` here would print the
+    secret in the log line most likely to be pasted into an issue. The failure
+    log therefore carries the exception's TYPE and the host, never the
+    exception's text."""
+    secret = "f0e1d2c3-b4a5-4697-8899-aabbccddeeff"
+    # A scheme-valid URL with no host: passes `_parse_ping_url`, and aiohttp
+    # rejects it with an error whose message quotes the URL verbatim.
+    ping = ExternalPing(http_session, f"http:///{secret}", interval_seconds=60.0)
+    with caplog.at_level(logging.WARNING, logger="epigone.safety.ping"):
+        ping.ping()
+        await _until(
+            lambda: any("failed" in r.getMessage() for r in caplog.records),
+            "the malformed ping to be logged",
+        )
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert secret not in logged
+    assert "InvalidUrl" in logged  # the type IS reported — diagnosable, not silent
     await ping.aclose()
 
 

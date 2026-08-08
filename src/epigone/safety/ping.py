@@ -69,12 +69,11 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-# One ping every minute (the ticket's cadence). Small relative to any sane
-# grace period on the external check, so a handful of dropped pings — a blip
-# on the pinging host's uplink, a sweep step that overran — costs nothing,
-# while a genuinely dead watchdog trips the check within the grace period the
-# operator chose rather than within a multiple of ours.
-DEFAULT_PING_INTERVAL_SECONDS = 60.0
+# The cadence is NOT defaulted here. It is an operator knob and
+# `epigone.safety.config` owns its default (DEFAULT_DEADMAN_PING_SECONDS, 60s)
+# beside the URL it goes with; a second 60 in this file would be a source of
+# truth that production never reads and a test could silently drift from.
+# `interval_seconds` is therefore required at construction.
 
 # What ONE ping may spend. Generously above a healthy round trip to a public
 # uptime service and far below the interval, so a slow ping never eats into
@@ -111,7 +110,7 @@ class ExternalPing:
         session: aiohttp.ClientSession,
         url: str,
         *,
-        interval_seconds: float = DEFAULT_PING_INTERVAL_SECONDS,
+        interval_seconds: float,
         timeout_seconds: float = PING_TIMEOUT_SECONDS,
     ) -> None:
         self._session = session
@@ -175,11 +174,24 @@ class ExternalPing:
                 self._timeout,
                 self._timeout * PING_CEILING_MULTIPLE,
             )
-        except Exception:
+        except Exception as exc:
             # Every ping failure shape lands here and is LOGGED, never
             # retried: the next pulse is the retry, and the external service
             # exists precisely to notice if enough of them fail in a row.
-            log.warning("external dead-man ping to %s failed", self.target, exc_info=True)
+            #
+            # The exception's TYPE and nothing more — deliberately not
+            # `exc_info=True`, and this is the one place the choice is not
+            # about noise. Several aiohttp errors put the offending URL in
+            # their message (`InvalidUrlClientError` and friends), and the
+            # URL is the credential; a traceback here would undo `target`'s
+            # whole reason for existing, in the log line most likely to be
+            # pasted into an issue. The class name plus the host is enough to
+            # act on — refused, DNS, TLS and malformed each name themselves —
+            # and `curl` against the value in the environment is the next
+            # diagnostic step either way.
+            log.warning(
+                "external dead-man ping to %s failed: %s", self.target, type(exc).__name__
+            )
 
     async def _get(self) -> None:
         timeout = aiohttp.ClientTimeout(total=self._timeout)

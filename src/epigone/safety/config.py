@@ -218,6 +218,16 @@ def _parse_ping_url(raw: str | None) -> str | None:
             "with NO out-of-band page path"
         )
         return None
+    if url.startswith("http://"):
+        # Accepted, not refused — a self-hosted checker on a private network is
+        # a legitimate setup, and refusing here would trade a working page path
+        # for a purity point. But the path is the credential, so plaintext puts
+        # it on the wire for anyone between here and there, and the operator
+        # should hear that once at startup rather than never.
+        log.warning(
+            "WATCHDOG_DEADMAN_PING_URL is plain http; the ping URL's path is a "
+            "credential and will travel in clear — prefer https"
+        )
     return url
 
 

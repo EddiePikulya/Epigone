@@ -43,8 +43,10 @@ async def create_pool(
     timeout_seconds: float | None = None,
     lock_timeout: str | None = None,
 ) -> asyncpg.Pool:
-    """A pool over `database_url`. With no arguments it is asyncpg's plain,
-    unbounded one — the scanners' and the migration runner's pool.
+    """A pool over `database_url`. With no arguments it is byte-for-byte the
+    pool this function has always returned — asyncpg's own defaults, including
+    its 60s connect timeout, and no query bound — which is the scanners' and
+    the migration runner's pool.
 
     `timeout_seconds` bounds EVERY plain touch of the pool, which is what a
     process with a deadline needs and what the module docstring explains the
@@ -81,13 +83,21 @@ async def create_pool(
     shielded, so a cancelled block's connection is still terminated within
     the acquire budget.
     """
-    server_settings = {"lock_timeout": lock_timeout} if lock_timeout is not None else None
-    pool = await asyncpg.create_pool(
-        database_url,
-        timeout=timeout_seconds,
-        command_timeout=timeout_seconds,
-        server_settings=server_settings,
-    )
+    # Passed only when set, never as an explicit None. asyncpg's `connect`
+    # defaults to `timeout=60`, and `create_pool` forwards **connect_kwargs
+    # straight into it — so handing it `timeout=None` does not mean "the
+    # default", it means `asyncio.timeout(None)`, i.e. NO connect bound at
+    # all. An unbounded default pool would be strictly LOOSER than the plain
+    # one this function used to return, and looser in the exact direction
+    # issue #213 exists to close: every scanner would hang forever on a
+    # black-holed host instead of failing in a minute.
+    bounds: dict[str, object] = {}
+    if timeout_seconds is not None:
+        bounds["timeout"] = timeout_seconds
+        bounds["command_timeout"] = timeout_seconds
+    if lock_timeout is not None:
+        bounds["server_settings"] = {"lock_timeout": lock_timeout}
+    pool = await asyncpg.create_pool(database_url, **bounds)
     assert pool is not None
     if timeout_seconds is None:
         return pool
