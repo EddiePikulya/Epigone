@@ -15,6 +15,7 @@ from epigone.monitor.config import (
     DEFAULT_RATE_WINDOW_MINUTES,
     DEFAULT_STARVATION_MIN_DUE,
     DEFAULT_STARVATION_WINDOW_MINUTES,
+    DEFAULT_WATCHDOG_CHECK_SECONDS,
     MonitorConfig,
 )
 
@@ -32,6 +33,7 @@ HEALTHCHECK_VARS = [
     "HEALTHCHECK_DISK_PERCENT",
     "HEALTHCHECK_DISK_PATH",
     "HEALTHCHECK_AGENT_KEY_WARN_DAYS",
+    "HEALTHCHECK_WATCHDOG_CHECK_SECONDS",
 ]
 
 
@@ -53,6 +55,7 @@ def test_defaults_when_unset() -> None:
     )
     assert config.thresholds.starvation_min_due == DEFAULT_STARVATION_MIN_DUE
     assert config.thresholds.agent_key_warn == timedelta(days=DEFAULT_AGENT_KEY_WARN_DAYS)
+    assert config.watchdog_check == timedelta(seconds=DEFAULT_WATCHDOG_CHECK_SECONDS)
 
 
 def test_coarse_staleness_defaults_to_twice_the_seed_interval() -> None:
@@ -143,3 +146,25 @@ def test_invalid_disk_percent_falls_back_to_the_default(
         config = MonitorConfig.from_env(seed_interval_minutes=60)
     assert config.thresholds.disk_percent == float(DEFAULT_DISK_PERCENT)
     assert "HEALTHCHECK_DISK_PERCENT" in caplog.text
+
+
+def test_the_watchdog_liveness_cadence_is_tunable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Issue #205: the liveness check's own timer, separate from the cycle the
+    # expensive checks are priced for.
+    monkeypatch.setenv("HEALTHCHECK_WATCHDOG_CHECK_SECONDS", "30")
+    config = MonitorConfig.from_env(seed_interval_minutes=60)
+    assert config.watchdog_check == timedelta(seconds=30)
+    assert config.interval == timedelta(minutes=DEFAULT_INTERVAL_MINUTES)
+
+
+def test_the_liveness_cadence_never_outruns_the_cycle_it_rides_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator who tightens the FULL cycle below the liveness cadence has
+    already said what the fastest tick should be; the loop ticks on the
+    liveness cadence, so leaving it larger would make the knob silently do
+    nothing — the check would run once per cycle and no more."""
+    monkeypatch.setenv("HEALTHCHECK_INTERVAL_MINUTES", "1")
+    monkeypatch.setenv("HEALTHCHECK_WATCHDOG_CHECK_SECONDS", "300")
+    config = MonitorConfig.from_env(seed_interval_minutes=60)
+    assert config.watchdog_check == timedelta(minutes=1) == config.interval

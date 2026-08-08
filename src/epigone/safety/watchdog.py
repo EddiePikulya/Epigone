@@ -139,8 +139,12 @@ properties are load-bearing:
   502s at 25s raises AmbiguousExecutionError, and the deadman re-queues an
   ambiguous push at once) — and measuring time keeps for free the property
   that makes going quiet safe at all: a leg that fails FAST keeps retrying,
-  so one blip never silences a signal for a ten-minute grind.
-  PULSE_LEG_BUDGET_SECONDS states the bound; `_pulse` carries the argument;
+  so one blip never silences a signal for a ten-minute grind. The budget
+  REFILLS ON THE CLOCK, every PULSE_LEG_REFILL_SECONDS of sweep, because a
+  cycle is a whole sweep and a budget that lasted one let a single slow
+  failure early in a grind silence a leg long enough for the armed schedule
+  to reach its horizon mid-halt anyway. PULSE_LEG_BUDGET_SECONDS states the
+  bound, PULSE_LEG_REFILL_SECONDS the window; `_pulse` carries the argument;
 - the keepalive runs on THIS task, not a sibling one. Deliverable 2 of
   issue #201 asked for an independent dead-man task; it is deliberately not
   one, because the deadman shares this process's single AuditedExecution-
@@ -154,8 +158,26 @@ properties are load-bearing:
   atomic counter and the exchange accepts out-of-order landing at this
   concurrency; the shared audit state is the real constraint.) Pulsing on
   the sweep's own task removes the emergent race — the schedule is pushed
-  every few seconds of the grind, never left to lapse — while keeping every
-  action on the lane strictly ordered.
+  every few seconds of a HEALTHY grind rather than once at the end of it —
+  while keeping every action on the lane strictly ordered. Not "never left to
+  lapse": under a saturated exchange the worst gap between two push attempts
+  still exceeds the half-horizon of slack, and PULSE_LEG_REFILL_SECONDS walks
+  that residual out step by step (issue #212).
+
+AND EVERY READ BETWEEN TWO PULSES IS BOUNDED (issue #204). Pulsing at every
+enumeration step only bounds the liveness gap if the step itself is bounded,
+and it was not: `parse_retry_after` handed the server our wall clock (fixed
+at the source — gateway/backoff.py caps it), and even without that a
+429-saturated read is RATE_LIMIT_MAX_TRIES answers at up to a 30s
+REQUEST_TIMEOUT each — long enough for one read to straddle a push-due
+boundary and let the last-resort net discharge under a working watchdog, and
+429 pressure is most plausible exactly while an account-wide sweep grinds.
+So every read this process makes goes through `_safety_read`: pulse, then a
+hard SAFETY_READ_CEILING_SECONDS on the read itself. `_asset_ids_for` was
+the worst of it — 2+N back-to-back HTTP reads, standing between the
+enumeration and the cancels it feeds, with no pulse and no ceiling — and now
+runs its fetch through `_PulsedUniverseReads`, which puts each of those
+reads on that same seam.
 
 Progress is also LOGGED per (account, dex), so a long sweep is legible in
 the container logs while it runs — "sweeping, 60% done" was previously
@@ -169,6 +191,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Protocol, TypeVar
 
 import asyncpg
 
@@ -179,6 +202,7 @@ from epigone.gateway import (
     GatewayError,
     HyperliquidGateway,
     OpenOrder,
+    PerpAsset,
     Position,
     fetch_asset_ids,
 )
@@ -249,11 +273,114 @@ KEEPALIVE_CEILING_SECONDS = 30.0
 #
 # One pulse interval's worth. A healthy beat is milliseconds, so this is
 # hundreds of healthy pulses and no working system ever reaches it, while a
-# single wedged attempt spends it outright. The bound it buys: a leg costs
-# a sweep at most this budget plus the one attempt that overran it — so at
-# most PULSE_LEG_BUDGET_SECONDS + KEEPALIVE_CEILING_SECONDS per leg, per
-# cycle, whatever the exchange and the database are doing.
+# single wedged attempt spends it outright. The bound it buys: a leg costs a
+# sweep at most this budget plus the one attempt that overran it, per REFILL
+# WINDOW (below) — so at most PULSE_LEG_BUDGET_SECONDS + that leg's ceiling
+# + the shielded drain the ceiling cannot itself cancel, whatever the
+# exchange and the database are doing.
+#
+# "+ the shielded drain" is not pedantry (round-3 review of PR #203, F5):
+# asyncio.wait_for AWAITS the cancellation it raises, and epigone.safety.db
+# shields Pool.release precisely so a cancelled block still terminates its
+# connection — so a beat wedged inside asyncpg costs its ceiling plus that
+# release budget before this counter ever sees it. Bounded, and deliberately
+# so; the number is just larger than the ceiling alone.
 PULSE_LEG_BUDGET_SECONDS = SWEEP_PULSE_INTERVAL.total_seconds()
+
+# How much sweep wall clock passes before a spent pulse leg is given its
+# budget back (round-3 review of PR #203, F1). Without this the budget lasted
+# the whole CYCLE, and a cycle is a whole sweep: one 30s slow-fail of a due
+# dead-man push early in a multi-minute grind silenced the push leg for the
+# rest of it, and the armed schedule could still reach its horizon mid-halt —
+# the 2026-08-07 incident, narrowed but not closed.
+#
+# The window is chosen against the number that matters — the half-horizon of
+# slack (150s at the default 300s horizon) between the dead-man's push falling
+# due and the schedule lapsing. THE RESIDUAL IS NARROWED, NOT CLOSED, and the
+# honest composition says why (merge-gate review of PR #209; an earlier
+# revision of this comment claimed 140s < 150s by counting one in-flight step
+# instead of two and by forgetting that the push falls due asynchronously to
+# the sweep). Walk it from the moment D at which a push becomes due:
+#
+#   D        the sweep is mid-step. That step is ALREADY IN FLIGHT and is not
+#            interruptible: up to 65s (a cancel POST, self-bounded by the
+#            gateway's 429 loop at RATE_LIMIT_TOTAL_BUDGET_SECONDS +
+#            REQUEST_TIMEOUT; a read is shorter, SAFETY_READ_CEILING_SECONDS
+#            binding first)
+#   D+65     pulse. The refill grants the leg its budget, the push attempt
+#            wedges, and it is cut at KEEPALIVE_CEILING_SECONDS — plus the
+#            drain the cut cannot itself cancel (the F5 correction, stated at
+#            PULSE_LEG_BUDGET_SECONDS, applies to THIS term too)
+#   D+95     budget spent; the next step is another saturated 65s cancel POST
+#   D+160    pulse, refill, attempt two. Even an INSTANT success lands after
+#            D+150 — the schedule has already lapsed. A push that itself
+#            needs its ceiling lands nearer D+190.
+#
+# So ~190s against 150s of slack under transient exchange saturation, and
+# larger under correlated failure: the pre-sign budget PACING SLEEP is
+# deliberately un-ceilinged (SharedWeightBudget's docstring — a token-deficit
+# wait may honestly run long and must not degrade the lane), the audited
+# gateway's attempt/outcome rows go to a database that may itself be wedged
+# to its 5s timeouts, and each cut leaves a shielded drain. ~250s when the
+# exchange and the database are both bad at once — which is the correlated
+# case this whole module exists for. "Every await between two pulses is
+# bounded" is therefore not literally true; the pacing sleep is the exception,
+# on purpose.
+#
+# WHY THIS IS SHIPPED ANYWAY, and what it costs when it fires: the residual
+# discharges in the FAIL-SAFE direction. The dead-man firing cancels every
+# resting order on the exchange, during a halt whose whole job was cancelling
+# resting orders — so the outcome is the intended one arriving by the
+# belt-and-braces route. It costs one of the account's 10 daily triggers and
+# an operator moment of "why did that fire", which the runbook now names so a
+# responder reads it as expected-rare rather than as a second incident.
+#
+# And what the window DOES buy is large: the quiet term used to be the REST OF
+# THE SWEEP — minutes, because a per-CYCLE budget lasts a whole sweep — and is
+# now at most this window. Minutes-to-45s is the difference between a residual
+# that needs conjunctive bad luck and one that the 2026-08-07 incident hit on
+# its first try. Closing it properly wants a deadline-aware priority push (one
+# attempt exempted from the budget when the armed schedule is within ~60s of
+# its horizon), which needs the deadman's armed-until time across the opaque
+# Keepalive seam: issue #212, a mainnet gate.
+#
+# The price is bounded and paid only when a leg is genuinely wedged: at worst
+# one budget plus one overrunning attempt per window, so a wedged keepalive
+# roughly halves a sweep's pace but cannot tax it per enumeration step, which
+# is the failure PR #203's budget existed to stop. Real time like every other
+# ceiling here — this measures actual awaits, and the fakes finish instantly.
+PULSE_LEG_REFILL_SECONDS = 45.0
+
+# The hard REAL-TIME ceiling on ONE read of the safety path (issue #204).
+#
+# The kill path's liveness guarantee is that no await between two sweep
+# pulses outlives the dead-man's slack. Every pulse sits between two reads,
+# so the guarantee is exactly a bound on a single read — and there was none:
+# a saturated 429 loop is RATE_LIMIT_MAX_TRIES answers at up to a 30s
+# REQUEST_TIMEOUT each plus the sleeps between them, and 429 pressure is most
+# plausible precisely while an account-wide sweep grinds through the shared
+# bucket. Capping Retry-After (gateway/backoff.py) bounds the sleeps; this
+# bounds the whole read.
+#
+# 45s is one and a half REQUEST_TIMEOUTs: a healthy read is milliseconds, a
+# read that rides out a 429 or two fits comfortably, and a saturated one is
+# cut. Cutting is safe because enumeration is idempotent and unverified — the
+# sweep leaves the halt unswept, says so, and the next cycle re-enumerates —
+# whereas NOT cutting it is how a single read straddles a push-due boundary.
+#
+# DELIBERATELY TIGHTER than the gateway's own bound on the same call
+# (RATE_LIMIT_TOTAL_BUDGET_SECONDS + REQUEST_TIMEOUT ≈ 65s), and that is the
+# point rather than a redundancy: this module's whole history is bounds that
+# turned out to have one more layer underneath them (the round 2–5 asyncpg
+# chase in the docstring above), so the safety path states its own number
+# instead of inheriting one. A read cut here that the gateway would have
+# completed at 50s costs one cycle's retry.
+#
+# The composed gap this participates in is written out in full at
+# PULSE_LEG_REFILL_SECONDS; on this axis a read is not the binding term,
+# because the cancel POST — which cannot be cut from outside without
+# orphaning its audit row — is longer.
+SAFETY_READ_CEILING_SECONDS = 45.0
 
 # A failed capability probe (network blip, info outage, unwritable verdict)
 # retries on this short fuse instead of waiting out the full check interval —
@@ -272,6 +399,16 @@ CAPABILITY_RETRY = timedelta(minutes=5)
 # watchdog without one is a real configuration (the deadman is the UPGRADE
 # path, ineligible below the $1M volume gate), not just a test shortcut.
 Keepalive = Callable[[], Awaitable[None]]
+
+# `Watchdog._safety_read` as a value, so a collaborator can be handed the
+# seam without being handed the watchdog (`_PulsedUniverseReads`). Generic in
+# the read's own result type: the seam changes WHEN a read is awaited, never
+# what it answers.
+T = TypeVar("T")
+
+
+class _SafetyRead(Protocol):
+    async def __call__(self, read: Awaitable[T]) -> T: ...
 
 
 @dataclass(frozen=True)
@@ -341,11 +478,13 @@ class Watchdog:
         self._keepalive = keepalive
         # When this process last emitted a liveness pulse (issue #201) —
         # the cycle-top beat counts, so a short cycle adds no extra writes —
-        # and, per leg, how much of this cycle's wall clock it has already
-        # spent (`_pulse`; both budgets refill at every cycle top).
+        # and, per leg, how much wall clock it has spent since the budgets
+        # were last refilled (`_pulse`; refilled at every cycle top and every
+        # PULSE_LEG_REFILL_SECONDS of a grinding sweep, monotonic seconds).
         self._pulsed_at: datetime | None = None
         self._beat_spent = 0.0
         self._keepalive_spent = 0.0
+        self._budgets_refilled_at = time.monotonic()
         self._capable: bool | None = None  # last on-chain verdict; None = unchecked
         self._next_capability_at: datetime | None = None  # None → due now
         # Postgres-independence state (module docstring): the onset of the
@@ -375,9 +514,9 @@ class Watchdog:
         now = self._clock.now()
         # Each cycle refills both pulse-leg budgets (issue #201, `_pulse`):
         # a leg that wedged during the last one gets a fresh one here, so
-        # the strike is a per-cycle bound and never a permanent give-up.
-        self._beat_spent = 0.0
-        self._keepalive_spent = 0.0
+        # the strike is never a permanent give-up. A long sweep refills them
+        # again from inside itself, on the clock (`_refill_leg_budgets`).
+        self._refill_leg_budgets(force=True)
         # INCIDENT-FIRST (round 5, the structural rule): an open incident
         # reaches the wire before this cycle touches Postgres AT ALL — no
         # beat, no reads, no state. Durable catch-up comes after the cancel.
@@ -385,6 +524,11 @@ class Watchdog:
             await self._incident_cycle(now)
             return
         self._beat_spent += await self._beat(now)
+        # The cycle-top beat is charged to the same budget the sweep's
+        # pulses spend, so it must report exhaustion the same way (round-3
+        # review of PR #203, F4): a beat that wedges HERE is the commonest
+        # shape of a quiet leg, and it used to go over budget silently.
+        _report_if_spent("heartbeat", self._beat_spent)
         try:
             halt, stall_reason = await asyncio.wait_for(
                 self._read_liveness(now), DB_BLOCK_CEILING_SECONDS
@@ -462,6 +606,25 @@ class Watchdog:
         assert self._keepalive is not None
         started = time.monotonic()
         try:
+            # THE ONE PLACE THIS PROCESS CANCELS AN AUDITED WRITE FROM OUTSIDE,
+            # and it is worth naming because three other docstrings here (the
+            # module's #204 section, SAFETY_READ_CEILING_SECONDS, and
+            # HttpExecutionGateway._post) argue that a write must bound ITSELF
+            # rather than be cut, precisely so no attempt row is left without
+            # an outcome. In production this keepalive IS an audited write — the
+            # deadman's scheduleCancel — so a push cut here can orphan its
+            # attempt row (AuditedExecutionGateway._audited catches Exception,
+            # and the CancelledError wait_for raises is not one).
+            #
+            # Accepted, not overlooked, and the trade runs the other way than
+            # it does for the cancel POST. The cancel is the protective action
+            # itself, so its evidence is the trail's most valuable row. This is
+            # ADVISORY work riding the protective path, and the thing being
+            # protected is the pulse loop's own liveness: an un-cut push wedges
+            # the sweep, which is the failure PR #203 exists to prevent. A
+            # repeated scheduleCancel set REPLACES, so nothing is lost but the
+            # row — an orphaned attempt with no outcome, which reads correctly
+            # as "we tried and never learned whether it landed".
             await asyncio.wait_for(self._keepalive(), KEEPALIVE_CEILING_SECONDS)
         except TimeoutError:
             log.error(
@@ -527,23 +690,71 @@ class Watchdog:
         one blip must not silence a signal for a ten-minute grind — and it
         gets that for free rather than by another rule.
 
-        The budget lasts the CYCLE, not the process: the next cycle gives
-        each leg a fresh one. The bound it buys is stated in
+        The budget REFILLS ON THE CLOCK, not once per cycle (round-3 review
+        of PR #203, F1): a cycle is a whole sweep, so a per-cycle budget let
+        one slow failure early in a multi-minute grind silence a leg for the
+        whole of it — long enough for an armed dead-man schedule to reach its
+        horizon mid-halt. PULSE_LEG_REFILL_SECONDS states the window and the
+        argument for its size; the bound it costs is in
         PULSE_LEG_BUDGET_SECONDS."""
         if not self._pulse_allowed():
             return
+        self._refill_leg_budgets()
         now = self._clock.now()
         if self._pulsed_at is not None and now - self._pulsed_at < SWEEP_PULSE_INTERVAL:
             return
         # The pulse clock advances even when both legs are spent, so a quiet
         # sweep does not re-enter this body at every step.
         self._pulsed_at = now
-        if self._beat_spent < PULSE_LEG_BUDGET_SECONDS:
-            self._beat_spent += await self._beat(now)
-            _report_if_spent("heartbeat", self._beat_spent)
+        # THE KEEPALIVE GOES FIRST. Both legs are advisory to the sweep, but
+        # only one has a deadline it can miss: the dead-man's schedule lapses
+        # a half-horizon after its push falls due (150s), while the beat's
+        # consumer — the monitor's staleness check — allows 300s. Beating
+        # first would put a wedged database's ceiling in front of the push on
+        # every pulse, which is the one term the gap arithmetic at
+        # PULSE_LEG_REFILL_SECONDS cannot afford.
         if self._keepalive is not None and self._keepalive_spent < PULSE_LEG_BUDGET_SECONDS:
             self._keepalive_spent += await self._push_keepalive()
             _report_if_spent("dead-man's push", self._keepalive_spent)
+        if self._beat_spent < PULSE_LEG_BUDGET_SECONDS:
+            self._beat_spent += await self._beat(now)
+            _report_if_spent("heartbeat", self._beat_spent)
+
+    def _refill_leg_budgets(self, *, force: bool = False) -> None:
+        """Give both pulse legs their budgets back — at every cycle top
+        (`force`) and every PULSE_LEG_REFILL_SECONDS of a grinding sweep.
+
+        Both legs refill together on ONE window because the window is a
+        property of the sweep's wall clock, not of either leg; the legs stay
+        independent where it matters, which is that each spends and strikes
+        on its own counter. Monotonic seconds, like every spend it undoes:
+        the injected clock can be frozen or fast-forwarded by a fake, and a
+        budget that refilled on it would refill never or always."""
+        elapsed = time.monotonic() - self._budgets_refilled_at
+        if not force and elapsed < PULSE_LEG_REFILL_SECONDS:
+            return
+        self._budgets_refilled_at = time.monotonic()
+        self._beat_spent = 0.0
+        self._keepalive_spent = 0.0
+
+    async def _safety_read(self, read: Awaitable[T]) -> T:
+        """ONE read of the safety path: say alive first, then a hard
+        real-time ceiling on the read itself (issue #204).
+
+        Both halves are the same guarantee seen from either side. The pulse
+        is what makes the gap between two liveness signals a gap of one read
+        rather than one enumeration pass; the ceiling is what makes that gap
+        finite at all, which uncapped it was not — a 429-saturated read can
+        run for minutes, and a minute of that spent straddling a push-due
+        boundary is a dead-man's switch fired under a working watchdog.
+
+        The pulse here is deliberately a SECOND one on the enumeration path:
+        `_walk_scope` already pulses before paying the shared bucket, because
+        the pacing sleep is itself time between signals. Within
+        SWEEP_PULSE_INTERVAL the second one costs nothing, and past it — a
+        slow pace, a slow read — it is exactly the signal that was missing."""
+        await self._pulse()
+        return await asyncio.wait_for(read, SAFETY_READ_CEILING_SECONDS)
 
     async def _read_liveness(self, now: datetime) -> tuple[Halt | None, str | None]:
         halt = await active_halt(self._pool)
@@ -901,7 +1112,8 @@ class Watchdog:
         await self._pulse()
         await self._budget.spend(META_WEIGHT)
         try:
-            dexs, dexs_complete = await self._read.get_perp_dexs(), True
+            dexs = await self._safety_read(self._read.get_perp_dexs())
+            dexs_complete = True
         except Exception:
             dexs = [dex for dex in POSITION_VENUES if dex is not None]
             dexs_complete = False
@@ -914,7 +1126,9 @@ class Watchdog:
         accounts: list[str | None] = [None]
         await self._budget.spend(META_WEIGHT)
         try:
-            accounts += list(await self._read.get_sub_accounts(self._master))
+            accounts += list(
+                await self._safety_read(self._read.get_sub_accounts(self._master))
+            )
             accounts_complete = True
         except Exception:
             accounts_complete = False
@@ -949,6 +1163,14 @@ class Watchdog:
         # reads. One map serves every account: asset ids are a property of the
         # venue, not of the book. Billing: core meta + perpDexs (when any dex
         # is needed) + one meta per needed dex.
+        #
+        # The spends are paid UP FRONT (the shared bucket paces them as a
+        # group), but the reads are not: fetch_asset_ids makes 2+N HTTP calls
+        # and they used to run back-to-back with no pulse and no ceiling
+        # between them (issue #204) — a stretch of the cancel path, sitting
+        # between the enumeration and the cancels it feeds, that was invisible
+        # to every liveness signal. `_PulsedUniverseReads` puts each of those
+        # reads on the same seam every other safety-path read runs through.
         needed = sorted(
             {o.order.coin.split(":", 1)[0] for o in orders if ":" in o.order.coin}
         )
@@ -956,7 +1178,9 @@ class Watchdog:
         for _ in range(spends):
             await self._pulse()
             await self._budget.spend(META_WEIGHT)
-        return await fetch_asset_ids(self._read, dexs=needed)
+        return await fetch_asset_ids(
+            _PulsedUniverseReads(self._read, self._safety_read), dexs=needed
+        )
 
     async def _walk_scope(
         self, dexs: list[str], accounts: list[str | None], weight: int
@@ -986,7 +1210,7 @@ class Watchdog:
         runs instead of only when it finishes."""
         orders: list[_AccountOrder] = []
         async for account, address, dex, at in self._walk_scope(dexs, accounts, ORDERS_WEIGHT):
-            found = await self._read.get_open_orders(address, dex=dex)
+            found = await self._safety_read(self._read.get_open_orders(address, dex=dex))
             orders.extend(_AccountOrder(account=account, order=order) for order in found)
             log.info(
                 "sweep progress: %s %s — %s on %s: %d resting order(s), %d so far",
@@ -1006,7 +1230,9 @@ class Watchdog:
         async for _account, address, dex, at in self._walk_scope(
             dexs, accounts, POSITIONS_WEIGHT
         ):
-            positions.extend(await self._read.get_open_positions(address, dex=dex))
+            positions.extend(
+                await self._safety_read(self._read.get_open_positions(address, dex=dex))
+            )
             log.info(
                 "sweep progress: position snapshot %s — %s on %s: %d open",
                 at,
@@ -1032,7 +1258,11 @@ class Watchdog:
             return
         await self._budget.spend(META_WEIGHT)
         try:
-            agents = await self._read.get_extra_agents(self._master)
+            # Ceilinged like every other read on this process (issue #204).
+            # Advisory work, but it runs on the watchdog's ONE task: a wedged
+            # extraAgents read holds up the next cycle, and with it the next
+            # heartbeat and the next dead-man push.
+            agents = await self._safety_read(self._read.get_extra_agents(self._master))
         except Exception:
             self._defer_capability_retry(now, "extraAgents read failed")
             return
@@ -1094,18 +1324,49 @@ class Watchdog:
         self._next_capability_at = now + CAPABILITY_RETRY
 
 
+class _PulsedUniverseReads:
+    """The watchdog's read gateway, seen the way the asset-map fetch must see
+    it on the safety path (issue #204): every universe read routed through
+    `_safety_read`, so `fetch_asset_ids`' 2+N back-to-back HTTP calls each
+    pulse first and each carry a ceiling.
+
+    A wrapper rather than a hook inside the helper, because the offset
+    arithmetic that makes an asset id correct lives in exactly one place
+    (gateway.fetch_asset_specs) and must keep living there; what the sweep
+    needs to change is how each read is AWAITED, which is precisely what a
+    wrapper can say and a parameter cannot. Satisfies gateway's narrow
+    PerpUniverseReader — the two methods that fetch actually makes.
+
+    Handed the gateway and the seam rather than the watchdog: what it needs
+    is a way to read and a way to read SAFELY, and naming exactly those two
+    keeps it from being a second door into the watchdog's internals."""
+
+    def __init__(self, read: HyperliquidGateway, through: "_SafetyRead") -> None:
+        self._read = read
+        self._through = through
+
+    async def get_perp_assets(self, dex: str | None = None) -> list[PerpAsset]:
+        return await self._through(self._read.get_perp_assets(dex))
+
+    async def get_perp_dexs(self) -> list[str]:
+        return await self._through(self._read.get_perp_dexs())
+
+
 def _report_if_spent(leg: str, spent: float) -> None:
-    """A pulse leg that has just gone over its per-cycle budget says so
-    once, where a reader of the sweep's own progress lines will see it: the
-    signal it carries is about to stop, and the reason is that it was
-    costing the sweep more than the sweep can pay."""
+    """A pulse leg that has just gone over its budget says so once, where a
+    reader of the sweep's own progress lines will see it: the signal it
+    carries is about to stop, and the reason is that it was costing the sweep
+    more than the sweep can pay. Said again after each refill, because each
+    refill is a fresh attempt and a fresh exhaustion."""
     if spent >= PULSE_LEG_BUDGET_SECONDS:
         log.error(
-            "sweep pulse: the %s leg has spent %.1fs of this sweep (budget %.1fs) — "
-            "quiet until the next cycle; the protective work continues",
+            "sweep pulse: the %s leg has spent %.1fs (budget %.1fs) — quiet until "
+            "the budget refills in at most %.0fs of sweep, or at the next cycle; "
+            "the protective work continues",
             leg,
             spent,
             PULSE_LEG_BUDGET_SECONDS,
+            PULSE_LEG_REFILL_SECONDS,
         )
 
 

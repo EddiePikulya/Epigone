@@ -131,11 +131,18 @@ async def test_the_ceiling_is_wired_into_every_db_block_of_a_cycle() -> None:
     at the module's ceiling — so a future block added without one is a visible
     diff here rather than a hang at 3am.
 
-    ONE ceiling in the module is deliberately not a DB one: the sweep pulse's
-    keepalive (issue #201) bounds an EXCHANGE call, so it gets its own,
-    separately reasoned KEEPALIVE_CEILING_SECONDS. It is named here rather
-    than exempted by pattern — a second non-DB ceiling must be argued for in
-    this test's diff, not slipped in."""
+    TWO ceilings in the module are deliberately not DB ones, and each is
+    named here rather than exempted by pattern — a further non-DB ceiling
+    must be argued for in this test's diff, not slipped in:
+
+    - the sweep pulse's keepalive (issue #201) bounds an EXCHANGE write, so
+      it gets its own, separately reasoned KEEPALIVE_CEILING_SECONDS. Exactly
+      one, because there is exactly one keepalive leg;
+    - every safety-path READ (issue #204) bounds an info-endpoint call, so it
+      gets SAFETY_READ_CEILING_SECONDS. Exactly one of those too, and that is
+      the load-bearing part: it means every read goes through the ONE seam
+      (`_safety_read`, which pulses first), rather than each read site
+      remembering to wrap itself."""
     import ast
     import inspect
 
@@ -150,14 +157,20 @@ async def test_the_ceiling_is_wired_into_every_db_block_of_a_cycle() -> None:
     ]
     # heartbeat.beat, the liveness read, the reconcile, mark_swept and the
     # capability verdict — the five durable/state blocks the module docstring
-    # enumerates — plus the keepalive's own.
-    assert len(ceilinged) >= 6
+    # enumerates — plus the keepalive's own and the safety read's own.
+    assert len(ceilinged) >= 7
     ceilings = [
         call.args[1].id for call in ceilinged if isinstance(call.args[1], ast.Name)
     ]
     assert len(ceilings) == len(ceilinged)  # every one is a named constant
     assert ceilings.count("KEEPALIVE_CEILING_SECONDS") == 1
+    assert ceilings.count("SAFETY_READ_CEILING_SECONDS") == 1
     assert all(
-        name in ("DB_BLOCK_CEILING_SECONDS", "KEEPALIVE_CEILING_SECONDS")
+        name
+        in (
+            "DB_BLOCK_CEILING_SECONDS",
+            "KEEPALIVE_CEILING_SECONDS",
+            "SAFETY_READ_CEILING_SECONDS",
+        )
         for name in ceilings
     )

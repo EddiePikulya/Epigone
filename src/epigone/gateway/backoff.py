@@ -1,6 +1,6 @@
 """The shared 429 backoff-and-retry vocabulary for both gateway directions
 (issue #28 read-side, issue #133 write-side): bounded tries, exponential
-equal-jitter windows, Retry-After respected when parseable.
+equal-jitter windows, Retry-After respected when parseable and bounded always.
 
 Both HTTP gateways retry a 429 in place and only surface a sustained streak
 as their RateLimited error. What each direction may REPLAY differs — reads
@@ -10,6 +10,7 @@ the shared arithmetic lives here.
 """
 
 from collections.abc import Callable
+from datetime import datetime
 
 # Bounded 429 retries: 6 tries = up to 5 sleeps (1+2+4+8+16s at full jitter),
 # ~30s worst case — long enough to ride out a blip, short enough that a pass
@@ -17,6 +18,54 @@ from collections.abc import Callable
 RATE_LIMIT_MAX_TRIES = 6
 RATE_LIMIT_BACKOFF_BASE_SECONDS = 1.0
 RATE_LIMIT_BACKOFF_CAP_SECONDS = 30.0
+
+# Retry-After is TRUSTED BUT BOUNDED (issue #204). The header is the server's
+# number and we sleep on it, so uncapped it is a remote party's hand on this
+# process's wall clock: one `Retry-After: 100000` makes a single read or cancel
+# arbitrarily long, and the kill path's liveness argument — every await between
+# two sweep pulses bounded well under one dead-man period — is load-bearing on
+# it. The cap is deliberately the SAME number as our own backoff's: 30s is
+# already the longest this codebase is willing to wait between two tries, and
+# a server asking for longer gets our maximum rather than its own. Asking for
+# MORE is not ignored, it is answered the way sustained limiting is meant to be
+# answered — the tries run out, RateLimitedError surfaces, and the pass moves on
+# and resumes next cycle instead of sleeping through the incident.
+RETRY_AFTER_CAP_SECONDS = RATE_LIMIT_BACKOFF_CAP_SECONDS
+
+# And the whole retry loop is bounded in WALL CLOCK, not only in tries
+# (issue #204). The cap above bounds one sleep; six tries of it still add up
+# to minutes, and a slow-answering server needs no Retry-After at all to get
+# there — six 429s that each take most of a 30s REQUEST_TIMEOUT to arrive is
+# three minutes of one call, which is the arithmetic the ticket opens with.
+#
+# Tries alone cannot express "this call must be over by then", so this does:
+# a retry is taken only if the sleep it needs still fits inside this budget.
+# Composed with REQUEST_TIMEOUT it bounds ANY 429-riding call at
+# RATE_LIMIT_TOTAL_BUDGET_SECONDS + REQUEST_TIMEOUT ≈ 60s — which is what
+# lets the watchdog's cancel POST be bounded without cancelling it. Cancelling
+# a WRITE mid-flight is not available on that path: it would leave the audit
+# trail's attempt row with no outcome, on the one path whose evidence matters
+# most, so the write has to bound itself, and this is where it does.
+#
+# Thirty-five seconds is the smallest budget that changes NOTHING about the
+# behaviour this codebase already has and everything about the behaviour it
+# never chose: the full-jitter ladder above tops out at 1+2+4+8+16 = 31s, so
+# all RATE_LIMIT_MAX_TRIES tries still happen when we are pacing ourselves,
+# while a server dictating 30s waits gets exactly one of them. Past the
+# budget, the pass treats a RateLimited streak the way it always has —
+# pacing, retried later, never an abort (docs/spec-defaults.md, "Rate
+# budget").
+RATE_LIMIT_TOTAL_BUDGET_SECONDS = 35.0
+
+
+def retry_fits_budget(started: datetime, now: datetime, delay: float) -> bool:
+    """Whether one more 429 retry — after sleeping `delay` — still lands
+    inside RATE_LIMIT_TOTAL_BUDGET_SECONDS of when the call began.
+
+    On the caller's INJECTED clock, so it measures the same seconds the sleeps
+    are taken on: under the real clock that is the request time too, and under
+    a fake one the sleeps alone, which is the half a test can drive."""
+    return (now - started).total_seconds() + delay <= RATE_LIMIT_TOTAL_BUDGET_SECONDS
 
 
 def backoff_delay(attempt: int, rng: Callable[[], float]) -> float:
@@ -26,12 +75,16 @@ def backoff_delay(attempt: int, rng: Callable[[], float]) -> float:
 
 
 def parse_retry_after(value: str | None) -> float | None:
-    """Retry-After as delta-seconds; the HTTP-date form (or garbage) falls back
-    to our own backoff rather than trusting a parse of the server's clock."""
+    """Retry-After as delta-seconds, clamped into [0, RETRY_AFTER_CAP_SECONDS];
+    the HTTP-date form (or garbage) falls back to our own backoff rather than
+    trusting a parse of the server's clock.
+
+    Clamped at BOTH ends for the same reason: what comes back is the other
+    side's number, and this process sleeps on it (issue #204)."""
     if value is None:
         return None
     try:
         seconds = float(value)
     except ValueError:
         return None
-    return max(0.0, seconds)
+    return min(max(0.0, seconds), RETRY_AFTER_CAP_SECONDS)

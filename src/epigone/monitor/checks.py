@@ -87,6 +87,39 @@ COPY_PAGER_ACTIONS = (
 )
 
 
+# The execution processes' liveness columns, as SELECT-list text and as the
+# HealthSnapshot fields they fill. Written once because TWO cadences read them
+# now (issue #205): the full gather and the fast watchdog-liveness tick. A
+# column added to `process_heartbeats` for one of them and forgotten by the
+# other is a check that disagrees with itself depending on which timer ran.
+_HEARTBEAT_COLUMNS = """
+            (SELECT beaten_at FROM process_heartbeats WHERE process = 'executor')
+                AS executor_beaten_at,
+            (SELECT beaten_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_beaten_at,
+            (SELECT capable FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capable,
+            (SELECT capability_detail FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_detail,
+            (SELECT capability_checked_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_capability_checked_at,
+            (SELECT started_at FROM process_heartbeats WHERE process = 'watchdog')
+                AS watchdog_started_at
+"""
+
+
+def _heartbeat_fields(row: asyncpg.Record) -> dict[str, object]:
+    """The `_HEARTBEAT_COLUMNS` half of a HealthSnapshot's keyword arguments."""
+    return {
+        "executor_beaten_at": row["executor_beaten_at"],
+        "watchdog_beaten_at": row["watchdog_beaten_at"],
+        "watchdog_capable": row["watchdog_capable"],
+        "watchdog_capability_detail": row["watchdog_capability_detail"],
+        "watchdog_capability_checked_at": row["watchdog_capability_checked_at"],
+        "watchdog_started_at": row["watchdog_started_at"],
+    }
+
+
 class DiskProbe(Protocol):
     """Host disk visibility, injected so tests feed a synthetic percentage and
     the container needs only a mounted host path (not the docker socket)."""
@@ -215,8 +248,9 @@ async def gather_snapshot(
     of "how many recently", leaving the threshold decision to `evaluate_checks`."""
     now = clock.now()
     row = await pool.fetchrow(
-        """
+        f"""
         SELECT
+            {_HEARTBEAT_COLUMNS},
             (SELECT count(*) FROM traders) AS wallet_count,
             (SELECT max(fine_refreshed_at) FROM traders) AS last_fine_refresh,
             (SELECT max(fine_attempted_at) FROM traders) AS last_fine_attempt,
@@ -232,18 +266,6 @@ async def gather_snapshot(
                 AS recent_rate_limits,
             (SELECT min(expires_at) FROM agent_keys WHERE revoked_at IS NULL)
                 AS nearest_agent_key_expiry,
-            (SELECT beaten_at FROM process_heartbeats WHERE process = 'executor')
-                AS executor_beaten_at,
-            (SELECT beaten_at FROM process_heartbeats WHERE process = 'watchdog')
-                AS watchdog_beaten_at,
-            (SELECT capable FROM process_heartbeats WHERE process = 'watchdog')
-                AS watchdog_capable,
-            (SELECT capability_detail FROM process_heartbeats WHERE process = 'watchdog')
-                AS watchdog_capability_detail,
-            (SELECT capability_checked_at FROM process_heartbeats WHERE process = 'watchdog')
-                AS watchdog_capability_checked_at,
-            (SELECT started_at FROM process_heartbeats WHERE process = 'watchdog')
-                AS watchdog_started_at,
             (SELECT halted_at FROM execution_halts WHERE resumed_at IS NULL)
                 AS active_halt_since,
             (SELECT source FROM execution_halts WHERE resumed_at IS NULL)
@@ -285,12 +307,7 @@ async def gather_snapshot(
         recent_rate_limits=row["recent_rate_limits"],
         disk_percent_used=disk.percent_used(),
         nearest_agent_key_expiry=row["nearest_agent_key_expiry"],
-        executor_beaten_at=row["executor_beaten_at"],
-        watchdog_beaten_at=row["watchdog_beaten_at"],
-        watchdog_capable=row["watchdog_capable"],
-        watchdog_capability_detail=row["watchdog_capability_detail"],
-        watchdog_capability_checked_at=row["watchdog_capability_checked_at"],
-        watchdog_started_at=row["watchdog_started_at"],
+        **_heartbeat_fields(row),  # type: ignore[arg-type]
         active_halt_since=row["active_halt_since"],
         active_halt_source=row["active_halt_source"],
         active_halt_reason=row["active_halt_reason"],
@@ -302,6 +319,41 @@ async def gather_snapshot(
         position_lane_since=row["position_lane_since"],
         position_lane_reason=row["position_lane_reason"],
     )
+
+
+async def gather_watchdog_snapshot(pool: asyncpg.Pool, clock: Clock) -> HealthSnapshot:
+    """The LIVENESS-ONLY snapshot (issue #205): the execution processes' own
+    heartbeat row and nothing else.
+
+    Why a second gather rather than the full one on a faster timer: the full
+    one counts wallets, due Traders, undelivered alerts, rate events and copy
+    pagers across five tables, and running that every minute would trade a
+    monitoring gap for a load problem. What the dead-man's timing actually
+    needs is one indexed single-row read, so that is what this is — the
+    expensive checks keep the 15-minute cycle.
+
+    Every field here is one `_watchdog_check` reads, and it is the SAME check
+    function both cadences evaluate: a fast tick that judged watchdog liveness
+    by its own rules would flap against the slow cycle's verdict in the shared
+    alerting state machine."""
+    row = await pool.fetchrow(f"SELECT {_HEARTBEAT_COLUMNS}")
+    assert row is not None
+    return HealthSnapshot(
+        now=clock.now(),
+        db_reachable=True,
+        **_heartbeat_fields(row),  # type: ignore[arg-type]
+    )
+
+
+def evaluate_watchdog_liveness(
+    snapshot: HealthSnapshot, thresholds: CheckThresholds
+) -> list[CheckResult]:
+    """The one check the fast tick evaluates (issue #205), in list form so it
+    feeds the alerting state machine exactly like `evaluate_checks` does.
+
+    Deliberately the same `_watchdog_check` the full cycle runs, over the same
+    fields: one verdict for one check name, whichever cadence produced it."""
+    return [_watchdog_check(snapshot, thresholds.watchdog_stale)]
 
 
 def db_down(now: datetime) -> HealthSnapshot:

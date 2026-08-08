@@ -43,6 +43,22 @@ DEFAULT_AGENT_KEY_WARN_DAYS = 14
 # comfortably surviving a deploy restart. Critical when tripped: the PRIMARY
 # dead-man's switch is down.
 DEFAULT_WATCHDOG_STALE_SECONDS = 300
+# How often the watchdog-liveness check ALONE is re-evaluated (issue #205).
+# The 15-minute cycle is priced for the expensive checks — five tables, a due
+# count, a disk read — and against the dead-man's switch that cadence is a
+# blind spot rather than a cadence: the switch's horizon is 300s, so a dead
+# watchdog whose staleness lands just after a pass is not reported until the
+# schedule has already fired (observed live 2026-08-07 — the watchdog froze at
+# 18:20:15, the 18:24 pass saw four minutes of staleness, and the next look
+# would have been 18:39; the operator found it with an ad-hoc query).
+#
+# So the liveness check gets its own timer, at one minute — one indexed
+# single-row read, cheap enough to run 15× as often as the rest and short
+# enough that the lag between a heartbeat going stale and the operator being
+# told is a fraction of a dead-man period rather than three of them. The
+# absolute worst case from freeze to page is watchdog_stale + this, which is
+# the number the failover runbook states.
+DEFAULT_WATCHDOG_CHECK_SECONDS = 60
 # Coarse metrics older than this multiple of the seed interval mean the re-seed
 # likely stopped (issue #52). Default = 2× the configured cadence.
 COARSE_STALE_SEED_MULTIPLE = 2
@@ -51,6 +67,9 @@ COARSE_STALE_SEED_MULTIPLE = 2
 @dataclass(frozen=True)
 class MonitorConfig:
     interval: timedelta
+    # The watchdog-liveness-only cadence (issue #205), always ≤ `interval`:
+    # the loop ticks on this and runs the full cycle when it falls due.
+    watchdog_check: timedelta
     reminder: timedelta
     heartbeat_hour: int
     thresholds: CheckThresholds
@@ -61,14 +80,27 @@ class MonitorConfig:
         """Build from HEALTHCHECK_* env vars. `seed_interval_minutes` (the ingest
         cadence, issue #50) sets the default coarse-staleness window at 2× it."""
         coarse_default = seed_interval_minutes * COARSE_STALE_SEED_MULTIPLE
+        interval = timedelta(
+            minutes=parse_positive_int(
+                os.environ.get("HEALTHCHECK_INTERVAL_MINUTES"),
+                default=DEFAULT_INTERVAL_MINUTES,
+                name="HEALTHCHECK_INTERVAL_MINUTES",
+            )
+        )
+        watchdog_check = timedelta(
+            seconds=parse_positive_int(
+                os.environ.get("HEALTHCHECK_WATCHDOG_CHECK_SECONDS"),
+                default=DEFAULT_WATCHDOG_CHECK_SECONDS,
+                name="HEALTHCHECK_WATCHDOG_CHECK_SECONDS",
+            )
+        )
         return cls(
-            interval=timedelta(
-                minutes=parse_positive_int(
-                    os.environ.get("HEALTHCHECK_INTERVAL_MINUTES"),
-                    default=DEFAULT_INTERVAL_MINUTES,
-                    name="HEALTHCHECK_INTERVAL_MINUTES",
-                )
-            ),
+            interval=interval,
+            # Clamped rather than validated: an operator who tightens the full
+            # cycle below a minute has said what they want the fastest tick to
+            # be, and a liveness check that ran LESS often than the cycle it
+            # rides inside would be a knob that silently did nothing.
+            watchdog_check=min(watchdog_check, interval),
             reminder=timedelta(
                 hours=parse_positive_int(
                     os.environ.get("HEALTHCHECK_REMINDER_HOURS"),

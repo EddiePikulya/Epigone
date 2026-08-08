@@ -24,6 +24,10 @@ from eth_account import Account
 from hyperliquid.utils.signing import recover_agent_or_user_from_l1_action
 
 import epigone.gateway.execution_http as execution_http
+from epigone.gateway.backoff import (
+    RATE_LIMIT_TOTAL_BUDGET_SECONDS,
+    RETRY_AFTER_CAP_SECONDS,
+)
 from epigone.gateway.execution import (
     ActionRejectedError,
     AmbiguousExecutionError,
@@ -520,6 +524,19 @@ async def test_a_429_retry_reposts_the_identical_signed_payload(replaying: Any) 
     assert h.clock.slept  # backed off between tries
 
 
+async def test_an_absurd_retry_after_is_capped_on_the_write_side_too(
+    replaying: Any,
+) -> None:
+    """Issue #204: both directions sleep on `parse_retry_after`, so both are
+    bounded by it. The write side is where it bites hardest — a cancel POST is
+    on the watchdog's kill path, and a schedule pushed 100000s from now is a
+    dead-man's switch discharged by a header."""
+    h = await replaying(429, OK_DEFAULT, retry_after="100000")
+    await h.gateway.schedule_cancel(None)
+    assert len(h.received) == 2
+    assert h.clock.slept == [RETRY_AFTER_CAP_SECONDS]
+
+
 async def test_a_429_streak_escapes_as_rate_limited(replaying: Any) -> None:
     h = await replaying(*([429] * RATE_LIMIT_MAX_TRIES), retry_after="0.1")
     with pytest.raises(ExecutionRateLimitedError):
@@ -649,3 +666,22 @@ async def test_an_unreadable_ok_response_is_ambiguous(replaying: Any) -> None:
         await h.gateway.place_orders(
             [OrderSpec(asset=4, is_buy=True, size=Decimal("0.5"), limit_price=Decimal("1800"))]
         )
+
+
+async def test_a_cancel_post_bounds_its_own_429_loop_in_wall_clock(
+    replaying: Any,
+) -> None:
+    """Issue #204, the write side — and the reason the bound lives in the loop
+    rather than in a `wait_for` around it. The watchdog's sweep pulses between
+    cancels; a cancel POST riding six capped Retry-Afters is minutes long, long
+    enough to straddle the moment the dead-man's push falls due. It cannot be
+    cancelled from outside — that would leave the audit trail's attempt row
+    with no outcome, on the one path whose evidence matters most — so it stops
+    retrying on its own clock."""
+    h = await replaying(*([429] * RATE_LIMIT_MAX_TRIES), retry_after="100000")
+    with pytest.raises(ExecutionRateLimitedError):
+        await h.gateway.cancel_orders([CancelSpec(asset=1, oid=7)])
+
+    assert h.clock.slept == [RETRY_AFTER_CAP_SECONDS]
+    assert len(h.received) == 2  # not RATE_LIMIT_MAX_TRIES
+    assert sum(h.clock.slept) <= RATE_LIMIT_TOTAL_BUDGET_SECONDS

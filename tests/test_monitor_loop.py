@@ -3,6 +3,11 @@
 Drives `run_monitor_cycle` against synthetic DB states and asserts on the
 outgoing sendMessage calls (recipient = admin, text names the failing check and
 its numbers), the house convention used by test_alert_delivery.
+
+The last section drives `monitor_loop` itself (issue #205), because the
+watchdog-liveness check's CADENCE is the behaviour under test there — how soon
+the operator hears about a dead dead-man's switch is not visible from inside
+one cycle.
 """
 
 from dataclasses import replace
@@ -10,13 +15,19 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import asyncpg
+import pytest
 from aiogram import Bot
 
+import epigone.monitor.main as monitor_main
 from epigone.budget import record_rate_limit
 from epigone.monitor.alerting import Monitor
 from epigone.monitor.checks import CheckThresholds
 from epigone.monitor.config import MonitorConfig
-from epigone.monitor.main import run_monitor_cycle
+from epigone.monitor.main import (
+    monitor_loop,
+    run_monitor_cycle,
+    run_watchdog_liveness_cycle,
+)
 from epigone.safety import heartbeat
 from epigone.safety.audit import ExecutionAudit
 from epigone.safety.halt import WATCHDOG_SOURCE, request_halt
@@ -38,6 +49,7 @@ class FakeDiskProbe:
 def _config() -> MonitorConfig:
     return MonitorConfig(
         interval=timedelta(minutes=15),
+        watchdog_check=timedelta(seconds=60),
         reminder=timedelta(hours=6),
         heartbeat_hour=9,  # FakeClock sits at noon, so heartbeats never interfere
         thresholds=CheckThresholds(
@@ -335,3 +347,160 @@ async def test_a_live_halt_and_a_stale_watchdog_page_the_admin(
     halt_alert = next(m for m in messages if "HALTED" in m)
     assert "🚨" in watchdog_alert and "dead-man" in watchdog_alert
     assert "🚨" in halt_alert and "95s > 60s" in halt_alert and "sweep PENDING" in halt_alert
+
+
+# --- the fast watchdog-liveness tick (issue #205) -----------------------------
+# The full cycle is priced for its expensive checks; the watchdog's liveness is
+# the one check whose subject has a deadline, because the dead-man's schedule
+# it refreshes has a 300s horizon. These drive `monitor_loop` itself — the
+# cadence IS the behaviour under test, so a test of one cycle cannot see it.
+
+
+def _loop_config(**overrides: object) -> MonitorConfig:
+    return replace(_config(), **overrides)  # type: ignore[arg-type]
+
+
+async def test_a_dead_watchdog_pages_within_one_dead_man_period(
+    pool: asyncpg.Pool,
+    bot: Bot,
+    session: RecordingSession,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 2026-08-07 incident, as a cadence. The watchdog froze at 18:20:15;
+    the monitor's 18:24 pass saw ~4 minutes of staleness (under the 300s
+    threshold) and the next look would have been 18:39 — by which time the
+    dead-man's 300s schedule had long since fired and the operator had found
+    the freeze with an ad-hoc DB query.
+
+    The page must now land on the first liveness tick after the threshold is
+    crossed, so the whole lag from freeze to human is one staleness threshold
+    plus one liveness cadence — not plus one 15-minute check cycle. The send is
+    timestamped here rather than inferred from where the loop stopped: WHEN the
+    operator was told is the entire claim."""
+    paged_at: list[datetime] = []
+    real_send = monitor_main._send
+
+    async def timestamped(bot_: Bot, admin: int, text: str) -> None:
+        if "Watchdog" in text:
+            paged_at.append(clock.now())
+        await real_send(bot_, admin, text)
+
+    monkeypatch.setattr(monitor_main, "_send", timestamped)
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(minutes=2),
+        computed_at=clock.now() - timedelta(minutes=5),
+    )
+    froze_at = clock.now()
+    await heartbeat.beat(pool, heartbeat.WATCHDOG_PROCESS, froze_at)
+    config = _loop_config()
+
+    # Seven ticks: one full cycle at t=0 (the heartbeat is fresh then), then a
+    # liveness tick every minute. The staleness threshold falls in the
+    # tick-only stretch — the window the 15-minute cadence swallowed whole.
+    await monitor_loop(pool, bot, ADMIN_ID, config, clock, FakeDiskProbe(47.0), max_cycles=7)
+
+    paged = [s for s in session.sent_messages() if "Watchdog" in s.text]
+    assert len(paged) == 1
+    assert "🚨" in paged[0].text and "dead-man" in paged[0].text
+    lag = paged_at[0] - froze_at
+    assert lag <= config.thresholds.watchdog_stale + config.watchdog_check
+    # Strictly better than the cadence it replaces: under the old rule the next
+    # look after t=0 was a whole `interval` away.
+    assert lag < config.interval
+
+
+async def test_the_fast_tick_judges_only_the_watchdog(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The cadence split is the point: the expensive checks keep the 15-minute
+    clock. A wedged ingest present from the start is reported by the first FULL
+    cycle and then not again — the four liveness ticks that follow read one row
+    and judge one check, so nothing else is re-evaluated on their timer."""
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(days=2),
+        computed_at=clock.now() - timedelta(minutes=5),
+    )
+
+    await monitor_loop(
+        pool, bot, ADMIN_ID, _loop_config(), clock, FakeDiskProbe(91.0), max_cycles=5
+    )
+
+    sent = [s.text for s in session.sent_messages()]
+    assert len([t for t in sent if "Ingest" in t]) == 1
+    assert len([t for t in sent if "Disk" in t]) == 1
+    assert not any("Watchdog" in t for t in sent)  # no execution processes: quiet
+
+
+async def test_the_two_cadences_never_page_the_same_failure_twice(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """One alerting state machine serves both timers, so a watchdog the fast
+    tick has already paged about is not paged again by the full cycle that
+    comes after it — and the recovery, whichever timer sees it, closes the
+    loop exactly once."""
+    await _add_trader(
+        pool, "0xaaa", fine_refreshed_at=clock.now() - timedelta(minutes=2),
+        computed_at=clock.now() - timedelta(minutes=5),
+    )
+    await heartbeat.beat(
+        pool, heartbeat.WATCHDOG_PROCESS, clock.now() - timedelta(minutes=10)
+    )
+    # A 3-minute full cycle: the fast tick pages first, then a full cycle runs
+    # over the same still-stale row.
+    config = _loop_config(interval=timedelta(minutes=3))
+
+    await monitor_loop(pool, bot, ADMIN_ID, config, clock, FakeDiskProbe(47.0), max_cycles=5)
+
+    assert len([s for s in session.sent_messages() if "Watchdog" in s.text]) == 1
+
+
+async def test_a_watchdog_that_comes_back_is_reported_recovered_once(
+    pool: asyncpg.Pool, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The other half of the shared state: the fast tick can also CLEAR. A
+    watchdog restarting mid-incident is the common case — the operator is
+    watching the sweep and wants to know it is back — and hearing that a
+    quarter of an hour later is the same blind spot in the other direction."""
+    monitor = _monitor()
+    await heartbeat.beat(
+        pool, heartbeat.WATCHDOG_PROCESS, clock.now() - timedelta(minutes=10)
+    )
+
+    paged = await run_watchdog_liveness_cycle(pool, bot, ADMIN_ID, monitor, _config(), clock)
+    assert len(paged) == 1 and "Watchdog" in paged[0]
+
+    clock.advance(60)
+    await heartbeat.beat(pool, heartbeat.WATCHDOG_PROCESS, clock.now())
+    cleared = await run_watchdog_liveness_cycle(pool, bot, ADMIN_ID, monitor, _config(), clock)
+
+    assert cleared == ["✅ Watchdog recovered"]
+    # And it stays cleared: the recovery is a transition, not a repeat.
+    clock.advance(60)
+    assert await run_watchdog_liveness_cycle(pool, bot, ADMIN_ID, monitor, _config(), clock) == []
+
+
+async def test_a_liveness_tick_that_cannot_read_stays_quiet(
+    database_url: str, bot: Bot, session: RecordingSession, clock: FakeClock
+) -> None:
+    """The DB-down signal belongs to the full cycle, which gathers enough to
+    report it with its numbers. A one-row tick that failed would page from a
+    snapshot that knows one table — and, sharing the state machine, would then
+    suppress the full cycle's better-informed message."""
+    dead_pool = await asyncpg.create_pool(database_url)
+    assert dead_pool is not None
+    await dead_pool.close()
+
+    monitor = _monitor()
+    messages = await run_watchdog_liveness_cycle(
+        dead_pool, bot, ADMIN_ID, monitor, _config(), clock
+    )
+
+    assert messages == []
+    assert session.sent_messages() == []
+    # …and the full cycle's own DB-down alert is still ahead of it, unsuppressed.
+    assert "unreachable" in (
+        await run_monitor_cycle(
+            dead_pool, bot, ADMIN_ID, monitor, _config(), clock, FakeDiskProbe(47.0)
+        )
+    )[0]

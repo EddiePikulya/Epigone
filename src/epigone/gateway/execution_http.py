@@ -41,7 +41,12 @@ from hyperliquid.utils.signing import sign_l1_action
 
 from epigone.budget import Budget
 from epigone.clock import Clock
-from epigone.gateway.backoff import RATE_LIMIT_MAX_TRIES, backoff_delay, parse_retry_after
+from epigone.gateway.backoff import (
+    RATE_LIMIT_MAX_TRIES,
+    backoff_delay,
+    parse_retry_after,
+    retry_fits_budget,
+)
 from epigone.gateway.execution import (
     ActionRejectedError,
     AmbiguousExecutionError,
@@ -304,8 +309,20 @@ class HttpExecutionGateway:
         error, HTTP error status, unparseable 200 body — may follow a
         request the exchange received, and any failure after a 429'd attempt
         inherits that attempt's possibly-processed status (the unverified
-        429 assumption, see ExecutionRateLimitedError) — all ambiguous."""
+        429 assumption, see ExecutionRateLimitedError) — all ambiguous.
+
+        The 429 loop is bounded in TRIES and in WALL CLOCK (issue #204). The
+        clock bound is what makes a CANCEL POST safe for the watchdog's kill
+        path to await: a cancel riding six slow 429s used to be minutes long,
+        which is long enough to straddle the moment the dead-man's push falls
+        due and let the last-resort net discharge behind a working watchdog.
+        It has to bound ITSELF rather than be cancelled from outside —
+        cancelling a write mid-flight would leave the audit trail's attempt
+        row with no outcome, on the one path whose evidence matters most."""
+        started = self._clock.now()
+        tries = 0
         for attempt in range(RATE_LIMIT_MAX_TRIES):
+            tries = attempt + 1
             try:
                 async with self._session.post(
                     self._exchange_url, json=payload, timeout=REQUEST_TIMEOUT
@@ -337,16 +354,20 @@ class HttpExecutionGateway:
                     f"exchange request failed after send — the action may have "
                     f"executed; reconcile before re-issuing: {exc}"
                 ) from exc
-            if attempt + 1 < RATE_LIMIT_MAX_TRIES:
-                log.warning(
-                    "429 from %s: backing off %.1fs (try %d)",
-                    self._exchange_url,
-                    delay,
-                    attempt + 1,
-                )
-                await self._clock.sleep(delay)
+            if attempt + 1 >= RATE_LIMIT_MAX_TRIES or not retry_fits_budget(
+                started, self._clock.now(), delay
+            ):
+                break
+            log.warning(
+                "429 from %s: backing off %.1fs (try %d)",
+                self._exchange_url,
+                delay,
+                attempt + 1,
+            )
+            await self._clock.sleep(delay)
         raise ExecutionRateLimitedError(
-            f"still 429 from {self._exchange_url} after {RATE_LIMIT_MAX_TRIES} tries "
+            f"still 429 from {self._exchange_url} after {tries} tries in "
+            f"{(self._clock.now() - started).total_seconds():.0f}s "
             "(whether any 429'd attempt was processed is unverified — reconcile "
             "before re-issuing non-idempotent work)"
         )
