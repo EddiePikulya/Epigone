@@ -298,7 +298,7 @@ def _budget_lines(parsed: CopyRequest, existing: CopySub | None) -> list[str]:
             f"• ⚠️ NO loss budget — this CLEARS the "
             f"${fixed_point(existing.loss_budget_usd)} budget currently set on this "
             f"leader"
-            + (f" (${spent:.2f} of it spent)" if spent is not None else "")
+            + ("" if spent is None else f" ({_spent(spent)})")
             + ". Re-add 'loss &lt;usd&gt;' to keep one."
         ]
     lines = [
@@ -311,15 +311,22 @@ def _budget_lines(parsed: CopyRequest, existing: CopySub | None) -> list[str]:
     ]
     if spent is not None:
         lines.append(
-            f"• Already spent on this leader: ${spent:.2f}"
+            f"• Already spent on this leader: {_spent(spent)}"
             + (
                 f" — past the new ${fixed_point(parsed.loss_budget)} budget, so this "
                 f"copy winds down on the executor's next cycle."
                 if spent >= parsed.loss_budget
-                else f" of the new ${fixed_point(parsed.loss_budget)}."
+                else f", against the new ${fixed_point(parsed.loss_budget)}."
             )
         )
     return lines
+
+
+def _spent(value: Decimal) -> str:
+    """A measured spend as prose. A NEGATIVE spend is a sub in PROFIT, and
+    `$-120.00` is not how anyone reads that — the sign is information, so it is
+    said in words rather than printed as a minus in front of a dollar sign."""
+    return f"${value:.2f} spent" if value >= 0 else f"${-value:.2f} ahead"
 
 
 async def on_copy_confirm(
@@ -360,9 +367,8 @@ async def _register(
     exists by having its INSERT rejected, which aborts whatever transaction it
     ran in. A savepoint scopes that abort to the failed INSERT, so the
     re-enable path continues in the same transaction the read happened in."""
-    leader = parsed.leader
     async with pool.acquire() as conn, conn.transaction():
-        return await _write_mapping(pool, conn, clock, operator_id, parsed, leader)
+        return await _write_mapping(pool, conn, clock, operator_id, parsed)
 
 
 async def _write_mapping(
@@ -371,8 +377,8 @@ async def _write_mapping(
     clock: Clock,
     operator_id: int,
     parsed: CopyRequest,
-    leader: str,
 ) -> str:
+    leader = parsed.leader
     # Read BEFORE the write, for the audit row: a budget change is stated as
     # old → new the way /limits states a knob change, and the old value only
     # exists until the update lands. Insert or re-enable, one read covers both
@@ -414,9 +420,7 @@ async def _write_mapping(
         )
         if reenabled is None:  # pragma: no cover - the row exists by definition
             return "Could not re-enable that mapping — try /copy again."
-        await _audit_budget_change(
-            pool, conn, clock, operator_id, leader, before, parsed
-        )
+        await _audit_budget_change(pool, conn, clock, operator_id, before, parsed)
         return (
             f"♻️ Re-enabled copying of {esc(leader)} on its existing sub-account "
             f"{esc(reenabled.sub_address or '(not yet provisioned)')} — allocation "
@@ -425,13 +429,15 @@ async def _write_mapping(
             f"{esc(reenabled.leverage_summary)}, mode {esc(reenabled.copy_mode)}, "
             f"{esc(_budget_summary(reenabled))}."
             + (
-                # An in-progress wind-down is CANCELLED by a re-issued /copy
-                # (issue #181): a breach of the operator's own threshold is
-                # overridable by an explicit, logged act, never a ratchet. Said
-                # here because the row that recorded it has just been cleared.
+                # A wind-down is cancelled by CHANGING the threshold (issue
+                # #181): a breach of the operator's own number is overridable
+                # by an explicit, logged act, never a ratchet. Read off the row
+                # rather than re-deriving the rule — `reenable_sub` owns when
+                # the marks clear, and a second copy of that condition here is
+                # where a message that lies to the operator comes from.
                 "\n\n▶️ The wind-down on this leader is cancelled — copying resumes on "
                 "the executor's next cycle."
-                if before is not None and before.winding_down
+                if before is not None and before.winding_down and not reenabled.winding_down
                 else ""
             )
         )
@@ -442,7 +448,7 @@ async def _write_mapping(
             f"Epigone has never seen {esc(leader)}. Paste the address to open its "
             f"profile first — a wallet with no observed history has nothing to copy."
         )
-    await _audit_budget_change(pool, conn, clock, operator_id, leader, before, parsed)
+    await _audit_budget_change(pool, conn, clock, operator_id, before, parsed)
     return (
         f"⏳ Copying {esc(leader)}. The executor will create and fund the sub-account on "
         f"its next loop and report back here — nothing is copied until it does."
@@ -460,7 +466,6 @@ async def _audit_budget_change(
     conn: asyncpg.Connection,
     clock: Clock,
     operator_id: int,
-    leader: str,
     before: CopySub | None,
     parsed: CopyRequest,
 ) -> None:
@@ -478,6 +483,7 @@ async def _audit_budget_change(
     old value is only knowable before the write. That is the same trade
     /limits makes, and the executor's own budget events (armed, warned,
     breached, disabled) are write-ahead where it matters."""
+    leader = parsed.leader
     old = None if before is None else before.loss_budget_usd
     new = parsed.loss_budget
     if old == new:
@@ -510,9 +516,7 @@ def _budget_summary(sub: CopySub) -> str:
     positions."""
     if sub.loss_budget_usd is None:
         return "no loss budget"
-    spent = (
-        "" if sub.budget_spent_usd is None else f", ${sub.budget_spent_usd:.2f} spent"
-    )
+    spent = "" if sub.budget_spent_usd is None else f", {_spent(sub.budget_spent_usd)}"
     if sub.winding_down:
         return f"loss budget ${fixed_point(sub.loss_budget_usd)} SPENT{spent} — winding down"
     return f"loss budget ${fixed_point(sub.loss_budget_usd)}{spent}"

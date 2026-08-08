@@ -371,9 +371,11 @@ read it as a loss and can wind the copy down.)
 
 **Changing it, and cancelling a wind-down.** Re-issue `/copy`:
 
-- a **higher** budget, or `loss off`, **cancels an in-progress wind-down** and
-  resumes copying on the next cycle — a breach of your own threshold is
-  overridable by an explicit, logged act, never a ratchet;
+- a **different** budget — higher, or `loss off` — **cancels an in-progress
+  wind-down** and resumes copying on the next cycle; a breach of your own
+  threshold is overridable by an explicit, logged act, never a ratchet.
+  Re-stating the SAME budget (a `/copy` that only moves the stake, say) changes
+  nothing about the wind-down and does not re-send the 80% notice;
 - the **baseline and the spend survive** a change of amount. Raising the
   number is not an amnesty for losses already booked;
 - a **lower** budget is accepted even when it is already spent, and breaches on

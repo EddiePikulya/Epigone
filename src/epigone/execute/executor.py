@@ -814,17 +814,12 @@ class CopyExecutor:
         states: dict[int, SubState] = {}
         judged: list[CopySub] = []
         for sub in subs:
-            judged.append(sub)
-            if not sub.is_provisioned:
-                continue
-            try:
-                state = await self._sub_state(sub)
-            except Exception:
-                # A read failure is not a divergence. Skipping this sub for
-                # one cycle costs latency; guessing would cost money.
-                log.warning(
-                    "copy executor: could not read sub %s this cycle", sub.sub_name, exc_info=True
-                )
+            state = await self._readable_state(sub)
+            if state is None:
+                # Unprovisioned, or unreadable this cycle. Either way the sub
+                # goes back UNJUDGED — carrying whatever the row already said,
+                # so a breach recorded on an earlier cycle still binds.
+                judged.append(sub)
                 continue
             states[sub.id] = state
             # The equity this read already carried, written down before any
@@ -839,12 +834,28 @@ class CopyExecutor:
             # LAST, so "flat" counts the episodes this cycle just ended: a
             # bracket that fired ends its episode above, and the sub it leaves
             # behind is exactly the flat, wound-down sub the budget disables.
-            judged[-1] = await self._evaluate_budget(sub, state, now)
+            judged.append(await self._judge_loss_budget(sub, state, now))
         return states, judged
+
+    async def _readable_state(self, sub: CopySub) -> SubState | None:
+        """This cycle's live state for one sub, or None when there is not one
+        to be had: the mapping is not provisioned yet, or the read failed.
+
+        A read failure is not a divergence. Skipping this sub for one cycle
+        costs latency; guessing would cost money."""
+        if not sub.is_provisioned:
+            return None
+        try:
+            return await self._sub_state(sub)
+        except Exception:
+            log.warning(
+                "copy executor: could not read sub %s this cycle", sub.sub_name, exc_info=True
+            )
+            return None
 
     # --- the Loss Budget (issue #181, amendment D-9) --------------------------
 
-    async def _evaluate_budget(
+    async def _judge_loss_budget(
         self, sub: CopySub, state: SubState, now: datetime
     ) -> CopySub:
         """One sub's Loss Budget, judged once per cycle from the state this
@@ -878,7 +889,7 @@ class CopyExecutor:
         if sub.loss_budget_usd is None or not sub.enabled:
             return sub
         if sub.budget_baseline_usd is None:
-            return await self._arm_budget(sub, state, now)
+            return await self._arm_loss_budget(sub, state, now)
         assert sub.budget_armed_at is not None  # paired by the schema's CHECK
         loss = budget_loss(
             baseline_usd=sub.budget_baseline_usd,
@@ -920,18 +931,17 @@ class CopyExecutor:
                 )
                 return sub
             if breached_at is not None:
-                await self._budget_event(
+                await self._loss_budget_event(
                     conn,
                     sub,
                     action="copy_budget_breached",
                     reason=(
-                        f"loss budget spent: ${_money(loss)} lost of "
-                        f"${fixed_point(sub.loss_budget_usd)} since the budget was set — "
-                        f"wind-down begins"
+                        f"loss budget spent: {_spent_of(loss, sub.loss_budget_usd)} since "
+                        f"the budget was set — wind-down begins"
                     ),
                     body=(
                         f"🛑 Loss budget SPENT on {_short(sub.leader_address)} — "
-                        f"${_money(loss)} lost of ${fixed_point(sub.loss_budget_usd)}.\n"
+                        f"{_spent_of(loss, sub.loss_budget_usd)}.\n"
                         f"Winding down: opens, scale-ins and flip open-legs are refused "
                         f"from now on. Exits keep copying and brackets stay maintained, so "
                         f"the copy still follows them out. The sub is disabled once it is "
@@ -940,18 +950,19 @@ class CopyExecutor:
                     now=now,
                 )
             elif warned_at is not None and stage == BUDGET_WARNING:
-                await self._budget_event(
+                await self._loss_budget_event(
                     conn,
                     sub,
                     action="copy_budget_warned",
                     reason=(
                         f"loss budget {int(BUDGET_WARNING_FRACTION * 100)}% spent: "
-                        f"${_money(loss)} of ${fixed_point(sub.loss_budget_usd)}"
+                        f"{_spent_of(loss, sub.loss_budget_usd)}"
                     ),
                     body=(
                         f"⚠️ Loss budget {int(BUDGET_WARNING_FRACTION * 100)}% spent on "
-                        f"{_short(sub.leader_address)} — ${_money(loss)} lost of "
-                        f"${fixed_point(sub.loss_budget_usd)} since the budget was set.\n"
+                        f"{_short(sub.leader_address)} — "
+                        f"{_spent_of(loss, sub.loss_budget_usd)} since the budget was "
+                        f"set.\n"
                         f"At the full budget this copy winds down and the sub is disabled "
                         f"once flat. /copy changes the number; /uncopy stops now."
                     ),
@@ -967,7 +978,7 @@ class CopyExecutor:
             return judged
         return await self._disable_if_flat(judged, state, loss, now)
 
-    async def _arm_budget(self, sub: CopySub, state: SubState, now: datetime) -> CopySub:
+    async def _arm_loss_budget(self, sub: CopySub, state: SubState, now: datetime) -> CopySub:
         """Snapshot the equity a new budget is measured from.
 
         HERE AND NOT IN /copy, because the baseline is a covered-venue equity
@@ -986,10 +997,15 @@ class CopyExecutor:
         $1,400 and not from its allocation."""
         assert sub.loss_budget_usd is not None  # only a budgeted sub is baselined
         async with self._pool.acquire() as conn, conn.transaction():
-            await subs_store.arm_budget(
+            # Announced only if the snapshot LANDED: `arm_budget` refuses to
+            # re-baseline a budget that already has one, and a notice naming a
+            # baseline the budget is not measured from would be worse than
+            # silence.
+            if not await subs_store.arm_budget(
                 conn, sub.id, baseline_usd=state.account_value, now=now
-            )
-            await self._budget_event(
+            ):
+                return sub
+            await self._loss_budget_event(
                 conn,
                 sub,
                 action="copy_budget_armed",
@@ -1036,25 +1052,25 @@ class CopyExecutor:
                 conn, sub.id, breached_at=sub.budget_breached_at
             ):
                 return sub
-            await self._budget_event(
+            await self._loss_budget_event(
                 conn,
                 sub,
                 action="copy_budget_disabled",
                 reason=(
-                    f"wound down and flat: ${_money(loss)} lost of "
-                    f"${fixed_point(sub.loss_budget_usd)} — mapping disabled"
+                    f"wound down and flat: {_spent_of(loss, sub.loss_budget_usd)} — "
+                    f"mapping disabled"
                 ),
                 body=(
                     f"⏹ Copy of {_short(sub.leader_address)} is DISABLED — its loss budget "
-                    f"is spent and the sub is now flat. Final loss ${_money(loss)} of a "
-                    f"${fixed_point(sub.loss_budget_usd)} budget. Nothing further is "
+                    f"is spent and the sub is now flat. Final "
+                    f"{_spent_of(loss, sub.loss_budget_usd)}. Nothing further is "
                     f"copied; copying this leader again is a fresh /copy."
                 ),
                 now=now,
             )
         return replace(sub, enabled=False)
 
-    async def _budget_event(
+    async def _loss_budget_event(
         self,
         conn: asyncpg.Connection,
         sub: CopySub,
@@ -2666,6 +2682,18 @@ def _held(state: SubState, coin: str) -> Decimal:
 
 def _money(value: Decimal) -> str:
     return f"{value:.2f}"
+
+
+def _spent_of(loss: Decimal, budget: Decimal) -> str:
+    """A Loss Budget's spend as the operator reads it, in one phrase.
+
+    One function because FOUR surfaces say it — the warning, the breach, the
+    disable, and each one's audit row — and four hand-built copies of "$X lost
+    of $Y" is four places for the figures to start disagreeing about how they
+    are rounded. The loss is COMPUTED so it goes through `_money`; the budget
+    is the operator's own number, so it goes through `fixed_point` and never
+    grows cents they did not type."""
+    return f"${_money(loss)} lost of ${fixed_point(budget)}"
 
 
 __all__ = ["EXECUTOR_CONSUMER", "CopyExecutor", "SubState"]

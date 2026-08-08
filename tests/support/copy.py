@@ -239,6 +239,32 @@ async def copy_sub(
     return next(s for s in rows if s.id == sub.id)
 
 
+async def record_spend(
+    pool: asyncpg.Pool,
+    sub: CopySub,
+    spent: str,
+    *,
+    warned_at: datetime | None = None,
+    breached_at: datetime | None = None,
+) -> None:
+    """Put a sub's budget ledger where a test needs it, through the same setter
+    the executor uses — so a test can never reach a budget state by a route the
+    executor does not have.
+
+    It passes the sub's OWN terms as the compare-and-set, which is exactly what
+    the executor passes when nothing changed under it."""
+    assert sub.loss_budget_usd is not None and sub.budget_armed_at is not None
+    await subs_store.record_budget_spend(
+        pool,
+        sub.id,
+        spent_usd=Decimal(spent),
+        warned_at=warned_at,
+        breached_at=breached_at,
+        judged_budget_usd=sub.loss_budget_usd,
+        judged_armed_at=sub.budget_armed_at,
+    )
+
+
 async def set_limits(pool: asyncpg.Pool, clock: FakeClock, **knobs: str) -> None:
     """Move global risk knobs the way /limits does — through the same setter,
     so a test can never configure a limit by a route the operator does not

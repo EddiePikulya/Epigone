@@ -2341,6 +2341,7 @@ async def test_a_recopied_sub_is_topped_up_to_its_allocation(
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
+        loss_budget_usd=None,
     )
     assert reenabled is not None and reenabled.provisioned_at is None  # funding reopened
 
@@ -2373,6 +2374,7 @@ async def test_a_sub_already_holding_its_allocation_is_not_funded_again(
         copy_mode="default",
         take_profit_pct=None,
         stop_loss_pct=None,
+        loss_budget_usd=None,
     )
 
     await h.executor.run_cycle()
@@ -2514,6 +2516,7 @@ async def test_a_sub_mapped_to_any_leader_is_never_adopted(
         take_profit_pct=None,
         stop_loss_pct=None,
         now=clock.now(),
+        loss_budget_usd=None,
     )
     await subs_store.record_sub_address(pool, foreign.id, held[2])
     sub = await copy_sub(pool, clock, provisioned=False, allocation="1000")

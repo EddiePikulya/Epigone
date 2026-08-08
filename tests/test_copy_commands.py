@@ -18,7 +18,7 @@ from epigone.execute import episodes as ep
 from epigone.execute import subs as subs_store
 from epigone.gateway.fake import FakeHyperliquidGateway
 from tests.support.clock import FakeClock
-from tests.support.copy import LEADER, SUB, copy_sub, seed_trader
+from tests.support.copy import LEADER, SUB, copy_sub, record_spend, seed_trader
 from tests.support.telegram import RecordingSession, feed_callback, feed_text
 
 ADMIN = 370818090
@@ -307,6 +307,7 @@ async def test_uncopy_stops_copying_and_never_flattens(
         take_profit_pct=None,
         stop_loss_pct=None,
         now=clock.now(),
+        loss_budget_usd=None,
     )
     await ep.open_episode(
         pool,
@@ -541,9 +542,7 @@ async def test_raising_the_budget_keeps_the_ledger_and_cancels_the_wind_down(
     sub = await copy_sub(
         pool, clock, loss_budget="500", baseline="1000", operator=ADMIN
     )
-    await subs_store.record_budget_spend(
-        pool, sub.id, spent_usd=Decimal("612"), breached_at=clock.now()
-    )
+    await record_spend(pool, sub, "612", breached_at=clock.now())
 
     await feed_text(
         admin_dp, bot, f"/copy {LEADER} 1000 200 mirror default loss 900", user_id=ADMIN
@@ -576,7 +575,7 @@ async def test_lowering_a_budget_below_what_is_already_lost_is_accepted_and_warn
     sub = await copy_sub(
         pool, clock, loss_budget="500", baseline="1000", operator=ADMIN
     )
-    await subs_store.record_budget_spend(pool, sub.id, spent_usd=Decimal("300"))
+    await record_spend(pool, sub, "300")
 
     await feed_text(
         admin_dp, bot, f"/copy {LEADER} 1000 200 mirror default loss 100", user_id=ADMIN
@@ -605,9 +604,7 @@ async def test_a_fresh_copy_after_a_budget_disable_starts_a_clean_ledger(
     sub = await copy_sub(
         pool, clock, loss_budget="500", baseline="1000", operator=ADMIN
     )
-    await subs_store.record_budget_spend(
-        pool, sub.id, spent_usd=Decimal("612"), warned_at=clock.now(), breached_at=clock.now()
-    )
+    await record_spend(pool, sub, "612", warned_at=clock.now(), breached_at=clock.now())
     await subs_store.disable_sub(pool, operator_id=ADMIN, leader_address=LEADER)
 
     await feed_text(
@@ -636,15 +633,47 @@ async def test_copies_shows_the_budget_the_spend_and_the_wind_down(
     sub = await copy_sub(
         pool, clock, loss_budget="500", baseline="1000", operator=ADMIN
     )
-    await subs_store.record_budget_spend(pool, sub.id, spent_usd=Decimal("420"))
+    await record_spend(pool, sub, "420")
 
     await feed_text(admin_dp, bot, "/copies", user_id=ADMIN)
     listing = session.sent_messages()[-1].text or ""
     assert "loss budget $500, $420.00 spent" in listing
 
-    await subs_store.record_budget_spend(
-        pool, sub.id, spent_usd=Decimal("612"), breached_at=clock.now()
-    )
+    await record_spend(pool, sub, "612", breached_at=clock.now())
     await feed_text(admin_dp, bot, "/copies", user_id=ADMIN)
     listing = session.sent_messages()[-1].text or ""
     assert "winding down" in listing
+
+
+async def test_a_copy_that_does_not_move_the_budget_leaves_the_marks_alone(
+    admin_dp: Dispatcher,
+    bot: Bot,
+    session: RecordingSession,
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+) -> None:
+    """The warning fires once per arming, and a wind-down is cancelled by
+    CHANGING the threshold. A /copy that moves the stake and re-states the same
+    budget has restated nothing: clearing the marks there would re-announce a
+    breach the operator already heard about."""
+    await seed_trader(pool, clock)
+    sub = await copy_sub(
+        pool, clock, loss_budget="500", baseline="1000", operator=ADMIN
+    )
+    await record_spend(
+        pool, sub, "612", warned_at=clock.now(), breached_at=clock.now()
+    )
+
+    await feed_text(
+        admin_dp, bot, f"/copy {LEADER} 1000 300 mirror default loss 500", user_id=ADMIN
+    )
+    await feed_callback(admin_dp, bot, COPY_CONFIRM_PREFIX + "go", user_id=ADMIN)
+
+    row = await pool.fetchrow("SELECT * FROM copy_subs WHERE id = $1", sub.id)
+    assert row is not None
+    assert row["base_stake_usd"] == Decimal("300")  # the change they asked for
+    assert row["budget_warned_at"] is not None  # not re-warned
+    assert row["budget_breached_at"] is not None  # still winding down
+    assert "wind-down on this leader is cancelled" not in (
+        session.edited_messages()[-1].text or ""
+    )

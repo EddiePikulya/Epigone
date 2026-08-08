@@ -150,7 +150,7 @@ async def register_sub(
     take_profit_pct: Decimal | None,
     stop_loss_pct: Decimal | None,
     now: datetime,
-    loss_budget_usd: Decimal | None = None,
+    loss_budget_usd: Decimal | None,
 ) -> CopySub:
     """Record the operator's intent to copy `leader_address`. Writes a PENDING
     mapping — no sub-account exists yet — because this runs in the bot process,
@@ -207,7 +207,7 @@ async def reenable_sub(
     copy_mode: str,
     take_profit_pct: Decimal | None,
     stop_loss_pct: Decimal | None,
-    loss_budget_usd: Decimal | None = None,
+    loss_budget_usd: Decimal | None,
 ) -> CopySub | None:
     """Turn an existing mapping back on with fresh terms, reusing its
     sub-account. Returns None when there is nothing to re-enable.
@@ -229,11 +229,15 @@ async def reenable_sub(
       re-snapshots it. A new copy of the same Leader is not haunted by the old
       ledger.
 
-    The two MARKS clear in every armed case: the operator has just restated
-    their threshold, so an in-progress wind-down is cancelled (the override
-    this feature promises — a breach of one's own number is never a ratchet)
-    and the 80% notice may fire once against the new number. If the loss is
-    still past the new budget, the next cycle breaches again and says so.
+    The two MARKS clear only when the NUMBER ACTUALLY MOVED (or the sub was
+    disabled). Changing the threshold is what cancels an in-progress wind-down
+    — the override this feature promises, since a breach of one's own number is
+    never a ratchet — and it is also a new number to warn once about. A /copy
+    that moves the stake and re-states the SAME budget has restated nothing:
+    clearing the marks there would re-fire the 80% notice on a sub already
+    warned and re-stamp a wind-down already announced, which is the "once per
+    arming" property in reverse. If the loss is still past a raised budget, the
+    next cycle breaches again and says so.
 
     `provisioned_at` is CLEARED, which is what re-opens the funding leg:
     /uncopy never flattens, so the sub comes back holding whatever last time
@@ -265,8 +269,12 @@ async def reenable_sub(
             budget_spent_usd = CASE
                 WHEN $10::numeric IS NULL OR NOT enabled THEN NULL
                 ELSE budget_spent_usd END,
-            budget_warned_at = NULL,
-            budget_breached_at = NULL
+            budget_warned_at = CASE
+                WHEN $10::numeric IS DISTINCT FROM loss_budget_usd OR NOT enabled THEN NULL
+                ELSE budget_warned_at END,
+            budget_breached_at = CASE
+                WHEN $10::numeric IS DISTINCT FROM loss_budget_usd OR NOT enabled THEN NULL
+                ELSE budget_breached_at END
         WHERE operator_id = $1 AND leader_address = $2
         RETURNING *
         """,
@@ -437,14 +445,18 @@ async def arm_budget(
     *,
     baseline_usd: Decimal,
     now: datetime,
-) -> None:
-    """Snapshot the baseline a budget is measured from, once.
+) -> bool:
+    """Snapshot the baseline a budget is measured from, once. Returns whether
+    this call is the one that did it.
 
     `budget_baseline_usd IS NULL` in the WHERE is the once: a second cycle can
     only ever re-arm a budget the operator re-issued (which cleared the
     baseline itself), never re-baseline a running one — that would forgive
-    every loss booked so far, silently, on a restart."""
-    await conn.execute(
+    every loss booked so far, silently, on a restart. The return value is what
+    keeps the ANNOUNCEMENT honest too: a caller that reported an arming the
+    WHERE had refused would tell the operator a baseline that is not the one
+    the budget is measured from."""
+    result = await conn.execute(
         """
         UPDATE copy_subs SET budget_baseline_usd = $2, budget_armed_at = $3
         WHERE id = $1 AND loss_budget_usd IS NOT NULL AND budget_baseline_usd IS NULL
@@ -453,6 +465,7 @@ async def arm_budget(
         baseline_usd,
         now,
     )
+    return str(result) != "UPDATE 0"
 
 
 async def record_budget_spend(
@@ -460,10 +473,10 @@ async def record_budget_spend(
     sub_id: int,
     *,
     spent_usd: Decimal,
-    warned_at: datetime | None = None,
-    breached_at: datetime | None = None,
-    judged_budget_usd: Decimal | None = None,
-    judged_armed_at: datetime | None = None,
+    warned_at: datetime | None,
+    breached_at: datetime | None,
+    judged_budget_usd: Decimal,
+    judged_armed_at: datetime,
 ) -> bool:
     """This cycle's measured loss, and the marks it earned. Returns whether the
     write landed.
@@ -478,17 +491,16 @@ async def record_budget_spend(
     executor cycle reads a sub, measures it, and writes — and a /copy raising
     the budget in that window would have its wind-down cancellation silently
     undone by a verdict about the old number. Stating the terms makes such a
-    write a no-op, and the next cycle judges the sub the operator actually has.
-    Omitted (the tests' convenience form), the write is unconditional."""
+    write a no-op, and the next cycle judges the sub the operator actually
+    has. Required rather than optional, so no caller can acquire the habit of
+    writing a verdict about terms it never checked."""
     result = await conn.execute(
         """
         UPDATE copy_subs
         SET budget_spent_usd = $2,
             budget_warned_at = COALESCE(budget_warned_at, $3),
             budget_breached_at = COALESCE(budget_breached_at, $4)
-        WHERE id = $1 AND budget_armed_at IS NOT NULL
-          AND ($5::numeric IS NULL OR loss_budget_usd = $5)
-          AND ($6::timestamptz IS NULL OR budget_armed_at = $6)
+        WHERE id = $1 AND loss_budget_usd = $5 AND budget_armed_at = $6
         """,
         sub_id,
         spent_usd,

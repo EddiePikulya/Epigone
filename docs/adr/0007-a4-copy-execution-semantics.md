@@ -843,11 +843,21 @@ accepted and breaches on the next cycle. `loss off`, and an omitted keyword,
 disarm entirely: `/copy` states a mapping's terms in full, exactly as an
 omitted TP/SL leaves a sub bracket-less.
 
-**Re-arm cancels a wind-down.** Re-issuing `/copy` clears the warned and
-breached marks, so a higher budget (or `loss off`) resumes copying — a breach
-of the operator's own threshold is overridable by an explicit, logged act,
-never a ratchet. The change is audited old → new in the same transaction as
-the mapping write, the way `/limits` audits a knob.
+**Re-arm cancels a wind-down.** Re-issuing `/copy` with a DIFFERENT budget
+clears the warned and breached marks, so a higher budget (or `loss off`)
+resumes copying — a breach of the operator's own threshold is overridable by an
+explicit, logged act, never a ratchet. Re-stating the SAME budget clears
+nothing: the operator has restated no threshold, and clearing there would
+re-fire the 80% notice and re-stamp a wind-down already announced, which is
+story 21's "once per arming" in reverse. The change is audited old → new in the
+same transaction as the mapping write, the way `/limits` audits a knob.
+
+**One notice beyond the three the spec listed.** The arming notice (`🎯 Loss
+budget armed … measured from what the sub is worth right now`) exists because
+this design moved the baseline snapshot from `/copy` to the executor: the
+operator's confirmation cannot state a number the bot process is unable to
+read, so without this the baseline every later "spent $X" is measured from
+would never be visible. It carries its own audit action, `copy_budget_armed`.
 
 **Enforcement is entry-side only,** as a new skip reason in the existing entry
 chain — so the skip digest coalesces it and the audit row carries it.

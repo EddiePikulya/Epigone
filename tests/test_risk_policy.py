@@ -34,7 +34,8 @@ from epigone.execute.policy import (
     stake_headroom,
 )
 from epigone.execute.subs import USD_MICRO, deposits_since
-from epigone.gateway import MarketStats, Position, Side
+from epigone.gateway import GatewayError, MarketStats, Position, Side, fetch_account_state
+from epigone.gateway.fake import FakeHyperliquidGateway
 from epigone.safety.audit import EXECUTOR_ACTOR, OK, ExecutionAudit
 from tests.support.clock import FakeClock
 from tests.support.copy import SUB
@@ -502,3 +503,35 @@ async def _transfer_attempt(audit: ExecutionAudit, sub_address: str, usd: str):
         },
         risk_decision="test transfer",
     )
+
+
+async def test_the_equity_the_budget_measures_sums_every_covered_venue() -> None:
+    """The other half of the arithmetic, and the one a core-only read gets
+    silently wrong: each venue collateralises itself, so a sub holding $400 on
+    core and $300 on the builder DEX is worth $700 — not $400, which would read
+    as a $300 loss the sub never took."""
+    gateway = FakeHyperliquidGateway()
+    gateway.set_account_value(SUB, Decimal("400"))  # core
+    gateway.set_account_value(SUB, Decimal("300"), dex="xyz")
+
+    state = await fetch_account_state(gateway, SUB)
+
+    assert state.account_value == Decimal("700")
+    assert budget_loss(
+        baseline_usd=Decimal("1000"),
+        deposits_usd=Decimal("0"),
+        equity_usd=state.account_value,
+    ) == Decimal("300")
+
+
+async def test_a_venue_that_cannot_be_read_raises_rather_than_summing_short() -> None:
+    """A venue contributing zero because it failed to answer is
+    indistinguishable from a sub that moved that balance out — and the budget
+    would read the difference as a loss. Raising leaves the sub unjudged for a
+    cycle, which is the cheap failure."""
+    gateway = FakeHyperliquidGateway()
+    gateway.set_account_value(SUB, Decimal("400"))
+    gateway.positions_errors_by_dex[(SUB, "xyz")] = GatewayError("xyz unreachable")
+
+    with pytest.raises(GatewayError):
+        await fetch_account_state(gateway, SUB)
