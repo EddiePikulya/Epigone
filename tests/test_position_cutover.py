@@ -324,23 +324,27 @@ async def test_a_websocket_shadow_row_never_suppresses_the_poller(
     assert [row["kind"] for row in await alerts(pool)] == ["close"]
 
 
-async def waiting_on_a_lock(pool: asyncpg.Pool) -> None:
-    """Block until some other backend on this database is waiting for a lock.
+async def waiting_for_the_authority_row(pool: asyncpg.Pool) -> None:
+    """Block until a backend is parked on a lock while running the authority
+    row's `FOR UPDATE` — the transfer, waiting.
 
     Read off `pg_stat_activity` rather than timed out, so the test asserts the
-    thing itself — a transaction parked on a lock — instead of inferring it from
-    a task that has not finished yet."""
+    thing itself instead of inferring it from a task that has not finished yet.
+    Matched on the statement as well as the wait, so an unrelated waiter
+    elsewhere in the suite's database cannot satisfy it."""
     for _ in range(500):
         waiting = await pool.fetchval(
             """
             SELECT count(*) FROM pg_stat_activity
-            WHERE datname = current_database() AND wait_event_type = 'Lock'
+            WHERE datname = current_database()
+              AND wait_event_type = 'Lock'
+              AND query ILIKE '%lane_authority FOR UPDATE%'
             """
         )
         if waiting:
             return
         await asyncio.sleep(0.01)
-    raise AssertionError("no backend ever waited on a lock")
+    raise AssertionError("the transfer never waited for the authority row")
 
 
 async def test_a_transfer_waits_for_the_websocket_write_it_races(
@@ -398,16 +402,24 @@ async def test_a_transfer_waits_for_the_websocket_write_it_races(
             await may_commit.wait()
 
     writer = asyncio.create_task(websocket_write())
-    await holding_the_share_lock.wait()
+    poller: asyncio.Task[None] | None = None
+    try:
+        await holding_the_share_lock.wait()
 
-    poller = asyncio.create_task(poll(pool, gateway, clock))
-    await waiting_on_a_lock(pool)
-    assert not poller.done()  # the transfer is parked behind the write
-    assert (await read_authority(pool)).owner == WS_OWNER  # and has not landed
+        poller = asyncio.create_task(poll(pool, gateway, clock))
+        await waiting_for_the_authority_row(pool)
+        assert not poller.done()  # the transfer is parked behind the write
+        assert (await read_authority(pool)).owner == WS_OWNER  # and has not landed
+    finally:
+        # Whatever happened above, the writer must not be left parked on
+        # `may_commit` — it is holding an open transaction, and the next test's
+        # TRUNCATE would queue behind it forever, turning one failed assertion
+        # into a wedged suite.
+        may_commit.set()
+        await asyncio.gather(*(t for t in (writer, poller) if t), return_exceptions=True)
 
-    may_commit.set()
-    await writer
-    await poller
+    assert not writer.cancelled() and writer.exception() is None
+    assert poller is not None and poller.exception() is None
 
     # One producer, one event, one alert — decided by the database rather than
     # by which coroutine happened to run first.

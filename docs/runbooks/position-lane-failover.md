@@ -139,7 +139,20 @@ comparing its own diff against what the lane produced.
    and the event was produced by the poller. The lane will re-read absolute
    state for every wallet before it is trusted again.
 
-4. **If drift repeats on the same wallet**, that wallet's subscription is the
+4. **If a busy Leader bounces on every handback**, you are looking at a known
+   open shape rather than a lane fault (#199, round-3 review). A Leader who
+   trades inside the ≤10s window before a handback strands on that handback:
+   the recovery cycle ends in escalation, transfer back, and a fresh 300s
+   probation, so ownership never sticks to the websocket for a continuously
+   active Leader — worst case an incident about every five minutes, all of them
+   reading "was seen by the websocket while the poller owned production". The
+   direction is safe (the poller produces; nothing is missed) and the reason
+   line above already says not to investigate it. But a repeating ~5-minute
+   cadence on the same Leader is the signal that the probation/handback design
+   needs a straddler-tolerant path — record it and reopen #199 rather than
+   restarting anything.
+
+5. **If drift repeats on the same wallet**, that wallet's subscription is the
    suspect. Restarting the ws service re-subscribes everything from a clean
    connection. If it repeats across wallets, set `WS_AUTHORITATIVE=0` on the
    `stream` service, redeploy that one service, and open an issue with the rows

@@ -141,6 +141,11 @@ async def record_events(
     has not thought about ownership must be made to, and the type checker is
     where that happens.
 
+    `source` keeps its default beside it, and the asymmetry is the point rather
+    than an oversight: getting `source` wrong mislabels a row in a comparison
+    dataset, while getting `authoritative` wrong doubles a position. Only one of
+    those is worth making every caller restate.
+
     Retention is applied here, in the pass that wrote, rather than by a sweeper
     — the `record_rate_limit` precedent (`epigone.budget` prunes stale
     rate_limit_events as it inserts one). Events are rare, so the table stays

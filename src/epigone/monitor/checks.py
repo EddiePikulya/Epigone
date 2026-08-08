@@ -661,6 +661,17 @@ def _copy_pager_check(snapshot: HealthSnapshot) -> CheckResult:
     )
 
 
+# Poll-owned reasons that are not a failure, and what to say instead. A map
+# rather than a branch each, because the set has grown twice and every member
+# differs only in its sentence — see `_position_lane_check` for why each is
+# here. Any reason NOT in it is an incident: the default direction has to be
+# "tell someone", or a reason added later goes silently unwatched.
+_NOT_A_FAULT = {
+    DISABLED_REASON: "Websocket authority switched off by the operator",
+    PRE_CUTOVER_REASON: "Websocket has not taken position events over yet (pre-cutover)",
+}
+
+
 def _position_lane_check(snapshot: HealthSnapshot) -> CheckResult:
     """The websocket lane having LOST event production (issue #158, ADR-0009).
 
@@ -700,21 +711,13 @@ def _position_lane_check(snapshot: HealthSnapshot) -> CheckResult:
             severity=WARNING,
             detail="Websocket owns position events",
         )
-    if reason == DISABLED_REASON:
+    if reason in _NOT_A_FAULT:
         return CheckResult(
             POSITION_LANE,
             "Position lane",
             ok=True,
             severity=WARNING,
-            detail="Websocket authority switched off by the operator",
-        )
-    if reason == PRE_CUTOVER_REASON:
-        return CheckResult(
-            POSITION_LANE,
-            "Position lane",
-            ok=True,
-            severity=WARNING,
-            detail="Websocket has not taken position events over yet (pre-cutover)",
+            detail=_NOT_A_FAULT[reason],
         )
     return CheckResult(
         POSITION_LANE,

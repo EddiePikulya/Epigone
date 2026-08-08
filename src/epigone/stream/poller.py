@@ -161,9 +161,17 @@ MAX_CONSECUTIVE_FAILURES = 5
 # so a lane that genuinely cannot baseline the wallet is escalated on long before
 # it could ever be handed production back.
 #
+# What it replaces is short: while the websocket owns production the poller runs
+# at STANDBY_POLL_INTERVAL_SECONDS, so the two looks a doubt used to take to
+# escalate are ~120s. This is 1.5× that, not an order of magnitude — the grace
+# buys a couple more deferred baselines, not a different regime.
+#
 # The cost of being too large is latency on the first change of a brand-new
-# wallet — the change is held, never lost. The cost of being too small is the
-# spurious global escalation the grace exists to prevent, so it errs large.
+# wallet: it is held, never lost, but held means nobody is told, so an alert AND
+# a copy signal on that wallet can wait out the grace. The cost of being too
+# small is the spurious global escalation the grace exists to prevent, which
+# takes production off the websocket for every OTHER wallet and files an
+# incident. It errs large because that second cost is the wider one.
 WS_BASELINE_GRACE_SECONDS = 180.0
 WS_BASELINE_GRACE = timedelta(seconds=WS_BASELINE_GRACE_SECONDS)
 
@@ -189,8 +197,9 @@ class _Applied:
 
     `held_since` is the window the held doubt was raised in, to be stored beside
     it (#200): this pass's previous look for a fresh doubt, and the ORIGINAL
-    window for a doubt this pass re-held rather than judged. Meaningless — and
-    not written — when nothing is held."""
+    window for a doubt this pass re-held rather than judged. It always carries a
+    value; when nothing is held it describes nothing, and the write site stores
+    NULL instead — the doubt and its window are written or cleared together."""
 
     events: int = 0
     produced: int = 0
@@ -569,7 +578,7 @@ async def _reconcile(
       significance threshold measures against the LAST OBSERVATION, and the
       lanes observe at different cadences, so a position creeping up ~8% per
       push crosses 25% against a 60s-old anchor and never against any single
-      push. The lane emitted nothing and is completely current. `_still_owed`
+      push. The lane emitted nothing and is completely current. `_lane_memory`
       asks the lane's own memory, and a lane that agrees with reality missed
       nothing — this is the benign divergence class #158's 2026-08-02 comment
       names, and it must be classified as expected rather than as a lane error.
@@ -616,7 +625,7 @@ async def _reconcile(
     **A lane that has not baselined a wallet yet is joining, not drifting.** A
     wallet followed while the websocket owns production is invisible to that
     lane until its next tracked-set refresh, and its baseline is a REST read
-    that pacing can defer. `_still_owed` reports an unbaselined wallet as owing
+    that pacing can defer. `_lane_memory` reports an unbaselined wallet as owing
     everything — correctly, since absence of memory is absence of watching — so
     with no guard the wallet's first change is doubted, confirmed one look
     later, and escalates GLOBALLY: production leaves the websocket for every
@@ -653,7 +662,7 @@ async def _reconcile(
     held_since = since
     drifted = False
     if unvouched and not await owns(conn, POLL_SOURCE):
-        memory = await _still_owed(conn, address, positions, now)
+        memory = await _lane_memory(conn, address, positions, now)
         owed = memory.owed
         # Two ways a change can still be somebody's to produce, and the anchor
         # alone only sees the first:
@@ -677,7 +686,7 @@ async def _reconcile(
         unvouched = [event for event in unvouched if event.coin in missed | stranded]
         doubted = missed | stranded
         confirmed = doubted & pending
-        if confirmed and _still_joining(memory, poller_baselined_at, now):
+        if confirmed and memory.still_joining(poller_baselined_at, now):
             # The lane has never baselined this wallet and has not yet had the
             # time a baseline honestly takes. That is not drift, and escalating
             # on it moves production for every OTHER wallet too (see the
@@ -778,8 +787,25 @@ class _LaneMemory:
     watching: bool
     owed: set[str]
 
+    def still_joining(self, poller_baselined_at: datetime, now: datetime) -> bool:
+        """Whether this lane's silence about the wallet is it still ARRIVING
+        rather than it having drifted (#199).
 
-async def _still_owed(
+        Two conditions, and the second is what keeps the grace from becoming a
+        licence: the lane has no memory of the wallet at all, and the wallet is
+        new enough that a lane doing everything right might legitimately not
+        have reached it — it learns about a new wallet on its next tracked-set
+        refresh and baselines it with a REST read that pacing can defer.
+
+        Measured from the POLLER's baseline because that is when this wallet
+        entered the poll set, as closely as the poller can know it, and it is
+        already in the row. A wallet the lane merely lost track of keeps its
+        `ws_lane_state` row and so is never joining; a wallet whose baseline
+        never lands leaves the grace and escalates like any other drift."""
+        return not self.watching and (now - poller_baselined_at) < WS_BASELINE_GRACE
+
+
+async def _lane_memory(
     conn: asyncpg.Connection, address: str, positions: list[Position], now: datetime
 ) -> _LaneMemory:
     """The coins on which the websocket lane's OWN memory says it still owes an
@@ -822,24 +848,6 @@ async def _still_owed(
             if change.event is not None
         },
     )
-
-
-def _still_joining(memory: _LaneMemory, poller_baselined_at: datetime, now: datetime) -> bool:
-    """Whether the websocket lane's silence about this wallet is it still
-    ARRIVING rather than it having drifted (#199).
-
-    Two conditions, and the second is what keeps the grace from becoming a
-    licence: the lane has no memory of the wallet at all, and the wallet is new
-    enough that a lane doing everything right might legitimately not have
-    reached it — it learns about a new wallet on its next tracked-set refresh
-    and baselines it with a REST read that pacing can defer.
-
-    Measured from the POLLER's baseline because that is when this wallet entered
-    the poll set, as closely as the poller can know it, and it is already in the
-    row. A wallet the lane merely lost track of keeps its `ws_lane_state` row and
-    so is never joining; a wallet whose baseline never lands leaves the grace and
-    escalates like any other drift."""
-    return not memory.watching and (now - poller_baselined_at) < WS_BASELINE_GRACE
 
 
 # Which way a change moves the position. `flip` is both legs at once (ADR-0006

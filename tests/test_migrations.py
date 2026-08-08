@@ -142,9 +142,13 @@ def test_scratch_databases_follow_the_isolation_test_database_url_provides() -> 
 
     assert len(mine) == len(roles)
     assert not mine & theirs
-    # Same run, same names — the scratch DBs are reused across invocations rather
-    # than piling up one per run.
-    assert mine == {scratch_dbname(role, "epigone_test_branch_a") for role in roles}
+    # And the name is derived, not random: the same test database gets the same
+    # scratch set every run, so they are reused rather than piling up one trio
+    # per invocation. Spelled out rather than round-tripped through the function,
+    # which would pass however it was computed.
+    assert scratch_dbname(SCRATCH_ROLE, "epigone_test_branch_a") == (
+        "epigone_test_migrations_scratch_abf2e74a"
+    )
 
 
 def test_scratch_database_names_fit_the_postgres_identifier_limit() -> None:
