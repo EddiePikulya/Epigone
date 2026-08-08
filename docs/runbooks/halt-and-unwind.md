@@ -378,18 +378,48 @@ Nearly every await between two pulses is now bounded (issue #204):
   evidence matters most;
 - the pulse-leg refill above is the third.
 
-**The dead-man residual is NARROWED, NOT CLOSED, and you should expect to see
-it fire.** The push falls due asynchronously to the sweep, so the arithmetic
-is: the step already in flight when it falls due (up to 65s) + a wedged push
-cut at its 30s ceiling + the next saturated step (another 65s) before the leg
-refills and can try again. That is ~190s against 150s of slack under a
-saturated exchange, and nearer ~250s when the database is simultaneously
-wedged — the pre-sign budget's pacing sleep is deliberately un-ceilinged, so
-"every await is bounded" is not literally true either. What changed is the
-size of the quiet window, from *the rest of the sweep* (minutes) to at most
-45s: the residual now needs bad luck, where the 2026-08-07 incident hit it
-first try. Issue #212 tracks closing it properly with a deadline-aware
-priority push; it is a mainnet gate.
+**The dead-man residual, and what the sweep now does about it (issue #212).**
+The push falls due asynchronously to the sweep, so before the fix the
+arithmetic was: the step already in flight when it falls due (up to 65s) + a
+wedged push cut at its 30s ceiling + the next saturated step (another 65s)
+before the leg's budget refills and it can try again — ~190s against 150s of
+slack under a saturated exchange. The sweep now watches the deadline itself:
+when the armed schedule is within 95s of its horizon (one step bound plus one
+push ceiling), a push attempt jumps the leg budget and the pulse throttle
+both, so a step about to start is never the reason the last attempt was
+skipped — as long as that step is the longest thing between two of the sweep's
+pulses, which the un-ceilinged pacing sleep below is not. In the log that
+reads
+
+```
+dead-man's schedule is 55s from its horizon and the next sweep step could
+outlive it — a budget-exempt push attempt now (issue #212)
+```
+
+which during a long sweep is **expected and self-healing**, not a fault: it
+means the grind walked a horizon down and the schedule was re-armed in front
+of it. Attempts are paced at 5s and the window is 95s wide, so **one or two
+per horizon is the healthy shape and ~19 in a row is the ceiling** — a burst
+approaching that means every push is failing, and the
+`sweep keepalive (dead-man's push) failed` / `hit its ceiling` lines beside it
+say which way. If you also see
+`dead-man's switch: retrying at once rather than in 6h`, the exchange rejected
+a `scheduleCancel` outright while a schedule was still standing: the switch is
+deliberately ignoring its 6-hourly re-probe cadence until that schedule either
+gets re-armed or runs out, and the reject's own message is on the audit trail.
+
+**What is still NOT closed, so a fire is still possible.** If every attempt
+inside that 95s window wedges for its full 30s ceiling — up to four of them —
+the schedule still lapses; that needs an exchange that cannot accept a
+`scheduleCancel` at all across the window, rather than a push that was merely
+deprioritised. The pre-sign budget's pacing sleep is also deliberately
+un-ceilinged, so a token-deficit wait longer than the window outlasts
+everything above — that is the one gap in "a step is never the reason an
+attempt was skipped", and "every await is bounded" is still not literally
+true.
+And a DB-blind sweep does not push at all, by design (it runs with zero
+Postgres behind it) — under one of those the schedule lapses within a horizon,
+which is the same cancel-all the blind sweep is already performing.
 
 **So: a `scheduleCancel` that fires mid-halt is expected-rare, not a second
 incident.** It discharges in the fail-safe direction — it cancels every

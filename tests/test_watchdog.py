@@ -40,7 +40,7 @@ from epigone.safety.halt import (
     request_halt,
     resume,
 )
-from epigone.safety.watchdog import Watchdog
+from epigone.safety.watchdog import SWEEP_PULSE_INTERVAL, Watchdog
 from tests.support.clock import FakeClock
 from tests.support.orders import open_order
 
@@ -1805,6 +1805,296 @@ async def test_a_slow_leg_gets_its_budget_back_mid_sweep(
     assert attempts >= 2
     halt = await active_halt(pool)
     assert halt is not None and halt.swept_at is not None
+
+
+@pytest.mark.parametrize("deadline_aware", [True, False])
+async def test_a_lapsing_schedule_is_pushed_even_when_the_leg_is_spent(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    exec_gateway: FakeExecutionGateway,
+    monkeypatch: pytest.MonkeyPatch,
+    deadline_aware: bool,
+) -> None:
+    """Issue #212 — the residual PR #203's refill narrowed but did not close,
+    reproduced at the numbers the issue states and then closed.
+
+    The setup IS the issue's arithmetic: the push leg is spent (no budget,
+    and a refill window too long to rescue it) and every enumeration step
+    costs the 65s an exchange-saturated cancel POST can take. The schedule is
+    armed for 300s with the push falling due at half that, so 150s of slack
+    against a sweep that moves in 65s jumps — and under the budget alone the
+    next attempt lands after the horizon. `deadline_aware=False` is that
+    counterfactual, pinned: the schedule LAPSES mid-halt, the last-resort net
+    discharges under a working watchdog, and one of the account's 10 daily
+    triggers is burned.
+
+    Deadline-aware, the push stops waiting for a budget it will not get: the
+    step boundary that finds the horizon inside PRIORITY_PUSH_WINDOW_SECONDS
+    makes one exempted attempt first, and the net stays armed across the
+    whole grind."""
+    from epigone.safety import watchdog as watchdog_module
+    from epigone.safety.deadman import DeadMansSwitch
+
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_REFILL_SECONDS", 3600.0)
+    horizon = timedelta(seconds=300)
+    deadman = DeadMansSwitch(
+        audited,
+        audit,
+        clock,
+        horizon=horizon,
+        reprobe=timedelta(hours=6),
+        master_address=MASTER,
+    )
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=deadman.maintain,
+        keepalive_deadline=deadman.armed_until if deadline_aware else None,
+    )
+    await deadman.maintain()  # armed: now+300, next push due at now+150
+    # Two accounts × four venues: a sweep whose enumeration alone outruns the
+    # horizon, which is what a real account-wide one does.
+    read_gateway.sub_accounts[MASTER] = ["0x" + "11" * 20]
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(65)  # a saturated cancel POST's own bound, per step
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    armed = [at for name, at in exec_gateway.actions if name == "schedule_cancel"]
+    latest = armed[-1]
+    assert isinstance(latest, datetime)
+    if deadline_aware:
+        # The initial arm, plus one exempted push per horizon the grind walks
+        # back down to: this sweep is long enough to reach two of them.
+        assert len(armed) == 3
+        assert latest > clock.now()  # the net never lapsed while the sweep ran
+    else:
+        assert len(armed) == 1  # the spent leg never pushes again
+        assert latest < clock.now()  # …so it fired mid-halt: the #212 residual
+
+
+async def test_a_wedged_exempt_attempt_does_not_spend_the_window(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The term the issue's own arithmetic turns on, and the reason the rule
+    is not "one exempted attempt per armed schedule" however the decision
+    comment phrases it.
+
+    Issue #212 walks its worst case from the moment D a push falls due: an
+    in-flight 65s step, then a boundary at D+65 where the attempt WEDGES and
+    is cut at its ceiling, then a 65s step that carries the sweep past the
+    horizon at D+150. One exemption is spent by the wedge at D+65 — which the
+    refilled ordinary budget would have paid for anyway — and the schedule
+    lapses regardless.
+
+    So the window admits the NEXT boundary too. Here the first attempt wedges
+    and is cut; the second, 30s later and still 55s clear of the horizon, has
+    its whole ceiling in front of it and lands. That is the composition the
+    fix removes: a push that was deprioritised rather than impossible."""
+    from epigone.safety import watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "KEEPALIVE_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_REFILL_SECONDS", 3600.0)
+    armed_until = clock.now() + timedelta(seconds=85)  # the D+65 boundary
+    seen: list[datetime] = []
+
+    async def wedges_once() -> None:
+        nonlocal armed_until
+        seen.append(clock.now())
+        if len(seen) == 1:
+            clock.advance(30)  # the ceiling this attempt is about to be cut at
+            await asyncio.sleep(3600)  # real seconds: never returns
+        armed_until = clock.now() + timedelta(seconds=300)
+
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=wedges_once,
+        keepalive_deadline=lambda: armed_until,
+    )
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    started = clock.now()
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(65)
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert seen[0] == started  # 85s left: inside the window, so it tries
+    assert seen[1] == started + timedelta(seconds=30)  # cut, and tried again
+    assert armed_until > clock.now()  # …and the second one saved the schedule
+
+
+@pytest.mark.parametrize(("seconds_left", "exempted"), [(60, 2), (3600, 0)])
+async def test_the_exempt_push_is_paced_not_issued_at_every_step(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+    seconds_left: int,
+    exempted: int,
+) -> None:
+    """What the exemption costs a wedged sweep, bounded: attempts are PACED
+    at SWEEP_PULSE_INTERVAL, never issued once per enumeration step.
+
+    The push here always fails, so the deadline never moves and the window
+    stays open for the whole sweep — the shape that would otherwise pay a
+    keepalive attempt at every step, which is precisely the tax PR #203's
+    budget exists to prevent. Sixteen pulse boundaries pass here (four venues
+    enumerated, then the position pass, each pulsing twice) inside eight
+    seconds, and exactly two attempts come out of them: the pace decides, not
+    the step count.
+
+    It also pins the throttle exemption: the first boundary runs in the same
+    instant as the cycle-top beat, so an attempt there at all means the
+    priority path outranks the pulse throttle as well as the leg budget.
+
+    `seconds_left=3600` is the counterfactual that keeps the WINDOW
+    load-bearing rather than the mere presence of a deadline: a schedule
+    nowhere near its horizon buys the spent leg nothing."""
+    from epigone.safety import watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_REFILL_SECONDS", 3600.0)
+    armed_until = clock.now() + timedelta(seconds=seconds_left)
+    seen: list[datetime] = []
+
+    async def failing_push() -> None:
+        seen.append(clock.now())
+        raise ConnectionError("connection refused")  # the deadline never moves
+
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=failing_push,
+        keepalive_deadline=lambda: armed_until,
+    )
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    started = clock.now()
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(2)  # inside SWEEP_PULSE_INTERVAL: the throttle would bite
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    assert len(seen) == exempted
+    if exempted:
+        assert seen[0] == started  # the first boundary, throttle notwithstanding
+        assert seen[1] - seen[0] >= SWEEP_PULSE_INTERVAL
+    halt = await active_halt(pool)
+    assert halt is not None and halt.swept_at is not None
+
+
+async def test_each_newly_armed_schedule_gets_its_own_exempt_push(
+    pool: asyncpg.Pool,
+    clock: FakeClock,
+    read_gateway: FakeHyperliquidGateway,
+    audited: AuditedExecutionGateway,
+    audit: ExecutionAudit,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window re-opens for every horizon a grind walks back down to. A
+    sweep runs for minutes and a horizon is 300s, so a rule that saved the
+    FIRST schedule and then went quiet would leave the residual untouched for
+    every horizon after it. Nothing is remembered per schedule: a landed push
+    moves the deadline 300s out, which closes the window by itself, and the
+    grind re-opens it."""
+    from epigone.safety import watchdog as watchdog_module
+
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(watchdog_module, "PULSE_LEG_REFILL_SECONDS", 3600.0)
+    armed_until = clock.now() + timedelta(seconds=60)
+    seen: list[datetime] = []
+
+    async def push() -> None:
+        nonlocal armed_until
+        seen.append(clock.now())
+        armed_until = clock.now() + timedelta(seconds=300)
+
+    watchdog = Watchdog(
+        pool,
+        clock,
+        read_gateway,
+        audited,
+        audit,
+        WeightBudget(1_000_000, clock),
+        master_address=MASTER,
+        signer_address=SIGNER,
+        executor_stale=STALE,
+        db_blind_after=DB_BLIND,
+        capability_interval=CAPABILITY_INTERVAL,
+        keepalive=push,
+        keepalive_deadline=lambda: armed_until,
+    )
+    await request_halt(pool, clock, audit, source=KILL_SOURCE, reason="/kill")
+    started = clock.now()
+    inner = read_gateway.get_open_orders
+
+    async def paced(address: str, dex: str | None = None) -> list[OpenOrder]:
+        clock.advance(65)
+        return await inner(address, dex)
+
+    monkeypatch.setattr(read_gateway, "get_open_orders", paced)
+
+    await watchdog.run_cycle()
+
+    # Two horizons approached, two exempted pushes. The gap is the sweep's own
+    # arithmetic: the landed push buys 300s, this scope's four 65s steps spend
+    # 260 of them, and the next boundary is back inside the window.
+    assert seen == [started, started + timedelta(seconds=260)]
 
 
 async def test_a_saturated_read_is_cut_at_its_ceiling(
